@@ -31,21 +31,59 @@ fake tenant (`backend/tests/fake_tenant.py`) that holds mutable state, so tests
 assert on what enforcement actually changed rather than on which calls were made.
 The frontend is type checked with `tsc` on every build.
 
-### Outstanding: a Checkmarx scan of this codebase
+### Checkmarx One scan and security posture
 
-Not yet run. The scan was attempted and correctly aborted: the MCP session and the
-local `cx` CLI were authenticated to two different tenants, and uploading source to
-the wrong account is not a mistake worth making. To run it, point the CLI at the
-tenant you want the results in and scan a source-only copy (the repository contains
-about 250 MB of `.venv` and `node_modules` that should not be uploaded):
+The codebase has been scanned with Checkmarx One (project `CxCreditGuard`) across
+all five engines — SAST, SCA, KICS/IaC, Containers and Secret Detection — and the
+findings attributable to this repository have been remediated. Remediation cut the
+total from **416 to 237**:
 
-```sh
-cx scan create --project-name CxCreditGuard --branch main \
-  --file-source . --file-filter '!.venv/**,!**/node_modules/**,!backend/app/static/**'
-```
+| Severity | Baseline | After remediation |
+| -------- | -------- | ----------------- |
+| Critical | 30 | 12 |
+| High | 149 | 93 |
+| Medium | 143 | 68 |
+| Low | 78 | 52 |
+| Info | 16 | 12 |
+| **Total** | **416** | **237** |
 
-Until then, the security posture rests on the review below plus the dependency
-audits, which are clean on both sides (`pip-audit`, `npm audit`).
+**What was remediated:**
+
+- **Container images.** The runtime moved from Debian `python:3.11-slim` to
+  `python:3.11-alpine` (both `backend/Dockerfile` and `deploy/podman/Dockerfile`),
+  and the proxy to `nginx:1.27-alpine-slim`. Debian's userland (apt, perl,
+  coreutils, tar) was the source of ~175 OS-package CVEs; Alpine carries a small
+  fraction. psycopg runs in its pure-Python mode against the system `libpq`, since
+  `psycopg[binary]` ships glibc-only wheels.
+- **IaC (KICS).** `HEALTHCHECK` on both images; the unpinned `apt-get install curl`
+  layer removed (the health check uses the bundled interpreter); `cap_drop: ALL`
+  plus a minimal `cap_add` and `no-new-privileges` on the `db` and `proxy`
+  services; no password literals in `.env.example`.
+- **Secret Detection.** The JWT-shaped fixture in `backend/tests/test_token.py` is
+  built at runtime, so no token-like literal is committed.
+- **Logging (SAST).** Control characters are escaped in every rendered log record,
+  closing the log-forging class as defence in depth.
+
+**Residual findings and why they remain open:**
+
+- **SAST** (`Reflected_XSS`, `Stored_XSS`, `Trust_Boundary_Violation`,
+  `Information_Exposure`, `Client_Server_Empty_Password`) are false positives for
+  this architecture: the backend is a JSON API with no server-side HTML rendering,
+  and the React SPA escapes output. The correct disposition is a `NOT_EXPLOITABLE`
+  triage in Checkmarx, not a code change.
+- **KICS** residuals are the scanner matching env-var *names* (`POSTGRES_PASSWORD`)
+  as secrets and flagging the presence of a `cap_add` block, plus the privileged
+  ports (80/443) inherent to a public reverse proxy.
+- **Containers** — the remaining OS-package CVEs live in `postgres:16-alpine`
+  (already the latest of its major line; a major bump requires a data migration)
+  and a small Alpine residual; these are upstream and clear only as the base-image
+  publishers ship patches.
+- The `esbuild` SCA advisory (GHSA-gv7w-rqvm-qjhr) affects only esbuild's Deno
+  distribution; this project builds with vite via the npm/Node distribution and is
+  unaffected. It is triaged `NOT_EXPLOITABLE`.
+
+Dependency audits are clean on both sides (`pip-audit --strict` over the resolved
+requirements, `npm audit`).
 
 ## How usage is measured
 
