@@ -80,7 +80,10 @@ services:
       - internal
 
   proxy:
-    image: nginx:1.27-alpine
+    # The -slim variant drops the xslt/image-filter/geoip modules (and their
+    # libxml2/libxslt/libgd dependencies, a recurring source of CVEs) that this
+    # plain reverse-proxy config never uses.
+    image: nginx:1.27-alpine-slim
     restart: unless-stopped
     depends_on:
       - app
