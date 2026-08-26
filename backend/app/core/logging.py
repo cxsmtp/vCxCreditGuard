@@ -31,6 +31,7 @@ def sanitize_log(text: str) -> str:
     """Escape control characters so untrusted text cannot forge log entries."""
     return text.translate(_CONTROL_CHARS)
 
+
 _PATTERNS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
     # JSON Web Tokens (API key, access token, id token) anywhere in the message.
     (re.compile(r"\bey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"), REDACTED),
