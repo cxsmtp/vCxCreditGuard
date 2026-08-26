@@ -25,22 +25,26 @@ COPY frontend/ ./
 RUN npx vite build --outDir dist --emptyOutDir
 
 # --- Stage 2: runtime -------------------------------------------------------
-FROM python:3.11-slim AS runtime
+# Alpine keeps the runtime image's OS-package CVE surface minimal.
+FROM python:3.11-alpine AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# No OS packages are installed: every dependency ships a wheel (no compiler
-# needed) and the Podman health check reaches /healthz through the bundled
-# interpreter (see HEALTHCHECK below) rather than pulling in curl.
-
 WORKDIR /app
 
 # Dependencies first so a source change does not invalidate the install layer.
+# libpq is the only runtime OS package (psycopg's pure-Python mode loads it);
+# the build toolchain goes in a throwaway virtual package and is removed after.
+# psycopg is installed directly rather than via ".[postgres]" because that extra
+# pulls psycopg[binary], whose wheels are glibc-only (manylinux).
 COPY backend/pyproject.toml ./
-RUN pip install --no-cache-dir ".[postgres]" \
+RUN apk add --no-cache libpq \
+    && apk add --no-cache --virtual .build gcc musl-dev python3-dev \
+    && pip install --no-cache-dir . psycopg \
+    && apk del .build \
     && pip uninstall -y pip setuptools wheel 2>/dev/null || true
 
 COPY backend/alembic.ini ./
@@ -53,8 +57,10 @@ COPY deploy/podman/easy-entrypoint.sh /usr/local/bin/easy-entrypoint.sh
 # only when it is not.
 COPY --from=frontend /build/dist ./app/static
 
+# Alpine ships busybox adduser/addgroup rather than shadow's useradd.
 RUN chmod +x /usr/local/bin/easy-entrypoint.sh \
-    && useradd --system --create-home --uid 10001 cxcg \
+    && addgroup -g 10001 cxcg \
+    && adduser -D -H -u 10001 -G cxcg cxcg \
     && mkdir -p /app/data \
     && chown -R cxcg:cxcg /app
 

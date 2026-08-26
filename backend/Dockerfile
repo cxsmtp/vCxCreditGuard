@@ -17,23 +17,28 @@ COPY frontend/ ./
 RUN npx vite build --outDir dist --emptyOutDir
 
 
-FROM python:3.11-slim AS runtime
+# Alpine keeps the runtime image's OS-package CVE surface minimal (Debian slim
+# ships a large userland - apt, perl, coreutils, tar - each with its own CVEs).
+FROM python:3.11-alpine AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# No OS packages are installed: every Python dependency ships a wheel, no
-# compiler is needed, and the container health check uses the interpreter that
-# is already present (see HEALTHCHECK below) rather than pulling in curl. That
-# keeps the runtime image free of an apt layer and its attack surface.
-
 WORKDIR /app
 
 # Dependencies first so a source change does not invalidate the install layer.
+# libpq is the only runtime OS package (psycopg's pure-Python mode loads it);
+# the build toolchain goes in a throwaway virtual package so any dependency
+# without a musl wheel can still compile, then is removed to keep the image lean.
+# psycopg is installed directly rather than via the ".[postgres]" extra because
+# that extra pulls psycopg[binary], whose wheels are glibc-only (manylinux).
 COPY backend/pyproject.toml ./
-RUN pip install --no-cache-dir ".[postgres]" \
+RUN apk add --no-cache libpq \
+    && apk add --no-cache --virtual .build gcc musl-dev python3-dev \
+    && pip install --no-cache-dir . psycopg \
+    && apk del .build \
     && pip uninstall -y pip setuptools wheel 2>/dev/null || true
 
 COPY backend/alembic.ini ./
@@ -47,8 +52,10 @@ COPY backend/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY --from=frontend /build/dist ./app/static
 
 # Run as an unprivileged user. /app/data is only used by the SQLite backend.
+# Alpine ships busybox adduser/addgroup rather than shadow's useradd.
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
-    && useradd --system --create-home --uid 10001 cxcg \
+    && addgroup -g 10001 cxcg \
+    && adduser -D -H -u 10001 -G cxcg cxcg \
     && mkdir -p /app/data \
     && chown -R cxcg:cxcg /app
 
