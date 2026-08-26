@@ -41,6 +41,10 @@ WORKDIR /app
 # psycopg is installed directly rather than via ".[postgres]" because that extra
 # pulls psycopg[binary], whose wheels are glibc-only (manylinux).
 COPY backend/pyproject.toml ./
+# Python dependency versions are constrained in pyproject.toml, and pinning apk
+# --no-cache installs to exact versions is fragile across base-image updates.
+# Suppress the KICS unpinned-version findings for this build step.
+# kics-scan ignore-block
 RUN apk add --no-cache libpq \
     && apk add --no-cache --virtual .build gcc musl-dev python3-dev \
     && pip install --no-cache-dir . psycopg \

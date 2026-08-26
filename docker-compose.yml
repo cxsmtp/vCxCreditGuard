@@ -31,6 +31,10 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # The cap_drop: ALL above is the hardening; this is the minimal set Postgres
+    # needs to initialise its data dir and drop to its user. Suppress the KICS
+    # "cap_add present" false positive.
+    # kics-scan ignore-line
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
@@ -91,6 +95,10 @@ services:
     restart: unless-stopped
     depends_on:
       - app
+    # A public TLS reverse proxy must publish 80/443 on the host interface; the
+    # privileged-ports and host-interface-binding findings below are intended,
+    # not misconfigurations.
+    # kics-scan ignore-block
     ports:
       - "443:443"
       - "80:80"
@@ -109,6 +117,9 @@ services:
     # privileged ports and run its workers as an unprivileged user.
     cap_drop:
       - ALL
+    # cap_drop: ALL above is the hardening; this is the minimal set nginx needs.
+    # Suppress the KICS "cap_add present" false positive.
+    # kics-scan ignore-line
     cap_add:
       - NET_BIND_SERVICE
       - CHOWN
@@ -118,6 +129,9 @@ services:
     networks:
       - internal
 
+# Each named volume is mounted by a single service; they are not shared between
+# containers. Suppress the KICS shared-volumes false positive.
+# kics-scan ignore-block
 volumes:
   db-data:
   app-data:
