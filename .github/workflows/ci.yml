@@ -39,8 +39,13 @@ jobs:
           CXCG_COOKIE_SECURE: "false"
 
       - name: Dependency audit
-        # Fails the build on a known vulnerable dependency.
-        run: python -m pip_audit --strict
+        # Fails the build on a known vulnerable dependency. Audit the resolved
+        # third-party requirements rather than the live environment: the latter
+        # includes the local editable project (cxcreditguard), which is not on
+        # PyPI and would otherwise trip --strict on every run.
+        run: |
+          python -m pip freeze --exclude-editable > /tmp/requirements.txt
+          python -m pip_audit --strict -r /tmp/requirements.txt
 
   frontend:
     runs-on: ubuntu-latest

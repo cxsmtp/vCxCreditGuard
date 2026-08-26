@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import Decimal
 
-import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -120,7 +118,8 @@ def test_user_credit_increase_restores_roles(db: Session) -> None:
 
 
 def test_project_credit_increase_restores_access(db: Session) -> None:
-    """When a restricted project's credit limit is increased, the next run restores project configuration."""
+    """When a restricted project's credit limit is increased, the next run
+    restores project configuration."""
     tenant, client = prepare(db)
     limit = add_limit(
         db,
@@ -170,7 +169,8 @@ def test_project_credit_increase_restores_access(db: Session) -> None:
 
 
 def test_application_credit_increase_restores_child_projects(db: Session) -> None:
-    """When an application limit breaches and is later given more credit, child projects are restored."""
+    """When an application limit breaches and is later given more credit, child
+    projects are restored."""
     tenant, client = prepare(db)
     limit = add_limit(
         db,
@@ -183,7 +183,9 @@ def test_application_credit_increase_restores_child_projects(db: Session) -> Non
     evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
     db.commit()
 
-    tenant.set_entity_credits(view="application", name="Payments", credits=500, entity_id="app-payments")
+    tenant.set_entity_credits(
+        view="application", name="Payments", credits=500, entity_id="app-payments"
+    )
     ingestion.ingest_usage(db, client)
     db.commit()
 
@@ -229,7 +231,9 @@ def test_group_credit_increase_restores_child_projects(db: Session) -> None:
     db.commit()
 
     # Project in group consumes credits
-    tenant.set_entity_credits(view="project", name="payments/web", credits=200, entity_id="proj-web")
+    tenant.set_entity_credits(
+        view="project", name="payments/web", credits=200, entity_id="proj-web"
+    )
     ingestion.ingest_usage(db, client)
     db.commit()
 
@@ -260,7 +264,8 @@ def test_group_credit_increase_restores_child_projects(db: Session) -> None:
 
 
 def test_update_limit_service_restores_immediately_on_credit_increase(db: Session) -> None:
-    """Updating credit limit via limits_service restores access immediately when client is supplied."""
+    """Updating credit limit via limits_service restores access immediately when
+    client is supplied."""
     tenant, client = prepare(db)
     limit = add_limit(
         db,
