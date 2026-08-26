@@ -32,11 +32,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# curl lets Podman healthchecks reach /healthz. Nothing else is installed and
-# every dependency ships a wheel, so no compiler is needed.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+# No OS packages are installed: every dependency ships a wheel (no compiler
+# needed) and the Podman health check reaches /healthz through the bundled
+# interpreter (see HEALTHCHECK below) rather than pulling in curl.
 
 WORKDIR /app
 
@@ -73,6 +71,11 @@ ENV CXCG_ENV=development \
 USER cxcg
 
 EXPOSE 8000
+
+# Liveness probe via the bundled interpreter, so the image needs no extra
+# tooling. A non-2xx response raises and exits non-zero, marking it unhealthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
 
 # The easy entrypoint generates/persists the master key and a first admin, then
 # applies migrations. Pass the real uvicorn command via CMD.

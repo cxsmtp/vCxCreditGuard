@@ -24,11 +24,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# curl is needed by the compose healthcheck. Nothing else is installed, and no
-# compiler is present in the final image: every dependency ships a wheel.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+# No OS packages are installed: every Python dependency ships a wheel, no
+# compiler is needed, and the container health check uses the interpreter that
+# is already present (see HEALTHCHECK below) rather than pulling in curl. That
+# keeps the runtime image free of an apt layer and its attack surface.
 
 WORKDIR /app
 
@@ -56,6 +55,12 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
 USER cxcg
 
 EXPOSE 8000
+
+# Liveness probe using the bundled interpreter, so the image needs no extra
+# tooling. A non-2xx response raises and exits non-zero, marking the container
+# unhealthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
 
 # The container listens on plain HTTP. TLS is terminated by the reverse proxy in
 # docker-compose.yml, which is the documented deployment.

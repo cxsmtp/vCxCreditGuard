@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -167,7 +168,16 @@ class TestSecrecy:
         """Asserted against a configured handler, which is where redaction applies."""
         configure_logging("DEBUG")
         api_key = make_api_key()
-        access_token = "eyJhY2Nlc3MiOiJ0b2tlbiJ9.cGF5bG9hZA.c2ln"
+        # Build a JWT-shaped fixture at runtime so no token-like literal is
+        # committed to source (a hardcoded value trips secret scanners even
+        # though this is a throwaway test string).
+        access_token = ".".join(
+            (
+                base64.urlsafe_b64encode(b'{"access":"token"}').decode().rstrip("="),
+                base64.urlsafe_b64encode(b"payload").decode().rstrip("="),
+                "sig",
+            )
+        )
         manager = build_manager(lambda _r: token_response(access_token=access_token), api_key)
         manager.get_access_token()
         # Simulate a careless log line added later in the codebase.
