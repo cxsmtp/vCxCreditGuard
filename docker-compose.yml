@@ -19,6 +19,8 @@ services:
       # kics-scan ignore-line
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
     volumes:
+      # Used only by this service; not shared with another container.
+      # kics-scan ignore-line
       - db-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cxcg} -d ${POSTGRES_DB:-cxcreditguard}"]
@@ -64,6 +66,8 @@ services:
       CXCG_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cxcg}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cxcreditguard}
     volumes:
       # Only used if you switch CXCG_DATABASE_URL back to SQLite.
+      # Used only by this service; not shared with another container.
+      # kics-scan ignore-line
       - app-data:/app/data
     healthcheck:
       # The image ships no curl; probe with the bundled Python interpreter.
@@ -129,9 +133,6 @@ services:
     networks:
       - internal
 
-# Each named volume is mounted by a single service; they are not shared between
-# containers. Suppress the KICS shared-volumes false positive.
-# kics-scan ignore-block
 volumes:
   db-data:
   app-data:
