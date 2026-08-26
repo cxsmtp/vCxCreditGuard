@@ -13,7 +13,7 @@ reversible from the GUI with one click.
 
 | Step | Area | State |
 | ---- | ---- | ----- |
-| 1 | Skeleton, schema, migrations, utility auth, Docker | Done |
+| 1 | Skeleton, schema, migrations, utility auth, containers | Done |
 | 2 | Checkmarx auth: API key parsing, token exchange, refresh | Done |
 | 3 | Org model sync (users, groups, projects, applications) | Done |
 | 4 | Usage ingestion and attribution | Done |
@@ -176,7 +176,12 @@ flag **and its full config**, and the prior severity list. Restore replays that
 snapshot. A feature that was already off before the utility touched it stays off
 afterwards, and a restore never resets branches or severity levels.
 
-## Quick start with Docker
+## Hardened deployment (Podman Compose)
+
+For a production posture — HTTPS via an nginx TLS proxy plus PostgreSQL — run the
+root `docker-compose.yml` with Podman Compose (Podman 4.1+, or `podman-compose`).
+The single-container quick start below is easier for a first look; this is the
+path to actually deploy.
 
 ```sh
 cp .env.example .env
@@ -196,9 +201,12 @@ Provide a TLS certificate as described in
 [deploy/nginx/README.md](deploy/nginx/README.md), then:
 
 ```sh
-docker compose up -d
-docker compose logs -f app
+podman compose -f docker-compose.yml up -d
+podman compose -f docker-compose.yml logs -f app
 ```
+
+(The compose file keeps its conventional `docker-compose.yml` name, which Podman
+Compose reads directly.)
 
 Create the first administrator by setting `CXCG_BOOTSTRAP_ADMIN_USERNAME` and
 `CXCG_BOOTSTRAP_ADMIN_PASSWORD` in `.env` before the first start. The account is
@@ -218,14 +226,21 @@ plain HTTP on port 8000, so the UI is reachable from any browser at
 environment variables**: on first start the image generates its own master key
 and a first admin account for you.
 
-On Windows (Podman Desktop installed), from the repository root in PowerShell:
+On Windows (Podman Desktop installed), from the repository root, either in
+PowerShell:
 
 ```powershell
 .\run-podman.ps1
 ```
 
-That builds the `cxcreditguard:podman` image and starts (or restarts) the
-`cxcreditguard` container, then prints the startup log. Then open:
+or from `cmd.exe` (handy when PowerShell's execution policy blocks the `.ps1`):
+
+```bat
+run.bat
+```
+
+Both build the `cxcreditguard:podman` image and start (or restart) the
+`cxcreditguard` container, then tail the startup log. Then open:
 
 - **UI:** http://localhost:8000
 - **API docs** (development mode only): http://localhost:8000/docs
@@ -247,12 +262,12 @@ podman run -d --name cxcreditguard --restart unless-stopped \
   -p 8000:8000 -v cxcreditguard-data:/app/data cxcreditguard:podman
 ```
 
-| Action                   | `run-podman.ps1`        | `make`          |
-| ------------------------ | ----------------------- | --------------- |
-| Build and run            | `.\run-podman.ps1`      | `make podman-run` |
-| Stream logs              | `.\run-podman.ps1 -Logs` | `make podman-logs` |
-| Stop / remove container  | `.\run-podman.ps1 -Down` | `make podman-down` |
-| Stop and erase all data  | `.\run-podman.ps1 -Purge` | `make podman-purge` |
+| Action                   | `run.bat` (cmd)   | `run-podman.ps1`          | `make`            |
+| ------------------------ | ----------------- | ------------------------- | ----------------- |
+| Build and run            | `run.bat`         | `.\run-podman.ps1`        | `make podman-run` |
+| Stream logs              | `run.bat logs`    | `.\run-podman.ps1 -Logs`  | `make podman-logs` |
+| Stop / remove container  | `run.bat down`    | `.\run-podman.ps1 -Down`  | `make podman-down` |
+| Stop and erase all data  | `run.bat purge`   | `.\run-podman.ps1 -Purge` | `make podman-purge` |
 
 What lives where and how to keep it safe:
 
@@ -274,8 +289,8 @@ Security posture of this convenience image:
   silently discards `Secure` cookies over HTTP — login would appear to "do
   nothing" rather than error. **Do not expose it directly to the internet.**
 - For a hardened, HTTPS + Postgres deployment, use the root `docker-compose.yml`
-  (which builds `backend/Dockerfile`) exactly as documented under "Quick start
-  with Docker" above.
+  with Podman Compose (which builds `backend/Dockerfile`), as documented under
+  "Hardened deployment (Podman Compose)" above.
 
 ## Local development
 
