@@ -1,0 +1,45 @@
+# Keep image build contexts small and free of local secrets / caches.
+# Comments are not allowed mid-pattern in some builders, so keep it simple.
+
+# VCS and CI metadata
+.git
+.gitignore
+.github
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+secrets/
+deploy/nginx/certs/
+
+# Python
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Local runtime data and logs (never shipped in the image)
+backend/data/
+*.db
+*.sqlite3
+backend/*.log
+
+# Node / frontend build products (rebuilt inside the image)
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+backend/app/static/

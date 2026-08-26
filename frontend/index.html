@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>CxCreditGuard</title>
+    <link rel="icon" href="data:," />
+    <!--
+      No inline script here on purpose: the backend serves a strict CSP with
+      script-src 'self' and no 'unsafe-inline'. The theme is applied at the top of
+      main.tsx, which runs before React paints anything.
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

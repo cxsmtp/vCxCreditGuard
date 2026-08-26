@@ -1,0 +1,7 @@
+INFO:     Started server process [10100]
+INFO:     Waiting for application startup.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+WARNI [app.services.auth] Created bootstrap admin account 'admin' from the environment. Log in, change the password, then remove CXCG_BOOTSTRAP_ADMIN_USERNAME and CXCG_BOOTSTRAP_ADMIN_PASSWORD from the environment.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)

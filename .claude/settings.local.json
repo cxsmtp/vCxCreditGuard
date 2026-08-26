@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker --version)",
+      "mcp__Checkmarx__listApplications",
+      "mcp__Checkmarx__listProjects",
+      "mcp__Checkmarx__getProjectConfig"
+    ]
+  }
+}
