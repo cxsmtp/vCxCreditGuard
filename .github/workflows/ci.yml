@@ -78,4 +78,8 @@ jobs:
       - name: Validate the compose file
         run: docker compose config --quiet
         env:
+          # Not a secret: a throwaway placeholder so the compose `:?` guard is
+          # satisfied while validating the file. Suppress the KICS
+          # generic-password false positive (it matches the key name).
+          # kics-scan ignore-line
           POSTGRES_PASSWORD: ci-placeholder

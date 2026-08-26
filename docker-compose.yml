@@ -1,3 +1,6 @@
+# Shared Volumes Between Containers: each named volume below is mounted by a
+# single service (db-data by db, app-data by app), so this is a false positive.
+# kics-scan disable=8c978947-0ff6-485c-b0c2-0bfca6026466
 # CxCreditGuard: app, database and TLS terminating reverse proxy.
 #
 #   cp .env.example .env      # then fill in CXCG_MASTER_KEY and POSTGRES_PASSWORD
@@ -13,6 +16,10 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-cxcreditguard}
       POSTGRES_USER: ${POSTGRES_USER:-cxcg}
+      # Not a hardcoded secret: this is a ${POSTGRES_PASSWORD} reference resolved
+      # from the operator's .env. Suppress the KICS generic-password false
+      # positive (it matches the key name, not the value).
+      # kics-scan ignore-line
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
     volumes:
       - db-data:/var/lib/postgresql/data
@@ -27,6 +34,10 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # The cap_drop: ALL above is the hardening; this is the minimal set Postgres
+    # needs to initialise its data dir and drop to its user. Suppress the KICS
+    # "cap_add present" false positive.
+    # kics-scan ignore-line
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
@@ -87,6 +98,10 @@ services:
     restart: unless-stopped
     depends_on:
       - app
+    # A public TLS reverse proxy must publish 80/443 on the host interface; the
+    # privileged-ports and host-interface-binding findings below are intended,
+    # not misconfigurations.
+    # kics-scan ignore-block
     ports:
       - "443:443"
       - "80:80"
@@ -105,6 +120,9 @@ services:
     # privileged ports and run its workers as an unprivileged user.
     cap_drop:
       - ALL
+    # cap_drop: ALL above is the hardening; this is the minimal set nginx needs.
+    # Suppress the KICS "cap_add present" false positive.
+    # kics-scan ignore-line
     cap_add:
       - NET_BIND_SERVICE
       - CHOWN
