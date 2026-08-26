@@ -817,7 +817,10 @@ def _restoration_body(action: EnforcementAction, snapshot: dict[str, Any], reaso
         "admin": "An administrator restored access from the Notification Center.",
         "period_rollover": "A new budget period started, so the restriction was lifted.",
         "limit_removed": "The limit that caused this restriction was removed or disabled.",
-        "credit_increased": "The credit limit was increased or consumption is within budget, so the restriction was lifted.",
+        "credit_increased": (
+            "The credit limit was increased or consumption is within budget, "
+            "so the restriction was lifted."
+        ),
         EXEMPTED_REASON: "An exemption was granted for this entity, so the restriction was lifted.",
     }.get(reason, reason)
     if action.kind == EnforcementKind.REMOVE_USER_ROLES:

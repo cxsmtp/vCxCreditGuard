@@ -135,9 +135,7 @@ class TestProjectEnforcement:
         has both Auto Triage and SCM-based triage and remediation enabled must
         have both disabled when its limit is breached."""
         tenant = FakeTenant()
-        tenant.add_project(
-            project_id="proj-api", name="singakash/CxHybrid", repo_id=228481
-        )
+        tenant.add_project(project_id="proj-api", name="singakash/CxHybrid", repo_id=228481)
         tenant, client = setup_tenant(db, tenant)
         limit = make_limit(
             db, entity_type=EntityType.PROJECT, entity_id="proj-api", label="singakash/CxHybrid"
@@ -393,9 +391,7 @@ class TestReconciliation:
     """Already-applied restrictions are re-verified every run and re-asserted if
     they drifted back on in Checkmarx One."""
 
-    def test_auto_triage_drift_is_redisabled_with_snapshot_preserved(
-        self, db: Session
-    ) -> None:
+    def test_auto_triage_drift_is_redisabled_with_snapshot_preserved(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
         limit = make_limit(db, entity_type=EntityType.PROJECT, entity_id="proj-web")
         out1 = enforcement.apply_enforcement(
@@ -420,9 +416,7 @@ class TestReconciliation:
     def test_user_roles_drift_is_removed_again(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
         limit = make_limit(db, entity_type=EntityType.USER, entity_id="user-harsh")
-        enforcement.apply_enforcement(
-            db, client, limit=limit, period_key=PERIOD, actor=ACTOR
-        )
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
         db.commit()
         assert not any(r in tenant.role_mappings["user-harsh"] for r in AI_ROLE_NAMES)
 
@@ -439,9 +433,7 @@ class TestReconciliation:
     def test_pr_remediation_drift_is_reasserted(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
         limit = make_limit(db, entity_type=EntityType.PROJECT, entity_id="proj-api")
-        enforcement.apply_enforcement(
-            db, client, limit=limit, period_key=PERIOD, actor=ACTOR
-        )
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
         db.commit()
         assert tenant.repo_severities["repo-1"] == []
 
@@ -453,9 +445,7 @@ class TestReconciliation:
         db.commit()
 
         assert tenant.repo_severities["repo-1"] == []
-        assert any(
-            a.kind == EnforcementKind.DISABLE_PR_REMEDIATION for a in out2.reconciled
-        )
+        assert any(a.kind == EnforcementKind.DISABLE_PR_REMEDIATION for a in out2.reconciled)
 
     def test_pr_severities_are_captured_and_restored_exactly(self, db: Session) -> None:
         """The real, current severities (including MEDIUM/LOW) are captured before
@@ -470,9 +460,7 @@ class TestReconciliation:
         )
         db.commit()
         pr_action = next(
-            a
-            for a in outcome.applied
-            if a.kind == EnforcementKind.DISABLE_PR_REMEDIATION
+            a for a in outcome.applied if a.kind == EnforcementKind.DISABLE_PR_REMEDIATION
         )
         # Disabling captured what was really configured, not a C/H default.
         assert pr_action.undo_snapshot["severities_before"] == [
@@ -491,19 +479,16 @@ class TestReconciliation:
     def test_reconciliation_is_audited(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
         limit = make_limit(db, entity_type=EntityType.PROJECT, entity_id="proj-web")
-        enforcement.apply_enforcement(
-            db, client, limit=limit, period_key=PERIOD, actor=ACTOR
-        )
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
         db.commit()
         tenant.auto_triage["proj-web"]["enabled"] = True
-        enforcement.apply_enforcement(
-            db, client, limit=limit, period_key=PERIOD, actor=ACTOR
-        )
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
         db.commit()
 
-        assert db.scalar(
-            select(AuditLogEntry).where(AuditLogEntry.action == "enforcement.reconciled")
-        ) is not None
+        assert (
+            db.scalar(select(AuditLogEntry).where(AuditLogEntry.action == "enforcement.reconciled"))
+            is not None
+        )
 
 
 class TestExemptions:
@@ -542,9 +527,7 @@ class TestExemptions:
         leaving it unlocked (treated as an admin restore) for the whole period."""
         tenant, client = setup_tenant(db)
         limit = make_limit(db, entity_type=EntityType.PROJECT, entity_id="proj-web")
-        enforcement.apply_enforcement(
-            db, client, limit=limit, period_key=PERIOD, actor=ACTOR
-        )
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
         db.commit()
         assert tenant.auto_triage["proj-web"]["enabled"] is False
 

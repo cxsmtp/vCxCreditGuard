@@ -42,7 +42,14 @@ from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
 from app.db.base import utcnow
-from app.models.enums import EnforcementStatus, EntityType, LimitStatus, PeriodType, Severity, UsageView
+from app.models.enums import (
+    EnforcementStatus,
+    EntityType,
+    LimitStatus,
+    PeriodType,
+    Severity,
+    UsageView,
+)
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
 from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
 from app.services import enforcement, ingestion, notifications
@@ -358,12 +365,13 @@ def _evaluate_one(
                 state.restricted_at = state.restricted_at or moment
                 result.enforced += len(outcome.applied)
     else:
-        # Not breaching the limit. If access was previously restricted (e.g. because credit limit
-        # was lower or usage was higher), restore the removed access now that consumption is within budget.
-        was_restricted = (
-            state.status in {LimitStatus.RESTRICTED, LimitStatus.BREACHED}
-            or _has_active_enforcement(session, limit.id, window.key)
-        )
+        # Not breaching the limit. If access was previously restricted (e.g. because credit
+        # limit was lower or usage was higher), restore the removed access now that
+        # consumption is within budget.
+        was_restricted = state.status in {
+            LimitStatus.RESTRICTED,
+            LimitStatus.BREACHED,
+        } or _has_active_enforcement(session, limit.id, window.key)
         restored = 0
         if was_restricted:
             if client is not None:

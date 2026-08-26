@@ -208,6 +208,7 @@ def update_limit(
         )
     elif credit_increased and client is not None:
         from app.models.enums import LimitStatus
+
         states = list(
             session.scalars(
                 select(LimitPeriodState).where(

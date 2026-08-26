@@ -20,6 +20,18 @@ from typing import Final
 REDACTED: Final = "[REDACTED]"
 _MIN_REGISTERED_SECRET_LENGTH: Final = 8
 
+# Carriage returns, line feeds and other C0 control characters let user
+# controlled values forge extra log lines (log injection). They are escaped to
+# their visible form so a single logical record stays on a single line.
+_CONTROL_CHARS: Final = {c: f"\\x{c:02x}" for c in range(0x20) if c not in (0x09,)}
+_CONTROL_CHARS[0x7F] = "\\x7f"
+
+
+def sanitize_log(text: str) -> str:
+    """Escape control characters so untrusted text cannot forge log entries."""
+    return text.translate(_CONTROL_CHARS)
+
+
 _PATTERNS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
     # JSON Web Tokens (API key, access token, id token) anywhere in the message.
     (re.compile(r"\bey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"), REDACTED),
@@ -102,7 +114,9 @@ class RedactingFilter(logging.Filter):
             rendered = record.getMessage()
         except Exception:  # noqa: BLE001 - a broken log line must not break the app
             rendered = str(record.msg)
-        record.msg = redact(rendered)
+        # Escape control characters first so an injected newline cannot forge a
+        # second log line, then strip any secret that survived interpolation.
+        record.msg = redact(sanitize_log(rendered))
         record.args = None
         if record.exc_text:
             record.exc_text = redact(record.exc_text)

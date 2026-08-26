@@ -356,9 +356,9 @@ def _ingest_dimension(
         session.delete(snapshot)
         session.flush()
         raise FallbackDetected(
-                f"viewBy={view} returned the same subjects as an unrecognised viewBy "
-                "value, so the endpoint silently fell back to the user dimension."
-            )
+            f"viewBy={view} returned the same subjects as an unrecognised viewBy "
+            "value, so the endpoint silently fell back to the user dimension."
+        )
 
     snapshot.raw = raw_pages
     snapshot.total_items = total_items
