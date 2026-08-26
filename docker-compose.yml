@@ -13,6 +13,10 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-cxcreditguard}
       POSTGRES_USER: ${POSTGRES_USER:-cxcg}
+      # Not a hardcoded secret: this is a ${POSTGRES_PASSWORD} reference resolved
+      # from the operator's .env. Suppress the KICS generic-password false
+      # positive (it matches the key name, not the value).
+      # kics-scan ignore-line
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
     volumes:
       - db-data:/var/lib/postgresql/data
