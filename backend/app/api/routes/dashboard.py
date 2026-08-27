@@ -15,7 +15,7 @@ from app.models.connection import CxConnection
 from app.models.enums import ConnectionStatus, EnforcementStatus, EntityType, UsageView
 from app.models.limits import CreditLimit, EnforcementAction, Exemption
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
-from app.models.usage import SchedulerRun, UnresolvedSubject
+from app.models.usage import SchedulerRun, UnresolvedSubject, UsageRecord, UsageSnapshot
 from app.schemas.dashboard import (
     ActionBreakdownItem,
     AuditEntryResponse,
@@ -370,15 +370,44 @@ def list_unresolved(ctx: CurrentUser, db: DbSession) -> list[UnresolvedSubjectRe
     return [_subject_response(db, row) for row in rows]
 
 
+def _reattribute_latest_snapshot(db, subject_key: str, user_id: str | None) -> None:  # type: ignore[no-untyped-def]
+    """Point the newest user snapshot's rows for this subject at ``user_id``.
+
+    A mapping is a pin that the next poll honours, but an admin who just fixed an
+    attribution expects the dashboard and limits to reflect it now, not after the
+    next cycle. So the latest snapshot is re-pointed immediately; ``None`` clears
+    it back to unattributed.
+    """
+    latest = db.scalar(
+        select(UsageSnapshot)
+        .where(UsageSnapshot.view_by == str(UsageView.USER))
+        .order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc())
+        .limit(1)
+    )
+    if latest is None:
+        return
+    records = db.scalars(
+        select(UsageRecord).where(
+            UsageRecord.snapshot_id == latest.id,
+            UsageRecord.view_by == str(UsageView.USER),
+            UsageRecord.subject_key == subject_key,
+        )
+    )
+    for record in records:
+        record.entity_type = EntityType.USER
+        record.entity_id = user_id
+
+
 @router.post("/usage/unresolved/{subject_id}/map", response_model=UnresolvedSubjectResponse)
 def map_unresolved(
     subject_id: int, payload: MapSubjectRequest, ctx: AdminUser, db: DbSession
 ) -> UnresolvedSubjectResponse:
     """Pin an unmatched consumption subject to a known user.
 
-    From the next poll onwards its credits count towards that user's limits. This
-    is the fix for a user whose AI actions are reported under a different address
-    than their IAM email.
+    Its credits count towards that user's limits immediately - the latest
+    snapshot is re-attributed on the spot - and every future poll honours the
+    pin. This is the fix for a user whose AI actions are reported under a
+    different address than their IAM email. A null ``user_id`` clears the mapping.
     """
     row = db.get(UnresolvedSubject, subject_id)
     if row is None:
@@ -398,6 +427,7 @@ def map_unresolved(
 
     before = {"mapped_user_id": row.mapped_user_id}
     row.mapped_user_id = payload.user_id
+    _reattribute_latest_snapshot(db, row.subject_key, payload.user_id)
     db.flush()
     record_audit(
         db,

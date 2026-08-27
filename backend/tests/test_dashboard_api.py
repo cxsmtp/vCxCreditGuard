@@ -275,6 +275,34 @@ class TestUnresolvedSubjects:
 
         assert float(ingestion.latest_totals(db, UsageView.USER)["user-akash"]) == 7.0
 
+    def test_mapping_attributes_immediately(
+        self, admin_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        """The latest snapshot is re-pointed on the spot, without a fresh cycle."""
+        subject_id = admin_client.get("/api/usage/unresolved").json()[0]["id"]
+        body = admin_client.post(
+            f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-akash"}
+        ).json()
+        # The response reflects the new attribution for the GUI to render at once.
+        assert body["counts_towards_user_id"] == "user-akash"
+        assert body["counts_towards_label"] == "Akash Singh"
+
+        from app.models.enums import UsageView
+
+        # No new ingest has run, yet the credits already count towards the user.
+        assert float(ingestion.latest_totals(db, UsageView.USER)["user-akash"]) == 7.0
+
+    def test_clearing_a_mapping_reverts_the_snapshot(
+        self, admin_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        subject_id = admin_client.get("/api/usage/unresolved").json()[0]["id"]
+        admin_client.post(f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-akash"})
+        admin_client.post(f"/api/usage/unresolved/{subject_id}/map", json={"user_id": None})
+
+        from app.models.enums import UsageView
+
+        assert "user-akash" not in ingestion.latest_totals(db, UsageView.USER)
+
     def test_mapping_is_audited(
         self, admin_client: TestClient, db: Session, tenant: FakeTenant
     ) -> None:
