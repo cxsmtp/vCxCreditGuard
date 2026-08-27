@@ -30,9 +30,12 @@ from app.checkmarx.errors import (
     CheckmarxResponseError,
 )
 from app.db.base import utcnow
-from app.models.enums import EntityType, UsageView
+from app.models.enums import ActorType, EntityType, UsageView
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
 from app.models.usage import DimensionState, UnresolvedSubject, UsageRecord, UsageSnapshot
+from app.services import subject_matching
+from app.services.audit import AuditActor, record_audit
+from app.services.subject_matching import MatchMethod, MatchOutcome, UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +77,13 @@ class DimensionResult:
     supported: bool
     records: int = 0
     total_credits: Decimal = Decimal("0")
+    # User rows not counted towards a limit: disputed plus unmatched, excluding
+    # automation handles. These are what the "unmatched usage" banner surfaces.
     unresolved: int = 0
+    # Rows the fuzzy matcher attributed automatically (and logged).
+    auto_matched: int = 0
+    # Plausible matches left for a human to confirm.
+    disputed: int = 0
     # Rows attributed to automation rather than to a person, such as Auto Triage.
     automated: int = 0
     snapshot_id: int | None = None
@@ -97,6 +106,8 @@ class IngestResult:
                 "records": dimension.records,
                 "credits": str(dimension.total_credits),
                 "unresolved": dimension.unresolved,
+                "auto_matched": dimension.auto_matched,
+                "disputed": dimension.disputed,
                 "automated": dimension.automated,
                 "error": dimension.error,
             }
@@ -116,15 +127,17 @@ class UserIndex:
     by_full_name: dict[str, str]
     ambiguous_full_names: frozenset[str]
     pinned: dict[str, str]
+    # Token profiles for the fuzzy fall-through, one per synced user.
+    profiles: tuple[UserProfile, ...] = ()
 
-    def resolve(self, *, subject_key: str, name: str | None, email: str | None) -> str | None:
-        """Match ladder, most reliable first.
+    def _resolve_exact(
+        self, *, subject_key: str, name: str | None, email: str | None
+    ) -> str | None:
+        """The deterministic ladder: email, then username, then unambiguous name.
 
         Full name is last and only when unambiguous: two people called
         "Sean Casey" must not have one budget between them.
         """
-        if subject_key in self.pinned:
-            return self.pinned[subject_key]
         for candidate in (email, name):
             if candidate and usage_api.looks_like_email(candidate):
                 found = self.by_email.get(candidate.strip().lower())
@@ -141,12 +154,32 @@ class UserIndex:
                     return found
         return None
 
+    def resolve_detailed(
+        self, *, subject_key: str, name: str | None, email: str | None
+    ) -> MatchOutcome:
+        """Full attribution decision: pin, then exact ladder, then fuzzy triage."""
+        pinned = self.pinned.get(subject_key)
+        if pinned:
+            return MatchOutcome(MatchMethod.PINNED, pinned)
+        exact = self._resolve_exact(subject_key=subject_key, name=name, email=email)
+        if exact:
+            return MatchOutcome(MatchMethod.EXACT, exact)
+        return subject_matching.classify(
+            subject_key=subject_key, name=name, email=email, profiles=self.profiles
+        )
+
+    def resolve(self, *, subject_key: str, name: str | None, email: str | None) -> str | None:
+        """The user a subject's credits count towards, or None. Backwards-compatible."""
+        outcome = self.resolve_detailed(subject_key=subject_key, name=name, email=email)
+        return outcome.counted_user_id
+
 
 def build_user_index(session: Session) -> UserIndex:
     by_email: dict[str, str] = {}
     by_username: dict[str, str] = {}
     by_full_name: dict[str, str] = {}
     duplicates: set[str] = set()
+    profiles: list[UserProfile] = []
 
     for user in session.scalars(select(CxUser).where(CxUser.is_deleted.is_(False))):
         if user.email:
@@ -162,6 +195,14 @@ def build_user_index(session: Session) -> UserIndex:
             if key in by_full_name and by_full_name[key] != user.id:
                 duplicates.add(key)
             by_full_name[key] = user.id
+
+        # One token set per user, drawn from every identifier they carry, so the
+        # fuzzy matcher can compare a handle against name and email at once.
+        tokens = subject_matching.tokenize(
+            full_name or None, user.email, user.username, user.first_name, user.last_name
+        )
+        if tokens:
+            profiles.append(UserProfile(user_id=user.id, label=user.display_name, tokens=tokens))
 
     for key in duplicates:
         by_full_name.pop(key, None)
@@ -179,6 +220,7 @@ def build_user_index(session: Session) -> UserIndex:
         by_full_name=by_full_name,
         ambiguous_full_names=frozenset(duplicates),
         pinned=pinned,
+        profiles=tuple(profiles),
     )
 
 
@@ -368,17 +410,23 @@ def _ingest_dimension(
     total = Decimal("0")
 
     for item in merged.values():
-        entity_type, entity_id = _attribute(
-            view=view,
-            item=item,
-            user_index=user_index,
-            projects_by_id=projects_by_id,
-            projects_by_name=projects_by_name,
-            apps_by_id=apps_by_id,
-            apps_by_name=apps_by_name,
-            groups_by_id=groups_by_id or {},
-            groups_by_name=groups_by_name or {},
-        )
+        outcome: MatchOutcome | None = None
+        if view == UsageView.USER:
+            outcome = user_index.resolve_detailed(
+                subject_key=item.subject_key, name=item.subject_name, email=item.subject_email
+            )
+            entity_type, entity_id = EntityType.USER, outcome.counted_user_id
+        else:
+            entity_type, entity_id = _attribute(
+                view=view,
+                item=item,
+                projects_by_id=projects_by_id,
+                projects_by_name=projects_by_name,
+                apps_by_id=apps_by_id,
+                apps_by_name=apps_by_name,
+                groups_by_id=groups_by_id or {},
+                groups_by_name=groups_by_name or {},
+            )
         session.add(
             UsageRecord(
                 snapshot_id=snapshot.id,
@@ -398,18 +446,14 @@ def _ingest_dimension(
         total += item.credits_used
         result.records += 1
 
-        # A synthetic subject such as "Auto-triage" is automation, not a person. It
-        # is stored and counted tenant wide, but never offered as an unmatched user
-        # for an admin to map, and never attributed to a user limit.
-        if (
-            view == UsageView.USER
-            and entity_id is None
-            and not is_synthetic_subject(item.subject_key)
-        ):
-            _record_unresolved(session, item, now)
-            result.unresolved += 1
-        elif view == UsageView.USER and is_synthetic_subject(item.subject_key):
-            result.automated += 1
+        if view == UsageView.USER and outcome is not None:
+            # A synthetic subject such as "Auto-triage" is automation, not a
+            # person. It is stored and counted tenant wide, but never offered as
+            # an unmatched user and never attributed to a user limit.
+            if is_synthetic_subject(item.subject_key):
+                result.automated += 1
+            else:
+                _apply_user_outcome(session, item, outcome, now, result)
 
     snapshot.total_credits = total
     result.total_credits = total
@@ -437,7 +481,6 @@ def _attribute(
     *,
     view: UsageView,
     item: usage_api.ParsedUsageItem,
-    user_index: UserIndex,
     projects_by_id: dict[str, str],
     projects_by_name: dict[str, str],
     apps_by_id: dict[str, str],
@@ -445,12 +488,8 @@ def _attribute(
     groups_by_id: dict[str, str],
     groups_by_name: dict[str, str],
 ) -> tuple[str | None, str | None]:
-    if view == UsageView.USER:
-        user_id = user_index.resolve(
-            subject_key=item.subject_key, name=item.subject_name, email=item.subject_email
-        )
-        return (EntityType.USER, user_id) if user_id else (EntityType.USER, None)
-
+    """Attribute a non-user dimension. The user dimension is resolved inline so
+    its full match outcome (auto-match, dispute, suggestions) can be recorded."""
     if view == UsageView.APPLICATION:
         found = _match_named(item, apps_by_id, apps_by_name)
         return EntityType.APPLICATION, found
@@ -480,10 +519,54 @@ def _match_named(
     return None
 
 
-def _record_unresolved(session: Session, item: usage_api.ParsedUsageItem, now) -> None:
+def _apply_user_outcome(
+    session: Session,
+    item: usage_api.ParsedUsageItem,
+    outcome: MatchOutcome,
+    now,
+    result: DimensionResult,
+) -> None:
+    """Record the review state for one user subject and bump the run counters.
+
+    A cleanly resolved subject (exact match) needs no review row, so any stale
+    one it left behind is removed. Everything else - an automatic fuzzy match, a
+    dispute or a plain miss - is upserted so it can be shown and overridden.
+    """
     row = session.scalar(
         select(UnresolvedSubject).where(UnresolvedSubject.subject_key == item.subject_key)
     )
+
+    if outcome.method in (MatchMethod.PINNED, MatchMethod.EXACT):
+        # Now resolved for real. Drop a lingering review row unless an admin
+        # pinned it (that mapping is the resolution and must stay).
+        if row is not None and row.mapped_user_id is None:
+            session.delete(row)
+        return
+
+    if outcome.method == MatchMethod.FUZZY_AUTO:
+        result.auto_matched += 1
+    elif outcome.method == MatchMethod.DISPUTED:
+        result.disputed += 1
+        result.unresolved += 1
+    elif not outcome.is_bot:
+        # A plain miss still counts towards the unmatched banner; a bot does not.
+        result.unresolved += 1
+
+    top = outcome.candidates[0] if outcome.candidates else None
+    suggestions = [candidate.as_dict() for candidate in outcome.candidates]
+
+    # A newly established (or retargeted) auto-match is worth one audit entry;
+    # an unchanged one is not, or a steady state would re-log every cycle.
+    newly_auto = (
+        outcome.method == MatchMethod.FUZZY_AUTO
+        and top is not None
+        and (
+            row is None
+            or row.status != MatchMethod.FUZZY_AUTO
+            or row.suggested_user_id != top.user_id
+        )
+    )
+
     if row is None:
         session.add(
             UnresolvedSubject(
@@ -495,14 +578,40 @@ def _record_unresolved(session: Session, item: usage_api.ParsedUsageItem, now) -
                 first_seen_at=now,
                 last_seen_at=now,
                 times_seen=1,
+                status=outcome.method,
+                is_bot=outcome.is_bot,
+                suggested_user_id=top.user_id if top else None,
+                match_score=top.score if top else None,
+                suggestions=suggestions or None,
             )
         )
-        return
-    row.last_seen_at = now
-    row.times_seen += 1
-    row.credits_used = item.credits_used
-    if item.subject_email and not row.subject_email:
-        row.subject_email = item.subject_email
+    else:
+        row.last_seen_at = now
+        row.times_seen += 1
+        row.credits_used = item.credits_used
+        if item.subject_email and not row.subject_email:
+            row.subject_email = item.subject_email
+        row.status = outcome.method
+        row.is_bot = outcome.is_bot
+        row.suggested_user_id = top.user_id if top else None
+        row.match_score = top.score if top else None
+        row.suggestions = suggestions or None
+
+    if newly_auto and top is not None:
+        record_audit(
+            session,
+            action="usage.subject_auto_matched",
+            actor=AuditActor(actor_type=ActorType.SYSTEM, actor_name="matcher"),
+            target_type="unresolved_subject",
+            target_id=item.subject_key[:64],
+            target_label=item.subject_key,
+            after={"suggested_user_id": top.user_id, "score": round(top.score, 4)},
+            detail=(
+                f"Credit usage reported as {item.subject_key} was automatically matched to "
+                f"{top.label} at {round(top.score * 100)}% confidence. Override it on the "
+                "Settings page if this is wrong."
+            ),
+        )
 
 
 # ------------------------------------------------------------------ reading back

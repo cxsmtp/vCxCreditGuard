@@ -25,6 +25,7 @@ from app.schemas.dashboard import (
     MeResponse,
     OrgEntity,
     StatusTiles,
+    SubjectSuggestion,
     TopConsumerItem,
     TrendPoint,
     UnresolvedSubjectResponse,
@@ -112,11 +113,18 @@ def get_dashboard(
         )
         or 0
     )
+    # Subjects whose credits count towards nobody: not mapped by an admin, not
+    # auto-matched, and not automation handles. Auto-matched rows are attributed
+    # (just not manually), so they do not belong in the "unmatched" banner.
     unresolved = int(
         db.scalar(
             select(func.count())
             .select_from(UnresolvedSubject)
-            .where(UnresolvedSubject.mapped_user_id.is_(None))
+            .where(
+                UnresolvedSubject.mapped_user_id.is_(None),
+                UnresolvedSubject.status != "auto_matched",
+                UnresolvedSubject.is_bot.is_(False),
+            )
         )
         or 0
     )
@@ -303,32 +311,63 @@ def list_audit(
     )
 
 
+def _subject_response(db, row: UnresolvedSubject) -> UnresolvedSubjectResponse:  # type: ignore[no-untyped-def]
+    """Serialise a subject, resolving user ids to display names as we go."""
+
+    def label_for(user_id: str | None) -> str | None:
+        if not user_id:
+            return None
+        user = db.get(CxUser, user_id)
+        return user.display_name if user else user_id
+
+    mapped_label = label_for(row.mapped_user_id)
+    suggested_label = label_for(row.suggested_user_id)
+    suggestions = [
+        SubjectSuggestion(
+            user_id=str(entry.get("user_id")),
+            label=str(entry.get("label") or entry.get("user_id")),
+            score=float(entry.get("score") or 0.0),
+        )
+        for entry in (row.suggestions or [])
+        if isinstance(entry, dict) and entry.get("user_id")
+    ]
+
+    # What actually counts today: an admin mapping wins, then an auto-match.
+    if row.mapped_user_id:
+        counts_id, counts_label = row.mapped_user_id, mapped_label
+    elif row.status == "auto_matched" and row.suggested_user_id:
+        counts_id, counts_label = row.suggested_user_id, suggested_label
+    else:
+        counts_id, counts_label = None, None
+
+    return UnresolvedSubjectResponse(
+        id=row.id,
+        subject_key=row.subject_key,
+        subject_name=row.subject_name,
+        subject_email=row.subject_email,
+        credits_used=row.credits_used,
+        first_seen_at=row.first_seen_at,
+        last_seen_at=row.last_seen_at,
+        times_seen=row.times_seen,
+        mapped_user_id=row.mapped_user_id,
+        mapped_user_label=mapped_label,
+        status=row.status,
+        is_bot=row.is_bot,
+        match_score=row.match_score,
+        suggested_user_id=row.suggested_user_id,
+        suggested_user_label=suggested_label,
+        suggestions=suggestions,
+        counts_towards_user_id=counts_id,
+        counts_towards_label=counts_label,
+    )
+
+
 @router.get("/usage/unresolved", response_model=list[UnresolvedSubjectResponse])
 def list_unresolved(ctx: CurrentUser, db: DbSession) -> list[UnresolvedSubjectResponse]:
     rows = list(
         db.scalars(select(UnresolvedSubject).order_by(UnresolvedSubject.credits_used.desc()))
     )
-    responses: list[UnresolvedSubjectResponse] = []
-    for row in rows:
-        label = None
-        if row.mapped_user_id:
-            user = db.get(CxUser, row.mapped_user_id)
-            label = user.display_name if user else row.mapped_user_id
-        responses.append(
-            UnresolvedSubjectResponse(
-                id=row.id,
-                subject_key=row.subject_key,
-                subject_name=row.subject_name,
-                subject_email=row.subject_email,
-                credits_used=row.credits_used,
-                first_seen_at=row.first_seen_at,
-                last_seen_at=row.last_seen_at,
-                times_seen=row.times_seen,
-                mapped_user_id=row.mapped_user_id,
-                mapped_user_label=label,
-            )
-        )
-    return responses
+    return [_subject_response(db, row) for row in rows]
 
 
 @router.post("/usage/unresolved/{subject_id}/map", response_model=UnresolvedSubjectResponse)
@@ -376,18 +415,7 @@ def map_unresolved(
     )
     db.commit()
 
-    return UnresolvedSubjectResponse(
-        id=row.id,
-        subject_key=row.subject_key,
-        subject_name=row.subject_name,
-        subject_email=row.subject_email,
-        credits_used=row.credits_used,
-        first_seen_at=row.first_seen_at,
-        last_seen_at=row.last_seen_at,
-        times_seen=row.times_seen,
-        mapped_user_id=row.mapped_user_id,
-        mapped_user_label=user.display_name if user else None,
-    )
+    return _subject_response(db, row)
 
 
 @router.get("/usage/dimensions")

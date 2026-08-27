@@ -106,6 +106,15 @@ class AuditListResponse(BaseModel):
     actions: list[str]
 
 
+class SubjectSuggestion(BaseModel):
+    """A ranked guess at which user a consumption subject belongs to."""
+
+    user_id: str
+    label: str
+    # 0..1 similarity between the reported handle and this user.
+    score: float
+
+
 class UnresolvedSubjectResponse(BaseModel):
     id: int
     subject_key: str
@@ -117,6 +126,17 @@ class UnresolvedSubjectResponse(BaseModel):
     times_seen: int
     mapped_user_id: str | None
     mapped_user_label: str | None = None
+    # Fuzzy-match triage: "unmatched" | "disputed" | "auto_matched".
+    status: str = "unmatched"
+    is_bot: bool = False
+    match_score: float | None = None
+    suggested_user_id: str | None = None
+    suggested_user_label: str | None = None
+    suggestions: list[SubjectSuggestion] = Field(default_factory=list)
+    # The user this subject's credits currently count towards (a manual mapping,
+    # or the auto-match), with a label for display. Null when nothing counts.
+    counts_towards_user_id: str | None = None
+    counts_towards_label: str | None = None
 
 
 class MapSubjectRequest(StrictModel):

@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import DimensionState, UnresolvedSubject, UsageRecord, UsageSnapshot
+from app.models.audit import AuditLogEntry
 from app.models.enums import UsageView
 from app.services import ingestion, org_sync
 from tests.fake_tenant import FakeTenant, populated_tenant
@@ -265,6 +266,109 @@ class TestDimensionProbing:
         db.commit()
         assert db.get(DimensionState, "user").supported is True
         assert ingestion.dimension_supported(db, UsageView.USER) is True
+
+
+class TestFuzzyAttribution:
+    """The similarity fall-through for handles the exact ladder cannot resolve."""
+
+    def _tenant_with_handle(self, reported_as: str, credits: int = 4) -> FakeTenant:
+        tenant = FakeTenant()
+        tenant.add_user(
+            user_id="user-ryan",
+            username="ryan.wakeham@checkmarx.com",
+            email="ryan.wakeham@checkmarx.com",
+            first_name="Ryan",
+            last_name="Wakeham",
+        )
+        tenant.set_user_credits(name=reported_as, credits=credits)
+        return tenant
+
+    def test_a_cx_handle_is_auto_matched_to_its_user(self, db: Session) -> None:
+        tenant = self._tenant_with_handle("cx-ryan-wakeham")
+        client = synced(db, tenant)
+        result = ingestion.ingest_usage(db, client)
+        db.commit()
+
+        # Its credits count towards the user, and it is not flagged as unmatched.
+        assert ingestion.latest_totals(db, UsageView.USER)["user-ryan"] == Decimal("4")
+        assert result.dimensions["user"].auto_matched == 1
+        assert result.dimensions["user"].unresolved == 0
+
+        row = db.scalar(select(UnresolvedSubject))
+        assert row is not None
+        assert row.status == "auto_matched"
+        assert row.suggested_user_id == "user-ryan"
+        assert row.match_score == 1.0
+
+    def test_an_auto_match_is_audited_once(self, db: Session) -> None:
+        tenant = self._tenant_with_handle("cx-ryan-wakeham")
+        client = synced(db, tenant)
+        ingestion.ingest_usage(db, client)
+        db.commit()
+        ingestion.ingest_usage(db, client)  # steady state must not re-log
+        db.commit()
+
+        entries = list(
+            db.scalars(
+                select(AuditLogEntry).where(AuditLogEntry.action == "usage.subject_auto_matched")
+            )
+        )
+        assert len(entries) == 1
+        assert entries[0].after["suggested_user_id"] == "user-ryan"
+
+    def test_a_first_name_only_is_disputed_with_suggestions(self, db: Session) -> None:
+        tenant = self._tenant_with_handle("ryan")
+        client = synced(db, tenant)
+        result = ingestion.ingest_usage(db, client)
+        db.commit()
+
+        # A dispute is not counted, but is surfaced for a human to confirm.
+        assert ingestion.latest_totals(db, UsageView.USER) == {}
+        assert result.dimensions["user"].disputed == 1
+        assert result.dimensions["user"].unresolved == 1
+
+        row = db.scalar(select(UnresolvedSubject))
+        assert row is not None
+        assert row.status == "disputed"
+        assert row.suggestions[0]["user_id"] == "user-ryan"
+
+    def test_a_bot_handle_is_flagged_and_not_disputed(self, db: Session) -> None:
+        tenant = self._tenant_with_handle("dependabot[bot]")
+        client = synced(db, tenant)
+        result = ingestion.ingest_usage(db, client)
+        db.commit()
+
+        row = db.scalar(select(UnresolvedSubject))
+        assert row is not None
+        assert row.is_bot is True
+        assert row.status == "unmatched"
+        # A bot is automation, so it does not nag the unmatched-usage banner.
+        assert result.dimensions["user"].unresolved == 0
+
+    def test_a_review_row_is_cleared_once_the_subject_resolves_exactly(self, db: Session) -> None:
+        # A subject reported by an email whose user has not synced yet.
+        tenant = FakeTenant()
+        tenant.set_user_credits(name="Ryan Wakeham", email="ryan.wakeham@checkmarx.com", credits=4)
+        client = synced(db, tenant)
+        ingestion.ingest_usage(db, client)
+        db.commit()
+        assert db.scalar(select(UnresolvedSubject)) is not None
+
+        # Once the user is synced, the same subject resolves exactly and the
+        # stale review row is dropped rather than left dangling.
+        tenant.add_user(
+            user_id="user-ryan",
+            username="ryan.wakeham@checkmarx.com",
+            email="ryan.wakeham@checkmarx.com",
+            first_name="Ryan",
+            last_name="Wakeham",
+        )
+        org_sync.sync_org_model(db, client)
+        db.commit()
+        ingestion.ingest_usage(db, client)
+        db.commit()
+        assert db.scalar(select(UnresolvedSubject)) is None
+        assert ingestion.latest_totals(db, UsageView.USER)["user-ryan"] == Decimal("4")
 
 
 def test_latest_totals_is_empty_before_any_ingestion(db: Session) -> None:

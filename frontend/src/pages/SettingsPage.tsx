@@ -481,6 +481,27 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
 
 /* ------------------------------------------------------------- attribution */
 
+type AttributionTab = "disputed" | "auto_matched" | "unmatched";
+
+const TAB_LABELS: Record<AttributionTab, string> = {
+  disputed: "Disputes",
+  auto_matched: "Auto-matched",
+  unmatched: "Unmatched",
+};
+
+const TAB_BLURB: Record<AttributionTab, string> = {
+  disputed:
+    "A likely user was found but the match is not certain. Confirm one of the suggestions, or map it yourself. Nothing is counted until you do.",
+  auto_matched:
+    "Matched to a user automatically at high confidence, and counted towards their limits from the next poll. Override any that look wrong.",
+  unmatched:
+    "No user resembled the reported handle closely enough to suggest. Map these by hand. Automation accounts (bots) are listed here too and are never counted.",
+};
+
+function confidence(score: number | null | undefined): string {
+  return score == null ? "" : `${Math.round(score * 100)}%`;
+}
+
 function AttributionCard({
   isAdmin,
   subjects,
@@ -493,22 +514,31 @@ function AttributionCard({
   onChanged: () => Promise<void>;
 }) {
   const toast = useToast();
+  const [tab, setTab] = useState<AttributionTab>("disputed");
   const [mapping, setMapping] = useState<UnresolvedSubject | null>(null);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<OrgEntity[]>([]);
   const [busy, setBusy] = useState(false);
+  const [busyId, setBusyId] = useState<number | null>(null);
+
+  const groups: Record<AttributionTab, UnresolvedSubject[]> = {
+    disputed: subjects.filter((s) => s.status === "disputed"),
+    auto_matched: subjects.filter((s) => s.status === "auto_matched"),
+    unmatched: subjects.filter((s) => s.status === "unmatched"),
+  };
+  const rows = groups[tab];
 
   useEffect(() => {
     if (!mapping) return;
     const controller = new AbortController();
     const timer = window.setTimeout(async () => {
       try {
-        const rows = await api.get<OrgEntity[]>(
+        const found = await api.get<OrgEntity[]>(
           "/api/org/entities",
           { entity_type: "user", q: query, limit: 15 },
           controller.signal,
         );
-        setResults(rows);
+        setResults(found);
       } catch {
         // The dialog shows an empty list rather than an error toast per keystroke.
       }
@@ -519,6 +549,25 @@ function AttributionCard({
     };
   }, [mapping, query]);
 
+  // Map a subject directly, e.g. by accepting a suggestion, without the dialog.
+  async function mapSubject(subject: UnresolvedSubject, userId: string | null) {
+    setBusyId(subject.id);
+    try {
+      await api.post(`/api/usage/unresolved/${subject.id}/map`, { user_id: userId });
+      toast.success(
+        userId
+          ? "Confirmed. From the next poll onwards this usage counts towards that user."
+          : "Mapping cleared.",
+      );
+      await onChanged();
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not save the mapping.");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  // Map via the free-form search dialog.
   async function assign(userId: string | null) {
     if (!mapping) return;
     setBusy(true);
@@ -539,18 +588,63 @@ function AttributionCard({
     }
   }
 
+  function openDialog(subject: UnresolvedSubject) {
+    setMapping(subject);
+    setQuery(subject.subject_email ?? subject.subject_name ?? "");
+  }
+
   return (
     <Card
-      title="Unmatched credit usage"
-      description="Consumption Checkmarx reports against a name or address that does not match any synced user. It is not counted towards any user limit until you map it."
+      title="Consumption attribution"
+      description="How Checkmarx-reported usage maps to synced users. Handles it cannot match exactly are matched by similarity, then triaged into the tabs below."
     >
       <div id="attribution" />
+
+      <div className="mb-4 flex gap-1 border-b border-hairline">
+        {(Object.keys(TAB_LABELS) as AttributionTab[]).map((key) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setTab(key)}
+            className="-mb-px border-b-2 px-3 py-2 text-sm"
+            style={{
+              borderColor: tab === key ? "var(--focus)" : "transparent",
+              color: tab === key ? "var(--text-primary)" : "var(--text-secondary)",
+              fontWeight: tab === key ? 600 : 400,
+            }}
+          >
+            {TAB_LABELS[key]}
+            {groups[key].length > 0 && (
+              <span className="ml-1.5">
+                <Badge tone={key === "disputed" ? "warning" : "neutral"}>
+                  {groups[key].length}
+                </Badge>
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
+        {TAB_BLURB[tab]}
+      </p>
+
       {loading ? (
         <Spinner />
-      ) : subjects.length === 0 ? (
+      ) : rows.length === 0 ? (
         <EmptyState
-          title="Everything is attributed"
-          description="Every consumption row matched a Checkmarx user."
+          title={
+            tab === "disputed"
+              ? "No disputes to resolve"
+              : tab === "auto_matched"
+                ? "Nothing was auto-matched"
+                : "Nothing is unmatched"
+          }
+          description={
+            tab === "auto_matched"
+              ? "When a handle is matched to a user by similarity it will appear here to review."
+              : "Every consumption row in this state is clear."
+          }
         />
       ) : (
         <Table>
@@ -558,15 +652,20 @@ function AttributionCard({
             <tr>
               <Th>Reported as</Th>
               <Th align="right">Credits</Th>
-              <Th>Mapped to</Th>
+              <Th>{tab === "auto_matched" ? "Matched to" : "Suggestion"}</Th>
               <Th align="right" />
             </tr>
           </thead>
           <tbody>
-            {subjects.map((subject) => (
+            {rows.map((subject) => (
               <tr key={subject.id}>
                 <Td>
                   <span className="text-sm">{subject.subject_name ?? subject.subject_key}</span>
+                  {subject.is_bot && (
+                    <span className="ml-1.5">
+                      <Badge tone="neutral">Bot</Badge>
+                    </span>
+                  )}
                   {subject.subject_email && subject.subject_email !== subject.subject_name && (
                     <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
                       {subject.subject_email}
@@ -580,8 +679,34 @@ function AttributionCard({
                   <span className="tabular">{formatCredits(subject.credits_used)}</span>
                 </Td>
                 <Td>
-                  {subject.mapped_user_label ? (
-                    <Badge tone="good">{subject.mapped_user_label}</Badge>
+                  {tab === "auto_matched" ? (
+                    <span className="flex items-center gap-2">
+                      <Badge tone="good">{subject.counts_towards_label ?? "—"}</Badge>
+                      {subject.match_score != null && (
+                        <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+                          {confidence(subject.match_score)} confidence
+                        </span>
+                      )}
+                    </span>
+                  ) : subject.suggestions.length > 0 ? (
+                    <div className="flex flex-wrap gap-1.5">
+                      {subject.suggestions.map((suggestion) => (
+                        <button
+                          key={suggestion.user_id}
+                          type="button"
+                          disabled={!isAdmin || busyId === subject.id}
+                          onClick={() => mapSubject(subject, suggestion.user_id)}
+                          title={`Confirm ${suggestion.label} (${confidence(suggestion.score)} match)`}
+                          className="rounded-full border px-2.5 py-1 text-xs"
+                          style={{ borderColor: "var(--border)", color: "var(--text-secondary)" }}
+                        >
+                          {suggestion.label}{" "}
+                          <span style={{ color: "var(--text-muted)" }}>
+                            {confidence(suggestion.score)}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
                   ) : (
                     <Badge tone="warning">Not counted</Badge>
                   )}
@@ -592,12 +717,9 @@ function AttributionCard({
                       type="button"
                       className="text-xs underline"
                       style={{ color: "var(--text-secondary)" }}
-                      onClick={() => {
-                        setMapping(subject);
-                        setQuery(subject.subject_email ?? subject.subject_name ?? "");
-                      }}
+                      onClick={() => openDialog(subject)}
                     >
-                      {subject.mapped_user_id ? "Change" : "Map to a user"}
+                      {tab === "auto_matched" ? "Override" : "Map to a user"}
                     </button>
                   )}
                 </Td>
@@ -642,9 +764,11 @@ function AttributionCard({
               </li>
             )}
           </ul>
-          {mapping?.mapped_user_id && (
+          {(mapping?.mapped_user_id || mapping?.status === "auto_matched") && (
             <Button variant="secondary" onClick={() => assign(null)} loading={busy}>
-              Clear the current mapping
+              {mapping?.mapped_user_id
+                ? "Clear the current mapping"
+                : "Reject the auto-match (leave uncounted)"}
             </Button>
           )}
         </div>
