@@ -57,7 +57,13 @@ COPY --from=frontend /build/dist ./app/static
 
 # Run as an unprivileged user. /app/data is only used by the SQLite backend.
 # Alpine ships busybox adduser/addgroup rather than shadow's useradd.
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+# Strip any CR bytes first: a Windows checkout (core.autocrlf=true) can rewrite
+# the script to CRLF, and the kernel then reads the shebang as "#!/bin/sh\r" and
+# fails to exec with a misleading "No such file or directory". .gitattributes
+# pins these files to LF, but this makes the image build correct even from a
+# checkout that predates it.
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh \
     && addgroup -g 10001 cxcg \
     && adduser -D -H -u 10001 -G cxcg cxcg \
     && mkdir -p /app/data \

@@ -1,0 +1,17 @@
+# Normalise line endings so a Windows checkout (core.autocrlf=true) cannot
+# rewrite files that must stay LF. Shell scripts baked into the container
+# images break at runtime if they carry CRLF: the kernel reads the shebang
+# as "#!/bin/sh\r" and fails to exec with a misleading
+#   "easy-entrypoint.sh: No such file or directory".
+* text=auto
+
+# Anything the Linux containers execute must be LF regardless of platform.
+*.sh text eol=lf
+deploy/podman/easy-entrypoint.sh text eol=lf
+backend/docker-entrypoint.sh text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+
+# Windows helper scripts stay CRLF.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
