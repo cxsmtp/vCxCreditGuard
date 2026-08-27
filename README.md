@@ -35,7 +35,7 @@ schedule or on demand via `POST /api/ops/run-cycle`:
    ┌────────────────────────────────────────────────────────────────┐
    │                    cycle.py  (one orchestrator)                │
    │                                                                │
-   │    org_sync  ─▶  ingestion  ─▶  evaluation  ─▶  enforcement    │
+   │    org_sync  ─▶  ingestion  ─▶  evaluation  ─▶  enforcement  │
    │    users,        snapshots +    usage vs        reversible     │
    │    projects      attribution    limits,         role / AI      │
    │                  (fuzzy match)   period          changes, with │
