@@ -168,11 +168,6 @@ class UserIndex:
             subject_key=subject_key, name=name, email=email, profiles=self.profiles
         )
 
-    def resolve(self, *, subject_key: str, name: str | None, email: str | None) -> str | None:
-        """The user a subject's credits count towards, or None. Backwards-compatible."""
-        outcome = self.resolve_detailed(subject_key=subject_key, name=name, email=email)
-        return outcome.counted_user_id
-
 
 def build_user_index(session: Session) -> UserIndex:
     by_email: dict[str, str] = {}

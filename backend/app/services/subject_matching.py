@@ -77,11 +77,6 @@ class MatchMethod:
     UNMATCHED = "unmatched"  # nothing crossed the dispute threshold
 
 
-# Statuses that are recorded on ``unresolved_subject`` for review. PINNED and
-# EXACT need no review row, so they never appear here.
-REVIEW_STATUSES = frozenset({MatchMethod.FUZZY_AUTO, MatchMethod.DISPUTED, MatchMethod.UNMATCHED})
-
-
 @dataclass(frozen=True, slots=True)
 class Candidate:
     """One ranked user a subject might belong to."""

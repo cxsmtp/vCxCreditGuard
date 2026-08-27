@@ -1,0 +1,709 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CxCreditGuard User Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+  rel="stylesheet"
+/>
+<style>
+  /* ---- Tokens: light is the bare :root, dark redefines tokens only ---- */
+  :root {
+    --page: #f5f7f7;
+    --surface: #ffffff;
+    --surface-2: #eef2f1;
+    --ink: #16211f;
+    --ink-2: #48554f;
+    --ink-3: #6d7a75;
+    --border: #e0e7e4;
+    --border-strong: #cdd7d3;
+    --accent: #0f766e;
+    --accent-2: #0b5a54;
+    --accent-soft: #d9ece9;
+    --on-accent: #ffffff;
+    --good: #15803d;
+    --good-soft: #dcf0e2;
+    --warn: #a5620a;
+    --warn-soft: #f6e8d3;
+    --crit: #b42318;
+    --crit-soft: #f7dedb;
+    --shadow: 0 1px 2px rgba(16, 33, 31, 0.04), 0 8px 24px -12px rgba(16, 33, 31, 0.14);
+    --radius: 12px;
+    --maxread: 46rem;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --page: #0d1211;
+      --surface: #131b19;
+      --surface-2: #1a2523;
+      --ink: #e9efec;
+      --ink-2: #a7b4af;
+      --ink-3: #77847f;
+      --border: #26332f;
+      --border-strong: #35443f;
+      --accent: #2dd4bf;
+      --accent-2: #5fe6d5;
+      --accent-soft: #123531;
+      --on-accent: #06100e;
+      --good: #4ade80;
+      --good-soft: #10291a;
+      --warn: #fbbf24;
+      --warn-soft: #2e2410;
+      --crit: #f87171;
+      --crit-soft: #2e1615;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 30px -14px rgba(0, 0, 0, 0.6);
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --page: #0d1211;
+    --surface: #131b19;
+    --surface-2: #1a2523;
+    --ink: #e9efec;
+    --ink-2: #a7b4af;
+    --ink-3: #77847f;
+    --border: #26332f;
+    --border-strong: #35443f;
+    --accent: #2dd4bf;
+    --accent-2: #5fe6d5;
+    --accent-soft: #123531;
+    --good: #4ade80;
+    --good-soft: #10291a;
+    --warn: #fbbf24;
+    --warn-soft: #2e2410;
+    --crit: #f87171;
+    --crit-soft: #2e1615;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 30px -14px rgba(0, 0, 0, 0.6);
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 5.5rem; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { animation: none !important; transition: none !important; }
+  }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3, h4 {
+    font-family: "Schibsted Grotesk", system-ui, sans-serif;
+    line-height: 1.15;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+    color: var(--ink);
+  }
+  a { color: var(--accent-2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  :root[data-theme="dark"] a, :root:not([data-theme="light"]) a { color: var(--accent); }
+  code, kbd, pre { font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+  /* ---- Header ---- */
+  .topbar {
+    position: sticky; top: 0; z-index: 40;
+    display: flex; align-items: center; gap: 1rem;
+    padding: 0.75rem clamp(1rem, 3vw, 2rem);
+    background: color-mix(in srgb, var(--surface) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 0.6rem; font-family: "Schibsted Grotesk", sans-serif; font-weight: 700; font-size: 1.05rem; letter-spacing: -0.02em; }
+  .brand .mark {
+    width: 26px; height: 26px; border-radius: 7px; flex: none;
+    background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 55%, var(--ink)));
+    display: grid; place-items: center; color: var(--on-accent); font-weight: 700; font-size: 0.85rem;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15);
+  }
+  .brand small { display:block; font-family:"Inter",sans-serif; font-weight:500; font-size:0.7rem; color: var(--ink-3); letter-spacing: 0.02em; }
+  .topbar .spacer { flex: 1; }
+  .iconbtn {
+    appearance: none; border: 1px solid var(--border-strong); background: var(--surface);
+    color: var(--ink-2); border-radius: 8px; width: 38px; height: 38px; cursor: pointer;
+    display: grid; place-items: center; font-size: 1rem;
+  }
+  .iconbtn:hover { color: var(--ink); border-color: var(--accent); }
+  #menuBtn { display: none; }
+
+  /* ---- Layout ---- */
+  .shell { display: grid; grid-template-columns: 16rem minmax(0, 1fr); gap: clamp(1.5rem, 4vw, 3.5rem); max-width: 74rem; margin: 0 auto; padding: 0 clamp(1rem, 3vw, 2rem); }
+  nav.toc { position: sticky; top: 4.5rem; align-self: start; height: calc(100vh - 5.5rem); overflow-y: auto; padding: 1.5rem 0.25rem 3rem; font-size: 0.9rem; }
+  nav.toc .group { font-family:"Schibsted Grotesk",sans-serif; text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.68rem; font-weight: 700; color: var(--ink-3); margin: 1.4rem 0 0.5rem; }
+  nav.toc .group:first-child { margin-top: 0; }
+  nav.toc a { display: block; color: var(--ink-2); padding: 0.28rem 0.7rem; border-radius: 7px; border-left: 2px solid transparent; margin-left: -2px; }
+  nav.toc a:hover { color: var(--ink); background: var(--surface-2); text-decoration: none; }
+  nav.toc a.active { color: var(--accent-2); border-left-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+  :root[data-theme="dark"] nav.toc a.active, :root:not([data-theme="light"]) nav.toc a.active { color: var(--accent); }
+
+  main { min-width: 0; padding: 2.5rem 0 6rem; }
+  main > section { max-width: var(--maxread); scroll-margin-top: 5rem; }
+  main > section + section { margin-top: 3.5rem; padding-top: 3.5rem; border-top: 1px solid var(--border); }
+
+  /* ---- Hero ---- */
+  .hero { max-width: var(--maxread); }
+  .eyebrow { font-family:"JetBrains Mono",monospace; font-size: 0.72rem; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent-2); margin: 0 0 0.9rem; }
+  :root[data-theme="dark"] .eyebrow, :root:not([data-theme="light"]) .eyebrow { color: var(--accent); }
+  .hero h1 { font-size: clamp(2rem, 5vw, 2.9rem); font-weight: 700; margin: 0 0 0.8rem; }
+  .hero .lede { font-size: 1.15rem; color: var(--ink-2); margin: 0 0 1.6rem; }
+
+  h2 { font-size: 1.6rem; font-weight: 700; margin: 0 0 0.4rem; }
+  .section-kicker { font-family:"JetBrains Mono",monospace; font-size:0.7rem; letter-spacing:0.14em; text-transform:uppercase; color: var(--ink-3); margin: 0 0 0.5rem; }
+  h3 { font-size: 1.15rem; font-weight: 600; margin: 2rem 0 0.5rem; }
+  p { margin: 0 0 1rem; }
+  ul, ol { margin: 0 0 1rem; padding-left: 1.25rem; }
+  li { margin: 0.3rem 0; }
+  li::marker { color: var(--ink-3); }
+  strong { font-weight: 600; color: var(--ink); }
+
+  /* inline code */
+  p code, li code, td code, h3 code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 0.08em 0.4em; font-size: 0.85em; color: var(--ink); }
+
+  /* code block */
+  pre { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.1rem; overflow-x: auto; font-size: 0.85rem; line-height: 1.6; margin: 0 0 1.2rem; }
+  pre code { color: var(--ink); }
+  .cmt { color: var(--ink-3); }
+
+  /* cards / callouts */
+  .callout { display: grid; grid-template-columns: auto 1fr; gap: 0.75rem; border: 1px solid var(--border); border-left-width: 3px; border-radius: 10px; padding: 0.9rem 1.1rem; margin: 0 0 1.3rem; background: var(--surface); }
+  .callout .ico { font-size: 1.1rem; line-height: 1.5; }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .h { font-weight: 600; font-family: "Schibsted Grotesk", sans-serif; }
+  .callout.tip { border-left-color: var(--accent); background: var(--accent-soft); }
+  .callout.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+  .callout.danger { border-left-color: var(--crit); background: var(--crit-soft); }
+
+  /* tables */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); margin: 0 0 1.3rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.6rem 0.85rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-family: "Schibsted Grotesk", sans-serif; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-2); background: var(--surface-2); }
+  tr:last-child td { border-bottom: none; }
+  td code { white-space: nowrap; }
+
+  /* chips */
+  .chip { display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 0.12rem 0.5rem; border-radius: 999px; border: 1px solid var(--border-strong); font-family: "Inter", sans-serif; white-space: nowrap; }
+  .chip.good { color: var(--good); background: var(--good-soft); border-color: color-mix(in srgb, var(--good) 30%, transparent); }
+  .chip.warn { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+  .chip.crit { color: var(--crit); background: var(--crit-soft); border-color: color-mix(in srgb, var(--crit) 30%, transparent); }
+  .chip.accent { color: var(--accent-2); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+  :root[data-theme="dark"] .chip.accent, :root:not([data-theme="light"]) .chip.accent { color: var(--accent); }
+
+  /* flow diagram */
+  .flow { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 1.25rem; margin: 0 0 1.3rem; box-shadow: var(--shadow); }
+  .flow .row { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.6rem; }
+  .flow .node { flex: 1 1 8rem; min-width: 7rem; border: 1px solid var(--border); border-radius: 9px; padding: 0.7rem 0.8rem; background: var(--surface-2); }
+  .flow .node .n { font-family:"Schibsted Grotesk",sans-serif; font-weight: 600; font-size: 0.92rem; display:flex; align-items:center; gap:0.4rem; }
+  .flow .node .d { font-size: 0.78rem; color: var(--ink-3); margin-top: 0.2rem; }
+  .flow .node .step { font-family:"JetBrains Mono",monospace; font-size: 0.68rem; color: var(--accent-2); }
+  :root[data-theme="dark"] .flow .node .step, :root:not([data-theme="light"]) .flow .node .step { color: var(--accent); }
+  .flow .arrow { align-self: center; color: var(--ink-3); font-size: 1.1rem; flex: none; }
+  .flow .cap { font-size: 0.8rem; color: var(--ink-3); margin-top: 0.9rem; text-align: center; }
+
+  /* feature grid */
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.9rem; margin: 0 0 1.3rem; }
+  .fcard { border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.1rem; background: var(--surface); }
+  .fcard h4 { margin: 0 0 0.3rem; font-size: 1rem; font-weight: 600; }
+  .fcard p { margin: 0; font-size: 0.88rem; color: var(--ink-2); }
+
+  .footer { max-width: var(--maxread); margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--ink-3); font-size: 0.85rem; }
+
+  .backtop { display:inline-block; margin-top: 1.5rem; font-size: 0.8rem; font-family:"JetBrains Mono",monospace; color: var(--ink-3); }
+
+  /* ---- Responsive ---- */
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr; }
+    #menuBtn { display: grid; }
+    nav.toc {
+      position: fixed; inset: 3.6rem 0 0 auto; width: min(20rem, 82vw); height: calc(100vh - 3.6rem);
+      background: var(--surface); border-left: 1px solid var(--border); padding: 1.25rem 1.25rem 3rem;
+      transform: translateX(100%); transition: transform 0.22s ease; z-index: 45; box-shadow: var(--shadow);
+    }
+    nav.toc.open { transform: translateX(0); }
+    .scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.4); opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 44; }
+    .scrim.open { opacity: 1; pointer-events: auto; }
+  }
+  @media (min-width: 901px) { .scrim { display: none; } }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">
+    <span class="mark">Cx</span>
+    <span>CxCreditGuard<small>User guide</small></span>
+  </span>
+  <span class="spacer"></span>
+  <button class="iconbtn" id="themeBtn" aria-label="Toggle colour theme" title="Toggle theme">◐</button>
+  <button class="iconbtn" id="menuBtn" aria-label="Toggle contents" aria-expanded="false">☰</button>
+</header>
+
+<div class="scrim" id="scrim"></div>
+
+<div class="shell">
+  <nav class="toc" id="toc" aria-label="Contents">
+    <div class="group">Start here</div>
+    <a href="#overview">What it is</a>
+    <a href="#how-it-works">How it works</a>
+    <a href="#deploy">Deploy</a>
+    <a href="#setup">First-time setup</a>
+    <div class="group">Daily use</div>
+    <a href="#dashboard">The dashboard</a>
+    <a href="#limits">Setting limits</a>
+    <a href="#measurement">How usage is measured</a>
+    <a href="#attribution">Attribution &amp; disputes</a>
+    <a href="#enforcement">Enforcement</a>
+    <a href="#notifications">Notifications</a>
+    <a href="#settings">Settings</a>
+    <div class="group">Operating it</div>
+    <a href="#permissions">Checkmarx permissions</a>
+    <a href="#security">Security posture</a>
+    <a href="#runbooks">Runbooks</a>
+    <a href="#troubleshooting">Troubleshooting</a>
+  </nav>
+
+  <main>
+    <div class="hero" id="top">
+      <p class="eyebrow">Governance for Checkmarx One AI credits</p>
+      <h1>Budget, watch, and cap AI credit spend — safely.</h1>
+      <p class="lede">
+        Checkmarx One spends AI credits on Triage, Remediation, DAST correlation, Fusion scans and
+        Auto Triage, but gives you no way to budget them per user, group, project or application.
+        CxCreditGuard polls consumption on a schedule, compares it against limits you define, and can
+        restrict access when a budget is breached — with every restriction recorded and reversible in
+        one click.
+      </p>
+      <p style="color: var(--ink-2);">
+        This guide walks an administrator from first deploy to running enforcement in production. If
+        you only read one thing, read <a href="#measurement">How usage is measured</a> — it explains
+        the single non-obvious idea the whole tool is built on.
+      </p>
+    </div>
+
+    <!-- OVERVIEW -->
+    <section id="overview">
+      <p class="section-kicker">01 — Start here</p>
+      <h2>What CxCreditGuard is</h2>
+      <p>
+        It is a self-hosted governance layer that sits beside Checkmarx One. It never spends credits
+        itself; it observes what Checkmarx reports and, when you ask it to, turns off the AI features
+        that spend them. Three ideas shape everything:
+      </p>
+      <div class="grid2">
+        <div class="fcard"><h4>Poll, don't stream</h4><p>Checkmarx reports running totals over a lookback window, not individual events — so per-period usage is derived by comparison, not by summing events.</p></div>
+        <div class="fcard"><h4>Attribute, don't guess</h4><p>Every usage row is matched to a real user — exactly where possible, by similarity where not — and anything uncertain is surfaced for review instead of billed to the wrong person.</p></div>
+        <div class="fcard"><h4>Act reversibly</h4><p>Before any restriction, the prior state is snapshotted. Every enforcement is one click to undo, and a feature that was already off stays off on restore.</p></div>
+      </div>
+      <div class="callout tip">
+        <span class="ico">◆</span>
+        <div><span class="h">Monitor first.</span><p style="margin-top:0.2rem;">Every new limit defaults to <strong>monitor-only</strong>. Nothing is ever restricted until you deliberately switch a limit to <em>enforce</em> — so you can watch the numbers for a full budget period before anything acts.</p></div>
+      </div>
+    </section>
+
+    <!-- HOW IT WORKS -->
+    <section id="how-it-works">
+      <p class="section-kicker">02 — Start here</p>
+      <h2>How it works</h2>
+      <p>
+        CxCreditGuard is <strong>one deployable unit</strong>: a backend that also serves the web UI
+        from the same origin, a background scheduler in the same process, and a database (SQLite by
+        default, PostgreSQL for the hardened deployment). Everything of consequence happens in one
+        loop — a <em>cycle</em> — run on a schedule or on demand.
+      </p>
+      <div class="flow" role="img" aria-label="A cycle runs organisation sync, then usage ingestion and attribution, then evaluation against limits, then enforcement, then notifications.">
+        <div class="row">
+          <div class="node"><div class="n">🔄 Sync</div><div class="step">org_sync</div><div class="d">Users, groups, projects, applications</div></div>
+          <div class="arrow">→</div>
+          <div class="node"><div class="n">📥 Ingest</div><div class="step">ingestion</div><div class="d">Poll consumption, snapshot, attribute to users</div></div>
+          <div class="arrow">→</div>
+          <div class="node"><div class="n">⚖️ Evaluate</div><div class="step">evaluation</div><div class="d">Usage vs limits, using period baselines</div></div>
+          <div class="arrow">→</div>
+          <div class="node"><div class="n">🛡️ Enforce</div><div class="step">enforcement</div><div class="d">Reversible role &amp; AI-feature changes</div></div>
+        </div>
+        <div class="cap">Each step writes to the database and raises notifications; the web UI and email/webhook read from there.</div>
+      </div>
+      <p>
+        You can run a cycle by hand any time from the Dashboard or Settings (<strong>Run a cycle
+        now</strong>), which is the fastest way to see a change take effect without waiting for the
+        schedule.
+      </p>
+    </section>
+
+    <!-- DEPLOY -->
+    <section id="deploy">
+      <p class="section-kicker">03 — Start here</p>
+      <h2>Deploy</h2>
+      <p>Two supported paths, both on Podman. Start with the single container to try it; use Compose to run it for real.</p>
+
+      <h3>Quick start — single container</h3>
+      <p>
+        The whole tool ships in one image (UI bundled with the API) over plain HTTP on port 8000, with
+        <strong>no required configuration</strong>: on first start it generates its own encryption key
+        and a first admin account. From the repository root:
+      </p>
+      <pre><code><span class="cmt"># Linux / macOS / WSL</span>
+make podman-run
+
+<span class="cmt"># Windows: run.bat (cmd.exe)  or  .\run-podman.ps1 (PowerShell)</span></code></pre>
+      <p>
+        Each builds the image, starts the container, and tails the startup log — which prints the
+        initial <code>admin</code> credentials on a fresh volume. Then open
+        <a href="http://localhost:8000">http://localhost:8000</a>.
+      </p>
+      <div class="callout warn">
+        <span class="ico">▲</span>
+        <div><span class="h">This convenience image runs over plain HTTP</span><p style="margin-top:0.2rem;">Secure cookies are disabled because a browser silently discards them over HTTP. It is perfect for a local look, but <strong>do not expose it directly to the internet</strong> — use the Compose path for that.</p></div>
+      </div>
+
+      <h3>Hardened deployment — Podman Compose</h3>
+      <p>For production (HTTPS via an nginx TLS proxy, plus PostgreSQL), run the root <code>docker-compose.yml</code> with Podman Compose (Podman 4.1+):</p>
+      <pre><code>cp .env.example .env
+<span class="cmt"># Generate a master key for the .env file:</span>
+python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"</code></pre>
+      <p>
+        Set <code>CXCG_MASTER_KEY</code> (the value printed above — everything encrypted at rest
+        depends on it) and <code>POSTGRES_PASSWORD</code>. To create the first admin, also set
+        <code>CXCG_BOOTSTRAP_ADMIN_USERNAME</code> and <code>CXCG_BOOTSTRAP_ADMIN_PASSWORD</code>
+        before the first start, then remove them after logging in. Provide a TLS certificate per
+        <code>deploy/nginx/README.md</code>, then:
+      </p>
+      <pre><code>podman compose -f docker-compose.yml up -d
+podman compose -f docker-compose.yml logs -f app</code></pre>
+      <div class="callout danger">
+        <span class="ico">⚠</span>
+        <div><span class="h">Back up the data volume</span><p style="margin-top:0.2rem;">The master key lives in <code>cxcreditguard-data</code> (single container) or your database plus <code>CXCG_MASTER_KEY</code> (Compose). Lose the key and stored Checkmarx secrets become unrecoverable.</p></div>
+      </div>
+    </section>
+
+    <!-- SETUP -->
+    <section id="setup">
+      <p class="section-kicker">04 — Start here</p>
+      <h2>First-time setup</h2>
+      <ol>
+        <li><strong>Sign in and change the password.</strong> Use the credentials from the startup log (single container) or the ones you set in <code>.env</code> (Compose). You will be asked to change the password on first login.</li>
+        <li><strong>Connect Checkmarx.</strong> On the <strong>Setup</strong> page, paste an API key. The tool derives the tenant and region and shows them for you to confirm <em>before</em> anything is stored, then tests the connection. You can override the regional base URL if needed.</li>
+        <li><strong>Let a cycle run.</strong> Either wait for the schedule or press <strong>Run a cycle now</strong>. The first cycle syncs your organisation model and takes the first usage snapshot.</li>
+        <li><strong>Review attribution.</strong> Open <strong>Settings → Consumption attribution</strong> and clear any disputes so usage counts against the right people (see <a href="#attribution">Attribution</a>).</li>
+        <li><strong>Add limits in monitor mode</strong> and watch for a full period before enforcing (see <a href="#runbooks">Runbooks</a>).</li>
+      </ol>
+      <div class="callout tip">
+        <span class="ico">◆</span>
+        <div><span class="h">Use a dedicated service account</span><p style="margin-top:0.2rem;">Not a person's key. A named engineer's key inherits their permissions, breaks when they leave, and makes the audit trail read as though they personally restricted every colleague. A read-only key runs the whole tool in monitor-only mode.</p></div>
+      </div>
+    </section>
+
+    <!-- DASHBOARD -->
+    <section id="dashboard">
+      <p class="section-kicker">05 — Daily use</p>
+      <h2>The dashboard</h2>
+      <p>The dashboard answers "what is being spent, by whom, and is anything at risk" at a glance.</p>
+      <ul>
+        <li><strong>Status tiles</strong> — credits reported for the window, entities near a limit, entities restricted, and the next scheduled run.</li>
+        <li><strong>Credits consumed over time</strong> — plotted as the <em>difference between polls</em>, not the cumulative curve (which says nothing useful over a sliding window). Both figures appear in the chart's table view.</li>
+        <li><strong>By action type</strong> — where credits went: Triage, Remediation, Fusion, DAST correlation, Auto Triage.</li>
+        <li><strong>Top consumers</strong> per level (user, project, group, application), with any configured limit marked so you see headroom next to consumption.</li>
+      </ul>
+      <div class="callout tip">
+        <span class="ico">◆</span>
+        <div><span class="h">The unmatched-usage banner</span><p style="margin-top:0.2rem;">If the dashboard warns that some consumption "could not be matched to a Checkmarx user," those credits count towards nobody's limit. Follow the link to <a href="#attribution">resolve it</a>.</p></div>
+      </div>
+    </section>
+
+    <!-- LIMITS -->
+    <section id="limits">
+      <p class="section-kicker">06 — Daily use</p>
+      <h2>Setting limits</h2>
+      <p>A limit is a credit budget on one entity, for one period. Create and manage them on the <strong>Limits</strong> page — one tab per level (user, group, project, application), each with a live usage bar.</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Setting</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Credit limit</strong></td><td>The budget for the period.</td></tr>
+          <tr><td><strong>Warning threshold</strong></td><td>Percentage at which the entity is flagged as "near a limit" and a notification is raised — before anything is restricted.</td></tr>
+          <tr><td><strong>Period</strong></td><td>Lifetime, custom range, monthly or quarterly. The period type decides how history is counted — see <a href="#measurement">below</a>.</td></tr>
+          <tr><td><strong>Monitor / Enforce</strong></td><td><span class="chip warn">Monitor</span> only warns. <span class="chip crit">Enforce</span> restricts access when breached. New limits default to monitor.</td></tr>
+          <tr><td><strong>Exemptions</strong></td><td>An entity on the exemption list is evaluated but never restricted — for break-glass accounts and projects that must never lose AI features.</td></tr>
+          <tr><td><strong>Bulk edit &amp; CSV</strong></td><td>Change many limits at once, or import/export the whole set as CSV.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="callout tip">
+        <span class="ico">◆</span>
+        <div><span class="h">The most restrictive limit wins.</span><p style="margin-top:0.2rem;">A user can be restricted by a group, project or application limit they never saw. When investigating, remember that overlapping limits all apply and the tightest one fires.</p></div>
+      </div>
+    </section>
+
+    <!-- MEASUREMENT -->
+    <section id="measurement">
+      <p class="section-kicker">07 — Daily use</p>
+      <h2>How usage is measured</h2>
+      <p>This is the one idea worth understanding. Checkmarx's consumption endpoint returns <strong>aggregate totals over a lookback window</strong> — not a stream of timestamped events. There are no event IDs or timestamps, so per-period usage cannot be summed from events. Instead:</p>
+      <ol>
+        <li>Each cycle stores the reported totals (a <em>snapshot</em>).</li>
+        <li>When a budget period opens, the total reported at that moment becomes the period's <strong>baseline</strong>.</li>
+        <li>Usage for the period is <code>latest reported total − baseline</code>.</li>
+      </ol>
+      <p>The baseline depends on the period type, because the period type is what decides whether history should count:</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Period</th><th>Baseline</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Lifetime</td><td>Zero — everything counts</td><td>"Lifetime" means all credits ever. Discounting history would silently redefine it.</td></tr>
+          <tr><td>Custom range</td><td>Zero — everything counts</td><td>You chose the window explicitly and expect consumption inside it to count.</td></tr>
+          <tr><td>Monthly / quarterly</td><td>Total when the period opened</td><td>The lookback window is wider than the period, and the API does not say <em>when</em> credits were spent — so counting the lot would let a year of history exhaust a fresh monthly budget on day one. Set <code>count_existing_usage</code> to include it anyway.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="callout tip">
+        <span class="ico">◆</span>
+        <div><span class="h">Why a number can read as 0 of 10 when Checkmarx says 13</span><p style="margin-top:0.2rem;">The 13 was spent before the period opened, so it sits in the baseline. The Limits page shows both the reported total and the discounted amount under the bar, so this is always explained rather than mysterious.</p></div>
+      </div>
+    </section>
+
+    <!-- ATTRIBUTION -->
+    <section id="attribution">
+      <p class="section-kicker">08 — Daily use</p>
+      <h2>Attribution &amp; disputes</h2>
+      <p>
+        The consumption feed identifies users inconsistently: some rows carry a clean email, some a
+        display name, some a service-style handle like <code>cx-ryan-wakeham</code>. Attribution runs
+        in two stages so credits reach the right person's budget.
+      </p>
+      <h3>Stage 1 — exact match</h3>
+      <p>Email, then an email found in the name field, then username, then unambiguous full name. Two different people with the same name are never merged into one budget.</p>
+      <h3>Stage 2 — similarity, for the messy tail</h3>
+      <p>
+        A handle the exact ladder can't place is normalised to a <em>token set</em> — the <code>cx-</code>
+        prefix stripped, an email reduced to its local part — so <code>cx-ryan-wakeham</code>,
+        <code>Ryan Wakeham</code> and <code>ryan.wakeham@checkmarx.com</code> all reduce to
+        <code>{ryan, wakeham}</code> and score against every synced user. The score, kept deliberately
+        conservative because a wrong match bills the wrong person, decides the outcome:
+      </p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Confidence</th><th>Outcome</th></tr></thead>
+        <tbody>
+          <tr><td><span class="chip good">≥ 85%</span> one clear winner</td><td>Matched automatically and written to the audit log. Counted from the next poll — and still overridable.</td></tr>
+          <tr><td><span class="chip warn">≥ 60%</span> or a near-tie</td><td>Left <strong>uncounted</strong> and raised as a <strong>dispute</strong> with ranked suggestions to confirm.</td></tr>
+          <tr><td><span class="chip">below 60%</span></td><td>Unmatched — map it by hand. Automation handles like <code>dependabot[bot]</code> are flagged and kept out of the queue.</td></tr>
+        </tbody>
+      </table></div>
+      <h3>The attribution queue</h3>
+      <p>On <strong>Settings → Consumption attribution</strong>, subjects are grouped into three tabs:</p>
+      <div class="grid2">
+        <div class="fcard"><h4><span class="chip warn">Disputes</span></h4><p>A likely user was found but not with certainty. Click a suggestion chip to confirm, or map to any user. Nothing counts until you do.</p></div>
+        <div class="fcard"><h4><span class="chip good">Auto-matched</span></h4><p>Matched automatically at high confidence and counted. Review, and override any that look wrong.</p></div>
+        <div class="fcard"><h4><span class="chip">Unmatched</span></h4><p>No user resembled the handle. Map by hand. Bots appear here and are never counted.</p></div>
+      </div>
+      <p>A manual mapping always wins over the automatic decision, and takes effect from the next poll onward.</p>
+    </section>
+
+    <!-- ENFORCEMENT -->
+    <section id="enforcement">
+      <p class="section-kicker">09 — Daily use</p>
+      <h2>Enforcement</h2>
+      <p>When an <em>enforcing</em> limit is breached, CxCreditGuard turns off the AI features that spend credits for that entity. What changes depends on the level:</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Level breached</th><th>What changes</th></tr></thead>
+        <tbody>
+          <tr><td>User</td><td>The AI roles and the scan-viewing role are unmapped from the user on the <code>ast-app</code> client.</td></tr>
+          <tr><td>Project</td><td>Auto Triage is disabled, and PR triage &amp; remediation is disabled by clearing the remediation severities.</td></tr>
+          <tr><td>Group</td><td>Both project actions, on every project in the group.</td></tr>
+          <tr><td>Application</td><td>Both project actions, on every project in the application.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="callout tip">
+        <span class="ico">↺</span>
+        <div><span class="h">Everything is reversible.</span><p style="margin-top:0.2rem;">Before any change, the exact prior state is snapshotted onto the enforcement record — which roles the user held, the project's Auto Triage config, the prior severity list. <strong>Restore access</strong> replays that snapshot. A feature that was already off beforehand stays off on restore.</p></div>
+      </div>
+    </section>
+
+    <!-- NOTIFICATIONS -->
+    <section id="notifications">
+      <p class="section-kicker">10 — Daily use</p>
+      <h2>Notifications</h2>
+      <p>The <strong>Notification Center</strong> is always the record of truth — a filterable feed with an unread badge, an active-restrictions table, and one-click <strong>Restore access</strong>. Email and webhook are optional copies, so a broken SMTP server can never lose a warning.</p>
+      <ul>
+        <li><strong>Minimum severity</strong> filters what gets pushed out (default: warning and above), so quiet informational events don't wake anyone.</li>
+        <li><strong>Retries stop</strong> after three failed delivery attempts, so a dead endpoint isn't retried forever. Changing the delivery settings resets the counters.</li>
+        <li><strong>Signed webhooks</strong> — when a signing secret is set, each request carries an HMAC-SHA256 signature over a timestamped body, so a captured request can't be replayed.</li>
+      </ul>
+      <p>Both channels are configured on Settings, which has a <strong>Send a test</strong> button that delivers a sample without leaving a row in the feed.</p>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="settings">
+      <p class="section-kicker">11 — Daily use</p>
+      <h2>Settings</h2>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Area</th><th>Controls</th></tr></thead>
+        <tbody>
+          <tr><td>Scheduler</td><td>Run cycles automatically or by hand; fixed interval or a cron expression; organisation-model refresh rate.</td></tr>
+          <tr><td>Usage ingestion</td><td>Lookback window (must be at least as wide as your widest budget period), page size, data retention.</td></tr>
+          <tr><td>Notification delivery</td><td>Minimum severity, SMTP, webhook URL and signing secret.</td></tr>
+          <tr><td>Consumption attribution</td><td>The Disputes / Auto-matched / Unmatched tabs from the <a href="#attribution">attribution</a> section.</td></tr>
+          <tr><td>Utility accounts</td><td>Who can sign in to CxCreditGuard itself. Admin has full control; Viewer is read-only.</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <!-- PERMISSIONS -->
+    <section id="permissions">
+      <p class="section-kicker">12 — Operating it</p>
+      <h2>Checkmarx permissions the key needs</h2>
+      <p>The service-account API key needs to reach these endpoints. The last two rows are <strong>only</strong> needed for enforce mode — a read-only key runs the whole tool in monitor-only mode.</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Purpose</th><th>Access</th></tr></thead>
+        <tbody>
+          <tr><td>Token exchange</td><td>The API key itself</td></tr>
+          <tr><td>Users, roles, groups</td><td>Read users and groups in IAM</td></tr>
+          <tr><td>Projects, applications</td><td>Read projects and applications, tenant-wide</td></tr>
+          <tr><td>Credit usage</td><td>Read credit consumption</td></tr>
+          <tr><td>Role mapping <span class="chip crit">enforce</span></td><td>IAM admin, enough to manage role mappings</td></tr>
+          <tr><td>Project AI toggles <span class="chip crit">enforce</span></td><td>Manage project configuration</td></tr>
+        </tbody>
+      </table></div>
+      <p>Enforcement fails with a clear 403 naming the missing permission rather than silently doing nothing. Projects the key cannot see are reported as a warning rather than undercounted quietly.</p>
+    </section>
+
+    <!-- SECURITY -->
+    <section id="security">
+      <p class="section-kicker">13 — Operating it</p>
+      <h2>Security posture</h2>
+      <p>A condensed view; the repository README carries the full detail and threat model.</p>
+      <ul>
+        <li><strong>Secrets at rest</strong> — API key, TOTP and delivery secrets are encrypted with AES-256-GCM, with per-purpose keys derived from the master key. The master key comes from the environment or a mounted file and is never stored in the database.</li>
+        <li><strong>Utility auth</strong> — Argon2id password hashing, an enforced policy, optional TOTP, opaque session tokens stored only as digests, <code>HttpOnly</code>/<code>Secure</code>/<code>SameSite=Strict</code> cookies, idle and absolute timeouts.</li>
+        <li><strong>Abuse resistance</strong> — per-username and per-IP rate limiting with account lockout; identical timing and messaging for unknown users and wrong passwords.</li>
+        <li><strong>Transport &amp; app</strong> — HTTPS with HSTS, a strict CSP with no inline scripts, CSRF double-submit, RBAC, ORM-only parameterised SQL, and an append-only audit log.</li>
+        <li><strong>Container</strong> — non-root user, dropped capabilities, <code>no-new-privileges</code>, and no compiler or package manager in the final image.</li>
+      </ul>
+    </section>
+
+    <!-- RUNBOOKS -->
+    <section id="runbooks">
+      <p class="section-kicker">14 — Operating it</p>
+      <h2>Runbooks</h2>
+
+      <h3>Turning enforcement on for the first time</h3>
+      <p>The failure mode of this tool is restricting the wrong person, so go slowly:</p>
+      <ol>
+        <li>Connect with a <strong>read-only</strong> key; leave every limit on monitor.</li>
+        <li>Let it run for at least one full budget period. Are the figures what you expect? Is anyone showing as disputed or unmatched?</li>
+        <li>Fix attribution first — an unmatched user is a budget that silently undercounts.</li>
+        <li>Add exemptions for break-glass accounts and must-never-restrict projects.</li>
+        <li>Switch <strong>one</strong> limit to enforce, on an entity you control, and verify both the restriction and the restore end to end.</li>
+        <li>Only then widen, using bulk edit.</li>
+      </ol>
+
+      <h3>The tool restricted someone it should not have</h3>
+      <ol>
+        <li><strong>Restore first, investigate second.</strong> Use <strong>Restore access</strong> in the Notification Center — it replays the exact captured state. Don't hand-edit roles in Checkmarx, or the undo snapshot goes stale.</li>
+        <li><strong>Stop the re-fire.</strong> Switch that limit to monitor or add the entity to exemptions, otherwise the next cycle re-enforces.</li>
+        <li><strong>Find the cause.</strong> The Audit Log holds before/after state for every action, and the raw consumption payload is stored on each event for exactly this comparison.</li>
+      </ol>
+
+      <h3>A figure on screen doesn't match Checkmarx</h3>
+      <p>Two causes look identical from outside; the built-in diagnostic separates them:</p>
+      <pre><code>cd backend
+python -m scripts.diagnose_usage --user "someone@example.com"</code></pre>
+      <ul>
+        <li><strong>Attribution failure</strong> — credits were reported under a name that didn't match the synced user, so they count towards nothing. Fix it in the attribution queue.</li>
+        <li><strong>Baseline effect</strong> — the credits matched but were spent before the period opened, so they sit in the baseline. Expected behaviour (see <a href="#measurement">measurement</a>).</li>
+      </ul>
+    </section>
+
+    <!-- TROUBLESHOOTING -->
+    <section id="troubleshooting">
+      <p class="section-kicker">15 — Operating it</p>
+      <h2>Troubleshooting</h2>
+
+      <h3>I didn't see the admin password</h3>
+      <p>On a reused volume the password is only printed the first time it's generated. Read it back from the container:</p>
+      <pre><code>podman exec cxcreditguard cat /app/data/.admin_password</code></pre>
+
+      <h3>The container won't start (<code>easy-entrypoint.sh: No such file or directory</code>)</h3>
+      <p>This is a line-endings problem from a Windows checkout rewriting the entrypoint script to CRLF. The repository pins these scripts to LF and the image strips carriage returns during build, so a plain rebuild fixes it. To also clean your working copy:</p>
+      <pre><code>git config core.autocrlf false
+git add --renormalize .
+git checkout .</code></pre>
+
+      <h3>An IAM sync only read some of my users</h3>
+      <p>User pagination is handled automatically. If a sync still reports fewer users than the tenant has, it warns with the exact shortfall rather than treating the partial list as complete — check the cycle warnings on the Dashboard.</p>
+
+      <h3>A whole dimension shows as unavailable</h3>
+      <p>Checkmarx silently returns the user view for a dimension a tenant doesn't support. CxCreditGuard detects this and marks the dimension unavailable rather than filing one entity's usage as another's. Limits at that level simply aren't evaluated — nothing is assumed to be zero.</p>
+
+      <div class="callout tip">
+        <span class="ico">◆</span>
+        <div><span class="h">When in doubt, run a cycle and read the warnings.</span><p style="margin-top:0.2rem;">The cycle result names every step's outcome — users synced, records ingested per dimension, limits evaluated, warnings raised, restrictions applied, and any step that failed.</p></div>
+      </div>
+
+      <div class="footer">
+        <p><strong>CxCreditGuard</strong> — self-hosted governance for Checkmarx One AI credit consumption. This guide lives at <code>docs/user-guide.html</code> in the repository; the <code>README.md</code> carries the full architecture, security and configuration reference.</p>
+      </div>
+      <a href="#top" class="backtop">↑ Back to top</a>
+    </section>
+  </main>
+</div>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    // Theme toggle, persisted per viewer. Wrapped so storage failures never break the page.
+    var KEY = "cxcg-guide-theme";
+    try {
+      var saved = localStorage.getItem(KEY);
+      if (saved === "dark" || saved === "light") root.setAttribute("data-theme", saved);
+    } catch (e) {}
+    function current() {
+      var attr = root.getAttribute("data-theme");
+      if (attr) return attr;
+      return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    var themeBtn = document.getElementById("themeBtn");
+    themeBtn && themeBtn.addEventListener("click", function () {
+      var next = current() === "dark" ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      try { localStorage.setItem(KEY, next); } catch (e) {}
+    });
+
+    // Mobile contents drawer.
+    var toc = document.getElementById("toc");
+    var scrim = document.getElementById("scrim");
+    var menuBtn = document.getElementById("menuBtn");
+    function setMenu(open) {
+      toc.classList.toggle("open", open);
+      scrim.classList.toggle("open", open);
+      menuBtn && menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+    menuBtn && menuBtn.addEventListener("click", function () { setMenu(!toc.classList.contains("open")); });
+    scrim && scrim.addEventListener("click", function () { setMenu(false); });
+    toc && toc.addEventListener("click", function (e) { if (e.target.tagName === "A") setMenu(false); });
+
+    // Scroll-spy: highlight the section currently in view.
+    var links = Array.prototype.slice.call(toc.querySelectorAll("a"));
+    var byId = {};
+    links.forEach(function (a) { byId[a.getAttribute("href").slice(1)] = a; });
+    var sections = links.map(function (a) { return document.getElementById(a.getAttribute("href").slice(1)); }).filter(Boolean);
+    if ("IntersectionObserver" in window) {
+      var seen = {};
+      var obs = new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) { seen[en.target.id] = en.isIntersecting; });
+        var activeId = null;
+        for (var i = 0; i < sections.length; i++) { if (seen[sections[i].id]) { activeId = sections[i].id; break; } }
+        if (activeId) {
+          links.forEach(function (a) { a.classList.remove("active"); });
+          if (byId[activeId]) byId[activeId].classList.add("active");
+        }
+      }, { rootMargin: "-45% 0px -50% 0px", threshold: 0 });
+      sections.forEach(function (s) { obs.observe(s); });
+    }
+  })();
+</script>
+</body>
+</html>
