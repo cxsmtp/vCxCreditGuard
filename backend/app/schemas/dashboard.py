@@ -233,14 +233,6 @@ class CsvImportResultResponse(BaseModel):
     dry_run: bool
 
 
-class ImportPreviewRow(BaseModel):
-    row: int
-    entity_type: str | None
-    entity_id: str | None
-    action: str
-    detail: str | None = None
-
-
 class MeResponse(BaseModel):
     """Everything the SPA needs on load to decide what to render."""
 

@@ -9,6 +9,11 @@ it against limits you define, and can restrict access when a limit is breached.
 Every restriction it makes is recorded with the state needed to undo it, and is
 reversible from the GUI with one click.
 
+> **New here?** The [**User Guide**](docs/user-guide.html) (`docs/user-guide.html`)
+> is a self-contained HTML walkthrough — deploy, first-time setup, daily use and
+> the operator runbooks — written for administrators. Open it in any browser.
+> This README is the deeper architecture, security and configuration reference.
+
 ## High-level architecture
 
 CxCreditGuard is **one deployable unit**: a FastAPI backend that also serves the
