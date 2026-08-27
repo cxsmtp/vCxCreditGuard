@@ -47,6 +47,12 @@ if [ -z "${CXCG_BOOTSTRAP_ADMIN_PASSWORD:-}" ]; then
     PW_FILE="$DATA_DIR/.admin_password"
     if [ -s "$PW_FILE" ]; then
         CXCG_BOOTSTRAP_ADMIN_PASSWORD="$(cat "$PW_FILE")"
+        # Reused data volume: the password was printed when it was first
+        # generated and is not re-echoed here (it would land in the logs on every
+        # restart). Point the operator at the file instead.
+        echo "CxCreditGuard: admin account already initialised on this volume."
+        echo "CxCreditGuard: username=$CXCG_BOOTSTRAP_ADMIN_USERNAME; the generated password is stored at $PW_FILE"
+        echo "CxCreditGuard: read it with 'podman exec <container> cat $PW_FILE'"
     else
         # Generate a password that satisfies the app's policy, using the app's
         # own validator so a random string can never lock bootstrap out.
