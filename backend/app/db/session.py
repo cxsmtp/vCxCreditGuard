@@ -43,10 +43,16 @@ def build_engine(url: str) -> Engine:
         @event.listens_for(engine, "connect")
         def _sqlite_pragmas(dbapi_connection, _record):  # type: ignore[no-untyped-def]
             cursor = dbapi_connection.cursor()
-            # WAL keeps the scheduler's writes from blocking dashboard reads.
+            # WAL lets readers run while a single writer holds the lock, so the
+            # scheduler's writes do not block dashboard reads, and concurrent
+            # writers queue on busy_timeout instead of dead-locking.
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA busy_timeout=5000")
+            # A cycle (org sync + ingest + enforce) writes a lot in one go; a
+            # login landing mid-cycle must wait for that write lock rather than
+            # failing with "database is locked". 30s is generous headroom for
+            # this single-node, low-concurrency deployment.
+            cursor.execute("PRAGMA busy_timeout=30000")
             cursor.close()
 
         return engine
