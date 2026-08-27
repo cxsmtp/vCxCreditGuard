@@ -246,21 +246,18 @@ class FakeTenant:
     def _users_response(self, params: dict[str, list[str]]) -> httpx.Response:
         if not self.users_requires_paging:
             return httpx.Response(200, json={"filteredCount": len(self.users), "users": self.users})
-        # Simulate an endpoint that caps its unpaginated response.
-        size = int(params.get("size", ["2"])[0])
-        page = int(params.get("page", ["0"])[0] or 0)
-        if page == 0:
-            return httpx.Response(
-                200, json={"filteredCount": len(self.users), "users": self.users[:1]}
-            )
-        start = (page - 1) * size
-        return httpx.Response(
-            200,
-            json={
-                "filteredCount": len(self.users),
-                "users": self.users[start : start + size],
-            },
-        )
+        # Simulate a Keycloak-style endpoint that caps each page and paginates
+        # with `first` (0-based offset) and `max`.
+        cap = 2
+        first = params.get("first")
+        if first is None:
+            # Unparameterised call under-reports to force the caller to page.
+            window = self.users[:1]
+        else:
+            offset = int(first[0] or 0)
+            size = min(int(params.get("max", [str(cap)])[0]), cap)
+            window = self.users[offset : offset + size]
+        return httpx.Response(200, json={"filteredCount": len(self.users), "users": window})
 
     def _paged(
         self, rows: list[dict[str, Any]], key: str, params: dict[str, list[str]]

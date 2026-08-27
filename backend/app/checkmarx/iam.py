@@ -116,12 +116,12 @@ def fetch_users(
     Returns the users, the ``filteredCount`` the API reported, and a warning
     string when the two do not agree.
 
-    The pagination parameters for this endpoint are not documented in what we
-    were given, so the strategy is: ask once with no parameters, and only if the
-    result is short of ``filteredCount`` start paging with ``page`` and ``size``
-    (1 based, matching the convention the consumption endpoint uses). If paging
-    makes no progress we stop and report the shortfall rather than pretending the
-    partial list is complete, because a missing user means missing usage.
+    ``/users/v2`` is Keycloak-backed and paginates with ``first`` (a 0 based row
+    offset) and ``max`` (page size), not ``page``/``size``. We ask once with no
+    parameters to learn ``filteredCount``, then, when that first page is short,
+    page by advancing ``first`` until the whole set is read. If a page yields no
+    new users we stop and report the shortfall rather than pretending the partial
+    list is complete, because a missing user means missing usage.
     """
     payload = client.get_json(USERS_PATH, base="realm")
     users, reported_total = _parse_users_payload(payload)
@@ -129,23 +129,31 @@ def fetch_users(
         return users, reported_total, None
 
     logger.info(
-        "IAM returned %d of %d users without pagination, paging with page and size",
+        "IAM returned %d of %d users without pagination, paging with first and max",
         len(users),
         reported_total,
     )
     seen: dict[str, IamUser] = {user.id: user for user in users}
-    page_number = 1
-    while page_number <= MAX_PAGES and len(seen) < reported_total:
+    offset = len(users)
+    pages = 0
+    while pages < MAX_PAGES and len(seen) < reported_total:
+        pages += 1
         page_payload = client.get_json(
-            USERS_PATH, base="realm", params={"page": page_number, "size": page_size}
+            USERS_PATH, base="realm", params={"first": offset, "max": page_size}
         )
         page_users, _ = _parse_users_payload(page_payload)
-        new_ids = [user.id for user in page_users if user.id not in seen]
+        if not page_users:
+            break
+        before = len(seen)
         for user in page_users:
             seen[user.id] = user
-        if not new_ids:
+        # Advance by however many the page returned, so a server that caps the
+        # page below ``max`` still makes progress.
+        offset += len(page_users)
+        if len(seen) == before:
+            # Only already-seen users came back: the offset window is not
+            # advancing, so stop instead of looping forever.
             break
-        page_number += 1
 
     collected = list(seen.values())
     if len(collected) < reported_total:
