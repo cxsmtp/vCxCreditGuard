@@ -481,25 +481,33 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
 
 /* ------------------------------------------------------------- attribution */
 
-type AttributionTab = "disputed" | "auto_matched" | "unmatched";
+type AttributionTab = "disputed" | "matched" | "unmatched";
 
 const TAB_LABELS: Record<AttributionTab, string> = {
   disputed: "Disputes",
-  auto_matched: "Auto-matched",
+  matched: "Matched",
   unmatched: "Unmatched",
 };
 
 const TAB_BLURB: Record<AttributionTab, string> = {
   disputed:
     "A likely user was found but the match is not certain. Confirm one of the suggestions, or map it yourself. Nothing is counted until you do.",
-  auto_matched:
-    "Matched to a user automatically at high confidence, and counted towards their limits from the next poll. Override any that look wrong.",
+  matched:
+    "Counted towards a user's limits — either matched automatically at high confidence, or mapped by you. Change any that look wrong.",
   unmatched:
     "No user resembled the reported handle closely enough to suggest. Map these by hand. Automation accounts (bots) are listed here too and are never counted.",
 };
 
 function confidence(score: number | null | undefined): string {
   return score == null ? "" : `${Math.round(score * 100)}%`;
+}
+
+// A subject is counted when its credits currently reach a user's budget — an
+// admin mapping or a high-confidence auto-match. This, not the raw status, is
+// what decides which tab a row belongs in, so a manual mapping is reflected the
+// instant it is saved.
+function isCounted(s: UnresolvedSubject): boolean {
+  return Boolean(s.counts_towards_user_id);
 }
 
 function AttributionCard({
@@ -522,9 +530,11 @@ function AttributionCard({
   const [busyId, setBusyId] = useState<number | null>(null);
 
   const groups: Record<AttributionTab, UnresolvedSubject[]> = {
-    disputed: subjects.filter((s) => s.status === "disputed"),
-    auto_matched: subjects.filter((s) => s.status === "auto_matched"),
-    unmatched: subjects.filter((s) => s.status === "unmatched"),
+    // Grouped by effective attribution, not raw status: a mapped subject counts,
+    // so it belongs in "Matched" whatever the matcher last labelled it.
+    disputed: subjects.filter((s) => s.status === "disputed" && !isCounted(s)),
+    matched: subjects.filter(isCounted),
+    unmatched: subjects.filter((s) => !isCounted(s) && s.status !== "disputed"),
   };
   const rows = groups[tab];
 
@@ -556,7 +566,7 @@ function AttributionCard({
       await api.post(`/api/usage/unresolved/${subject.id}/map`, { user_id: userId });
       toast.success(
         userId
-          ? "Confirmed. From the next poll onwards this usage counts towards that user."
+          ? "Confirmed. This usage now counts towards that user."
           : "Mapping cleared.",
       );
       await onChanged();
@@ -575,7 +585,7 @@ function AttributionCard({
       await api.post(`/api/usage/unresolved/${mapping.id}/map`, { user_id: userId });
       toast.success(
         userId
-          ? "Mapped. From the next poll onwards this usage counts towards that user."
+          ? "Mapped. This usage now counts towards that user."
           : "Mapping cleared.",
       );
       setMapping(null);
@@ -636,13 +646,13 @@ function AttributionCard({
           title={
             tab === "disputed"
               ? "No disputes to resolve"
-              : tab === "auto_matched"
-                ? "Nothing was auto-matched"
+              : tab === "matched"
+                ? "Nothing is matched yet"
                 : "Nothing is unmatched"
           }
           description={
-            tab === "auto_matched"
-              ? "When a handle is matched to a user by similarity it will appear here to review."
+            tab === "matched"
+              ? "Confirmed mappings and high-confidence auto-matches appear here."
               : "Every consumption row in this state is clear."
           }
         />
@@ -652,7 +662,7 @@ function AttributionCard({
             <tr>
               <Th>Reported as</Th>
               <Th align="right">Credits</Th>
-              <Th>{tab === "auto_matched" ? "Matched to" : "Suggestion"}</Th>
+              <Th>{tab === "matched" ? "Counts towards" : "Suggestion"}</Th>
               <Th align="right" />
             </tr>
           </thead>
@@ -679,14 +689,16 @@ function AttributionCard({
                   <span className="tabular">{formatCredits(subject.credits_used)}</span>
                 </Td>
                 <Td>
-                  {tab === "auto_matched" ? (
+                  {isCounted(subject) ? (
                     <span className="flex items-center gap-2">
                       <Badge tone="good">{subject.counts_towards_label ?? "—"}</Badge>
-                      {subject.match_score != null && (
-                        <span className="text-xs" style={{ color: "var(--text-muted)" }}>
-                          {confidence(subject.match_score)} confidence
-                        </span>
-                      )}
+                      <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+                        {subject.mapped_user_id
+                          ? "mapped by you"
+                          : subject.match_score != null
+                            ? `${confidence(subject.match_score)} auto`
+                            : ""}
+                      </span>
                     </span>
                   ) : subject.suggestions.length > 0 ? (
                     <div className="flex flex-wrap gap-1.5">
@@ -719,7 +731,7 @@ function AttributionCard({
                       style={{ color: "var(--text-secondary)" }}
                       onClick={() => openDialog(subject)}
                     >
-                      {tab === "auto_matched" ? "Override" : "Map to a user"}
+                      {isCounted(subject) ? "Change" : "Map to a user"}
                     </button>
                   )}
                 </Td>
@@ -764,9 +776,9 @@ function AttributionCard({
               </li>
             )}
           </ul>
-          {(mapping?.mapped_user_id || mapping?.status === "auto_matched") && (
+          {mapping && isCounted(mapping) && (
             <Button variant="secondary" onClick={() => assign(null)} loading={busy}>
-              {mapping?.mapped_user_id
+              {mapping.mapped_user_id
                 ? "Clear the current mapping"
                 : "Reject the auto-match (leave uncounted)"}
             </Button>
