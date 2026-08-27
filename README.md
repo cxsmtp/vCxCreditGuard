@@ -9,6 +9,55 @@ it against limits you define, and can restrict access when a limit is breached.
 Every restriction it makes is recorded with the state needed to undo it, and is
 reversible from the GUI with one click.
 
+## High-level architecture
+
+CxCreditGuard is **one deployable unit**: a FastAPI backend that also serves the
+React single-page app from the same origin, a background scheduler running in the
+same process, and a database (SQLite by default, PostgreSQL for the hardened
+deployment). It talks to exactly one external system — the Checkmarx One APIs —
+and it does so only through a single hardened HTTP client.
+
+Everything of consequence happens in one loop, `services/cycle.py`, run on a
+schedule or on demand via `POST /api/ops/run-cycle`:
+
+```
+                         Checkmarx One APIs
+                   (IAM · projects · usage · AI toggles)
+                                 ▲   │
+             role / toggle       │   │   poll consumption
+             writes (enforce)    │   │   sync org model
+                                 │   ▼
+   ┌────────────────────────────────────────────────────────────────┐
+   │                    cycle.py  (one orchestrator)                │
+   │                                                                │
+   │    org_sync  ─▶  ingestion  ─▶  evaluation  ─▶  enforcement    │
+   │    users,        snapshots +    usage vs        reversible     │
+   │    projects      attribution    limits,         role / AI      │
+   │                  (fuzzy match)   period          changes, with │
+   │                                  baselines       an undo snap  │
+   │                                      │                         │
+   │                                      ▼                         │
+   │                              notifications                     │
+   └────────────────────────────────────────────────────────────────┘
+        │ reads / writes                        │ email · webhook
+        ▼                                        ▼
+   Database (SQLite / PostgreSQL)          Operators + the React GUI
+   snapshots, limits, enforcement,         (served from the same origin)
+   audit log, accounts, notifications
+```
+
+- **Poll, don't stream.** Checkmarx reports *aggregate totals over a lookback
+  window*, not events, so per-period usage is derived by diffing against a
+  baseline taken when the period opened (see [How usage is measured](#how-usage-is-measured)).
+- **Attribute, don't guess.** Each usage row is matched to a synced user — first
+  exactly, then by similarity — and anything uncertain is surfaced for review
+  rather than billed to the wrong person.
+- **Act reversibly.** Before any enforcement the prior state is snapshotted, so
+  every restriction is one click to undo.
+- **One-way dependencies.** `api` and `scheduler` call `services`; `services`
+  call `checkmarx` and `models`; nothing below `services` knows the web layer
+  exists. The [Code layout](#code-layout) section maps this to files.
+
 ## Build status
 
 | Step | Area | State |
@@ -26,7 +75,7 @@ reversible from the GUI with one click.
 `POST /api/ops/run-cycle` performs a full sync, ingest, evaluate and enforce pass
 and returns per step statistics, and the GUI drives the same endpoints.
 
-574 tests cover the backend, with every Checkmarx endpoint served by an in-memory
+647 tests cover the backend, with every Checkmarx endpoint served by an in-memory
 fake tenant (`backend/tests/fake_tenant.py`) that holds mutable state, so tests
 assert on what enforcement actually changed rather than on which calls were made.
 The frontend is type checked with `tsc` on every build.
@@ -155,11 +204,29 @@ consumption belongs to the project, and it is counted there and tenant wide.
 
 The consumption feed identifies users by display name and email, not by id, and
 inconsistently: some rows carry `email` and `userEmail`, some carry an address in
-`name`, some carry only a display name. Matching runs down an explicit ladder
-(email, then an email found in `name`, then username, then unambiguous full name)
-and anything that falls off the end lands in `unresolved_subject` and raises a
-notification. It is never dropped and never guessed: two people called "Sean
-Casey" do not share a budget.
+`name`, some carry only a display name, and some carry a service-style handle like
+`cx-ryan-wakeham`. Attribution happens in two stages.
+
+**Exact ladder first.** Email, then an email found in `name`, then username, then
+unambiguous full name. Two people called "Sean Casey" never share a budget: an
+ambiguous full name is not matched.
+
+**Similarity for the tail** (`services/subject_matching.py`). A handle the ladder
+cannot place is normalised to a token set — the `cx-` prefix stripped, an email
+reduced to its local part — so `cx-ryan-wakeham`, `Ryan Wakeham` and
+`ryan.wakeham@checkmarx.com` all reduce to `{ryan, wakeham}` and score against
+every synced user. The score, deliberately conservative because a wrong match
+bills the wrong person, decides:
+
+| Confidence | Outcome |
+| ---------- | ------- |
+| **≥ 85%**, one clear winner | Attributed automatically and written to the audit log. Still overridable. |
+| **≥ 60%**, or an auto-worthy near-tie between two people | Left **uncounted** and raised as a *dispute* with ranked suggestions to confirm on the Settings page. |
+| below 60% | Unmatched, mapped by hand. Automation handles (`dependabot[bot]`) are flagged and kept out of the queue. |
+
+Nothing is ever dropped: every subject lands in `unresolved_subject` with its
+status, and the Settings page groups them into **Disputes**, **Auto-matched** and
+**Unmatched** tabs. An admin mapping always wins over the automatic decision.
 
 ## What the enforcement actions actually are
 
@@ -176,84 +243,29 @@ flag **and its full config**, and the prior severity list. Restore replays that
 snapshot. A feature that was already off before the utility touched it stays off
 afterwards, and a restore never resets branches or severity levels.
 
-## Hardened deployment (Podman Compose)
+## Deploy
 
-For a production posture — HTTPS via an nginx TLS proxy plus PostgreSQL — run the
-root `docker-compose.yml` with Podman Compose (Podman 4.1+, or `podman-compose`).
-The single-container quick start below is easier for a first look; this is the
-path to actually deploy.
+Two supported paths, both on Podman. Start with the single container to try it;
+use Compose to run it for real.
 
-```sh
-cp .env.example .env
-```
+### Quick start — single container
 
-Then edit `.env` and set at least these two values:
+The whole utility ships in **one** image (UI bundled with the API) over plain
+HTTP on port 8000, with **no required configuration**: on first start it
+generates its own master key and a first admin account. From the repository root:
 
 ```sh
-# 32 random bytes, base64 encoded. Everything encrypted at rest depends on it.
-python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+# Linux / macOS / WSL
+make podman-run
+
+# Windows: run.bat (cmd.exe) or .\run-podman.ps1 (PowerShell)
 ```
 
-- `CXCG_MASTER_KEY`: the value printed above.
-- `POSTGRES_PASSWORD`: any strong value. Compose refuses to start without it.
+Each builds `cxcreditguard:podman`, starts the container, and tails the startup
+log — which prints the initial `admin` credentials on a fresh volume. Then open
+**http://localhost:8000**.
 
-Provide a TLS certificate as described in
-[deploy/nginx/README.md](deploy/nginx/README.md), then:
-
-```sh
-podman compose -f docker-compose.yml up -d
-podman compose -f docker-compose.yml logs -f app
-```
-
-(The compose file keeps its conventional `docker-compose.yml` name, which Podman
-Compose reads directly.)
-
-Create the first administrator by setting `CXCG_BOOTSTRAP_ADMIN_USERNAME` and
-`CXCG_BOOTSTRAP_ADMIN_PASSWORD` in `.env` before the first start. The account is
-created only when no accounts exist. Log in, change the password, then remove
-both variables from `.env` and restart.
-
-The password must satisfy the policy (12 characters or more, mixed case, a
-digit, a symbol, no common passwords, no long sequential runs). If it does not,
-the log says exactly why and no account is created.
-
-## Quick start with Podman (single container)
-
-The easiest way to try it. The whole utility ships in **one** image — the React
-UI is bundled with the API and served from the same origin — and runs over
-plain HTTP on port 8000, so the UI is reachable from any browser at
-`http://localhost:8000`. No TLS certificate, no Postgres and **no required
-environment variables**: on first start the image generates its own master key
-and a first admin account for you.
-
-On Windows (Podman Desktop installed), from the repository root, either in
-PowerShell:
-
-```powershell
-.\run-podman.ps1
-```
-
-or from `cmd.exe` (handy when PowerShell's execution policy blocks the `.ps1`):
-
-```bat
-run.bat
-```
-
-Both build the `cxcreditguard:podman` image and start (or restart) the
-`cxcreditguard` container, then tail the startup log. Then open:
-
-- **UI:** http://localhost:8000
-- **API docs** (development mode only): http://localhost:8000/docs
-- **Health:** http://localhost:8000/healthz
-
-Sign in with the initial credentials printed in the startup log on a fresh
-volume (`username=admin`, plus a generated password). To choose your own
-credentials instead, set `CXCG_BOOTSTRAP_ADMIN_USERNAME` and
-`CXCG_BOOTSTRAP_ADMIN_PASSWORD` before the first start (long, mixed case, a
-digit and a symbol; see the password policy above).
-
-Equivalent one-liners without the script (or on Linux / macOS / WSL via
-`make`):
+The equivalent without the helper scripts:
 
 ```sh
 podman build -f deploy/podman/Dockerfile -t cxcreditguard:podman .
@@ -262,35 +274,46 @@ podman run -d --name cxcreditguard --restart unless-stopped \
   -p 8000:8000 -v cxcreditguard-data:/app/data cxcreditguard:podman
 ```
 
-| Action                   | `run.bat` (cmd)   | `run-podman.ps1`          | `make`            |
-| ------------------------ | ----------------- | ------------------------- | ----------------- |
-| Build and run            | `run.bat`         | `.\run-podman.ps1`        | `make podman-run` |
-| Stream logs              | `run.bat logs`    | `.\run-podman.ps1 -Logs`  | `make podman-logs` |
-| Stop / remove container  | `run.bat down`    | `.\run-podman.ps1 -Down`  | `make podman-down` |
-| Stop and erase all data  | `run.bat purge`   | `.\run-podman.ps1 -Purge` | `make podman-purge` |
+| Action | `make` | `run.bat` | `run-podman.ps1` |
+| ------ | ------ | --------- | ---------------- |
+| Build and run | `make podman-run` | `run.bat` | `.\run-podman.ps1` |
+| Stream logs | `make podman-logs` | `run.bat logs` | `.\run-podman.ps1 -Logs` |
+| Stop / remove | `make podman-down` | `run.bat down` | `.\run-podman.ps1 -Down` |
+| Erase all data | `make podman-purge` | `run.bat purge` | `.\run-podman.ps1 -Purge` |
 
-What lives where and how to keep it safe:
+Good to know:
 
-- The **SQLite database, the master key and the generated admin credentials**
-  live in the named Podman volume `cxcreditguard-data` (mounted at `/app/data`),
-  so they survive rebuilds and container restarts. The container runs as the
-  unprivileged user `cxcg`.
-- If you store real Checkmarx secrets in the utility, back up that volume. The
-  master key file (`.master_key`) and generated password (`.admin_password`)
-  are kept inside it; losing the volume loses the key and makes stored secrets
-  unrecoverable.
-- If you prefer a host bind mount (`-v /your/path:/app/data`) instead of a named
-  volume, make sure that directory is writable by UID 10001.
+- **State lives in the `cxcreditguard-data` volume** (`/app/data`): the SQLite
+  database, the master key (`.master_key`) and the generated password
+  (`.admin_password`). Back it up if you store real Checkmarx secrets — losing
+  the volume loses the key and makes those secrets unrecoverable. A host bind
+  mount must be writable by UID 10001.
+- **This image runs in development mode over plain HTTP** (Secure cookies are off,
+  because a browser discards them over HTTP and login would appear to do nothing).
+  **Do not expose it directly to the internet** — use Compose for that.
 
-Security posture of this convenience image:
+### Hardened deployment — Podman Compose
 
-- It runs in `development` mode over plain HTTP
-  (`CXCG_COOKIE_SECURE=false`, `CXCG_HSTS_ENABLED=false`) because a browser
-  silently discards `Secure` cookies over HTTP — login would appear to "do
-  nothing" rather than error. **Do not expose it directly to the internet.**
-- For a hardened, HTTPS + Postgres deployment, use the root `docker-compose.yml`
-  with Podman Compose (which builds `backend/Dockerfile`), as documented under
-  "Hardened deployment (Podman Compose)" above.
+For production (HTTPS via an nginx TLS proxy, plus PostgreSQL) run the root
+`docker-compose.yml` with Podman Compose (Podman 4.1+):
+
+```sh
+cp .env.example .env
+# Generate a master key for the .env file:
+python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+```
+
+Set `CXCG_MASTER_KEY` (the value printed above — everything encrypted at rest
+depends on it) and `POSTGRES_PASSWORD` (any strong value; Compose won't start
+without it). To bootstrap the first admin, also set `CXCG_BOOTSTRAP_ADMIN_USERNAME`
+and `CXCG_BOOTSTRAP_ADMIN_PASSWORD` before the first start, then remove them after
+logging in. Provide a TLS certificate per [deploy/nginx/README.md](deploy/nginx/README.md),
+then:
+
+```sh
+podman compose -f docker-compose.yml up -d
+podman compose -f docker-compose.yml logs -f app
+```
 
 ## Local development
 
@@ -317,7 +340,7 @@ exposed in production), and health at `/healthz`.
 
 ```sh
 cd backend
-python -m pytest -q            # 501 tests
+python -m pytest -q            # 647 tests
 python -m ruff check .
 python -m ruff format --check .
 python -m pip_audit             # dependency vulnerability scan
@@ -351,7 +374,7 @@ one artefact.
 | **Limits** | Table per entity level with live usage bars, create and edit, monitor/enforce toggle, exemptions, bulk edit, CSV import and export |
 | **Notification Center** | Filterable feed, unread badge, active restrictions table, one click "Restore access" with confirmation |
 | **Audit log** | Searchable, paginated, with a before/after diff view per entry |
-| **Settings** | Scheduler interval or cron, org refresh, ingestion window, retention, SMTP and webhook, unmatched usage mapping, utility accounts |
+| **Settings** | Scheduler interval or cron, org refresh, ingestion window, retention, SMTP and webhook, consumption attribution (disputes / auto-matched / unmatched), utility accounts |
 
 Screenshots: `docs/screenshots/` (placeholders, to be captured against your own
 tenant).
@@ -399,7 +422,7 @@ limits in several states, notifications and audit entries, then you can sign in 
 screenshots and for finding your way around before pointing the tool at a real
 tenant.
 
-## Architecture
+## Code layout
 
 ```
 backend/app/
@@ -433,9 +456,10 @@ frontend/src/
 deploy/nginx/    TLS terminating reverse proxy
 ```
 
-The dependency direction is one way: `api` and `scheduler` call `services`,
-`services` call `checkmarx` and `models`, and nothing below `services` knows the
-web layer exists. `cycle.py` is the only orchestrator.
+The dependency direction is one way, as the [high-level diagram](#high-level-architecture)
+shows: `api` and `scheduler` call `services`, `services` call `checkmarx` and
+`models`, and nothing below `services` knows the web layer exists. `cycle.py` is
+the only orchestrator.
 
 Two design decisions worth knowing before reading the code:
 
