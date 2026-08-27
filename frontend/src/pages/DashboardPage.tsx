@@ -70,7 +70,10 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
 
   const data = dashboard.data;
   const tiles = data.tiles;
-  const unmatched = (unresolved.data ?? []).filter((row) => !row.mapped_user_id);
+  // Not counted towards anyone: no manual mapping, no auto-match, and not a bot.
+  const unmatched = (unresolved.data ?? []).filter(
+    (row) => !row.counts_towards_user_id && !row.is_bot,
+  );
 
   const consumers = {
     users: data.top_users,

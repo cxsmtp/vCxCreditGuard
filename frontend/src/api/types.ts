@@ -285,6 +285,14 @@ export interface CycleRun {
   skipped_reason: string | null;
 }
 
+export interface SubjectSuggestion {
+  user_id: string;
+  label: string;
+  score: number;
+}
+
+export type SubjectStatus = "unmatched" | "disputed" | "auto_matched";
+
 export interface UnresolvedSubject {
   id: number;
   subject_key: string;
@@ -296,6 +304,14 @@ export interface UnresolvedSubject {
   times_seen: number;
   mapped_user_id: string | null;
   mapped_user_label: string | null;
+  status: SubjectStatus;
+  is_bot: boolean;
+  match_score: number | null;
+  suggested_user_id: string | null;
+  suggested_user_label: string | null;
+  suggestions: SubjectSuggestion[];
+  counts_towards_user_id: string | null;
+  counts_towards_label: string | null;
 }
 
 export interface UtilityAccount {

@@ -22,7 +22,17 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -98,12 +108,20 @@ class UsageRecord(Base):
 
 
 class UnresolvedSubject(Base):
-    """A consumption row whose subject could not be matched to a synced user.
+    """A consumption row the exact ladder could not attribute to a synced user.
 
     Tracked deliberately: silently dropping usage would understate a budget, and
-    silently guessing would restrict the wrong person. The Notification Center
-    surfaces these so an admin can fix the mismatch (usually a user who signs in
-    through SAML under a different address than their IAM email).
+    silently guessing would restrict the wrong person. The fuzzy matcher then
+    triages each one into a ``status``:
+
+    * ``auto_matched`` - similarity was high and unambiguous, so its credits are
+      attributed to ``suggested_user_id`` and it is logged; an admin can still
+      override it.
+    * ``disputed`` - a plausible but not certain match. It stays uncounted and
+      carries ranked ``suggestions`` for a human to confirm.
+    * ``unmatched`` - nothing crossed the threshold (or the subject is a bot).
+
+    An admin ``mapped_user_id`` always wins over any of the above.
     """
 
     __tablename__ = "unresolved_subject"
@@ -121,6 +139,18 @@ class UnresolvedSubject(Base):
     times_seen: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     # An admin can pin the subject to a known user, which then resolves it forever.
     mapped_user_id: Mapped[str | None] = mapped_column(String(64))
+
+    # Fuzzy-match triage. "unmatched" | "disputed" | "auto_matched".
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="unmatched")
+    # True for automation handles (dependabot[bot] and similar), so the GUI can
+    # keep them out of the human dispute queue.
+    is_bot: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # The best fuzzy candidate: the user its credits count towards while
+    # status is auto_matched, or the leading suggestion while disputed.
+    suggested_user_id: Mapped[str | None] = mapped_column(String(64))
+    match_score: Mapped[float | None] = mapped_column(Float)
+    # Ranked candidates: [{"user_id", "label", "score"}], best first.
+    suggestions: Mapped[list | None] = mapped_column(JSONColumn)
 
 
 class DimensionState(Base):
