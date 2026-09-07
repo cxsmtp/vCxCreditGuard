@@ -1,0 +1,14 @@
+{
+  "name": "ecom-demo",
+  "version": "1.0.0",
+  "description": "A small demo e-commerce app used to demonstrate a Checkmarx One scan.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "express": "^4.19.2"
+  },
+  "license": "MIT"
+}
