@@ -363,6 +363,21 @@ export interface UtilityAccount {
   created_at: string;
 }
 
+export type DiagnosticStatus = "ok" | "warn" | "fail";
+
+export interface DiagnosticCheck {
+  key: string;
+  label: string;
+  status: DiagnosticStatus;
+  detail: string;
+}
+
+export interface Diagnostics {
+  generated_at: string;
+  overall: DiagnosticStatus;
+  checks: DiagnosticCheck[];
+}
+
 export interface TargetPreview {
   kind: string;
   target_type: string;

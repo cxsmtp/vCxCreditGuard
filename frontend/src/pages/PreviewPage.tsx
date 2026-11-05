@@ -1,7 +1,9 @@
 import { useCallback } from "react";
 import { api } from "../api/client";
-import type { BlastRadius, DryRunResult } from "../api/types";
+import type { BlastRadius, DryRunResult, DryRunRow } from "../api/types";
+import { ExportMenu } from "../components/ExportMenu";
 import { StatTile } from "../components/StatTile";
+import type { ExportColumn } from "../lib/export";
 import {
   Badge,
   Card,
@@ -33,6 +35,24 @@ export function PreviewPage() {
 
   const reload = useCallback(() => void dryRun.reload(), [dryRun]);
   const data = dryRun.data;
+  const rows = data?.rows ?? [];
+
+  const exportColumns: ExportColumn<DryRunRow>[] = [
+    { key: "entity", header: "Entity", value: (r) => r.entity_label ?? r.entity_id },
+    { key: "type", header: "Level", value: (r) => r.entity_type },
+    {
+      key: "used",
+      header: "Credits used",
+      value: (r) => (r.usage_available ? Number(r.credits_used) : ""),
+    },
+    { key: "limit", header: "Credit limit", value: (r) => r.credit_limit },
+    { key: "percent", header: "Percent used", value: (r) => (r.percent_used == null ? "" : r.percent_used.toFixed(1)) },
+    { key: "status", header: "Projected status", value: (r) => r.projected_status },
+    { key: "enforce", header: "Would enforce", value: (r) => (r.would_enforce ? "yes" : "no") },
+    { key: "projects", header: "Projects affected", value: (r) => r.blast?.affected_projects ?? 0 },
+    { key: "users", header: "Users affected", value: (r) => r.blast?.affected_users ?? 0 },
+    { key: "note", header: "Note", value: (r) => r.note ?? "" },
+  ];
 
   return (
     <div>
@@ -40,13 +60,21 @@ export function PreviewPage() {
         title="Simulation"
         description="A dry run of the next governance cycle against the usage on hand. Nothing here is applied: it shows what would warn, breach and (for enforced limits) be restricted, so you can see the blast radius before it happens."
         actions={
-          <button
-            type="button"
-            onClick={reload}
-            className="rounded-md border border-hairline px-3 py-1.5 text-sm"
-          >
-            Refresh
-          </button>
+          <>
+            <ExportMenu
+              rows={rows}
+              columns={exportColumns}
+              filenameBase="cxcreditguard-simulation"
+              title="CxCreditGuard simulation"
+            />
+            <button
+              type="button"
+              onClick={reload}
+              className="rounded-md border border-hairline px-3 py-1.5 text-sm"
+            >
+              Refresh
+            </button>
+          </>
         }
       />
 

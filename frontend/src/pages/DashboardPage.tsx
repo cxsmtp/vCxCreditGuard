@@ -6,6 +6,7 @@ import { BarList } from "../components/charts/BarList";
 import { BreakdownChart } from "../components/charts/BreakdownChart";
 import { TrendChart } from "../components/charts/TrendChart";
 import { StatTile } from "../components/StatTile";
+import { DiagnosticsPanel } from "../components/DiagnosticsPanel";
 import { Button, Card, ErrorNote, InfoNote, PageHeader, Spinner, Tabs } from "../components/ui";
 import { useInterval, useResource } from "../hooks/useResource";
 import { formatCredits, formatDateTime, formatNumber, formatRelative } from "../lib/format";
@@ -101,6 +102,10 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
           )
         }
       />
+
+      <div className="mb-5">
+        <DiagnosticsPanel />
+      </div>
 
       {data.unavailable_dimensions.length > 0 && (
         <div className="mb-5">

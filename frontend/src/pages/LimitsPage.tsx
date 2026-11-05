@@ -13,6 +13,8 @@ import type {
 } from "../api/types";
 import { BlastSummary } from "./PreviewPage";
 import { EntityPicker } from "../components/EntityPicker";
+import { ExportMenu } from "../components/ExportMenu";
+import type { ExportColumn } from "../lib/export";
 import {
   Badge,
   Button,
@@ -44,6 +46,25 @@ const ENTITY_TABS: { id: EntityType | "all"; label: string }[] = [
   { id: "group", label: "Groups" },
   { id: "project", label: "Projects" },
   { id: "application", label: "Applications" },
+];
+
+// Columns for the client-side export of the currently-visible limits.
+const LIMIT_EXPORT_COLUMNS: ExportColumn<Limit>[] = [
+  { key: "entity", header: "Entity", value: (l) => l.entity_label ?? l.entity_id },
+  { key: "type", header: "Level", value: (l) => l.entity_type },
+  { key: "limit", header: "Credit limit", value: (l) => l.credit_limit },
+  { key: "period", header: "Period", value: (l) => l.period_type },
+  { key: "warning", header: "Warning %", value: (l) => l.warning_threshold_pct },
+  { key: "enforce", header: "Enforce", value: (l) => (l.enforce ? "yes" : "no") },
+  { key: "active", header: "Active", value: (l) => (l.is_active ? "yes" : "no") },
+  { key: "exempt", header: "Exempt", value: (l) => (l.exempt ? "yes" : "no") },
+  {
+    key: "used",
+    header: "Used this period",
+    value: (l) => (l.current_period?.usage_available ? Number(l.current_period.credits_used) : ""),
+  },
+  { key: "status", header: "Status", value: (l) => l.current_period?.status ?? "" },
+  { key: "notes", header: "Notes", value: (l) => l.notes ?? "" },
 ];
 
 interface LimitForm {
@@ -288,15 +309,23 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
         description="Budgets for users, groups, projects and applications. A new limit is monitor only until you turn enforcement on."
         actions={
           <>
+            <ExportMenu
+              rows={visible}
+              columns={LIMIT_EXPORT_COLUMNS}
+              filenameBase="cxcreditguard-limits"
+              title="CxCreditGuard limits"
+            />
             <Button
               size="sm"
+              variant="secondary"
               onClick={() =>
                 downloadCsv("/api/limits/export", "cxcreditguard-limits.csv").catch(() =>
                   toast.error("The export could not be downloaded."),
                 )
               }
+              title="Server CSV with current-period usage for every limit"
             >
-              Export CSV
+              Full CSV
             </Button>
             {isAdmin && (
               <>

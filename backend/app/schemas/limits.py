@@ -177,3 +177,16 @@ class SchedulerStatusResponse(BaseModel):
     entities_restricted: int
     unread_notifications: int
     unresolved_subjects: int
+
+
+class DiagnosticCheckResponse(BaseModel):
+    key: str
+    label: str
+    status: str
+    detail: str
+
+
+class DiagnosticsResponse(BaseModel):
+    generated_at: datetime
+    overall: str
+    checks: list[DiagnosticCheckResponse]

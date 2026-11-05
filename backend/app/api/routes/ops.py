@@ -11,7 +11,13 @@ from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.models.enums import EnforcementStatus, LimitStatus, RunStatus
 from app.models.limits import EnforcementAction, LimitPeriodState
 from app.models.usage import SchedulerRun, UnresolvedSubject
-from app.schemas.limits import CycleRunResponse, SchedulerStatusResponse
+from app.schemas.limits import (
+    CycleRunResponse,
+    DiagnosticCheckResponse,
+    DiagnosticsResponse,
+    SchedulerStatusResponse,
+)
+from app.services import diagnostics as diagnostics_service
 from app.services import notifications as notification_service
 from app.services import settings_store
 from app.services.audit import record_audit
@@ -117,4 +123,20 @@ def scheduler_status(ctx: CurrentUser, db: DbSession) -> SchedulerStatusResponse
         entities_restricted=restricted,
         unread_notifications=notification_service.unread_count(db),
         unresolved_subjects=unresolved,
+    )
+
+
+@router.get("/diagnostics", response_model=DiagnosticsResponse)
+def diagnostics(ctx: CurrentUser, db: DbSession) -> DiagnosticsResponse:
+    """A read-only health read: connection, scheduler, usage freshness and more."""
+    report = diagnostics_service.run_diagnostics(db, include_detail=ctx.is_admin)
+    return DiagnosticsResponse(
+        generated_at=report.generated_at,
+        overall=report.overall,
+        checks=[
+            DiagnosticCheckResponse(
+                key=check.key, label=check.label, status=check.status, detail=check.detail
+            )
+            for check in report.checks
+        ],
     )
