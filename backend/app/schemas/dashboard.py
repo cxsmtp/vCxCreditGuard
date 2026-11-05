@@ -194,6 +194,10 @@ class SettingsResponse(BaseModel):
     credit_unit_cost: float = 0.0
     # Demo mode: synthetic data, enforcement suppressed, UI marked as demo.
     demo_mode: bool = False
+    # Hands-off automation: auto-approve pending credit requests within a cap.
+    automation_enabled: bool = False
+    auto_approve_max_increase: int = 0
+    auto_approve_expiry_days: int = 0
     current_schedule_description: str
 
 
@@ -222,6 +226,9 @@ class SettingsUpdateRequest(StrictModel):
     report_email_enabled: bool | None = None
     credit_unit_cost: float | None = Field(default=None, ge=0, le=1_000_000)
     demo_mode: bool | None = None
+    automation_enabled: bool | None = None
+    auto_approve_max_increase: int | None = Field(default=None, ge=0, le=10_000_000)
+    auto_approve_expiry_days: int | None = Field(default=None, ge=0, le=3650)
 
     @field_validator("schedule_mode")
     @classmethod

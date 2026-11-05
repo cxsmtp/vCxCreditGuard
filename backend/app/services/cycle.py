@@ -339,6 +339,19 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
         result.steps["override_expiry"] = {"ok": False, "error": str(exc)}
         _warn(session, "override_expiry", str(exc))
 
+    # Step 2e: hands-off automation. Auto-approve pending credit requests within
+    # the configured cap before evaluation, so a granted budget is reflected in
+    # this cycle (lifting a restriction straight away via the client). Never fatal.
+    try:
+        auto = requests_service.auto_decide_pending(session, client=client, actor=actor)
+        result.steps["automation"] = auto
+    except Exception as exc:  # noqa: BLE001 - automation must not fail the cycle
+        logger.exception("Hands-off automation failed")
+        result.errors.append(f"automation: {exc}")
+        result.status = RunStatus.PARTIAL
+        result.steps["automation"] = {"ok": False, "error": str(exc)}
+        _warn(session, "automation", str(exc))
+
     # Step 3: evaluation and enforcement. Runs even when ingestion failed, using
     # the last good snapshot, but a failed ingestion means no new breach can be
     # discovered from data we did not receive.

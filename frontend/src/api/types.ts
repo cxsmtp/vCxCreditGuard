@@ -328,6 +328,9 @@ export interface AppSettings {
   report_email_enabled: boolean;
   credit_unit_cost: number;
   demo_mode: boolean;
+  automation_enabled: boolean;
+  auto_approve_max_increase: number;
+  auto_approve_expiry_days: number;
   current_schedule_description: string;
 }
 

@@ -12,16 +12,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
 from app.db.base import utcnow
-from app.models.enums import EntityType, PeriodType, RequestStatus
+from app.models.enums import EntityType, PeriodType, RequestStatus, Severity
 from app.models.limits import CreditLimit, CreditRequest
-from app.services import limits_service
+from app.services import limits_service, notifications, settings_store
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -228,6 +228,120 @@ def deny_request(
         detail=note or "Denied.",
     )
     return request
+
+
+def auto_decide_pending(
+    session: Session,
+    *,
+    client: CheckmarxClient | None = None,
+    actor: AuditActor | None = None,
+    policy: settings_store.AutomationPolicy | None = None,
+) -> dict[str, int | bool]:
+    """Hands-off automation: auto-approve pending requests within the policy cap.
+
+    Approves only genuine raises whose increase over the entity's current budget
+    is within ``auto_approve_max_increase`` credits; larger or non-raise requests
+    are left for an admin. At most one request per entity is auto-approved per
+    cycle, so several small requests for one entity cannot be compounded past the
+    cap in a single run (the rest wait for the next cycle or an admin). Auto-grants
+    are made temporary when ``auto_approve_expiry_days`` is set, so they self-revert
+    through the existing grant-expiry step. Each decision is audited (via
+    ``approve_request``) and surfaced in the Notification Center.
+
+    Concurrency: this runs inside the cycle, which is serialised by the scheduler
+    lock, so it is effectively single-writer. The 30-minute stale-lock reclaim and
+    a simultaneous manual admin approval are the same pre-existing cycle-level race
+    the rest of the pipeline lives with; the per-request savepoint below limits the
+    blast radius to one request rather than the batch.
+    """
+    policy = policy or settings_store.automation_policy(session)
+    if not policy.auto_approves:
+        return {"enabled": policy.enabled, "auto_approved": 0, "considered": 0}
+
+    actor = actor or AuditActor.system("automation")
+    pending = list(
+        session.scalars(
+            select(CreditRequest)
+            .where(CreditRequest.status == RequestStatus.PENDING)
+            .order_by(CreditRequest.id.asc())
+        )
+    )
+    approved = 0
+    left_pending = 0
+    failed = 0
+    # Entities already auto-granted this cycle. Because approving one request
+    # raises the entity's limit, measuring the next request's increase against
+    # that raised limit would let several per-cap requests compound past the cap
+    # in one cycle; allowing only one auto-grant per entity per cycle closes that.
+    granted_entities: set[tuple[str, str]] = set()
+    for request in pending:
+        entity_key = (request.entity_type, request.entity_id)
+        if entity_key in granted_entities:
+            left_pending += 1
+            continue
+        existing = _existing_limit(session, request)
+        current = existing.credit_limit if existing is not None else 0
+        increase = request.requested_limit - current
+        # Only auto-approve a genuine raise whose size is within the cap.
+        if increase <= 0 or increase > policy.auto_approve_max_increase:
+            left_pending += 1
+            continue
+
+        expires_at = (
+            utcnow() + timedelta(days=policy.auto_approve_expiry_days)
+            if policy.auto_approve_expiry_days > 0
+            else None
+        )
+        window = f" for {policy.auto_approve_expiry_days} day(s)" if expires_at is not None else ""
+        # Isolate each grant in a savepoint so one failure (e.g. the client call
+        # that lifts a restriction) rolls back only that request and the batch
+        # continues, rather than half-applying a grant or poisoning the cycle.
+        try:
+            with session.begin_nested():
+                approve_request(
+                    session,
+                    request=request,
+                    actor=actor,
+                    expires_at=expires_at,
+                    note=(
+                        f"Auto-approved by hands-off automation: an increase of {increase} "
+                        f"credit(s) is within the {policy.auto_approve_max_increase}-credit "
+                        f"cap{window}."
+                    ),
+                    client=client,
+                )
+        except Exception:
+            logger.exception("Auto-approval of credit request %s failed", request.id)
+            failed += 1
+            continue
+
+        # Raised after the grant is safely committed to its savepoint, and kept
+        # out of it so the notify dedupe path can never roll the grant back.
+        notifications.notify(
+            session,
+            category="automation",
+            severity=Severity.INFO,
+            title="Credit request auto-approved",
+            body=(
+                f"Request #{request.id} for "
+                f"{request.entity_label or request.entity_id} was auto-approved at "
+                f"{request.requested_limit} credits{window} under hands-off automation."
+            ),
+            entity_type=request.entity_type,
+            entity_id=request.entity_id,
+            entity_label=request.entity_label,
+            dedupe_key=f"auto-approve:{request.id}",
+        )
+        granted_entities.add(entity_key)
+        approved += 1
+
+    return {
+        "enabled": True,
+        "considered": len(pending),
+        "auto_approved": approved,
+        "left_pending": left_pending,
+        "failed": failed,
+    }
 
 
 def revert_expired_grants(

@@ -483,6 +483,50 @@ export function SettingsPage({
             />
           </Card>
           <Card
+            title="Hands-off automation"
+            description="Let the governance cycle approve routine credit requests on its own, so small, safe raises do not wait for an admin."
+          >
+            <Toggle
+              checked={value("automation_enabled") ?? false}
+              disabled={!isAdmin}
+              onChange={(next) => set({ automation_enabled: next })}
+              label="Auto-approve credit requests within a cap"
+              description="When on, each cycle approves pending requests whose increase over the current budget is within the cap below. Requests above the cap always wait for an admin."
+            />
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <Field
+                label="Auto-approve cap (credits)"
+                hint="Largest increase over the current budget to approve automatically. 0 approves nothing, even when the switch is on."
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step="1"
+                  disabled={!isAdmin || !(value("automation_enabled") ?? false)}
+                  value={String(value("auto_approve_max_increase") ?? 0)}
+                  onChange={(event) =>
+                    set({ auto_approve_max_increase: Math.max(0, Math.floor(Number(event.target.value))) })
+                  }
+                />
+              </Field>
+              <Field
+                label="Auto-grant expiry (days)"
+                hint="0 makes auto-approvals permanent. A positive value makes each a temporary grant that self-reverts, so the mode is safe to leave on."
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step="1"
+                  disabled={!isAdmin || !(value("automation_enabled") ?? false)}
+                  value={String(value("auto_approve_expiry_days") ?? 0)}
+                  onChange={(event) =>
+                    set({ auto_approve_expiry_days: Math.max(0, Math.floor(Number(event.target.value))) })
+                  }
+                />
+              </Field>
+            </div>
+          </Card>
+          <Card
             title="Scheduled report"
             description="Email a weekly summary report to the notification recipients."
           >

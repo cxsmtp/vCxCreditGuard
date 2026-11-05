@@ -72,6 +72,16 @@ KEY_CREDIT_UNIT_COST = "reports.credit_unit_cost"
 # seeded synthetic dataset without touching a live tenant.
 KEY_DEMO_MODE = "demo.enabled"
 
+# Hands-off automation: when enabled, the cycle auto-approves pending credit
+# requests whose increase over the current budget is within
+# ``auto_approve_max_increase`` credits. A cap of 0 auto-approves nothing even
+# when enabled (an explicit, safe default: the admin must set a cap). A non-zero
+# ``auto_approve_expiry_days`` makes each auto-grant temporary, so it self-reverts
+# via the existing grant-expiry step and the mode stays safe to leave on.
+KEY_AUTOMATION_ENABLED = "automation.enabled"
+KEY_AUTO_APPROVE_MAX_INCREASE = "automation.auto_approve_max_increase"
+KEY_AUTO_APPROVE_EXPIRY_DAYS = "automation.auto_approve_expiry_days"
+
 # Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
 # so it can never collide with a real Checkmarx lookback window, and so the read
 # path can hide demo snapshots whenever demo mode is off.
@@ -101,6 +111,9 @@ DEFAULTS: dict[str, Any] = {
     KEY_REPORT_EMAIL_ENABLED: False,
     KEY_CREDIT_UNIT_COST: 0.0,
     KEY_DEMO_MODE: False,
+    KEY_AUTOMATION_ENABLED: False,
+    KEY_AUTO_APPROVE_MAX_INCREASE: 0,
+    KEY_AUTO_APPROVE_EXPIRY_DAYS: 0,
 }
 
 
@@ -133,6 +146,40 @@ def report_email_enabled(session: Session) -> bool:
 def demo_mode(session: Session) -> bool:
     """Whether demo mode is on (synthetic data, enforcement suppressed)."""
     return bool(get_value(session, KEY_DEMO_MODE, DEFAULTS[KEY_DEMO_MODE]))
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationPolicy:
+    """Hands-off automation settings, normalised to safe values."""
+
+    enabled: bool
+    auto_approve_max_increase: int
+    auto_approve_expiry_days: int
+
+    @property
+    def auto_approves(self) -> bool:
+        """Whether anything is actually auto-approved (enabled and a non-zero cap)."""
+        return self.enabled and self.auto_approve_max_increase > 0
+
+
+def _non_negative_int(value: Any, fallback: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if number >= 0 else fallback
+
+
+def automation_policy(session: Session) -> AutomationPolicy:
+    return AutomationPolicy(
+        enabled=bool(get_value(session, KEY_AUTOMATION_ENABLED, DEFAULTS[KEY_AUTOMATION_ENABLED])),
+        auto_approve_max_increase=_non_negative_int(
+            get_value(session, KEY_AUTO_APPROVE_MAX_INCREASE), 0
+        ),
+        auto_approve_expiry_days=_non_negative_int(
+            get_value(session, KEY_AUTO_APPROVE_EXPIRY_DAYS), 0
+        ),
+    )
 
 
 def credit_unit_cost(session: Session) -> float:
