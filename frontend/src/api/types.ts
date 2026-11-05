@@ -405,6 +405,31 @@ export interface AdminResetResult {
   expires_at: string;
 }
 
+export interface Attestation {
+  version: string;
+  migration_head: string | null;
+  config_digest: string;
+  generated_at: string;
+  update: { current: string; latest: string | null; update_available: boolean };
+}
+
+export interface WatchdogStatus {
+  state: "ok" | "stale" | "down" | "disabled";
+  enabled: boolean;
+  seconds_since_last_run: number | null;
+  last_run_at: string | null;
+  last_status: string | null;
+  tolerance_seconds: number;
+  detail: string;
+}
+
+export interface RestoreResult {
+  settings: number;
+  limits_created: number;
+  limits_updated: number;
+  exemptions: number;
+}
+
 export interface Projection {
   limit_id: number;
   entity_type: EntityType;

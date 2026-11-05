@@ -1,14 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { ApiError, api } from "../api/client";
 import type {
   AdminResetResult,
   AppSettings,
+  Attestation,
   CycleRun,
   OrgEntity,
+  RestoreResult,
   SchedulerStatus,
   UnresolvedSubject,
   UtilityAccount,
+  WatchdogStatus,
 } from "../api/types";
 import {
   Badge,
@@ -31,6 +34,7 @@ import {
   Toggle,
 } from "../components/ui";
 import { useResource } from "../hooks/useResource";
+import { downloadText, timestampedName } from "../lib/export";
 import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 
@@ -569,6 +573,7 @@ export function SettingsPage({
             loading={unresolved.initialLoading}
             onChanged={() => unresolved.reload()}
           />
+          {isAdmin && <OperationsCard />}
           {isAdmin && <AccountsCard />}
         </div>
       </div>
@@ -974,6 +979,158 @@ function AttributionCard({
 }
 
 /* ---------------------------------------------------------------- accounts */
+
+const WATCHDOG_TONE: Record<WatchdogStatus["state"], "good" | "neutral" | "warning" | "critical"> = {
+  ok: "good",
+  disabled: "neutral",
+  stale: "warning",
+  down: "critical",
+};
+
+function OperationsCard() {
+  const toast = useToast();
+  const attestation = useResource<Attestation>(
+    (signal) => api.get("/api/ops/attestation", undefined, signal),
+    [],
+  );
+  const watchdog = useResource<WatchdogStatus>(
+    (signal) => api.get("/api/ops/watchdog", undefined, signal),
+    [],
+  );
+  const [busy, setBusy] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  async function downloadBackup() {
+    setBusy(true);
+    try {
+      const data = await api.get<Record<string, unknown>>("/api/ops/backup");
+      downloadText(
+        JSON.stringify(data, null, 2),
+        timestampedName("cxcreditguard-config", "json"),
+        "application/json",
+      );
+      toast.success("Backup downloaded.");
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not export the backup.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function emailBackup() {
+    setBusy(true);
+    try {
+      await api.post("/api/ops/backup/email");
+      toast.success("Backup emailed to the notification recipients.");
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not email the backup.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restore(file: File) {
+    setBusy(true);
+    try {
+      const parsed = JSON.parse(await file.text());
+      const result = await api.post<RestoreResult>("/api/ops/restore", parsed);
+      toast.success(
+        `Restored ${result.limits_created + result.limits_updated} limit(s), ` +
+          `${result.settings} setting(s), ${result.exemptions} override(s).`,
+      );
+      await Promise.all([attestation.reload(), watchdog.reload()]);
+    } catch (caught) {
+      if (caught instanceof SyntaxError) toast.error("That file is not valid JSON.");
+      else toast.error(caught instanceof ApiError ? caught.message : "Restore failed.");
+    } finally {
+      setBusy(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  }
+
+  const att = attestation.data;
+  const watch = watchdog.data;
+
+  return (
+    <Card
+      title="Operations"
+      description="Version and integrity, scheduler liveness, and configuration backup and restore."
+    >
+      <div className="flex flex-col gap-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Version &amp; integrity
+            </p>
+            {att ? (
+              <div className="mt-1 text-sm">
+                <div>
+                  v{att.version}
+                  {att.update.update_available && (
+                    <span className="ml-2">
+                      <Badge tone="warning">Update to {att.update.latest}</Badge>
+                    </span>
+                  )}
+                </div>
+                <code className="text-xs break-all" style={{ color: "var(--text-muted)" }}>
+                  {att.config_digest.slice(0, 16)}…
+                </code>
+              </div>
+            ) : (
+              <Spinner />
+            )}
+          </div>
+          <div>
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Scheduler watchdog
+            </p>
+            {watch ? (
+              <div className="mt-1 flex items-center gap-2">
+                <Badge tone={WATCHDOG_TONE[watch.state]}>{watch.state}</Badge>
+                <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  {watch.detail}
+                </span>
+              </div>
+            ) : (
+              <Spinner />
+            )}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-hairline pt-4">
+          <Button size="sm" onClick={downloadBackup} disabled={busy}>
+            Download backup
+          </Button>
+          <Button size="sm" variant="secondary" onClick={emailBackup} disabled={busy}>
+            Email backup
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => fileInput.current?.click()}
+            disabled={busy}
+          >
+            Restore from file…
+          </Button>
+          <input
+            ref={fileInput}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void restore(file);
+            }}
+          />
+        </div>
+        <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+          Backups hold settings, limits and overrides only. Secrets, passwords and the audit log
+          are never exported. Restoring overwrites matching configuration.
+        </p>
+      </div>
+    </Card>
+  );
+}
 
 function AccountsCard() {
   const toast = useToast();

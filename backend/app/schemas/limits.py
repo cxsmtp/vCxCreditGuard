@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.enums import (
     EntityType,
@@ -207,3 +207,39 @@ class AuditChainResponse(BaseModel):
     tip: str | None
     broken_at_id: int | None = None
     reason: str | None = None
+
+
+class UpdateStatusResponse(BaseModel):
+    current: str
+    latest: str | None = None
+    update_available: bool = False
+
+
+class AttestationResponse(BaseModel):
+    version: str
+    migration_head: str | None
+    config_digest: str
+    generated_at: datetime
+    update: UpdateStatusResponse
+
+
+class WatchdogResponse(BaseModel):
+    state: str
+    enabled: bool
+    seconds_since_last_run: int | None
+    last_run_at: datetime | None
+    last_status: str | None
+    tolerance_seconds: int
+    detail: str
+
+
+class RestoreResultResponse(BaseModel):
+    settings: int
+    limits_created: int
+    limits_updated: int
+    exemptions: int
+
+
+class SetLatestVersionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: str = Field(min_length=1, max_length=64)
