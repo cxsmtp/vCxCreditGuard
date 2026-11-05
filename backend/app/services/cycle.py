@@ -28,12 +28,13 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.checkmarx import credits as credits_api
 from app.checkmarx.client import CheckmarxClient
 from app.checkmarx.errors import CheckmarxError, NotConfiguredError
 from app.db.base import utcnow
 from app.db.session import session_scope
 from app.models.enums import RunStatus, Severity
-from app.models.usage import SchedulerLock, SchedulerRun
+from app.models.usage import CreditBalanceSnapshot, SchedulerLock, SchedulerRun
 from app.services import connection as connection_service
 from app.services import (
     delivery,
@@ -236,6 +237,45 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
         result.status = RunStatus.PARTIAL
         result.steps["ingest"] = {"ok": False, "error": str(exc)}
         _warn(session, "ingest", str(exc))
+
+    # Step 2b: tenant credit pool. Best-effort and never fatal - an unreachable
+    # pool is unknown, so we keep the last good snapshot and record no zero. A new
+    # row is written only when the balance actually changed, so a steady-state
+    # tenant does not accumulate identical rows between retention prunes.
+    try:
+        balance = credits_api.fetch_credit_balance(client)
+        if balance is not None and balance.has_values():
+            latest = session.scalar(
+                select(CreditBalanceSnapshot).order_by(
+                    CreditBalanceSnapshot.collected_at.desc(), CreditBalanceSnapshot.id.desc()
+                )
+            )
+            unchanged = latest is not None and (
+                latest.total_credits == balance.total
+                and latest.used_credits == balance.used
+                and latest.available_credits == balance.available
+            )
+            if not unchanged:
+                session.add(
+                    CreditBalanceSnapshot(
+                        collected_at=utcnow(),
+                        total_credits=balance.total,
+                        used_credits=balance.used,
+                        available_credits=balance.available,
+                        raw=balance.raw,
+                    )
+                )
+            result.steps["credits"] = {
+                "ok": True,
+                "changed": not unchanged,
+                "total": str(balance.total) if balance.total is not None else None,
+                "available": str(balance.available) if balance.available is not None else None,
+            }
+        else:
+            result.steps["credits"] = {"ok": False, "reason": "unavailable"}
+    except Exception as exc:  # noqa: BLE001 - the pool read must not fail the cycle
+        logger.info("Credit balance step skipped: %s", exc)
+        result.steps["credits"] = {"ok": False, "error": str(exc)}
 
     # Step 3: evaluation and enforcement. Runs even when ingestion failed, using
     # the last good snapshot, but a failed ingestion means no new breach can be

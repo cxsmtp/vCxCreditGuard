@@ -44,6 +44,15 @@ class FakeTenant:
     applications: list[dict[str, Any]] = field(default_factory=list)
     # viewBy -> list of item dicts, exactly as the API would return them.
     consumption: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # The tenant AI credit pool returned by GET /api/credits/info. None models a
+    # tenant/endpoint that does not report it (the call 404s or errors).
+    credit_info: dict[str, Any] | None = field(
+        default_factory=lambda: {
+            "totalCredits": 1000,
+            "usedCredits": 150,
+            "availableCredits": 850,
+        }
+    )
     # user id -> role names currently mapped
     role_mappings: dict[str, list[str]] = field(default_factory=dict)
     # project id -> {"enabled": bool, "config": {...}}
@@ -220,6 +229,11 @@ class FakeTenant:
 
         if path.endswith("/api/credits/consumption"):
             return self._consumption_response(params)
+
+        if path.endswith("/api/credits/info"):
+            if self.credit_info is None:
+                return httpx.Response(404, json={"message": "no credit info for this tenant"})
+            return httpx.Response(200, json=self.credit_info)
 
         if path.endswith(f"/auth/admin/realms/{TENANT}/clients"):
             return httpx.Response(200, json=[{"id": CLIENT_UUID, "clientId": "ast-app"}])

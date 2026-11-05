@@ -120,6 +120,16 @@ export interface Dashboard {
   top_applications: TopConsumer[];
   tiles: StatusTiles;
   unavailable_dimensions: string[];
+  credit_pool: CreditPoolInfo | null;
+}
+
+export interface CreditPoolInfo {
+  total: string | null;
+  used: string | null;
+  available: string | null;
+  collected_at: string | null;
+  assigned: string;
+  over_allocation: string | null;
 }
 
 export interface LimitPeriodState {

@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
 from app.db.session import session_scope
-from app.models import Notification, SchedulerLock, SchedulerRun
+from app.models import CreditBalanceSnapshot, Notification, SchedulerLock, SchedulerRun
 from app.models.enums import RunStatus
 from app.services import connection as connection_service
 from app.services import cycle
@@ -254,3 +255,34 @@ class TestScheduler:
             assert scheduler_module.get_scheduler().get_job(scheduler_module.JOB_ID) is None
         finally:
             scheduler_module.shutdown()
+
+
+class TestCreditBalance:
+    def test_the_cycle_stores_a_balance_snapshot(
+        self, db: Session, configured_tenant: FakeTenant
+    ) -> None:
+        result = cycle.run_cycle(trigger="manual", force_org_sync=True)
+        assert result.steps["credits"]["ok"] is True
+        with session_scope() as session:
+            rows = list(session.scalars(select(CreditBalanceSnapshot)))
+        assert len(rows) == 1
+        assert rows[0].total_credits == Decimal("1000")
+        assert rows[0].available_credits == Decimal("850")
+
+    def test_an_unchanged_balance_is_not_rewritten(
+        self, db: Session, configured_tenant: FakeTenant
+    ) -> None:
+        cycle.run_cycle(trigger="manual", force_org_sync=True)
+        cycle.run_cycle(trigger="schedule")
+        with session_scope() as session:
+            count = session.scalar(select(func.count()).select_from(CreditBalanceSnapshot))
+        assert count == 1
+
+    def test_a_missing_credit_endpoint_is_not_fatal(
+        self, db: Session, configured_tenant: FakeTenant
+    ) -> None:
+        configured_tenant.credit_info = None  # endpoint 404s
+        result = cycle.run_cycle(trigger="manual", force_org_sync=True)
+        assert result.steps["credits"]["ok"] is False
+        with session_scope() as session:
+            assert session.scalar(select(func.count()).select_from(CreditBalanceSnapshot)) == 0

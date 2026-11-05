@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.models.enums import EntityType, LimitStatus, UsageView
 from app.models.limits import CreditLimit, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxProjectGroup, CxUser
-from app.models.usage import UsageRecord, UsageSnapshot
+from app.models.usage import CreditBalanceSnapshot, UsageRecord, UsageSnapshot
 from app.services import ingestion
 from app.services.periods import PeriodError, current_window, describe_window
 
@@ -27,6 +27,24 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TOP_N = 10
 DEFAULT_TREND_POINTS = 60
+
+
+@dataclass
+class CreditPool:
+    """The tenant credit pool next to what the utility's budgets have claimed.
+
+    ``total``/``used``/``available`` come from the last good Checkmarx balance
+    snapshot and are ``None`` when the pool has never been read. ``assigned`` is
+    the sum of the active budgets; ``over_allocation`` is how far the budgets
+    exceed the pool, only when the total is known.
+    """
+
+    total: Decimal | None
+    used: Decimal | None
+    available: Decimal | None
+    collected_at: object
+    assigned: Decimal
+    over_allocation: Decimal | None
 
 
 @dataclass
@@ -66,6 +84,32 @@ def latest_snapshot_records(session: Session, view: UsageView) -> list[UsageReco
             .where(UsageRecord.snapshot_id == snapshot.id)
             .order_by(UsageRecord.credits_used.desc())
         )
+    )
+
+
+def credit_pool(session: Session) -> CreditPool:
+    """The latest tenant credit balance alongside the budgets' total claim."""
+    snapshot = session.scalar(
+        select(CreditBalanceSnapshot).order_by(
+            CreditBalanceSnapshot.collected_at.desc(), CreditBalanceSnapshot.id.desc()
+        )
+    )
+    assigned = session.scalar(
+        select(func.coalesce(func.sum(CreditLimit.credit_limit), 0)).where(
+            CreditLimit.is_active.is_(True)
+        )
+    )
+    assigned_dec = Decimal(str(assigned or 0))
+
+    total = snapshot.total_credits if snapshot else None
+    over = total is not None and assigned_dec > total
+    return CreditPool(
+        total=total,
+        used=snapshot.used_credits if snapshot else None,
+        available=snapshot.available_credits if snapshot else None,
+        collected_at=snapshot.collected_at if snapshot else None,
+        assigned=assigned_dec,
+        over_allocation=(assigned_dec - total) if over else None,
     )
 
 

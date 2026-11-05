@@ -290,3 +290,42 @@ class TestCycleIntegration:
         db.add(entry)
         db.commit()
         assert _retention_due(db) is True
+
+
+class TestCreditBalancePruning:
+    def _add_balance(self, db: Session, *, days_old: int) -> None:
+        from app.models.usage import CreditBalanceSnapshot
+
+        db.add(
+            CreditBalanceSnapshot(
+                collected_at=utcnow() - timedelta(days=days_old),
+                total_credits=Decimal("1000"),
+                used_credits=Decimal("100"),
+                available_credits=Decimal("900"),
+                raw={},
+            )
+        )
+        db.commit()
+
+    def test_old_balances_are_pruned_but_the_latest_is_kept(self, db: Session) -> None:
+        from app.models.usage import CreditBalanceSnapshot
+
+        self._add_balance(db, days_old=400)
+        self._add_balance(db, days_old=200)  # still old, but the most recent
+        result = retention.prune(db, retention_days=30, actor=ACTOR)
+        db.commit()
+
+        remaining = list(db.scalars(select(CreditBalanceSnapshot)))
+        assert result.credit_balances == 1
+        # The newest row survives even though it is older than the window, so the
+        # last known good balance always stands.
+        assert len(remaining) == 1
+        assert remaining[0].collected_at == max(r.collected_at for r in remaining)
+
+    def test_a_recent_balance_is_untouched(self, db: Session) -> None:
+        from app.models.usage import CreditBalanceSnapshot
+
+        self._add_balance(db, days_old=1)
+        retention.prune(db, retention_days=30, actor=ACTOR)
+        db.commit()
+        assert db.scalar(select(func.count()).select_from(CreditBalanceSnapshot)) == 1
