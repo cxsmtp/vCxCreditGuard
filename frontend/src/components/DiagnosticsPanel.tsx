@@ -105,6 +105,15 @@ export function DiagnosticsPanel() {
                       <p className="mt-0.5 text-xs" style={{ color: "var(--text-secondary)" }}>
                         {check.detail}
                       </p>
+                      {check.remediation && (
+                        <p
+                          className="mt-1 rounded-md px-2 py-1.5 text-xs"
+                          style={{ background: "var(--hover)", color: "var(--text-primary)" }}
+                        >
+                          <span className="font-medium">How to fix: </span>
+                          {check.remediation}
+                        </p>
+                      )}
                     </div>
                   </li>
                 ))}

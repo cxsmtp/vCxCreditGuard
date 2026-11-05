@@ -8,7 +8,7 @@ human-readable detail; the overall status is the worst of them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
@@ -30,6 +30,53 @@ _RANK = {OK: 0, WARN: 1, FAIL: 2}
 # Usage older than this is treated as stale rather than current.
 USAGE_STALE_AFTER = timedelta(hours=24)
 
+# Guided-troubleshooting steps, keyed by (check key, status). Attached to each
+# non-OK check so the UI can show a concrete "how to fix" alongside the symptom.
+_REMEDIATION: dict[tuple[str, str], str] = {
+    ("connection", FAIL): (
+        "Open Setup and add (or re-enter) your Checkmarx One API key, then use Test "
+        "connection. Confirm the tenant URL is right and that this host can reach it."
+    ),
+    ("connection", WARN): (
+        "Open Setup and use Test connection. If it keeps failing, re-enter the API key and "
+        "check the tenant URL and outbound network access."
+    ),
+    ("scheduler", WARN): (
+        "Open Settings and enable the scheduler. If it is already enabled but stale, run a "
+        "cycle now from Operations and read the run history for why it stopped."
+    ),
+    ("scheduler", FAIL): (
+        "Read the failed run in the run history to find the cause (usually the Checkmarx "
+        "connection), fix it, then run a cycle now from Operations."
+    ),
+    ("usage", WARN): (
+        "Run a cycle now from Operations to ingest fresh usage. If it stays empty, confirm "
+        "the connection is healthy and that this tenant reports consumption."
+    ),
+    ("attribution", WARN): (
+        "Open Settings and map each unresolved consumer to a user so their usage counts "
+        "towards that user's limit."
+    ),
+    ("enforcement", WARN): (
+        "Restore the Checkmarx connection; the next healthy cycle retries the pending "
+        "actions. You can also run a cycle now from Operations."
+    ),
+    ("dimensions", FAIL): (
+        "This tenant does not report per-user consumption. Govern with project, application, "
+        "or group limits instead, or ask Checkmarx to enable per-user reporting."
+    ),
+    ("dimensions", WARN): (
+        "Set limits only at the dimensions this tenant reports; limits at unreported levels "
+        "show usage as unavailable."
+    ),
+}
+
+
+def _remediation_for(check: Check) -> str | None:
+    if check.status == OK:
+        return None
+    return _REMEDIATION.get((check.key, check.status))
+
 
 @dataclass(frozen=True, slots=True)
 class Check:
@@ -37,6 +84,8 @@ class Check:
     label: str
     status: str
     detail: str
+    # Guided-troubleshooting: concrete next steps shown when the check is not OK.
+    remediation: str | None = None
 
 
 @dataclass(slots=True)
@@ -61,6 +110,7 @@ def run_diagnostics(
         _pending_enforcement_check(session),
         _dimensions_check(session),
     ]
+    checks = [replace(c, remediation=_remediation_for(c)) for c in checks]
     overall = max((c.status for c in checks), key=lambda s: _RANK[s], default=OK)
     return Diagnostics(generated_at=moment, overall=overall, checks=checks)
 

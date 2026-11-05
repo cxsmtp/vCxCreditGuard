@@ -378,6 +378,32 @@ def send_report_email(
     _transmit(message, config=config, smtp_factory=smtp_factory)
 
 
+def send_direct_email(
+    *,
+    config: DeliveryConfig,
+    to: str,
+    subject: str,
+    text_body: str,
+    smtp_factory: SmtpFactory | None = None,
+) -> None:
+    """Send one message to a specific recipient over the configured SMTP transport.
+
+    Unlike report and notification mail, this does not go to the configured
+    recipient list; it targets ``to`` (e.g. the account a password reset is for).
+    It only needs the transport to be set up (host and from), not a recipient
+    list, so it raises on a missing transport rather than reusing ``email_enabled``.
+    """
+    if not (config.smtp_host and config.smtp_from):
+        raise DeliveryError("email transport is not configured")
+    message = EmailMessage()
+    message["Subject"] = _header_safe(f"[CxCreditGuard] {subject}")
+    message["From"] = _header_safe(config.smtp_from, limit=320)
+    message["To"] = _header_safe(to, limit=320)
+    message["X-CxCreditGuard-Category"] = "account"
+    message.set_content(text_body)
+    _transmit(message, config=config, smtp_factory=smtp_factory)
+
+
 def _default_smtp_factory(host: str, port: int, timeout: float) -> smtplib.SMTP:
     return smtplib.SMTP(host=host, port=port, timeout=timeout)
 

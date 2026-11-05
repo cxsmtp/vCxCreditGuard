@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import pyotp
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
@@ -27,7 +27,12 @@ from app.core.crypto import PURPOSE_TOTP_SECRET, get_secret_box
 from app.core.passwords import hash_password, needs_rehash, validate_password, verify_password
 from app.core.tokens import hash_token, new_token, tokens_equal
 from app.db.base import utcnow
-from app.models.auth import LoginAttempt, UtilitySession, UtilityUser
+from app.models.auth import (
+    LoginAttempt,
+    PasswordResetToken,
+    UtilitySession,
+    UtilityUser,
+)
 from app.models.enums import UtilityRole
 from app.services.audit import AuditActor, record_audit
 
@@ -36,6 +41,8 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_WINDOW_SECONDS = 60
 TOTP_ISSUER = "CxCreditGuard"
 TOTP_VALID_WINDOW = 1
+# How long a password-reset token stays valid once issued.
+PASSWORD_RESET_TTL = timedelta(hours=1)
 
 # Computed once, used to keep failed logins for unknown usernames as slow as
 # failed logins for real ones.
@@ -161,6 +168,143 @@ def set_password(
     revoke_all_sessions(session, user_id=user.id)
 
 
+class InvalidResetToken(Exception):
+    """The reset token is unknown, already used, or expired."""
+
+    def __init__(self) -> None:
+        super().__init__("This password reset link is invalid or has expired.")
+
+
+def _issue_reset_token(
+    session: Session, *, user: UtilityUser, ip_address: str | None, actor: AuditActor
+) -> str:
+    """Mint a fresh reset token for a user, invalidating any earlier unused one.
+
+    Returns the plaintext token; only its digest is stored. The caller delivers
+    the token (by email, or by handing it to an admin) and must never return it
+    to an unauthenticated requester.
+    """
+    now = utcnow()
+    session.execute(
+        update(PasswordResetToken)
+        .where(PasswordResetToken.user_id == user.id, PasswordResetToken.used_at.is_(None))
+        .values(used_at=now)
+    )
+    token = new_token()
+    session.add(
+        PasswordResetToken(
+            user_id=user.id,
+            token_hash=hash_token(token),
+            created_at=now,
+            expires_at=now + PASSWORD_RESET_TTL,
+            requested_ip=ip_address,
+        )
+    )
+    session.flush()
+    record_audit(
+        session,
+        action="auth.password_reset_requested",
+        actor=actor,
+        target_type="utility_user",
+        target_id=str(user.id),
+        target_label=user.username,
+        detail="A single-use password reset token was issued.",
+    )
+    return token
+
+
+def request_password_reset(
+    session: Session, *, identifier: str, ip_address: str | None = None
+) -> tuple[UtilityUser, str] | None:
+    """Resolve a username or email to an active account and issue a reset token.
+
+    Returns ``(user, token)`` when a matching active account exists, else
+    ``None``. The caller must give the same response either way, so that the
+    endpoint does not reveal whether an account exists.
+    """
+    needle = (identifier or "").strip().lower()[:320]
+    if not needle:
+        return None
+    user = get_user_by_username(session, needle)
+    if user is None and "@" in needle:
+        user = session.scalar(
+            select(UtilityUser).where(func.lower(UtilityUser.email) == needle).limit(1)
+        )
+    if user is None or not user.is_active:
+        return None
+    token = _issue_reset_token(
+        session,
+        user=user,
+        ip_address=ip_address,
+        actor=AuditActor.anonymous(ip_address=ip_address),
+    )
+    return user, token
+
+
+def admin_issue_reset_token(
+    session: Session, *, user: UtilityUser, actor: AuditActor, ip_address: str | None = None
+) -> str:
+    """Issue a reset token on an admin's behalf (e.g. when email is not set up).
+
+    The token is returned to the admin to hand to the user out of band.
+    """
+    return _issue_reset_token(session, user=user, ip_address=ip_address, actor=actor)
+
+
+def complete_password_reset(
+    session: Session, *, token: str, new_password: str, ip_address: str | None = None
+) -> UtilityUser:
+    """Redeem a reset token and set the new password.
+
+    Raises :class:`InvalidResetToken` for an unknown, used, or expired token, and
+    lets :class:`PasswordPolicyError` propagate for a weak new password (the token
+    is left unspent so the user can retry with a stronger one). On success the
+    account's failed-login lockout is cleared and every session is revoked.
+    """
+    actor = AuditActor.anonymous(ip_address=ip_address)
+    row = session.scalar(
+        select(PasswordResetToken).where(PasswordResetToken.token_hash == hash_token(token))
+    )
+    now = utcnow()
+    user = session.get(UtilityUser, row.user_id) if row is not None else None
+    if (
+        row is None
+        or row.used_at is not None
+        or row.expires_at <= now
+        or user is None
+        or not user.is_active
+    ):
+        # Audited so repeated invalid redemptions (a brute-force or a stale link
+        # being retried) are visible; the endpoint that calls this is rate limited.
+        record_audit(
+            session,
+            action="auth.password_reset_failed",
+            actor=actor,
+            target_type="utility_user",
+            target_id=str(user.id) if user is not None else None,
+            target_label=user.username if user is not None else None,
+            detail="A password reset token was rejected (unknown, used, or expired).",
+        )
+        raise InvalidResetToken
+
+    # Validates policy before any mutation, then revokes sessions and audits.
+    set_password(session, user=user, new_password=new_password, actor=actor)
+    row.used_at = now
+    user.failed_login_count = 0
+    user.locked_until = None
+    session.flush()
+    record_audit(
+        session,
+        action="auth.password_reset_completed",
+        actor=actor,
+        target_type="utility_user",
+        target_id=str(user.id),
+        target_label=user.username,
+        detail="Password set via reset token; account lockout cleared.",
+    )
+    return user
+
+
 def bootstrap_admin_if_needed(
     session: Session, settings: Settings | None = None
 ) -> UtilityUser | None:
@@ -242,6 +386,18 @@ def _check_rate_limit(
     if row.attempt_count > settings.login_rate_limit_per_minute:
         elapsed = (now - row.window_started_at).total_seconds()
         raise RateLimited(retry_after_seconds=max(1, int(RATE_LIMIT_WINDOW_SECONDS - elapsed)))
+
+
+def throttle(
+    session: Session, *, bucket: str, ip_address: str, settings: Settings | None = None
+) -> None:
+    """Public rate-limit guard for a named action, reusing the login counter.
+
+    Lets endpoints such as password-reset requests share the per-identifier,
+    per-IP throttle that login uses. Raises :class:`RateLimited` when exceeded.
+    """
+    settings = settings or get_settings()
+    _check_rate_limit(session, identifier=bucket[:128], ip_address=ip_address, settings=settings)
 
 
 def _lockout_seconds(failed_count: int, settings: Settings) -> int:

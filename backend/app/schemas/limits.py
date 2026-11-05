@@ -190,6 +190,7 @@ class DiagnosticCheckResponse(BaseModel):
     label: str
     status: str
     detail: str
+    remediation: str | None = None
 
 
 class DiagnosticsResponse(BaseModel):

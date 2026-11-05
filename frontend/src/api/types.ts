@@ -393,6 +393,15 @@ export interface UtilityAccount {
   created_at: string;
 }
 
+export interface MessageResponse {
+  message: string;
+}
+
+export interface AdminResetResult {
+  reset_token: string;
+  expires_at: string;
+}
+
 export interface Projection {
   limit_id: number;
   entity_type: EntityType;
@@ -435,6 +444,7 @@ export interface DiagnosticCheck {
   label: string;
   status: DiagnosticStatus;
   detail: string;
+  remediation: string | null;
 }
 
 export interface Diagnostics {

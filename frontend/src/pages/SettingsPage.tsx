@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { ApiError, api } from "../api/client";
 import type {
+  AdminResetResult,
   AppSettings,
   CycleRun,
   OrgEntity,
@@ -938,6 +939,9 @@ function AccountsCard() {
   );
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<UtilityAccount | null>(null);
+  const [resetFor, setResetFor] = useState<
+    (AdminResetResult & { username: string }) | null
+  >(null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<"admin" | "viewer">("viewer");
@@ -1010,6 +1014,17 @@ function AccountsCard() {
     }
   }
 
+  async function issueReset(account: UtilityAccount) {
+    try {
+      const result = await api.post<AdminResetResult>(
+        `/api/accounts/${account.id}/reset-password`,
+      );
+      setResetFor({ username: account.username, ...result });
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not issue a reset code.");
+    }
+  }
+
   return (
     <Card
       title="Utility accounts"
@@ -1079,6 +1094,16 @@ function AccountsCard() {
                         onClick={() => unlock(account)}
                       >
                         Unlock
+                      </button>
+                    )}
+                    {account.is_active && (
+                      <button
+                        type="button"
+                        className="underline"
+                        style={{ color: "var(--text-secondary)" }}
+                        onClick={() => issueReset(account)}
+                      >
+                        Reset password
                       </button>
                     )}
                     <button
@@ -1157,6 +1182,36 @@ function AccountsCard() {
         onConfirm={remove}
         onCancel={() => setDeleting(null)}
       />
+
+      <Modal
+        open={resetFor !== null}
+        title="One-time reset code"
+        description={
+          resetFor
+            ? `Give this code to ${resetFor.username}. They redeem it on the sign-in page under "I have a reset code". It is shown once.`
+            : ""
+        }
+        onClose={() => setResetFor(null)}
+        footer={
+          <Button variant="primary" onClick={() => setResetFor(null)}>
+            Done
+          </Button>
+        }
+      >
+        {resetFor && (
+          <div className="flex flex-col gap-3">
+            <code
+              className="block rounded-md px-3 py-2 text-sm break-all"
+              style={{ background: "var(--hover)" }}
+            >
+              {resetFor.reset_token}
+            </code>
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Expires {formatDateTime(resetFor.expires_at)}. Issuing a new code invalidates this one.
+            </p>
+          </div>
+        )}
+      </Modal>
     </Card>
   );
 }

@@ -31,6 +31,7 @@ EXPECTED_TABLES = {
     "limit_period_state",
     "login_attempt",
     "notification",
+    "password_reset_token",
     "scheduler_lock",
     "scheduler_run",
     "unresolved_subject",

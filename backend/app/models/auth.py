@@ -69,6 +69,27 @@ class UtilitySession(Base):
     __table_args__ = (Index("ix_utility_session_expiry", "idle_expires_at", "absolute_expires_at"),)
 
 
+class PasswordResetToken(Base):
+    """A single-use, time-limited token for self-service password reset.
+
+    Only the token's SHA-256 digest is stored, like session tokens. A token is
+    spent when ``used_at`` is set, and expires at ``expires_at``; requesting a new
+    one marks any earlier unused token for the same user as used.
+    """
+
+    __tablename__ = "password_reset_token"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("utility_user.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    requested_ip: Mapped[str | None] = mapped_column(String(64))
+
+
 class LoginAttempt(Base):
     """Per identifier rate limiting counter, keyed by username and client IP."""
 

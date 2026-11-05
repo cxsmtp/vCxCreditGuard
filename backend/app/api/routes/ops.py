@@ -178,7 +178,11 @@ def diagnostics(ctx: CurrentUser, db: DbSession) -> DiagnosticsResponse:
         overall=report.overall,
         checks=[
             DiagnosticCheckResponse(
-                key=check.key, label=check.label, status=check.status, detail=check.detail
+                key=check.key,
+                label=check.label,
+                status=check.status,
+                detail=check.detail,
+                remediation=check.remediation,
             )
             for check in report.checks
         ],
