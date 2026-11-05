@@ -80,15 +80,16 @@ def parse_credit_balance(payload: Any) -> CreditBalance | None:
         logger.warning("Credit balance response was %s, expected an object", type(payload).__name__)
         return None
 
-    # Unwrap a common envelope if the figures are not at the top level.
+    # Prefer figures at the top level; only unwrap a common envelope when the
+    # top level carries none of the keys we recognise.
     source = payload
-    for envelope in ("credits", "data", "result"):
-        inner = payload.get(envelope)
-        if isinstance(inner, dict) and any(
-            k in inner for k in (*_TOTAL_KEYS, *_USED_KEYS, *_AVAILABLE_KEYS)
-        ):
-            source = inner
-            break
+    _known = (*_TOTAL_KEYS, *_USED_KEYS, *_AVAILABLE_KEYS)
+    if not any(key in payload for key in _known):
+        for envelope in ("credits", "data", "result"):
+            inner = payload.get(envelope)
+            if isinstance(inner, dict) and any(k in inner for k in _known):
+                source = inner
+                break
 
     total = _first(source, _TOTAL_KEYS)
     used = _first(source, _USED_KEYS)

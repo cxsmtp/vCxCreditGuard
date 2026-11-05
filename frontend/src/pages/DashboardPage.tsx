@@ -231,9 +231,9 @@ function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
   const assigned = Number(pool.assigned);
   const over = pool.over_allocation !== null;
 
-  // Bar segments as a share of the total pool (or of the assigned amount when
-  // the real pool is unknown, so the bar still conveys relative allocation).
-  const scale = known ? total : Math.max(assigned, used ?? 0, 1);
+  // Bar segments as a share of the pool. Floor the scale at 1 so a genuine
+  // total of 0 (a real zero, not "unknown") can never produce 0/0 = NaN widths.
+  const scale = Math.max(known ? total : Math.max(assigned, used ?? 0), 1);
   const pct = (value: number) => `${Math.min(100, Math.max(0, (value / scale) * 100))}%`;
 
   const figure = (v: string | null) => (v === null ? "—" : formatCredits(v));

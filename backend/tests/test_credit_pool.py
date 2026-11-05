@@ -49,6 +49,32 @@ class TestParse:
         assert bal.total == Decimal("500")
         assert bal.available == Decimal("200")
 
+    def test_top_level_figures_win_over_an_envelope(self) -> None:
+        # A payload with both top-level figures and an envelope reads the top level.
+        bal = credits_api.parse_credit_balance({"totalCredits": 1000, "data": {"total": 5}})
+        assert bal is not None
+        assert bal.total == Decimal("1000")
+
+    def test_a_used_above_total_clamps_available_to_zero(self) -> None:
+        bal = credits_api.parse_credit_balance({"total": 100, "used": 150})
+        assert bal is not None
+        assert bal.available == Decimal("0")
+
+    def test_negative_and_bool_figures_are_unknown(self) -> None:
+        bal = credits_api.parse_credit_balance({"total": -5, "used": True, "available": 10})
+        assert bal is not None
+        assert bal.total is None
+        assert bal.used is None
+        assert bal.available == Decimal("10")
+
+    def test_a_genuine_zero_is_kept(self) -> None:
+        bal = credits_api.parse_credit_balance(
+            {"totalCredits": 0, "usedCredits": 0, "availableCredits": 0}
+        )
+        assert bal is not None
+        assert bal.total == Decimal("0")
+        assert bal.has_values() is True
+
 
 class TestFetch:
     def test_reads_the_tenant_balance(self, db: Session) -> None:

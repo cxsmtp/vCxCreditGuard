@@ -278,6 +278,26 @@ class TestCreditBalance:
             count = session.scalar(select(func.count()).select_from(CreditBalanceSnapshot))
         assert count == 1
 
+    def test_a_changed_balance_writes_a_new_row(
+        self, db: Session, configured_tenant: FakeTenant
+    ) -> None:
+        cycle.run_cycle(trigger="manual", force_org_sync=True)
+        configured_tenant.credit_info = {
+            "totalCredits": 1000,
+            "usedCredits": 250,
+            "availableCredits": 750,
+        }
+        result = cycle.run_cycle(trigger="schedule")
+        assert result.steps["credits"]["changed"] is True
+        with session_scope() as session:
+            rows = list(
+                session.scalars(
+                    select(CreditBalanceSnapshot).order_by(CreditBalanceSnapshot.id)
+                )
+            )
+        assert len(rows) == 2
+        assert rows[-1].used_credits == Decimal("250")
+
     def test_a_missing_credit_endpoint_is_not_fatal(
         self, db: Session, configured_tenant: FakeTenant
     ) -> None:
