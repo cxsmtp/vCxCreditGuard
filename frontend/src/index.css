@@ -40,7 +40,12 @@
   --status-critical: #d03b3b;
   --status-good-text: #006300;
 
-  --focus: #2a78d6;
+  /* Brand accent. Themeable by the admin via [data-accent]; drives primary
+     buttons, toggles, active states and focus rings. Separate from the
+     validated chart series palette, which never changes with the accent. */
+  --accent: #2a78d6;
+  --accent-contrast: #ffffff;
+  --focus: var(--accent);
 }
 
 :root[data-theme="dark"] {
@@ -71,8 +76,28 @@
   --status-critical: #d03b3b;
   --status-good-text: #0ca30c;
 
-  --focus: #3987e5;
+  --accent: #3987e5;
+  --accent-contrast: #ffffff;
+  --focus: var(--accent);
 }
+
+/*
+  Admin-selectable accent themes. Each overrides only the accent tokens, per
+  theme, so the validated chart palette and every surface token are untouched.
+  The dark values are deliberately lighter and carry a dark --accent-contrast
+  so button text stays legible. Default (blue) needs no override - it is the
+  base :root above.
+*/
+:root[data-accent="teal"][data-theme="light"] { --accent: #0f766e; --accent-contrast: #ffffff; }
+:root[data-accent="teal"][data-theme="dark"] { --accent: #2dd4bf; --accent-contrast: #06100e; }
+:root[data-accent="violet"][data-theme="light"] { --accent: #6d46c8; --accent-contrast: #ffffff; }
+:root[data-accent="violet"][data-theme="dark"] { --accent: #a78bfa; --accent-contrast: #140a2e; }
+:root[data-accent="amber"][data-theme="light"] { --accent: #b45309; --accent-contrast: #ffffff; }
+:root[data-accent="amber"][data-theme="dark"] { --accent: #f59e0b; --accent-contrast: #231a05; }
+:root[data-accent="rose"][data-theme="light"] { --accent: #be123c; --accent-contrast: #ffffff; }
+:root[data-accent="rose"][data-theme="dark"] { --accent: #fb7185; --accent-contrast: #2a0a12; }
+:root[data-accent="slate"][data-theme="light"] { --accent: #475569; --accent-contrast: #ffffff; }
+:root[data-accent="slate"][data-theme="dark"] { --accent: #94a3b8; --accent-contrast: #0b1220; }
 
 @theme inline {
   --color-page: var(--page);

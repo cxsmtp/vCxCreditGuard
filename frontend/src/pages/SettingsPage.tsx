@@ -31,7 +31,7 @@ import {
 } from "../components/ui";
 import { useResource } from "../hooks/useResource";
 import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
-import { useToast } from "../lib/ui-context";
+import { applyAccent, useToast } from "../lib/ui-context";
 
 export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
   const toast = useToast();
@@ -76,6 +76,7 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
     try {
       const updated = await api.put<AppSettings>("/api/settings", draft);
       settings.setData(updated);
+      applyAccent(updated.ui_accent);
       setDraft({});
       toast.success(`Settings saved. Schedule is now ${updated.current_schedule_description}.`);
       await status.reload();
@@ -449,6 +450,12 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
         </Card>
 
         <div className="flex flex-col gap-6">
+          <AppearanceCard
+            isAdmin={isAdmin}
+            value={value("ui_accent") ?? "default"}
+            options={current.allowed_accents ?? ["default"]}
+            onPick={(accent) => set({ ui_accent: accent })}
+          />
           <AttributionCard
             isAdmin={isAdmin}
             subjects={unresolved.data ?? []}
@@ -508,6 +515,76 @@ function confidence(score: number | null | undefined): string {
 // instant it is saved.
 function isCounted(s: UnresolvedSubject): boolean {
   return Boolean(s.counts_towards_user_id);
+}
+
+/* ------------------------------------------------------------- appearance */
+
+// Representative swatch colour per accent (the light-mode value). Purely for the
+// picker preview; the real tokens live in index.css under [data-accent].
+const ACCENT_SWATCH: Record<string, string> = {
+  default: "#2a78d6",
+  teal: "#0f766e",
+  violet: "#6d46c8",
+  amber: "#b45309",
+  rose: "#be123c",
+  slate: "#475569",
+};
+
+function AppearanceCard({
+  isAdmin,
+  value,
+  options,
+  onPick,
+}: {
+  isAdmin: boolean;
+  value: string;
+  options: string[];
+  onPick: (accent: string) => void;
+}) {
+  return (
+    <Card
+      title="Appearance"
+      description="The accent colour for everyone in this organisation. Light and dark mode stay a personal choice; this only sets the accent."
+    >
+      <div className="flex flex-wrap gap-2.5">
+        {options.map((accent) => {
+          const selected = accent === value;
+          return (
+            <button
+              key={accent}
+              type="button"
+              disabled={!isAdmin}
+              aria-pressed={selected}
+              onClick={() => onPick(accent)}
+              title={accent}
+              className="flex items-center gap-2 rounded-lg border px-3 py-2 text-sm capitalize transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+              style={{
+                borderColor: selected ? "var(--accent)" : "var(--border)",
+                background: selected ? "var(--hover)" : "transparent",
+                color: "var(--text-primary)",
+                fontWeight: selected ? 600 : 400,
+              }}
+            >
+              <span
+                className="inline-block size-4 rounded-full"
+                style={{
+                  background: ACCENT_SWATCH[accent] ?? "var(--accent)",
+                  outline: selected ? "2px solid var(--accent)" : "none",
+                  outlineOffset: "1px",
+                }}
+              />
+              {accent}
+            </button>
+          );
+        })}
+      </div>
+      {!isAdmin && (
+        <p className="mt-3 text-xs" style={{ color: "var(--text-muted)" }}>
+          Only an admin can change the organisation accent.
+        </p>
+      )}
+    </Card>
+  );
 }
 
 function AttributionCard({

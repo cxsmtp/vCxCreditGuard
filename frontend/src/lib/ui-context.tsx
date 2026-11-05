@@ -37,6 +37,33 @@ export function applyTheme(theme: Theme): void {
   document.documentElement.dataset.theme = theme;
 }
 
+/**
+ * The organisation accent theme (admin-set). Orthogonal to light/dark: it only
+ * remaps the --accent tokens via [data-accent]. An unknown value falls back to
+ * the base palette by simply not matching any preset selector. The last applied
+ * accent is cached so a reload can pre-apply it (via readInitialAccent) before
+ * /api/me resolves, avoiding a flash of the default accent.
+ */
+const ACCENT_KEY = "cxcg-accent";
+
+export function readInitialAccent(): string {
+  try {
+    return localStorage.getItem(ACCENT_KEY) || "default";
+  } catch {
+    return "default";
+  }
+}
+
+export function applyAccent(accent: string | null | undefined): void {
+  const value = accent || "default";
+  document.documentElement.dataset.accent = value;
+  try {
+    localStorage.setItem(ACCENT_KEY, value);
+  } catch {
+    // Not fatal: the accent simply will not survive a reload before /api/me.
+  }
+}
+
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [theme, setThemeState] = useState<Theme>(readInitialTheme);
 

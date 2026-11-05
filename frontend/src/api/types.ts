@@ -28,6 +28,7 @@ export interface Me {
   tenant_name: string | null;
   version: string;
   setup_required: boolean;
+  ui_accent: string;
 }
 
 export interface ConnectionPreview {
@@ -271,6 +272,8 @@ export interface AppSettings {
   webhook_secret_configured: boolean;
   allowed_interval_minutes: number[];
   allowed_usage_periods: string[];
+  ui_accent: string;
+  allowed_accents: string[];
   current_schedule_description: string;
 }
 

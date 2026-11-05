@@ -48,6 +48,11 @@ KEY_WEBHOOK_URL = "notify.webhook.url"
 KEY_WEBHOOK_SECRET = "notify.webhook.secret"  # secret
 KEY_NOTIFY_MIN_SEVERITY = "notify.min_severity"
 
+# Appearance: the organisation-wide accent theme an admin picks. Applied to
+# every signed-in browser; the chart series palette is never affected.
+KEY_UI_ACCENT = "ui.accent"
+ALLOWED_ACCENTS: tuple[str, ...] = ("default", "teal", "violet", "amber", "rose", "slate")
+
 SECRET_KEYS: dict[str, str] = {
     KEY_SMTP_PASSWORD: PURPOSE_SMTP_PASSWORD,
     KEY_WEBHOOK_SECRET: PURPOSE_WEBHOOK_SECRET,
@@ -67,6 +72,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_SMTP_PORT: 587,
     KEY_SMTP_USE_TLS: True,
     KEY_NOTIFY_MIN_SEVERITY: "warning",
+    KEY_UI_ACCENT: "default",
 }
 
 
@@ -77,6 +83,13 @@ class ScheduleConfig:
     interval_minutes: int
     cron: str | None
     org_refresh_minutes: int
+
+
+def ui_accent(session: Session) -> str:
+    """The organisation accent theme, falling back to the default if unset or
+    somehow invalid (so a stray stored value can never break the UI)."""
+    value = get_value(session, KEY_UI_ACCENT, DEFAULTS[KEY_UI_ACCENT])
+    return value if value in ALLOWED_ACCENTS else DEFAULTS[KEY_UI_ACCENT]
 
 
 def get_raw(session: Session, key: str) -> AppSetting | None:

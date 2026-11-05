@@ -62,6 +62,7 @@ def me(ctx: CurrentUser, db: DbSession) -> MeResponse:
         version=__version__,
         # Drives the redirect to Setup on first login.
         setup_required=connection is None,
+        ui_accent=settings_store.ui_accent(db),
     )
 
 

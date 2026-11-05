@@ -345,6 +345,26 @@ class TestSettingsApi:
         assert body["usage_period_param"] == "last_year"
         assert body["allowed_interval_minutes"] == [2, 5, 15, 60]
 
+    def test_accent_defaults_and_can_be_set(self, admin_client: TestClient) -> None:
+        body = admin_client.get("/api/settings").json()
+        assert body["ui_accent"] == "default"
+        assert "teal" in body["allowed_accents"]
+
+        response = admin_client.put("/api/settings", json={"ui_accent": "teal"})
+        assert response.status_code == httpx.codes.OK
+        assert response.json()["ui_accent"] == "teal"
+        # It is exposed on the SPA bootstrap payload so the browser can apply it.
+        assert admin_client.get("/api/me").json()["ui_accent"] == "teal"
+
+    def test_an_unknown_accent_is_rejected(self, admin_client: TestClient) -> None:
+        response = admin_client.put("/api/settings", json={"ui_accent": "chartreuse"})
+        assert response.status_code == httpx.codes.BAD_REQUEST
+        assert response.json()["detail"]["code"] == "invalid_accent"
+
+    def test_a_viewer_cannot_change_the_accent(self, viewer_client: TestClient) -> None:
+        response = viewer_client.put("/api/settings", json={"ui_accent": "teal"})
+        assert response.status_code == httpx.codes.FORBIDDEN
+
     def test_interval_can_be_changed(self, admin_client: TestClient) -> None:
         response = admin_client.put("/api/settings", json={"schedule_interval_minutes": 5})
         assert response.status_code == httpx.codes.OK

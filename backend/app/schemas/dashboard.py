@@ -182,6 +182,9 @@ class SettingsResponse(BaseModel):
     allowed_interval_minutes: list[int]
     # The lookback windows the consumption endpoint accepts. Anything else is a 400.
     allowed_usage_periods: list[str]
+    # The organisation accent theme and the set an admin may choose from.
+    ui_accent: str = "default"
+    allowed_accents: list[str] = Field(default_factory=list)
     current_schedule_description: str
 
 
@@ -205,6 +208,7 @@ class SettingsUpdateRequest(StrictModel):
     smtp_recipients: str | None = Field(default=None, max_length=2048)
     webhook_url: str | None = Field(default=None, max_length=1024)
     webhook_secret: str | None = Field(default=None, max_length=512)
+    ui_accent: str | None = Field(default=None, max_length=16)
 
     @field_validator("schedule_mode")
     @classmethod
@@ -261,4 +265,6 @@ class MeResponse(BaseModel):
     tenant_name: str | None
     version: str
     setup_required: bool
+    # The organisation accent theme, so the SPA can apply it on load.
+    ui_accent: str = "default"
     extra: dict[str, Any] = Field(default_factory=dict)

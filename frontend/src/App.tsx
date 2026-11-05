@@ -4,6 +4,7 @@ import { api, onUnauthorized } from "./api/client";
 import type { Me, NotificationList } from "./api/types";
 import { AppShell } from "./components/AppShell";
 import { Spinner } from "./components/ui";
+import { applyAccent } from "./lib/ui-context";
 import { useInterval } from "./hooks/useResource";
 import { AuditPage } from "./pages/AuditPage";
 import { DashboardPage } from "./pages/DashboardPage";
@@ -26,6 +27,7 @@ export function App() {
     try {
       const profile = await api.get<Me>("/api/me");
       setMe(profile);
+      applyAccent(profile.ui_accent);
       setAuthState("signedIn");
       return profile;
     } catch {

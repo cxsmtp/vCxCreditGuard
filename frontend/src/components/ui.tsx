@@ -99,10 +99,11 @@ export function Button({
 }) {
   const background =
     variant === "primary"
-      ? "var(--series-1)"
+      ? "var(--accent)"
       : variant === "danger"
         ? "var(--status-critical)"
         : "transparent";
+  const foreground = variant === "primary" ? "var(--accent-contrast)" : undefined;
   return (
     <button
       {...rest}
@@ -110,7 +111,7 @@ export function Button({
       className={`inline-flex items-center justify-center gap-2 rounded-md font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
         size === "sm" ? "px-2.5 py-1.5 text-xs" : "px-3.5 py-2 text-sm"
       } ${BUTTON_STYLES[variant]} ${className}`}
-      style={{ background, ...style }}
+      style={{ background, ...(foreground ? { color: foreground } : {}), ...style }}
     >
       {loading && <Spinner size={14} />}
       {children}
@@ -215,7 +216,7 @@ export function Toggle({
         disabled={disabled}
         onClick={() => onChange(!checked)}
         className="mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border border-hairline-strong transition-colors disabled:opacity-50"
-        style={{ background: checked ? "var(--series-1)" : "var(--hover)" }}
+        style={{ background: checked ? "var(--accent)" : "var(--hover)" }}
       >
         <span
           className="ml-0.5 inline-block size-4 rounded-full bg-white transition-transform"
