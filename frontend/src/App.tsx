@@ -11,6 +11,7 @@ import { DashboardPage } from "./pages/DashboardPage";
 import { LimitsPage } from "./pages/LimitsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { NotificationsPage } from "./pages/NotificationsPage";
+import { PreviewPage } from "./pages/PreviewPage";
 import { RequestsPage } from "./pages/RequestsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { SetupPage } from "./pages/SetupPage";
@@ -116,6 +117,7 @@ export function App() {
         <Route path="/" element={<DashboardPage isAdmin={isAdmin} />} />
         <Route path="/setup" element={<SetupPage isAdmin={isAdmin} onConnected={loadMe} />} />
         <Route path="/limits" element={<LimitsPage isAdmin={isAdmin} />} />
+        <Route path="/preview" element={<PreviewPage />} />
         {me.can_request_credits && (
           <Route path="/requests" element={<RequestsPage isAdmin={isAdmin} />} />
         )}

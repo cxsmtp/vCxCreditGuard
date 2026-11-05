@@ -1,7 +1,8 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { ApiError, api, downloadCsv } from "../api/client";
 import type {
+  BlastRadius,
   BulkResult,
   CsvImportResult,
   EntityType,
@@ -10,6 +11,7 @@ import type {
   OrgEntity,
   PeriodType,
 } from "../api/types";
+import { BlastSummary } from "./PreviewPage";
 import { EntityPicker } from "../components/EntityPicker";
 import {
   Badge,
@@ -642,6 +644,57 @@ function LimitDialog({
   );
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [blast, setBlast] = useState<BlastRadius | null>(null);
+  const [blastLoading, setBlastLoading] = useState(false);
+  const [blastError, setBlastError] = useState(false);
+  const [ackEnforce, setAckEnforce] = useState(false);
+
+  const targetType = entity?.entity_type ?? limit?.entity_type;
+  const targetId = entity?.entity_id ?? limit?.entity_id;
+  const wasEnforcing = editing && limit?.enforce === true;
+
+  // Fetch the blast radius whenever enforcement is on and we know the entity, so
+  // the admin sees exactly what enabling it would restrict before saving.
+  useEffect(() => {
+    if (!form.enforce || !targetType || !targetId) {
+      setBlast(null);
+      setBlastLoading(false);
+      setBlastError(false);
+      return;
+    }
+    const controller = new AbortController();
+    setBlastLoading(true);
+    setBlastError(false);
+    void (async () => {
+      try {
+        const result = await api.get<BlastRadius>(
+          "/api/preview/blast-radius",
+          { entity_type: targetType, entity_id: targetId },
+          controller.signal,
+        );
+        setBlast(result);
+      } catch {
+        if (!controller.signal.aborted) {
+          setBlast(null);
+          setBlastError(true);
+        }
+      } finally {
+        if (!controller.signal.aborted) setBlastLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [form.enforce, targetType, targetId]);
+
+  // A fresh acknowledgement is required when turning enforcement on (a new
+  // enforced limit, or editing one that was monitor only) and it would actually
+  // restrict something. We also fail closed when the blast radius could not be
+  // computed (the fetch errored) for a known entity: rather than silently skip
+  // the confirmation, require an explicit acknowledgement.
+  const haveTarget = Boolean(targetType && targetId);
+  const blastUnknown =
+    form.enforce && !wasEnforcing && haveTarget && !blastLoading && blastError;
+  const needsAck =
+    form.enforce && !wasEnforcing && ((blast?.total_actions ?? 0) > 0 || blastUnknown);
 
   function update<K extends keyof LimitForm>(key: K, value: LimitForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -718,7 +771,14 @@ function LimitDialog({
             variant="primary"
             onClick={save}
             loading={busy}
-            disabled={!form.credit_limit || (!editing && !entity)}
+            disabled={
+              !form.credit_limit ||
+              (!editing && !entity) ||
+              (needsAck && !ackEnforce) ||
+              // Don't let a new enforced limit be saved before its blast radius
+              // has loaded, so the confirmation can't be skipped by a fast save.
+              (form.enforce && !wasEnforcing && blastLoading)
+            }
           >
             {editing ? "Save changes" : "Create limit"}
           </Button>
@@ -854,11 +914,72 @@ function LimitDialog({
         </Field>
 
         {form.enforce && (
-          <InfoNote tone="warning">
-            Enforcement changes real access in Checkmarx One. For a user it removes the AI Triage and
-            Remediation roles; for a project, group or application it disables Auto Triage and PR
-            remediation on the affected projects.
-          </InfoNote>
+          <div
+            className="rounded-md border px-3 py-3"
+            style={{ borderColor: "var(--status-warning)", background: "var(--hover)" }}
+          >
+            <p className="text-sm font-medium">Enforcement blast radius</p>
+            {blastLoading ? (
+              <p className="mt-1 flex items-center gap-2 text-xs" style={{ color: "var(--text-secondary)" }}>
+                <Spinner size={12} /> Computing what this would restrict…
+              </p>
+            ) : blastUnknown ? (
+              <>
+                <p className="mt-1 text-xs" style={{ color: "var(--status-critical)" }}>
+                  The blast radius could not be computed right now. Enabling enforcement anyway means
+                  access can be restricted when the limit is reached, without a preview here.
+                </p>
+                <label className="mt-3 flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={ackEnforce}
+                    onChange={(event) => setAckEnforce(event.target.checked)}
+                  />
+                  <span>
+                    I understand I am enabling enforcement without seeing its blast radius. Every
+                    restriction stays reversible from the Notification Center.
+                  </span>
+                </label>
+              </>
+            ) : blast === null ? (
+              <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                Enforcement changes real access in Checkmarx One. Pick an entity to see exactly what
+                it would restrict.
+              </p>
+            ) : blast.total_actions === 0 ? (
+              <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                {blast.exempt
+                  ? "This entity is exempt, so nothing would be restricted."
+                  : "Nothing would be restricted right now (no linked projects or roles to change)."}
+              </p>
+            ) : (
+              <>
+                <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                  When this limit is reached, enforcement will restrict:
+                </p>
+                <p className="mt-1">
+                  <BlastSummary blast={blast} />
+                </p>
+                {needsAck && (
+                  <label className="mt-3 flex items-start gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={ackEnforce}
+                      onChange={(event) => setAckEnforce(event.target.checked)}
+                    />
+                    <span>
+                      I understand enabling enforcement can restrict{" "}
+                      {blast.affected_projects > 0 &&
+                        `${blast.affected_projects} ${blast.affected_projects === 1 ? "project" : "projects"}`}
+                      {blast.affected_users > 0 &&
+                        `${blast.affected_projects > 0 ? " and " : ""}${blast.affected_users} ${blast.affected_users === 1 ? "user" : "users"}`}
+                      . Every restriction stays reversible from the Notification Center.
+                    </span>
+                  </label>
+                )}
+              </>
+            )}
+          </div>
         )}
       </div>
     </Modal>

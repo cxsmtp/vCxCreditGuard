@@ -363,6 +363,53 @@ export interface UtilityAccount {
   created_at: string;
 }
 
+export interface TargetPreview {
+  kind: string;
+  target_type: string;
+  target_id: string;
+  target_label: string | null;
+}
+
+export interface BlastRadius {
+  entity_type: EntityType;
+  entity_id: string;
+  entity_label: string | null;
+  exempt: boolean;
+  affected_users: number;
+  affected_projects: number;
+  remove_user_roles: number;
+  disable_auto_triage: number;
+  disable_pr_remediation: number;
+  total_actions: number;
+  targets: TargetPreview[];
+}
+
+export interface DryRunRow {
+  limit_id: number;
+  entity_type: EntityType;
+  entity_id: string;
+  entity_label: string | null;
+  credit_limit: number;
+  enforce: boolean;
+  exempt: boolean;
+  usage_available: boolean;
+  credits_used: string;
+  percent_used: number | null;
+  projected_status: LimitStatus;
+  would_enforce: boolean;
+  blast: BlastRadius | null;
+  note: string | null;
+}
+
+export interface DryRunResult {
+  generated_at: string;
+  would_enforce_count: number;
+  would_warn_count: number;
+  affected_projects: number;
+  affected_users: number;
+  rows: DryRunRow[];
+}
+
 export interface CsvImportResult {
   created: number;
   updated: number;

@@ -10,6 +10,7 @@ function navItems(me: Me): NavItem[] {
   const items: NavItem[] = [
     { to: "/", label: "Dashboard", exact: true },
     { to: "/limits", label: "Limits" },
+    { to: "/preview", label: "Simulation" },
   ];
   // Only shown when this account may file or decide credit requests, which is
   // every admin and a viewer only once self-service is switched on.
