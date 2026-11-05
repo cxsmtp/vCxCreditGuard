@@ -555,7 +555,7 @@ export function Tabs<T extends string>({
             onClick={() => onChange(tab.id)}
             className="-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors"
             style={{
-              borderColor: selected ? "var(--series-1)" : "transparent",
+              borderColor: selected ? "var(--accent)" : "transparent",
               color: selected ? "var(--text-primary)" : "var(--text-secondary)",
             }}
           >

@@ -361,6 +361,15 @@ class TestSettingsApi:
         assert response.status_code == httpx.codes.BAD_REQUEST
         assert response.json()["detail"]["code"] == "invalid_accent"
 
+    def test_a_stray_stored_accent_falls_back_to_default(self, db: Session) -> None:
+        # set_value bypasses the route validation, so a value written by hand (or
+        # a future rename) must still never break the UI.
+        from app.services import settings_store
+
+        settings_store.set_value(db, settings_store.KEY_UI_ACCENT, "chartreuse")
+        db.commit()
+        assert settings_store.ui_accent(db) == "default"
+
     def test_a_viewer_cannot_change_the_accent(self, viewer_client: TestClient) -> None:
         response = viewer_client.put("/api/settings", json={"ui_accent": "teal"})
         assert response.status_code == httpx.codes.FORBIDDEN

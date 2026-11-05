@@ -79,6 +79,9 @@ export function App() {
     }
     setAuthState("signedOut");
     setMe(null);
+    // Drop the cached org accent so a shared browser does not pre-apply one
+    // organisation's accent for the next person who signs in.
+    applyAccent("default");
     navigate("/");
   }
 
