@@ -185,6 +185,8 @@ class SettingsResponse(BaseModel):
     # The organisation accent theme and the set an admin may choose from.
     ui_accent: str = "default"
     allowed_accents: list[str] = Field(default_factory=list)
+    # Whether viewers may submit credit requests for an admin to decide.
+    self_service_requests: bool = False
     current_schedule_description: str
 
 
@@ -209,6 +211,7 @@ class SettingsUpdateRequest(StrictModel):
     webhook_url: str | None = Field(default=None, max_length=1024)
     webhook_secret: str | None = Field(default=None, max_length=512)
     ui_accent: str | None = Field(default=None, max_length=16)
+    self_service_requests: bool | None = None
 
     @field_validator("schedule_mode")
     @classmethod
@@ -267,4 +270,7 @@ class MeResponse(BaseModel):
     setup_required: bool
     # The organisation accent theme, so the SPA can apply it on load.
     ui_accent: str = "default"
+    # Whether this user may submit credit requests: always true for an admin,
+    # and for a viewer only when self-service is enabled.
+    can_request_credits: bool = False
     extra: dict[str, Any] = Field(default_factory=dict)

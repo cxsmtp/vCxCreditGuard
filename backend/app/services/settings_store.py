@@ -53,6 +53,11 @@ KEY_NOTIFY_MIN_SEVERITY = "notify.min_severity"
 KEY_UI_ACCENT = "ui.accent"
 ALLOWED_ACCENTS: tuple[str, ...] = ("default", "teal", "violet", "amber", "rose", "slate")
 
+# Credit requests: when on, a non-admin (viewer) may submit a request to raise an
+# entity's budget for an admin to approve. Off by default, so self-service is a
+# deliberate choice an admin makes rather than something viewers get silently.
+KEY_SELF_SERVICE_REQUESTS = "requests.self_service"
+
 SECRET_KEYS: dict[str, str] = {
     KEY_SMTP_PASSWORD: PURPOSE_SMTP_PASSWORD,
     KEY_WEBHOOK_SECRET: PURPOSE_WEBHOOK_SECRET,
@@ -73,6 +78,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_SMTP_USE_TLS: True,
     KEY_NOTIFY_MIN_SEVERITY: "warning",
     KEY_UI_ACCENT: "default",
+    KEY_SELF_SERVICE_REQUESTS: False,
 }
 
 
@@ -90,6 +96,11 @@ def ui_accent(session: Session) -> str:
     somehow invalid (so a stray stored value can never break the UI)."""
     value = get_value(session, KEY_UI_ACCENT, DEFAULTS[KEY_UI_ACCENT])
     return value if value in ALLOWED_ACCENTS else DEFAULTS[KEY_UI_ACCENT]
+
+
+def self_service_requests_enabled(session: Session) -> bool:
+    """Whether a viewer may submit a credit request for an admin to decide."""
+    return bool(get_value(session, KEY_SELF_SERVICE_REQUESTS, DEFAULTS[KEY_SELF_SERVICE_REQUESTS]))
 
 
 def get_raw(session: Session, key: str) -> AppSetting | None:

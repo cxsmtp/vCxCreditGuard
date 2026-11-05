@@ -29,6 +29,29 @@ export interface Me {
   version: string;
   setup_required: boolean;
   ui_accent: string;
+  can_request_credits: boolean;
+}
+
+export type RequestStatus = "pending" | "approved" | "denied";
+
+export interface CreditRequest {
+  id: number;
+  entity_type: EntityType;
+  entity_id: string;
+  entity_label: string | null;
+  requested_limit: number;
+  reason: string | null;
+  status: RequestStatus;
+  requested_by_name: string | null;
+  requested_at: string;
+  decided_by_name: string | null;
+  decided_at: string | null;
+  decision_note: string | null;
+  approved_limit: number | null;
+  previous_limit: number | null;
+  expires_at: string | null;
+  reverted: boolean;
+  created_at: string;
 }
 
 export interface ConnectionPreview {
@@ -274,6 +297,7 @@ export interface AppSettings {
   allowed_usage_periods: string[];
   ui_accent: string;
   allowed_accents: string[];
+  self_service_requests: boolean;
   current_schedule_description: string;
 }
 

@@ -16,6 +16,7 @@ EXPECTED_TABLES = {
     "audit_log_entry",
     "credit_balance_snapshot",
     "credit_limit",
+    "credit_request",
     "cx_application",
     "cx_application_project",
     "cx_connection",

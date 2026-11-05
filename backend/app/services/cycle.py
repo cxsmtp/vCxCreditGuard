@@ -42,6 +42,7 @@ from app.services import (
     ingestion,
     notifications,
     org_sync,
+    requests_service,
     retention,
     settings_store,
 )
@@ -276,6 +277,20 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
     except Exception as exc:  # noqa: BLE001 - the pool read must not fail the cycle
         logger.info("Credit balance step skipped: %s", exc)
         result.steps["credits"] = {"ok": False, "error": str(exc)}
+
+    # Step 2c: roll back temporary credit grants whose expiry has passed, before
+    # evaluation so a re-tightened budget is judged against this cycle's usage. The
+    # client is passed so that removing an enforced grant also lifts any
+    # restriction it caused. Never fatal: a failure here must not stop enforcement.
+    try:
+        reverted = requests_service.revert_expired_grants(session, client=client)
+        result.steps["grant_expiry"] = {"ok": True, "reverted": reverted}
+    except Exception as exc:  # noqa: BLE001 - grant rollback must not fail the cycle
+        logger.exception("Expired grant rollback failed")
+        result.errors.append(f"grant_expiry: {exc}")
+        result.status = RunStatus.PARTIAL
+        result.steps["grant_expiry"] = {"ok": False, "error": str(exc)}
+        _warn(session, "grant_expiry", str(exc))
 
     # Step 3: evaluation and enforcement. Runs even when ingestion failed, using
     # the last good snapshot, but a failed ingestion means no new breach can be

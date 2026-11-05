@@ -456,6 +456,22 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
             options={current.allowed_accents ?? ["default"]}
             onPick={(accent) => set({ ui_accent: accent })}
           />
+          <Card
+            title="Self-service credit requests"
+            description="Let viewers submit requests to raise an entity's budget for you to approve or deny."
+          >
+            <Toggle
+              checked={value("self_service_requests") ?? false}
+              disabled={!isAdmin}
+              onChange={(next) => set({ self_service_requests: next })}
+              label="Allow viewers to request credits"
+              description={
+                (value("self_service_requests") ?? false)
+                  ? "Viewers see a Requests tab where they can ask for more budget. Admins always decide every request."
+                  : "Only admins can file credit requests. Turn this on to open it to viewers."
+              }
+            />
+          </Card>
           <AttributionCard
             isAdmin={isAdmin}
             subjects={unresolved.data ?? []}

@@ -63,6 +63,7 @@ def me(ctx: CurrentUser, db: DbSession) -> MeResponse:
         # Drives the redirect to Setup on first login.
         setup_required=connection is None,
         ui_accent=settings_store.ui_accent(db),
+        can_request_credits=(ctx.is_admin or settings_store.self_service_requests_enabled(db)),
     )
 
 

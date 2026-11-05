@@ -174,6 +174,13 @@ def update_limit(
             raise LimitError(f"{field} cannot be changed.")
         setattr(limit, field, value)
 
+    # Any change to the budget makes this a deliberate value, so it is no longer
+    # owned by the grant that may have set it. A credit request's approval
+    # re-stamps the limit itself after calling this, so the grant path is
+    # unaffected; every other caller (manual edit, bulk edit) drops the stamp.
+    if "credit_limit" in changes:
+        limit.granted_by_request_id = None
+
     _validate(
         session,
         LimitInput(

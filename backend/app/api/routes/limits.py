@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.checkmarx.client import CheckmarxClient
-from app.checkmarx.errors import CheckmarxError
 from app.db.base import utcnow
 from app.models.enums import EnforcementStatus, EntityType, LimitStatus
 from app.models.limits import CreditLimit, EnforcementAction, Exemption, LimitPeriodState
@@ -39,17 +38,8 @@ exemptions_router = APIRouter(prefix="/exemptions", tags=["limits"])
 
 
 def _optional_client(db: Session) -> CheckmarxClient | None:
-    """The Checkmarx client if one is configured, else None.
-
-    Limit administration must keep working when the tenant connection is down, so
-    a missing client degrades to "cannot lift restrictions right now" rather than
-    failing the request.
-    """
-    try:
-        return connection_service.get_client(db)
-    except CheckmarxError as exc:
-        logger.warning("No usable Checkmarx client for this request: %s", exc)
-        return None
+    """The Checkmarx client if one is configured, else None (shared helper)."""
+    return connection_service.optional_client(db)
 
 
 def _to_response(db: Session, limit: CreditLimit) -> LimitResponse:

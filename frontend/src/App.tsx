@@ -11,6 +11,7 @@ import { DashboardPage } from "./pages/DashboardPage";
 import { LimitsPage } from "./pages/LimitsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { NotificationsPage } from "./pages/NotificationsPage";
+import { RequestsPage } from "./pages/RequestsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { SetupPage } from "./pages/SetupPage";
 
@@ -115,6 +116,9 @@ export function App() {
         <Route path="/" element={<DashboardPage isAdmin={isAdmin} />} />
         <Route path="/setup" element={<SetupPage isAdmin={isAdmin} onConnected={loadMe} />} />
         <Route path="/limits" element={<LimitsPage isAdmin={isAdmin} />} />
+        {me.can_request_credits && (
+          <Route path="/requests" element={<RequestsPage isAdmin={isAdmin} />} />
+        )}
         <Route
           path="/notifications"
           element={<NotificationsPage isAdmin={isAdmin} onUnreadChange={setUnread} />}

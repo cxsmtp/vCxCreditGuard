@@ -75,6 +75,14 @@ class CreditLimit(Base, TimestampMixin):
         ForeignKey("utility_user.id", ondelete="SET NULL")
     )
 
+    # Set to the id of the credit request whose approval last set this limit's
+    # budget, and cleared the moment anyone changes the budget by any other path.
+    # A temporary grant is only rolled back when this still points at it, so an
+    # expiry can never undo a value an admin set deliberately, nor can two
+    # overlapping grants confuse each other's rollback. A plain id (not a FK) so a
+    # request row can be pruned without nulling it out from under this check.
+    granted_by_request_id: Mapped[int | None] = mapped_column(Integer)
+
     period_states: Mapped[list[LimitPeriodState]] = relationship(
         back_populates="limit", cascade="all, delete-orphan"
     )
@@ -214,3 +222,53 @@ class EnforcementAction(Base):
     __table_args__ = (
         Index("ix_enforcement_action_target_status", "target_type", "target_id", "status"),
     )
+
+
+class CreditRequest(Base):
+    """A request to raise (or create) an entity's credit budget.
+
+    Anyone with an account may file one when self-service is enabled; an admin
+    approves it (in full or part, and optionally only until ``expires_at``) or
+    denies it with a reason. Approval applies the budget to the entity's
+    ``CreditLimit`` and remembers ``previous_limit`` so a temporary grant can be
+    rolled back when it expires.
+    """
+
+    __tablename__ = "credit_request"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entity_type: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    entity_label: Mapped[str | None] = mapped_column(String(512))
+
+    requested_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(2048))
+
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+
+    requested_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("utility_user.id", ondelete="SET NULL")
+    )
+    requested_by_name: Mapped[str | None] = mapped_column(String(128))
+    requested_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+
+    decided_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("utility_user.id", ondelete="SET NULL")
+    )
+    decided_by_name: Mapped[str | None] = mapped_column(String(128))
+    decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    decision_note: Mapped[str | None] = mapped_column(String(2048))
+
+    # What was actually granted (may be less than requested), the limit that was
+    # in force beforehand (None if the grant created the limit), when a temporary
+    # grant lapses, and whether its rollback has run.
+    approved_limit: Mapped[int | None] = mapped_column(Integer)
+    previous_limit: Mapped[int | None] = mapped_column(Integer)
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    reverted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+
+    # ``status`` is already indexed via ``index=True`` on the column above, which
+    # produces ``ix_credit_request_status``; do not redeclare it here.
+    __table_args__ = (CheckConstraint("requested_limit >= 0", name="requested_limit_non_negative"),)
