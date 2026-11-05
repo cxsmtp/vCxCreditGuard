@@ -36,6 +36,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "smtp_from": settings_store.KEY_SMTP_FROM,
     "smtp_recipients": settings_store.KEY_SMTP_RECIPIENTS,
     "webhook_url": settings_store.KEY_WEBHOOK_URL,
+    "ui_accent": settings_store.KEY_UI_ACCENT,
 }
 
 _SECRET_FIELDS: dict[str, str] = {
@@ -72,6 +73,8 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         ),
         allowed_interval_minutes=list(settings_store.ALLOWED_INTERVAL_MINUTES),
         allowed_usage_periods=list(usage_api.SUPPORTED_PERIODS),
+        ui_accent=settings_store.ui_accent(db),
+        allowed_accents=list(settings_store.ALLOWED_ACCENTS),
         current_schedule_description=scheduler.describe_schedule(),
     )
 
@@ -115,6 +118,20 @@ def update_settings(
                     "message": (
                         f"{window!r} is not a lookback window Checkmarx accepts. "
                         f"Choose one of: {', '.join(usage_api.SUPPORTED_PERIODS)}."
+                    ),
+                },
+            )
+
+    if "ui_accent" in changes:
+        accent = str(changes["ui_accent"])
+        if accent not in settings_store.ALLOWED_ACCENTS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "invalid_accent",
+                    "message": (
+                        f"{accent!r} is not a known accent theme. "
+                        f"Choose one of: {', '.join(settings_store.ALLOWED_ACCENTS)}."
                     ),
                 },
             )
