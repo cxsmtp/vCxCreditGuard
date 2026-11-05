@@ -4,13 +4,27 @@ import type { Me } from "../api/types";
 import { useTheme, useToast } from "../lib/ui-context";
 import { Button } from "./ui";
 
-const NAV = [
-  { to: "/", label: "Dashboard", exact: true },
-  { to: "/limits", label: "Limits" },
-  { to: "/notifications", label: "Notifications" },
-  { to: "/audit", label: "Audit log" },
-  { to: "/settings", label: "Settings" },
-] as const;
+type NavItem = { to: string; label: string; exact?: boolean };
+
+function navItems(me: Me): NavItem[] {
+  const items: NavItem[] = [
+    { to: "/", label: "Dashboard", exact: true },
+    { to: "/limits", label: "Limits" },
+    { to: "/preview", label: "Simulation" },
+    { to: "/reports", label: "Reports" },
+  ];
+  // Only shown when this account may file or decide credit requests, which is
+  // every admin and a viewer only once self-service is switched on.
+  if (me.can_request_credits) {
+    items.push({ to: "/requests", label: "Requests" });
+  }
+  items.push(
+    { to: "/notifications", label: "Notifications" },
+    { to: "/audit", label: "Audit log" },
+    { to: "/settings", label: "Settings" },
+  );
+  return items;
+}
 
 function ThemeToggle() {
   const { theme, toggle } = useTheme();
@@ -75,6 +89,7 @@ export function AppShell({
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const location = useLocation();
+  const nav = navItems(me);
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -93,11 +108,11 @@ export function AppShell({
           </Link>
 
           <nav className="ml-4 hidden items-center gap-1 md:flex">
-            {NAV.map((item) => (
+            {nav.map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}
-                end={"exact" in item ? item.exact : false}
+                end={item.exact ?? false}
                 className="rounded-md px-3 py-1.5 text-sm font-medium"
                 style={({ isActive }) => ({
                   background: isActive ? "var(--hover)" : "transparent",
@@ -150,11 +165,11 @@ export function AppShell({
 
         {menuOpen && (
           <nav className="border-t border-hairline px-4 py-2 md:hidden">
-            {NAV.map((item) => (
+            {nav.map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}
-                end={"exact" in item ? item.exact : false}
+                end={item.exact ?? false}
                 onClick={() => setMenuOpen(false)}
                 className="block rounded-md px-3 py-2 text-sm"
                 style={({ isActive }) => ({
@@ -175,12 +190,28 @@ export function AppShell({
         )}
       </header>
 
+      {me.demo_mode && (
+        <div
+          className="border-b px-4 py-2 text-center text-xs font-medium sm:px-6"
+          style={{
+            background: "var(--status-warning)",
+            color: "#1a1205",
+            borderColor: "var(--status-serious)",
+          }}
+        >
+          Demo mode: showing synthetic data. Enforcement is suppressed, so nothing is changed in
+          Checkmarx.
+        </div>
+      )}
+
       {me.role === "viewer" && (
         <div
           className="border-b border-hairline px-4 py-2 text-center text-xs sm:px-6"
           style={{ background: "var(--hover)", color: "var(--text-secondary)" }}
         >
-          You are signed in as a viewer. Dashboards, notifications and the audit log are read only.
+          {me.can_request_credits
+            ? "You are signed in as a viewer. You can submit credit requests; limits and settings stay read only."
+            : "You are signed in as a viewer. Dashboards, notifications and the audit log are read only."}
         </div>
       )}
 

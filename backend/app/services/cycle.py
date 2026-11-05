@@ -42,10 +42,11 @@ from app.services import (
     ingestion,
     notifications,
     org_sync,
+    requests_service,
     retention,
     settings_store,
 )
-from app.services.audit import AuditActor
+from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +193,39 @@ def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> Cyc
 def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: bool) -> None:
     actor = AuditActor.system("scheduler")
 
+    # Demo mode: touch no live tenant - no sync, ingestion or enforcement. Still
+    # evaluate the seeded data with no client (so demo limits get period state and
+    # warnings without any Checkmarx write), and still deliver notifications and
+    # prune, so demo mode can run indefinitely without undelivered mail or
+    # unbounded run history.
+    if settings_store.demo_mode(session):
+        result.steps["demo"] = {"active": True}
+        try:
+            result.steps["evaluate"] = evaluation.evaluate_all(
+                session, client=None, actor=actor
+            ).as_stats()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Demo evaluation failed")
+            result.steps["evaluate"] = {"ok": False, "error": str(exc)}
+        try:
+            result.steps["deliver"] = delivery.deliver_pending(session).as_stats()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Notification delivery failed")
+            result.steps["deliver"] = {"ok": False, "error": str(exc)}
+        try:
+            if _retention_due(session):
+                result.steps["retention"] = retention.prune(
+                    session,
+                    retention_days=int(
+                        settings_store.get_value(session, settings_store.KEY_RETENTION_DAYS) or 365
+                    ),
+                    actor=actor,
+                ).as_stats()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Retention pruning failed")
+            result.steps["retention"] = {"ok": False, "error": str(exc)}
+        return
+
     try:
         client: CheckmarxClient | None = connection_service.get_client(session)
     except NotConfiguredError as exc:
@@ -277,6 +311,47 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
         logger.info("Credit balance step skipped: %s", exc)
         result.steps["credits"] = {"ok": False, "error": str(exc)}
 
+    # Step 2c: roll back temporary credit grants whose expiry has passed, before
+    # evaluation so a re-tightened budget is judged against this cycle's usage. The
+    # client is passed so that removing an enforced grant also lifts any
+    # restriction it caused. Never fatal: a failure here must not stop enforcement.
+    try:
+        reverted = requests_service.revert_expired_grants(session, client=client)
+        result.steps["grant_expiry"] = {"ok": True, "reverted": reverted}
+    except Exception as exc:  # noqa: BLE001 - grant rollback must not fail the cycle
+        logger.exception("Expired grant rollback failed")
+        result.errors.append(f"grant_expiry: {exc}")
+        result.status = RunStatus.PARTIAL
+        result.steps["grant_expiry"] = {"ok": False, "error": str(exc)}
+        _warn(session, "grant_expiry", str(exc))
+
+    # Step 2d: expire time-boxed overrides before evaluation, so an entity whose
+    # override has lapsed is enforced again this cycle. Never fatal.
+    try:
+        from app.services import limits_service
+
+        expired = limits_service.expire_overrides(session)
+        result.steps["override_expiry"] = {"ok": True, "expired": expired}
+    except Exception as exc:  # noqa: BLE001 - override expiry must not fail the cycle
+        logger.exception("Override expiry failed")
+        result.errors.append(f"override_expiry: {exc}")
+        result.status = RunStatus.PARTIAL
+        result.steps["override_expiry"] = {"ok": False, "error": str(exc)}
+        _warn(session, "override_expiry", str(exc))
+
+    # Step 2e: hands-off automation. Auto-approve pending credit requests within
+    # the configured cap before evaluation, so a granted budget is reflected in
+    # this cycle (lifting a restriction straight away via the client). Never fatal.
+    try:
+        auto = requests_service.auto_decide_pending(session, client=client, actor=actor)
+        result.steps["automation"] = auto
+    except Exception as exc:  # noqa: BLE001 - automation must not fail the cycle
+        logger.exception("Hands-off automation failed")
+        result.errors.append(f"automation: {exc}")
+        result.status = RunStatus.PARTIAL
+        result.steps["automation"] = {"ok": False, "error": str(exc)}
+        _warn(session, "automation", str(exc))
+
     # Step 3: evaluation and enforcement. Runs even when ingestion failed, using
     # the last good snapshot, but a failed ingestion means no new breach can be
     # discovered from data we did not receive.
@@ -319,6 +394,22 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
         logger.exception("Retention pruning failed")
         result.steps["retention"] = {"ok": False, "error": str(exc)}
 
+    # Step 6: weekly report email, when enabled and due. Never fatal: a mail
+    # failure is an operational issue, not a governance one, and is recorded.
+    try:
+        if settings_store.report_email_enabled(session) and _report_email_due(session):
+            sent = _send_weekly_report(session)
+            result.steps["report_email"] = (
+                {"ok": True, "sent": True}
+                if sent
+                else {"ok": True, "sent": False, "skipped": "smtp not configured"}
+            )
+        else:
+            result.steps["report_email"] = {"skipped": "disabled or not due"}
+    except Exception as exc:  # noqa: BLE001 - a mail failure must not fail the cycle
+        logger.exception("Weekly report email failed")
+        result.steps["report_email"] = {"ok": False, "error": str(exc)}
+
 
 def _org_sync_due(session: Session) -> bool:
     config = settings_store.schedule_config(session)
@@ -345,6 +436,56 @@ def _org_sync_due(session: Session) -> bool:
         .limit(1)
     )
     return last_sync is None or last_sync < cutoff
+
+
+def _report_email_due(session: Session) -> bool:
+    """At most once every ~7 days, judged by the last report email attempt.
+
+    Both a successful send and a skip (SMTP not configured) count, so a report
+    that is enabled but cannot be sent is attempted once a week, not every cycle.
+    """
+    from app.models.audit import AuditLogEntry
+
+    last = session.scalar(
+        select(AuditLogEntry.occurred_at)
+        .where(AuditLogEntry.action.in_(["report.emailed", "report.email_skipped"]))
+        .order_by(AuditLogEntry.occurred_at.desc())
+        .limit(1)
+    )
+    return last is None or last < utcnow() - timedelta(days=7)
+
+
+def _send_weekly_report(session: Session) -> bool:
+    """Send the weekly report. Returns True if it was emailed, False if skipped
+    because SMTP is not configured."""
+    from app.services import delivery, reporting_service
+
+    config = delivery.load_config(session)
+    if not config.email_enabled:
+        # Enabled in settings but SMTP not configured: record it so the admin sees
+        # why no report arrived, and do not retry until the next due window.
+        record_audit(
+            session,
+            action="report.email_skipped",
+            actor=AuditActor.system("reporter"),
+            target_type="report",
+            detail="Weekly report is enabled but SMTP is not configured.",
+        )
+        return False
+    report = reporting_service.build_report(session)
+    delivery.send_report_email(
+        config=config,
+        subject="Weekly credit governance report",
+        text_body=reporting_service.report_as_text(report),
+    )
+    record_audit(
+        session,
+        action="report.emailed",
+        actor=AuditActor.system("reporter"),
+        target_type="report",
+        detail=f"Weekly report emailed to {len(config.smtp_recipients)} recipient(s).",
+    )
+    return True
 
 
 def _retention_due(session: Session) -> bool:

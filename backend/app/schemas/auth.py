@@ -41,6 +41,24 @@ class ChangePasswordRequest(StrictModel):
     new_password: str = Field(min_length=12, max_length=128)
 
 
+class ForgotPasswordRequest(StrictModel):
+    # A username or an email address; not length-restricted to the username
+    # pattern because an email is also accepted.
+    identifier: str = Field(min_length=3, max_length=320)
+
+
+class ResetPasswordRequest(StrictModel):
+    token: str = Field(min_length=16, max_length=128)
+    new_password: str = Field(min_length=12, max_length=128)
+
+
+class AdminResetResponse(BaseModel):
+    """The one-time reset token handed to an admin to pass to the user."""
+
+    reset_token: str
+    expires_at: datetime
+
+
 class CreateUserRequest(StrictModel):
     username: str = Field(min_length=3, max_length=64, pattern=USERNAME_PATTERN)
     password: str = Field(min_length=12, max_length=128)

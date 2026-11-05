@@ -23,6 +23,9 @@ from app.api.routes import (
     limits,
     notifications,
     ops,
+    preview,
+    reports,
+    requests,
 )
 from app.api.routes import (
     settings as settings_routes,
@@ -102,6 +105,9 @@ def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) 
     api.include_router(connection.router)
     api.include_router(limits.router)
     api.include_router(limits.exemptions_router)
+    api.include_router(preview.router)
+    api.include_router(reports.router)
+    api.include_router(requests.router)
     api.include_router(notifications.router)
     api.include_router(ops.router)
     api.include_router(settings_routes.router)

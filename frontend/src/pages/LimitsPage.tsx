@@ -1,7 +1,8 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { ApiError, api, downloadCsv } from "../api/client";
 import type {
+  BlastRadius,
   BulkResult,
   CsvImportResult,
   EntityType,
@@ -10,7 +11,10 @@ import type {
   OrgEntity,
   PeriodType,
 } from "../api/types";
+import { BlastSummary } from "./PreviewPage";
 import { EntityPicker } from "../components/EntityPicker";
+import { ExportMenu } from "../components/ExportMenu";
+import type { ExportColumn } from "../lib/export";
 import {
   Badge,
   Button,
@@ -33,7 +37,7 @@ import {
   Toggle,
 } from "../components/ui";
 import { useResource } from "../hooks/useResource";
-import { entityLabel, formatCredits, formatPercent, periodLabel } from "../lib/format";
+import { entityLabel, formatCredits, formatDate, formatPercent, periodLabel } from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
 const ENTITY_TABS: { id: EntityType | "all"; label: string }[] = [
@@ -42,6 +46,26 @@ const ENTITY_TABS: { id: EntityType | "all"; label: string }[] = [
   { id: "group", label: "Groups" },
   { id: "project", label: "Projects" },
   { id: "application", label: "Applications" },
+];
+
+// Columns for the client-side export of the currently-visible limits.
+const LIMIT_EXPORT_COLUMNS: ExportColumn<Limit>[] = [
+  { key: "entity", header: "Entity", value: (l) => l.entity_label ?? l.entity_id },
+  { key: "type", header: "Level", value: (l) => l.entity_type },
+  { key: "limit", header: "Credit limit", value: (l) => l.credit_limit },
+  { key: "period", header: "Period", value: (l) => l.period_type },
+  { key: "warning", header: "Warning %", value: (l) => l.warning_threshold_pct },
+  { key: "enforce", header: "Enforce", value: (l) => (l.enforce ? "yes" : "no") },
+  { key: "active", header: "Active", value: (l) => (l.is_active ? "yes" : "no") },
+  { key: "exempt", header: "Exempt", value: (l) => (l.exempt ? "yes" : "no") },
+  {
+    key: "used",
+    header: "Used this period",
+    value: (l) => (l.current_period?.usage_available ? Number(l.current_period.credits_used) : ""),
+  },
+  { key: "status", header: "Status", value: (l) => l.current_period?.status ?? "" },
+  { key: "business_unit", header: "Business unit", value: (l) => l.business_unit ?? "" },
+  { key: "notes", header: "Notes", value: (l) => l.notes ?? "" },
 ];
 
 interface LimitForm {
@@ -56,6 +80,7 @@ interface LimitForm {
   custom_period_start: string;
   custom_period_end: string;
   notes: string;
+  business_unit: string;
 }
 
 const EMPTY_FORM: LimitForm = {
@@ -70,6 +95,7 @@ const EMPTY_FORM: LimitForm = {
   custom_period_start: "",
   custom_period_end: "",
   notes: "",
+  business_unit: "",
 };
 
 function statusBadge(limit: Limit) {
@@ -171,6 +197,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
   const [deleting, setDeleting] = useState<Limit | null>(null);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [overrideOpen, setOverrideOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const limits = useResource<Limit[]>((signal) => api.get("/api/limits", undefined, signal), []);
@@ -286,20 +313,31 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
         description="Budgets for users, groups, projects and applications. A new limit is monitor only until you turn enforcement on."
         actions={
           <>
+            <ExportMenu
+              rows={visible}
+              columns={LIMIT_EXPORT_COLUMNS}
+              filenameBase="cxcreditguard-limits"
+              title="CxCreditGuard limits"
+            />
             <Button
               size="sm"
+              variant="secondary"
               onClick={() =>
                 downloadCsv("/api/limits/export", "cxcreditguard-limits.csv").catch(() =>
                   toast.error("The export could not be downloaded."),
                 )
               }
+              title="Server CSV with current-period usage for every limit"
             >
-              Export CSV
+              Full CSV
             </Button>
             {isAdmin && (
               <>
                 <Button size="sm" onClick={() => setImportOpen(true)}>
                   Import CSV
+                </Button>
+                <Button size="sm" onClick={() => setOverrideOpen(true)}>
+                  Add override
                 </Button>
                 <Button size="sm" variant="primary" onClick={() => setCreating(true)}>
                   New limit
@@ -513,6 +551,11 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
                   <span className="font-medium">{row.entity_label ?? row.entity_id}</span>
                   <span style={{ color: "var(--text-muted)" }}>{entityLabel(row.entity_type)}</span>
                   {row.reason && <span style={{ color: "var(--text-secondary)" }}>{row.reason}</span>}
+                  {row.expires_at ? (
+                    <Badge tone="warning">Override until {formatDate(row.expires_at)}</Badge>
+                  ) : (
+                    <Badge tone="neutral">Permanent</Badge>
+                  )}
                   {isAdmin && (
                     <button
                       type="button"
@@ -538,6 +581,16 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
           onClose={() => setCreating(false)}
           onSaved={async () => {
             setCreating(false);
+            await reloadAll();
+          }}
+        />
+      )}
+
+      {overrideOpen && (
+        <OverrideDialog
+          onClose={() => setOverrideOpen(false)}
+          onSaved={async () => {
+            setOverrideOpen(false);
             await reloadAll();
           }}
         />
@@ -637,11 +690,63 @@ function LimitDialog({
           custom_period_start: limit.custom_period_start?.slice(0, 10) ?? "",
           custom_period_end: limit.custom_period_end?.slice(0, 10) ?? "",
           notes: limit.notes ?? "",
+          business_unit: limit.business_unit ?? "",
         }
       : EMPTY_FORM,
   );
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [blast, setBlast] = useState<BlastRadius | null>(null);
+  const [blastLoading, setBlastLoading] = useState(false);
+  const [blastError, setBlastError] = useState(false);
+  const [ackEnforce, setAckEnforce] = useState(false);
+
+  const targetType = entity?.entity_type ?? limit?.entity_type;
+  const targetId = entity?.entity_id ?? limit?.entity_id;
+  const wasEnforcing = editing && limit?.enforce === true;
+
+  // Fetch the blast radius whenever enforcement is on and we know the entity, so
+  // the admin sees exactly what enabling it would restrict before saving.
+  useEffect(() => {
+    if (!form.enforce || !targetType || !targetId) {
+      setBlast(null);
+      setBlastLoading(false);
+      setBlastError(false);
+      return;
+    }
+    const controller = new AbortController();
+    setBlastLoading(true);
+    setBlastError(false);
+    void (async () => {
+      try {
+        const result = await api.get<BlastRadius>(
+          "/api/preview/blast-radius",
+          { entity_type: targetType, entity_id: targetId },
+          controller.signal,
+        );
+        setBlast(result);
+      } catch {
+        if (!controller.signal.aborted) {
+          setBlast(null);
+          setBlastError(true);
+        }
+      } finally {
+        if (!controller.signal.aborted) setBlastLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [form.enforce, targetType, targetId]);
+
+  // A fresh acknowledgement is required when turning enforcement on (a new
+  // enforced limit, or editing one that was monitor only) and it would actually
+  // restrict something. We also fail closed when the blast radius could not be
+  // computed (the fetch errored) for a known entity: rather than silently skip
+  // the confirmation, require an explicit acknowledgement.
+  const haveTarget = Boolean(targetType && targetId);
+  const blastUnknown =
+    form.enforce && !wasEnforcing && haveTarget && !blastLoading && blastError;
+  const needsAck =
+    form.enforce && !wasEnforcing && ((blast?.total_actions ?? 0) > 0 || blastUnknown);
 
   function update<K extends keyof LimitForm>(key: K, value: LimitForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -660,6 +765,7 @@ function LimitDialog({
         hold_until_released: form.hold_until_released,
         count_existing_usage: form.count_existing_usage,
         notes: form.notes.trim() || null,
+        business_unit: form.business_unit.trim() || null,
       };
       if (form.period_type === "custom") {
         payload.custom_period_start = form.custom_period_start
@@ -718,7 +824,14 @@ function LimitDialog({
             variant="primary"
             onClick={save}
             loading={busy}
-            disabled={!form.credit_limit || (!editing && !entity)}
+            disabled={
+              !form.credit_limit ||
+              (!editing && !entity) ||
+              (needsAck && !ackEnforce) ||
+              // Don't let a new enforced limit be saved before its blast radius
+              // has loaded, so the confirmation can't be skipped by a fast save.
+              (form.enforce && !wasEnforcing && blastLoading)
+            }
           >
             {editing ? "Save changes" : "Create limit"}
           </Button>
@@ -844,6 +957,18 @@ function LimitDialog({
           )}
         </div>
 
+        <Field
+          label="Business unit"
+          hint="Optional. Groups this limit's consumption on the chargeback report."
+        >
+          <Input
+            value={form.business_unit}
+            onChange={(event) => update("business_unit", event.target.value)}
+            maxLength={128}
+            placeholder="e.g. Platform, Payments"
+          />
+        </Field>
+
         <Field label="Notes" hint="Optional. Shown in the limits table.">
           <Textarea
             rows={2}
@@ -854,11 +979,72 @@ function LimitDialog({
         </Field>
 
         {form.enforce && (
-          <InfoNote tone="warning">
-            Enforcement changes real access in Checkmarx One. For a user it removes the AI Triage and
-            Remediation roles; for a project, group or application it disables Auto Triage and PR
-            remediation on the affected projects.
-          </InfoNote>
+          <div
+            className="rounded-md border px-3 py-3"
+            style={{ borderColor: "var(--status-warning)", background: "var(--hover)" }}
+          >
+            <p className="text-sm font-medium">Enforcement blast radius</p>
+            {blastLoading ? (
+              <p className="mt-1 flex items-center gap-2 text-xs" style={{ color: "var(--text-secondary)" }}>
+                <Spinner size={12} /> Computing what this would restrict…
+              </p>
+            ) : blastUnknown ? (
+              <>
+                <p className="mt-1 text-xs" style={{ color: "var(--status-critical)" }}>
+                  The blast radius could not be computed right now. Enabling enforcement anyway means
+                  access can be restricted when the limit is reached, without a preview here.
+                </p>
+                <label className="mt-3 flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={ackEnforce}
+                    onChange={(event) => setAckEnforce(event.target.checked)}
+                  />
+                  <span>
+                    I understand I am enabling enforcement without seeing its blast radius. Every
+                    restriction stays reversible from the Notification Center.
+                  </span>
+                </label>
+              </>
+            ) : blast === null ? (
+              <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                Enforcement changes real access in Checkmarx One. Pick an entity to see exactly what
+                it would restrict.
+              </p>
+            ) : blast.total_actions === 0 ? (
+              <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                {blast.exempt
+                  ? "This entity is exempt, so nothing would be restricted."
+                  : "Nothing would be restricted right now (no linked projects or roles to change)."}
+              </p>
+            ) : (
+              <>
+                <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                  When this limit is reached, enforcement will restrict:
+                </p>
+                <p className="mt-1">
+                  <BlastSummary blast={blast} />
+                </p>
+                {needsAck && (
+                  <label className="mt-3 flex items-start gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={ackEnforce}
+                      onChange={(event) => setAckEnforce(event.target.checked)}
+                    />
+                    <span>
+                      I understand enabling enforcement can restrict{" "}
+                      {blast.affected_projects > 0 &&
+                        `${blast.affected_projects} ${blast.affected_projects === 1 ? "project" : "projects"}`}
+                      {blast.affected_users > 0 &&
+                        `${blast.affected_projects > 0 ? " and " : ""}${blast.affected_users} ${blast.affected_users === 1 ? "user" : "users"}`}
+                      . Every restriction stays reversible from the Notification Center.
+                    </span>
+                  </label>
+                )}
+              </>
+            )}
+          </div>
         )}
       </div>
     </Modal>
@@ -1080,6 +1266,115 @@ function ImportDialog({
               </p>
             )}
           </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------------------------------------------------------------- override */
+
+function OverrideDialog({
+  onClose,
+  onSaved,
+}: {
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const toast = useToast();
+  const [entityType, setEntityType] = useState<EntityType>("user");
+  const [entity, setEntity] = useState<OrgEntity | null>(null);
+  const [reason, setReason] = useState("");
+  const [temporary, setTemporary] = useState(true);
+  const [expiresAt, setExpiresAt] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function save() {
+    if (!entity) {
+      setError("Choose an entity first.");
+      return;
+    }
+    let expiresIso: string | null = null;
+    if (temporary) {
+      if (!expiresAt) {
+        setError("Set an expiry, or turn off the temporary override.");
+        return;
+      }
+      const parsed = new Date(expiresAt);
+      if (Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
+        setError("The expiry must be a date in the future.");
+        return;
+      }
+      expiresIso = parsed.toISOString();
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post("/api/exemptions", {
+        entity_type: entity.entity_type,
+        entity_id: entity.entity_id,
+        reason: reason.trim() || null,
+        expires_at: expiresIso,
+      });
+      toast.success(
+        temporary
+          ? "Temporary override added. It lifts any restriction now and expires automatically."
+          : "Permanent exemption added.",
+      );
+      await onSaved();
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "Could not add the override.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open
+      title="Add an override"
+      description="Exempt an entity from enforcement. A temporary override lifts any restriction now and is removed automatically when it expires."
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={save} loading={busy} disabled={!entity}>
+            Add override
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-5">
+        {error && <ErrorNote>{error}</ErrorNote>}
+        <EntityPicker
+          entityType={entityType}
+          onEntityTypeChange={setEntityType}
+          selected={entity}
+          onSelect={setEntity}
+          disabled={busy}
+        />
+        <Field label="Reason" hint="Recorded on the override and in the audit log.">
+          <Input value={reason} onChange={(event) => setReason(event.target.value)} maxLength={512} />
+        </Field>
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={temporary}
+            onChange={(event) => setTemporary(event.target.checked)}
+          />
+          Temporary override (auto-expires)
+        </label>
+        {temporary && (
+          <Field label="Expires at" required>
+            <Input
+              type="datetime-local"
+              value={expiresAt}
+              onChange={(event) => setExpiresAt(event.target.value)}
+            />
+          </Field>
         )}
       </div>
     </Modal>

@@ -613,11 +613,18 @@ def _apply_user_outcome(
 
 
 def latest_snapshot(session: Session, view: UsageView | str) -> UsageSnapshot | None:
+    from app.services import settings_store
+
+    query = select(UsageSnapshot).where(UsageSnapshot.view_by == str(view))
+    # Demo snapshots are only ever visible in demo mode. Outside it they are
+    # hidden from every reader (dashboard and evaluation alike), so seeded demo
+    # data can never be read as - or enforced as - live usage.
+    if not settings_store.demo_mode(session):
+        query = query.where(
+            UsageSnapshot.period_param.is_distinct_from(settings_store.DEMO_PERIOD_PARAM)
+        )
     return session.scalar(
-        select(UsageSnapshot)
-        .where(UsageSnapshot.view_by == str(view))
-        .order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc())
-        .limit(1)
+        query.order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc()).limit(1)
     )
 
 

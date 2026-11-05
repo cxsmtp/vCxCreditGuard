@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
@@ -11,13 +12,17 @@ from app.api.deps import AppSettings, CurrentUser, DbSession, client_ip, user_ag
 from app.core.passwords import PasswordPolicyError, verify_password
 from app.schemas.auth import (
     ChangePasswordRequest,
+    ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
+    ResetPasswordRequest,
     SessionInfo,
     TotpConfirmRequest,
     TotpEnrollResponse,
 )
 from app.services import auth as auth_service
+from app.services import delivery as delivery_service
+from app.services.delivery import DeliveryConfig
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -154,6 +159,132 @@ def change_password(
     # set_password revokes every session including this one, on purpose.
     db.commit()
     return MessageResponse(message="Password changed. Sign in again with the new password.")
+
+
+# The same response whether or not the account exists, so the endpoint never
+# reveals which usernames or emails are registered.
+_RESET_REQUESTED_MESSAGE = (
+    "If that account exists and has an email address on file, a reset link has been sent. "
+    "The link expires in one hour."
+)
+
+
+def _reset_email_body(token: str) -> str:
+    return (
+        "A password reset was requested for your CxCreditGuard account.\n\n"
+        "If this was you, open the sign-in page, choose 'Forgot password?', and enter "
+        "this one-time code to set a new password:\n\n"
+        f"    {token}\n\n"
+        "The code expires in one hour and can be used once. If you did not request this, "
+        "you can ignore this email; your password has not changed."
+    )
+
+
+def _dispatch_reset_email(config: DeliveryConfig, *, email: str, token: str) -> None:
+    """Send the reset email off the request thread.
+
+    Deliberately asynchronous: a synchronous SMTP call (up to the transport
+    timeout) in this unauthenticated endpoint would both block a worker and, by
+    making the response slower only when an account with an email exists, hand
+    the caller a timing oracle that undoes the deliberately generic response.
+    The worker never raises into the request and swallows every error so a mail
+    failure cannot signal whether the account exists.
+    """
+
+    def _run() -> None:
+        try:
+            delivery_service.send_direct_email(
+                config=config,
+                to=email,
+                subject="Password reset",
+                text_body=_reset_email_body(token),
+            )
+        except Exception:  # noqa: BLE001 - detached worker; nothing may surface
+            logger.warning("Password reset email could not be sent", exc_info=True)
+
+    threading.Thread(target=_run, name="password-reset-email", daemon=True).start()
+
+
+@router.post("/forgot-password", response_model=MessageResponse)
+def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    db: DbSession,
+    settings: AppSettings,
+) -> MessageResponse:
+    """Start a self-service reset. Always returns the same generic message.
+
+    Enumeration defence: the response body is constant, the email goes out on a
+    background thread (so an existing account with email is not slower), and the
+    only remaining per-request difference is a single indexed insert for an
+    account that exists, which is not a practical oracle for this single-node,
+    rate-limited deployment.
+    """
+    ip = client_ip(request)
+    # Normalise the throttle key exactly as the resolver does, so whitespace
+    # variants of one identifier cannot each get their own bucket and bypass it.
+    needle = payload.identifier.strip().lower()
+    try:
+        auth_service.throttle(db, bucket=f"reset:{needle}", ip_address=ip, settings=settings)
+    except auth_service.RateLimited as exc:
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "rate_limited", "message": str(exc)},
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+
+    result = auth_service.request_password_reset(db, identifier=payload.identifier, ip_address=ip)
+    config = delivery_service.load_config(db) if result and result[0].email else None
+    db.commit()
+    if result is not None and config is not None:
+        user, token = result
+        _dispatch_reset_email(config, email=user.email, token=token)  # type: ignore[arg-type]
+    return MessageResponse(message=_RESET_REQUESTED_MESSAGE)
+
+
+@router.post("/reset-password", response_model=MessageResponse)
+def reset_password(
+    payload: ResetPasswordRequest,
+    request: Request,
+    db: DbSession,
+    settings: AppSettings,
+) -> MessageResponse:
+    """Finish a reset by redeeming a token and setting a new password."""
+    ip = client_ip(request)
+    # Per-IP throttle: redemption tokens are high-entropy, but this closes off
+    # brute-force and weak-password retry spam as defence in depth.
+    try:
+        auth_service.throttle(db, bucket="reset-redeem", ip_address=ip, settings=settings)
+    except auth_service.RateLimited as exc:
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "rate_limited", "message": str(exc)},
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+    try:
+        auth_service.complete_password_reset(
+            db, token=payload.token, new_password=payload.new_password, ip_address=ip
+        )
+    except auth_service.InvalidResetToken as exc:
+        db.commit()  # persist the rejected-redemption audit row
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_token", "message": str(exc)},
+        ) from exc
+    except PasswordPolicyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "weak_password",
+                "message": "Password rejected.",
+                "problems": exc.problems,
+            },
+        ) from exc
+    db.commit()
+    return MessageResponse(message="Password set. Sign in with your new password.")
 
 
 @router.post("/totp/enroll", response_model=TotpEnrollResponse)

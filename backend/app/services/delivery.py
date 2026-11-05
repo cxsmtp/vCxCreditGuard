@@ -325,8 +325,15 @@ def send_email(
     if not config.email_enabled:
         raise DeliveryError("email is not configured")
 
-    factory = smtp_factory or _default_smtp_factory
     message = build_email(notification, config=config)
+    _transmit(message, config=config, smtp_factory=smtp_factory)
+
+
+def _transmit(
+    message: EmailMessage, *, config: DeliveryConfig, smtp_factory: SmtpFactory | None = None
+) -> None:
+    """Open an SMTP connection, send one already-built message, and close."""
+    factory = smtp_factory or _default_smtp_factory
     try:
         server = factory(config.smtp_host or "", config.smtp_port, SMTP_TIMEOUT_SECONDS)
     except (OSError, smtplib.SMTPException) as exc:
@@ -349,6 +356,52 @@ def send_email(
             server.quit()
         except (OSError, smtplib.SMTPException):
             logger.debug("SMTP connection did not close cleanly")
+
+
+def send_report_email(
+    *,
+    config: DeliveryConfig,
+    subject: str,
+    text_body: str,
+    smtp_factory: SmtpFactory | None = None,
+) -> None:
+    """Email a report to the configured recipients. Raises DeliveryError on any
+    configuration or transport problem, so callers can record the failure."""
+    if not config.email_enabled:
+        raise DeliveryError("email is not configured")
+    message = EmailMessage()
+    message["Subject"] = _header_safe(f"[CxCreditGuard] {subject}")
+    message["From"] = _header_safe(config.smtp_from or "", limit=320)
+    message["To"] = _header_safe(", ".join(config.smtp_recipients), limit=2048)
+    message["X-CxCreditGuard-Category"] = "report"
+    message.set_content(text_body)
+    _transmit(message, config=config, smtp_factory=smtp_factory)
+
+
+def send_direct_email(
+    *,
+    config: DeliveryConfig,
+    to: str,
+    subject: str,
+    text_body: str,
+    smtp_factory: SmtpFactory | None = None,
+) -> None:
+    """Send one message to a specific recipient over the configured SMTP transport.
+
+    Unlike report and notification mail, this does not go to the configured
+    recipient list; it targets ``to`` (e.g. the account a password reset is for).
+    It only needs the transport to be set up (host and from), not a recipient
+    list, so it raises on a missing transport rather than reusing ``email_enabled``.
+    """
+    if not (config.smtp_host and config.smtp_from):
+        raise DeliveryError("email transport is not configured")
+    message = EmailMessage()
+    message["Subject"] = _header_safe(f"[CxCreditGuard] {subject}")
+    message["From"] = _header_safe(config.smtp_from, limit=320)
+    message["To"] = _header_safe(to, limit=320)
+    message["X-CxCreditGuard-Category"] = "account"
+    message.set_content(text_body)
+    _transmit(message, config=config, smtp_factory=smtp_factory)
 
 
 def _default_smtp_factory(host: str, port: int, timeout: float) -> smtplib.SMTP:

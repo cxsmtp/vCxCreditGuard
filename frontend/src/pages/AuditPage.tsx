@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api } from "../api/client";
-import type { AuditEntry, AuditList } from "../api/types";
+import type { AuditChainResult, AuditEntry, AuditList } from "../api/types";
 import {
   Badge,
   Button,
@@ -67,7 +67,48 @@ function DiffView({ before, after }: { before: unknown; after: unknown }) {
   );
 }
 
-export function AuditPage() {
+function IntegrityCheck() {
+  const [result, setResult] = useState<AuditChainResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function verify() {
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    try {
+      setResult(await api.get<AuditChainResult>("/api/ops/audit/verify"));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Verification failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button size="sm" onClick={verify} disabled={loading}>
+        {loading ? "Verifying…" : "Verify integrity"}
+      </Button>
+      {error && <Badge tone="critical">Check failed</Badge>}
+      {result &&
+        (result.ok ? (
+          <Badge tone="good">Intact · {result.entries_checked} entries verified</Badge>
+        ) : (
+          <span className="flex items-center gap-2">
+            <Badge tone="critical">Tampered · entry {result.broken_at_id ?? "?"}</Badge>
+            {result.reason && (
+              <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+                {result.reason}
+              </span>
+            )}
+          </span>
+        ))}
+    </div>
+  );
+}
+
+export function AuditPage({ isAdmin }: { isAdmin: boolean }) {
   const [action, setAction] = useState("");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(0);
@@ -90,7 +131,8 @@ export function AuditPage() {
     <>
       <PageHeader
         title="Audit log"
-        description="Every action the utility took and every change an admin made, with the before and after state. Append only: nothing in the application can rewrite it."
+        description="Every action the utility took and every change an admin made, with the before and after state. Append only and hash-chained: each entry seals the one before it, so any edit or deletion is detectable."
+        actions={isAdmin ? <IntegrityCheck /> : undefined}
       />
 
       <Card padded={false}>
@@ -256,6 +298,16 @@ export function AuditPage() {
                 </dt>
                 <dd className="tabular">{detail.id}</dd>
               </div>
+              {detail.entry_hash && (
+                <div className="col-span-2">
+                  <dt className="text-xs" style={{ color: "var(--text-muted)" }}>
+                    Integrity hash
+                  </dt>
+                  <dd>
+                    <code className="text-xs break-all">{detail.entry_hash}</code>
+                  </dd>
+                </div>
+              )}
             </dl>
 
             {detail.detail && (

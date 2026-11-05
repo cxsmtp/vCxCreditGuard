@@ -29,6 +29,30 @@ export interface Me {
   version: string;
   setup_required: boolean;
   ui_accent: string;
+  can_request_credits: boolean;
+  demo_mode: boolean;
+}
+
+export type RequestStatus = "pending" | "approved" | "denied";
+
+export interface CreditRequest {
+  id: number;
+  entity_type: EntityType;
+  entity_id: string;
+  entity_label: string | null;
+  requested_limit: number;
+  reason: string | null;
+  status: RequestStatus;
+  requested_by_name: string | null;
+  requested_at: string;
+  decided_by_name: string | null;
+  decided_at: string | null;
+  decision_note: string | null;
+  approved_limit: number | null;
+  previous_limit: number | null;
+  expires_at: string | null;
+  reverted: boolean;
+  created_at: string;
 }
 
 export interface ConnectionPreview {
@@ -166,6 +190,7 @@ export interface Limit {
   count_existing_usage: boolean;
   exempt: boolean;
   notes: string | null;
+  business_unit: string | null;
   created_at: string;
   updated_at: string;
   current_period: LimitPeriodState | null;
@@ -178,7 +203,23 @@ export interface Exemption {
   entity_id: string;
   entity_label: string | null;
   reason: string | null;
+  expires_at: string | null;
   created_at: string;
+}
+
+export interface ChargebackRow {
+  business_unit: string;
+  limits: number;
+  credits_used: string;
+  estimated_cost: string | null;
+}
+
+export interface Chargeback {
+  generated_at: string;
+  unit_cost: number;
+  currency_known: boolean;
+  unassigned_limits: number;
+  rows: ChargebackRow[];
 }
 
 export interface OrgEntity {
@@ -243,12 +284,21 @@ export interface AuditEntry {
   after: Record<string, unknown> | null;
   detail: string | null;
   ip_address: string | null;
+  entry_hash: string | null;
 }
 
 export interface AuditList {
   items: AuditEntry[];
   total: number;
   actions: string[];
+}
+
+export interface AuditChainResult {
+  ok: boolean;
+  entries_checked: number;
+  tip: string | null;
+  broken_at_id: number | null;
+  reason: string | null;
 }
 
 export interface AppSettings {
@@ -274,6 +324,13 @@ export interface AppSettings {
   allowed_usage_periods: string[];
   ui_accent: string;
   allowed_accents: string[];
+  self_service_requests: boolean;
+  report_email_enabled: boolean;
+  credit_unit_cost: number;
+  demo_mode: boolean;
+  automation_enabled: boolean;
+  auto_approve_max_increase: number;
+  auto_approve_expiry_days: number;
   current_schedule_description: string;
 }
 
@@ -337,6 +394,138 @@ export interface UtilityAccount {
   last_login_at: string | null;
   locked_until: string | null;
   created_at: string;
+}
+
+export interface MessageResponse {
+  message: string;
+}
+
+export interface AdminResetResult {
+  reset_token: string;
+  expires_at: string;
+}
+
+export interface Attestation {
+  version: string;
+  migration_head: string | null;
+  config_digest: string;
+  generated_at: string;
+  update: { current: string; latest: string | null; update_available: boolean };
+}
+
+export interface WatchdogStatus {
+  state: "ok" | "stale" | "down" | "disabled";
+  enabled: boolean;
+  seconds_since_last_run: number | null;
+  last_run_at: string | null;
+  last_status: string | null;
+  tolerance_seconds: number;
+  detail: string;
+}
+
+export interface RestoreResult {
+  settings: number;
+  limits_created: number;
+  limits_updated: number;
+  exemptions: number;
+}
+
+export interface Projection {
+  limit_id: number;
+  entity_type: EntityType;
+  entity_id: string;
+  entity_label: string | null;
+  credit_limit: number;
+  enforce: boolean;
+  period_key: string;
+  credits_used: string;
+  burn_per_day: string;
+  projected_period_end: string;
+  percent_at_period_end: number | null;
+  days_to_exhaustion: number | null;
+  exhaustion_at: string | null;
+  will_breach: boolean;
+}
+
+export interface ReportImpact {
+  enforced_limits: number;
+  active_restrictions: number;
+  entities_restricted: number;
+  credits_over_budget: string;
+  warnings_active: number;
+  monitor_only_breaches: number;
+}
+
+export interface ReportSummary {
+  generated_at: string;
+  limits_total: number;
+  limits_enforcing: number;
+  breaching_soon: number;
+  impact: ReportImpact;
+  projections: Projection[];
+}
+
+export type DiagnosticStatus = "ok" | "warn" | "fail";
+
+export interface DiagnosticCheck {
+  key: string;
+  label: string;
+  status: DiagnosticStatus;
+  detail: string;
+  remediation: string | null;
+}
+
+export interface Diagnostics {
+  generated_at: string;
+  overall: DiagnosticStatus;
+  checks: DiagnosticCheck[];
+}
+
+export interface TargetPreview {
+  kind: string;
+  target_type: string;
+  target_id: string;
+  target_label: string | null;
+}
+
+export interface BlastRadius {
+  entity_type: EntityType;
+  entity_id: string;
+  entity_label: string | null;
+  exempt: boolean;
+  affected_users: number;
+  affected_projects: number;
+  remove_user_roles: number;
+  disable_auto_triage: number;
+  disable_pr_remediation: number;
+  total_actions: number;
+  targets: TargetPreview[];
+}
+
+export interface DryRunRow {
+  limit_id: number;
+  entity_type: EntityType;
+  entity_id: string;
+  entity_label: string | null;
+  credit_limit: number;
+  enforce: boolean;
+  exempt: boolean;
+  usage_available: boolean;
+  credits_used: string;
+  percent_used: number | null;
+  projected_status: LimitStatus;
+  would_enforce: boolean;
+  blast: BlastRadius | null;
+  note: string | null;
+}
+
+export interface DryRunResult {
+  generated_at: string;
+  would_enforce_count: number;
+  would_warn_count: number;
+  affected_projects: number;
+  affected_users: number;
+  rows: DryRunRow[];
 }
 
 export interface CsvImportResult {

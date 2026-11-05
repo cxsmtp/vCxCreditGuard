@@ -53,6 +53,40 @@ KEY_NOTIFY_MIN_SEVERITY = "notify.min_severity"
 KEY_UI_ACCENT = "ui.accent"
 ALLOWED_ACCENTS: tuple[str, ...] = ("default", "teal", "violet", "amber", "rose", "slate")
 
+# Credit requests: when on, a non-admin (viewer) may submit a request to raise an
+# entity's budget for an admin to approve. Off by default, so self-service is a
+# deliberate choice an admin makes rather than something viewers get silently.
+KEY_SELF_SERVICE_REQUESTS = "requests.self_service"
+
+# Scheduled report email: when on, a weekly summary report is emailed to the
+# configured notification recipients. Off by default; needs SMTP configured.
+KEY_REPORT_EMAIL_ENABLED = "reports.weekly_email"
+
+# Chargeback: the monetary cost of one credit, used only to put a figure next to
+# per-business-unit consumption. 0 means "cost unknown"; the report then shows
+# credits without a currency amount.
+KEY_CREDIT_UNIT_COST = "reports.credit_unit_cost"
+
+# Demo mode: when on, the UI is clearly marked as demo and real enforcement is
+# suppressed (no writes to Checkmarx), so the product can be trialled with the
+# seeded synthetic dataset without touching a live tenant.
+KEY_DEMO_MODE = "demo.enabled"
+
+# Hands-off automation: when enabled, the cycle auto-approves pending credit
+# requests whose increase over the current budget is within
+# ``auto_approve_max_increase`` credits. A cap of 0 auto-approves nothing even
+# when enabled (an explicit, safe default: the admin must set a cap). A non-zero
+# ``auto_approve_expiry_days`` makes each auto-grant temporary, so it self-reverts
+# via the existing grant-expiry step and the mode stays safe to leave on.
+KEY_AUTOMATION_ENABLED = "automation.enabled"
+KEY_AUTO_APPROVE_MAX_INCREASE = "automation.auto_approve_max_increase"
+KEY_AUTO_APPROVE_EXPIRY_DAYS = "automation.auto_approve_expiry_days"
+
+# Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
+# so it can never collide with a real Checkmarx lookback window, and so the read
+# path can hide demo snapshots whenever demo mode is off.
+DEMO_PERIOD_PARAM = "__demo__"
+
 SECRET_KEYS: dict[str, str] = {
     KEY_SMTP_PASSWORD: PURPOSE_SMTP_PASSWORD,
     KEY_WEBHOOK_SECRET: PURPOSE_WEBHOOK_SECRET,
@@ -73,6 +107,13 @@ DEFAULTS: dict[str, Any] = {
     KEY_SMTP_USE_TLS: True,
     KEY_NOTIFY_MIN_SEVERITY: "warning",
     KEY_UI_ACCENT: "default",
+    KEY_SELF_SERVICE_REQUESTS: False,
+    KEY_REPORT_EMAIL_ENABLED: False,
+    KEY_CREDIT_UNIT_COST: 0.0,
+    KEY_DEMO_MODE: False,
+    KEY_AUTOMATION_ENABLED: False,
+    KEY_AUTO_APPROVE_MAX_INCREASE: 0,
+    KEY_AUTO_APPROVE_EXPIRY_DAYS: 0,
 }
 
 
@@ -90,6 +131,65 @@ def ui_accent(session: Session) -> str:
     somehow invalid (so a stray stored value can never break the UI)."""
     value = get_value(session, KEY_UI_ACCENT, DEFAULTS[KEY_UI_ACCENT])
     return value if value in ALLOWED_ACCENTS else DEFAULTS[KEY_UI_ACCENT]
+
+
+def self_service_requests_enabled(session: Session) -> bool:
+    """Whether a viewer may submit a credit request for an admin to decide."""
+    return bool(get_value(session, KEY_SELF_SERVICE_REQUESTS, DEFAULTS[KEY_SELF_SERVICE_REQUESTS]))
+
+
+def report_email_enabled(session: Session) -> bool:
+    """Whether the weekly summary report is emailed to the notification recipients."""
+    return bool(get_value(session, KEY_REPORT_EMAIL_ENABLED, DEFAULTS[KEY_REPORT_EMAIL_ENABLED]))
+
+
+def demo_mode(session: Session) -> bool:
+    """Whether demo mode is on (synthetic data, enforcement suppressed)."""
+    return bool(get_value(session, KEY_DEMO_MODE, DEFAULTS[KEY_DEMO_MODE]))
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationPolicy:
+    """Hands-off automation settings, normalised to safe values."""
+
+    enabled: bool
+    auto_approve_max_increase: int
+    auto_approve_expiry_days: int
+
+    @property
+    def auto_approves(self) -> bool:
+        """Whether anything is actually auto-approved (enabled and a non-zero cap)."""
+        return self.enabled and self.auto_approve_max_increase > 0
+
+
+def _non_negative_int(value: Any, fallback: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if number >= 0 else fallback
+
+
+def automation_policy(session: Session) -> AutomationPolicy:
+    return AutomationPolicy(
+        enabled=bool(get_value(session, KEY_AUTOMATION_ENABLED, DEFAULTS[KEY_AUTOMATION_ENABLED])),
+        auto_approve_max_increase=_non_negative_int(
+            get_value(session, KEY_AUTO_APPROVE_MAX_INCREASE), 0
+        ),
+        auto_approve_expiry_days=_non_negative_int(
+            get_value(session, KEY_AUTO_APPROVE_EXPIRY_DAYS), 0
+        ),
+    )
+
+
+def credit_unit_cost(session: Session) -> float:
+    """Monetary cost of one credit for chargeback, or 0.0 when unset/invalid."""
+    value = get_value(session, KEY_CREDIT_UNIT_COST, DEFAULTS[KEY_CREDIT_UNIT_COST])
+    try:
+        cost = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return cost if cost >= 0 else 0.0
 
 
 def get_raw(session: Session, key: str) -> AppSetting | None:

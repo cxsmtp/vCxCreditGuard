@@ -37,6 +37,13 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "smtp_recipients": settings_store.KEY_SMTP_RECIPIENTS,
     "webhook_url": settings_store.KEY_WEBHOOK_URL,
     "ui_accent": settings_store.KEY_UI_ACCENT,
+    "self_service_requests": settings_store.KEY_SELF_SERVICE_REQUESTS,
+    "report_email_enabled": settings_store.KEY_REPORT_EMAIL_ENABLED,
+    "credit_unit_cost": settings_store.KEY_CREDIT_UNIT_COST,
+    "demo_mode": settings_store.KEY_DEMO_MODE,
+    "automation_enabled": settings_store.KEY_AUTOMATION_ENABLED,
+    "auto_approve_max_increase": settings_store.KEY_AUTO_APPROVE_MAX_INCREASE,
+    "auto_approve_expiry_days": settings_store.KEY_AUTO_APPROVE_EXPIRY_DAYS,
 }
 
 _SECRET_FIELDS: dict[str, str] = {
@@ -50,6 +57,7 @@ _REDACT_IN_AUDIT = frozenset(_SECRET_FIELDS)
 
 def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
     values = settings_store.all_public_settings(db)
+    policy = settings_store.automation_policy(db)
     return SettingsResponse(
         scheduler_enabled=bool(values.get(settings_store.KEY_SCHEDULER_ENABLED, True)),
         schedule_mode=str(values.get(settings_store.KEY_SCHEDULE_MODE) or "interval"),
@@ -75,6 +83,13 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         allowed_usage_periods=list(usage_api.SUPPORTED_PERIODS),
         ui_accent=settings_store.ui_accent(db),
         allowed_accents=list(settings_store.ALLOWED_ACCENTS),
+        self_service_requests=settings_store.self_service_requests_enabled(db),
+        report_email_enabled=settings_store.report_email_enabled(db),
+        credit_unit_cost=settings_store.credit_unit_cost(db),
+        demo_mode=settings_store.demo_mode(db),
+        automation_enabled=policy.enabled,
+        auto_approve_max_increase=policy.auto_approve_max_increase,
+        auto_approve_expiry_days=policy.auto_approve_expiry_days,
         current_schedule_description=scheduler.describe_schedule(),
     )
 

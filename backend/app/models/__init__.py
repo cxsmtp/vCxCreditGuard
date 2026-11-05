@@ -6,9 +6,15 @@ both discover tables through ``Base.metadata``.
 
 from app.db.base import Base
 from app.models.audit import AuditLogEntry, Notification
-from app.models.auth import LoginAttempt, UtilitySession, UtilityUser
+from app.models.auth import LoginAttempt, PasswordResetToken, UtilitySession, UtilityUser
 from app.models.connection import AppSetting, CxConnection
-from app.models.limits import CreditLimit, EnforcementAction, Exemption, LimitPeriodState
+from app.models.limits import (
+    CreditLimit,
+    CreditRequest,
+    EnforcementAction,
+    Exemption,
+    LimitPeriodState,
+)
 from app.models.org import (
     CxApplication,
     CxApplicationProject,
@@ -34,6 +40,7 @@ __all__ = [
     "Base",
     "CreditBalanceSnapshot",
     "CreditLimit",
+    "CreditRequest",
     "CxApplication",
     "CxApplicationProject",
     "CxConnection",
@@ -47,6 +54,7 @@ __all__ = [
     "Exemption",
     "LimitPeriodState",
     "LoginAttempt",
+    "PasswordResetToken",
     "Notification",
     "SchedulerLock",
     "SchedulerRun",

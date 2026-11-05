@@ -259,6 +259,20 @@ def get_client(session: Session) -> CheckmarxClient:
         return _cached_client
 
 
+def optional_client(session: Session) -> CheckmarxClient | None:
+    """The configured client, or None when the tenant connection is unusable.
+
+    Limit and request administration must keep working while the Checkmarx
+    connection is down, so a missing client degrades to "cannot lift restrictions
+    right now" rather than failing the request.
+    """
+    try:
+        return get_client(session)
+    except CheckmarxError as exc:
+        logger.warning("No usable Checkmarx client for this request: %s", exc)
+        return None
+
+
 # --------------------------------------------------------------------- testing
 
 

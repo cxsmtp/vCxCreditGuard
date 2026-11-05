@@ -114,6 +114,7 @@ class AuditEntryResponse(BaseModel):
     after: dict | None
     detail: str | None
     ip_address: str | None
+    entry_hash: str | None = None
 
 
 class AuditListResponse(BaseModel):
@@ -185,6 +186,18 @@ class SettingsResponse(BaseModel):
     # The organisation accent theme and the set an admin may choose from.
     ui_accent: str = "default"
     allowed_accents: list[str] = Field(default_factory=list)
+    # Whether viewers may submit credit requests for an admin to decide.
+    self_service_requests: bool = False
+    # Whether a weekly summary report is emailed to the notification recipients.
+    report_email_enabled: bool = False
+    # Monetary cost of one credit for chargeback (0 means cost unknown).
+    credit_unit_cost: float = 0.0
+    # Demo mode: synthetic data, enforcement suppressed, UI marked as demo.
+    demo_mode: bool = False
+    # Hands-off automation: auto-approve pending credit requests within a cap.
+    automation_enabled: bool = False
+    auto_approve_max_increase: int = 0
+    auto_approve_expiry_days: int = 0
     current_schedule_description: str
 
 
@@ -209,6 +222,13 @@ class SettingsUpdateRequest(StrictModel):
     webhook_url: str | None = Field(default=None, max_length=1024)
     webhook_secret: str | None = Field(default=None, max_length=512)
     ui_accent: str | None = Field(default=None, max_length=16)
+    self_service_requests: bool | None = None
+    report_email_enabled: bool | None = None
+    credit_unit_cost: float | None = Field(default=None, ge=0, le=1_000_000)
+    demo_mode: bool | None = None
+    automation_enabled: bool | None = None
+    auto_approve_max_increase: int | None = Field(default=None, ge=0, le=10_000_000)
+    auto_approve_expiry_days: int | None = Field(default=None, ge=0, le=3650)
 
     @field_validator("schedule_mode")
     @classmethod
@@ -267,4 +287,9 @@ class MeResponse(BaseModel):
     setup_required: bool
     # The organisation accent theme, so the SPA can apply it on load.
     ui_accent: str = "default"
+    # Whether this user may submit credit requests: always true for an admin,
+    # and for a viewer only when self-service is enabled.
+    can_request_credits: bool = False
+    # Demo mode, so the SPA can show the demo banner.
+    demo_mode: bool = False
     extra: dict[str, Any] = Field(default_factory=dict)

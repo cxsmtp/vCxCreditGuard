@@ -8,9 +8,16 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import AdminUser, DbSession
 from app.core.passwords import PasswordPolicyError
+from app.db.base import utcnow
 from app.models.auth import UtilityUser
 from app.models.enums import UtilityRole
-from app.schemas.auth import CreateUserRequest, MessageResponse, UpdateUserRequest, UserSummary
+from app.schemas.auth import (
+    AdminResetResponse,
+    CreateUserRequest,
+    MessageResponse,
+    UpdateUserRequest,
+    UserSummary,
+)
 from app.services import auth as auth_service
 from app.services.audit import record_audit
 
@@ -122,6 +129,28 @@ def update_account(
     )
     db.commit()
     return _to_summary(user)
+
+
+@router.post("/{user_id}/reset-password", response_model=AdminResetResponse)
+def admin_reset_password(user_id: int, ctx: AdminUser, db: DbSession) -> AdminResetResponse:
+    """Issue a one-time reset token for a user and return it to the admin.
+
+    For deployments without email, or when a user cannot receive the self-service
+    mail, an admin hands this code to the user out of band; the user redeems it on
+    the sign-in page. The token is shown once and only its digest is stored.
+    """
+    user = db.get(UtilityUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such account.")
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "inactive", "message": "Re-enable the account before resetting it."},
+        )
+    token = auth_service.admin_issue_reset_token(db, user=user, actor=ctx.actor)
+    expires_at = utcnow() + auth_service.PASSWORD_RESET_TTL
+    db.commit()
+    return AdminResetResponse(reset_token=token, expires_at=expires_at)
 
 
 @router.post("/{user_id}/unlock", response_model=MessageResponse)

@@ -63,6 +63,8 @@ def me(ctx: CurrentUser, db: DbSession) -> MeResponse:
         # Drives the redirect to Setup on first login.
         setup_required=connection is None,
         ui_accent=settings_store.ui_accent(db),
+        can_request_credits=(ctx.is_admin or settings_store.self_service_requests_enabled(db)),
+        demo_mode=settings_store.demo_mode(db),
     )
 
 
@@ -317,6 +319,7 @@ def list_audit(
                 after=row.after,
                 detail=row.detail,
                 ip_address=row.ip_address,
+                entry_hash=row.entry_hash,
             )
             for row in rows
         ],

@@ -11,6 +11,9 @@ import { DashboardPage } from "./pages/DashboardPage";
 import { LimitsPage } from "./pages/LimitsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { NotificationsPage } from "./pages/NotificationsPage";
+import { PreviewPage } from "./pages/PreviewPage";
+import { ReportsPage } from "./pages/ReportsPage";
+import { RequestsPage } from "./pages/RequestsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { SetupPage } from "./pages/SetupPage";
 
@@ -115,12 +118,20 @@ export function App() {
         <Route path="/" element={<DashboardPage isAdmin={isAdmin} />} />
         <Route path="/setup" element={<SetupPage isAdmin={isAdmin} onConnected={loadMe} />} />
         <Route path="/limits" element={<LimitsPage isAdmin={isAdmin} />} />
+        <Route path="/preview" element={<PreviewPage />} />
+        <Route path="/reports" element={<ReportsPage isAdmin={isAdmin} />} />
+        {me.can_request_credits && (
+          <Route path="/requests" element={<RequestsPage isAdmin={isAdmin} />} />
+        )}
         <Route
           path="/notifications"
           element={<NotificationsPage isAdmin={isAdmin} onUnreadChange={setUnread} />}
         />
-        <Route path="/audit" element={<AuditPage />} />
-        <Route path="/settings" element={<SettingsPage isAdmin={isAdmin} />} />
+        <Route path="/audit" element={<AuditPage isAdmin={isAdmin} />} />
+        <Route
+          path="/settings"
+          element={<SettingsPage isAdmin={isAdmin} onSettingsSaved={loadMe} />}
+        />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </AppShell>

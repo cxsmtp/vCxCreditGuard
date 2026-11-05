@@ -1,13 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { ApiError, api } from "../api/client";
 import type {
+  AdminResetResult,
   AppSettings,
+  Attestation,
   CycleRun,
   OrgEntity,
+  RestoreResult,
   SchedulerStatus,
   UnresolvedSubject,
   UtilityAccount,
+  WatchdogStatus,
 } from "../api/types";
 import {
   Badge,
@@ -30,10 +34,17 @@ import {
   Toggle,
 } from "../components/ui";
 import { useResource } from "../hooks/useResource";
+import { downloadText, timestampedName } from "../lib/export";
 import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 
-export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
+export function SettingsPage({
+  isAdmin,
+  onSettingsSaved,
+}: {
+  isAdmin: boolean;
+  onSettingsSaved?: () => Promise<unknown>;
+}) {
   const toast = useToast();
   const location = useLocation();
 
@@ -80,6 +91,9 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
       setDraft({});
       toast.success(`Settings saved. Schedule is now ${updated.current_schedule_description}.`);
       await status.reload();
+      // Refresh the bootstrap profile so shell-level state (the demo banner,
+      // the accent) reflects the save without a manual reload.
+      await onSettingsSaved?.();
     } catch (caught) {
       setError(caught instanceof ApiError ? caught.message : "Could not save the settings.");
     } finally {
@@ -456,12 +470,110 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
             options={current.allowed_accents ?? ["default"]}
             onPick={(accent) => set({ ui_accent: accent })}
           />
+          <Card
+            title="Self-service credit requests"
+            description="Let viewers submit requests to raise an entity's budget for you to approve or deny."
+          >
+            <Toggle
+              checked={value("self_service_requests") ?? false}
+              disabled={!isAdmin}
+              onChange={(next) => set({ self_service_requests: next })}
+              label="Allow viewers to request credits"
+              description={
+                (value("self_service_requests") ?? false)
+                  ? "Viewers see a Requests tab where they can ask for more budget. Admins always decide every request."
+                  : "Only admins can file credit requests. Turn this on to open it to viewers."
+              }
+            />
+          </Card>
+          <Card
+            title="Hands-off automation"
+            description="Let the governance cycle approve routine credit requests on its own, so small, safe raises do not wait for an admin."
+          >
+            <Toggle
+              checked={value("automation_enabled") ?? false}
+              disabled={!isAdmin}
+              onChange={(next) => set({ automation_enabled: next })}
+              label="Auto-approve credit requests within a cap"
+              description="When on, each cycle approves pending requests whose increase over the current budget is within the cap below. Requests above the cap always wait for an admin."
+            />
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <Field
+                label="Auto-approve cap (credits)"
+                hint="Largest increase over the current budget to approve automatically. 0 approves nothing, even when the switch is on."
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step="1"
+                  disabled={!isAdmin || !(value("automation_enabled") ?? false)}
+                  value={String(value("auto_approve_max_increase") ?? 0)}
+                  onChange={(event) =>
+                    set({ auto_approve_max_increase: Math.max(0, Math.floor(Number(event.target.value))) })
+                  }
+                />
+              </Field>
+              <Field
+                label="Auto-grant expiry (days)"
+                hint="0 makes auto-approvals permanent. A positive value makes each a temporary grant that self-reverts, so the mode is safe to leave on."
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step="1"
+                  disabled={!isAdmin || !(value("automation_enabled") ?? false)}
+                  value={String(value("auto_approve_expiry_days") ?? 0)}
+                  onChange={(event) =>
+                    set({ auto_approve_expiry_days: Math.max(0, Math.floor(Number(event.target.value))) })
+                  }
+                />
+              </Field>
+            </div>
+          </Card>
+          <Card
+            title="Scheduled report"
+            description="Email a weekly summary report to the notification recipients."
+          >
+            <Toggle
+              checked={value("report_email_enabled") ?? false}
+              disabled={!isAdmin}
+              onChange={(next) => set({ report_email_enabled: next })}
+              label="Email the weekly report"
+              description="Sends the Reports summary to the configured notification recipients once a week. Needs SMTP configured below. Admins can also send it on demand from the Reports page."
+            />
+            <div className="mt-4">
+              <Field
+                label="Credit unit cost (for chargeback)"
+                hint="Monetary cost of one credit. 0 shows chargeback in credits only, with no currency amount."
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step="0.0001"
+                  disabled={!isAdmin}
+                  value={String(value("credit_unit_cost") ?? 0)}
+                  onChange={(event) => set({ credit_unit_cost: Number(event.target.value) })}
+                />
+              </Field>
+            </div>
+          </Card>
+          {isAdmin && (
+            <DemoCard
+              enabled={value("demo_mode") ?? false}
+              onToggle={(next) => set({ demo_mode: next })}
+              onChanged={async () => {
+                await settings.reload();
+                await onSettingsSaved?.();
+              }}
+            />
+          )}
           <AttributionCard
             isAdmin={isAdmin}
             subjects={unresolved.data ?? []}
             loading={unresolved.initialLoading}
             onChanged={() => unresolved.reload()}
           />
+          {isAdmin && <OperationsCard />}
           {isAdmin && <AccountsCard />}
         </div>
       </div>
@@ -868,6 +980,158 @@ function AttributionCard({
 
 /* ---------------------------------------------------------------- accounts */
 
+const WATCHDOG_TONE: Record<WatchdogStatus["state"], "good" | "neutral" | "warning" | "critical"> = {
+  ok: "good",
+  disabled: "neutral",
+  stale: "warning",
+  down: "critical",
+};
+
+function OperationsCard() {
+  const toast = useToast();
+  const attestation = useResource<Attestation>(
+    (signal) => api.get("/api/ops/attestation", undefined, signal),
+    [],
+  );
+  const watchdog = useResource<WatchdogStatus>(
+    (signal) => api.get("/api/ops/watchdog", undefined, signal),
+    [],
+  );
+  const [busy, setBusy] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  async function downloadBackup() {
+    setBusy(true);
+    try {
+      const data = await api.get<Record<string, unknown>>("/api/ops/backup");
+      downloadText(
+        JSON.stringify(data, null, 2),
+        timestampedName("cxcreditguard-config", "json"),
+        "application/json",
+      );
+      toast.success("Backup downloaded.");
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not export the backup.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function emailBackup() {
+    setBusy(true);
+    try {
+      await api.post("/api/ops/backup/email");
+      toast.success("Backup emailed to the notification recipients.");
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not email the backup.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restore(file: File) {
+    setBusy(true);
+    try {
+      const parsed = JSON.parse(await file.text());
+      const result = await api.post<RestoreResult>("/api/ops/restore", parsed);
+      toast.success(
+        `Restored ${result.limits_created + result.limits_updated} limit(s), ` +
+          `${result.settings} setting(s), ${result.exemptions} override(s).`,
+      );
+      await Promise.all([attestation.reload(), watchdog.reload()]);
+    } catch (caught) {
+      if (caught instanceof SyntaxError) toast.error("That file is not valid JSON.");
+      else toast.error(caught instanceof ApiError ? caught.message : "Restore failed.");
+    } finally {
+      setBusy(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  }
+
+  const att = attestation.data;
+  const watch = watchdog.data;
+
+  return (
+    <Card
+      title="Operations"
+      description="Version and integrity, scheduler liveness, and configuration backup and restore."
+    >
+      <div className="flex flex-col gap-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Version &amp; integrity
+            </p>
+            {att ? (
+              <div className="mt-1 text-sm">
+                <div>
+                  v{att.version}
+                  {att.update.update_available && (
+                    <span className="ml-2">
+                      <Badge tone="warning">Update to {att.update.latest}</Badge>
+                    </span>
+                  )}
+                </div>
+                <code className="text-xs break-all" style={{ color: "var(--text-muted)" }}>
+                  {att.config_digest.slice(0, 16)}…
+                </code>
+              </div>
+            ) : (
+              <Spinner />
+            )}
+          </div>
+          <div>
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Scheduler watchdog
+            </p>
+            {watch ? (
+              <div className="mt-1 flex items-center gap-2">
+                <Badge tone={WATCHDOG_TONE[watch.state]}>{watch.state}</Badge>
+                <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  {watch.detail}
+                </span>
+              </div>
+            ) : (
+              <Spinner />
+            )}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-hairline pt-4">
+          <Button size="sm" onClick={downloadBackup} disabled={busy}>
+            Download backup
+          </Button>
+          <Button size="sm" variant="secondary" onClick={emailBackup} disabled={busy}>
+            Email backup
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => fileInput.current?.click()}
+            disabled={busy}
+          >
+            Restore from file…
+          </Button>
+          <input
+            ref={fileInput}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void restore(file);
+            }}
+          />
+        </div>
+        <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+          Backups hold settings, limits and overrides only. Secrets, passwords and the audit log
+          are never exported. Restoring overwrites matching configuration.
+        </p>
+      </div>
+    </Card>
+  );
+}
+
 function AccountsCard() {
   const toast = useToast();
   const accounts = useResource<UtilityAccount[]>(
@@ -876,6 +1140,9 @@ function AccountsCard() {
   );
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<UtilityAccount | null>(null);
+  const [resetFor, setResetFor] = useState<
+    (AdminResetResult & { username: string }) | null
+  >(null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<"admin" | "viewer">("viewer");
@@ -948,6 +1215,17 @@ function AccountsCard() {
     }
   }
 
+  async function issueReset(account: UtilityAccount) {
+    try {
+      const result = await api.post<AdminResetResult>(
+        `/api/accounts/${account.id}/reset-password`,
+      );
+      setResetFor({ username: account.username, ...result });
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not issue a reset code.");
+    }
+  }
+
   return (
     <Card
       title="Utility accounts"
@@ -1017,6 +1295,16 @@ function AccountsCard() {
                         onClick={() => unlock(account)}
                       >
                         Unlock
+                      </button>
+                    )}
+                    {account.is_active && (
+                      <button
+                        type="button"
+                        className="underline"
+                        style={{ color: "var(--text-secondary)" }}
+                        onClick={() => issueReset(account)}
+                      >
+                        Reset password
                       </button>
                     )}
                     <button
@@ -1095,6 +1383,114 @@ function AccountsCard() {
         onConfirm={remove}
         onCancel={() => setDeleting(null)}
       />
+
+      <Modal
+        open={resetFor !== null}
+        title="One-time reset code"
+        description={
+          resetFor
+            ? `Give this code to ${resetFor.username}. They redeem it on the sign-in page under "I have a reset code". It is shown once.`
+            : ""
+        }
+        onClose={() => setResetFor(null)}
+        footer={
+          <Button variant="primary" onClick={() => setResetFor(null)}>
+            Done
+          </Button>
+        }
+      >
+        {resetFor && (
+          <div className="flex flex-col gap-3">
+            <code
+              className="block rounded-md px-3 py-2 text-sm break-all"
+              style={{ background: "var(--hover)" }}
+            >
+              {resetFor.reset_token}
+            </code>
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Expires {formatDateTime(resetFor.expires_at)}. Issuing a new code invalidates this one.
+            </p>
+          </div>
+        )}
+      </Modal>
+    </Card>
+  );
+}
+
+/* -------------------------------------------------------------------- demo */
+
+function DemoCard({
+  enabled,
+  onToggle,
+  onChanged,
+}: {
+  enabled: boolean;
+  onToggle: (next: boolean) => void;
+  onChanged: () => Promise<unknown>;
+}) {
+  const toast = useToast();
+  const status = useResource<{ demo_mode: boolean; seeded: boolean }>(
+    (signal) => api.get("/api/ops/demo", undefined, signal),
+    [],
+  );
+  const [running, setRunning] = useState<"seed" | "clear" | null>(null);
+
+  async function run(path: "seed" | "clear") {
+    setRunning(path);
+    try {
+      await api.post(`/api/ops/demo/${path}`);
+      toast.success(
+        path === "seed"
+          ? "Demo data seeded and demo mode turned on."
+          : "Demo data cleared and demo mode turned off.",
+      );
+      await status.reload();
+      // Seeding/clearing flips demo mode server-side; refresh the toggle and the
+      // app banner so they match.
+      await onChanged();
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "The demo action failed.");
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  const busy = running !== null;
+
+  return (
+    <Card
+      title="Demo mode"
+      description="Explore CxCreditGuard with synthetic data. In demo mode the scheduler makes no change in Checkmarx, and demo data is never read as live."
+    >
+      <div className="flex flex-col gap-4">
+        <Toggle
+          checked={enabled}
+          onChange={onToggle}
+          label="Demo mode"
+          description={
+            enabled
+              ? "On. The app is marked as demo and automated cycles touch no live tenant. Save to apply."
+              : "Off. Live data and normal enforcement. Save after changing."
+          }
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" onClick={() => run("seed")} loading={running === "seed"} disabled={busy}>
+            Seed demo data
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => run("clear")}
+            loading={running === "clear"}
+            disabled={busy}
+          >
+            Clear demo data
+          </Button>
+          <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+            {status.data?.seeded ? "Demo data is present." : "No demo data seeded."}
+          </span>
+        </div>
+      </div>
     </Card>
   );
 }
