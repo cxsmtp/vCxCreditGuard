@@ -187,6 +187,8 @@ class SettingsResponse(BaseModel):
     allowed_accents: list[str] = Field(default_factory=list)
     # Whether viewers may submit credit requests for an admin to decide.
     self_service_requests: bool = False
+    # Whether a weekly summary report is emailed to the notification recipients.
+    report_email_enabled: bool = False
     current_schedule_description: str
 
 
@@ -212,6 +214,7 @@ class SettingsUpdateRequest(StrictModel):
     webhook_secret: str | None = Field(default=None, max_length=512)
     ui_accent: str | None = Field(default=None, max_length=16)
     self_service_requests: bool | None = None
+    report_email_enabled: bool | None = None
 
     @field_validator("schedule_mode")
     @classmethod

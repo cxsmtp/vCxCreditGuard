@@ -298,6 +298,7 @@ export interface AppSettings {
   ui_accent: string;
   allowed_accents: string[];
   self_service_requests: boolean;
+  report_email_enabled: boolean;
   current_schedule_description: string;
 }
 
@@ -361,6 +362,41 @@ export interface UtilityAccount {
   last_login_at: string | null;
   locked_until: string | null;
   created_at: string;
+}
+
+export interface Projection {
+  limit_id: number;
+  entity_type: EntityType;
+  entity_id: string;
+  entity_label: string | null;
+  credit_limit: number;
+  enforce: boolean;
+  period_key: string;
+  credits_used: string;
+  burn_per_day: string;
+  projected_period_end: string;
+  percent_at_period_end: number | null;
+  days_to_exhaustion: number | null;
+  exhaustion_at: string | null;
+  will_breach: boolean;
+}
+
+export interface ReportImpact {
+  enforced_limits: number;
+  active_restrictions: number;
+  entities_restricted: number;
+  credits_over_budget: string;
+  warnings_active: number;
+  monitor_only_breaches: number;
+}
+
+export interface ReportSummary {
+  generated_at: string;
+  limits_total: number;
+  limits_enforcing: number;
+  breaching_soon: number;
+  impact: ReportImpact;
+  projections: Projection[];
 }
 
 export type DiagnosticStatus = "ok" | "warn" | "fail";

@@ -46,7 +46,7 @@ from app.services import (
     retention,
     settings_store,
 )
-from app.services.audit import AuditActor
+from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +334,22 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
         logger.exception("Retention pruning failed")
         result.steps["retention"] = {"ok": False, "error": str(exc)}
 
+    # Step 6: weekly report email, when enabled and due. Never fatal: a mail
+    # failure is an operational issue, not a governance one, and is recorded.
+    try:
+        if settings_store.report_email_enabled(session) and _report_email_due(session):
+            sent = _send_weekly_report(session)
+            result.steps["report_email"] = (
+                {"ok": True, "sent": True}
+                if sent
+                else {"ok": True, "sent": False, "skipped": "smtp not configured"}
+            )
+        else:
+            result.steps["report_email"] = {"skipped": "disabled or not due"}
+    except Exception as exc:  # noqa: BLE001 - a mail failure must not fail the cycle
+        logger.exception("Weekly report email failed")
+        result.steps["report_email"] = {"ok": False, "error": str(exc)}
+
 
 def _org_sync_due(session: Session) -> bool:
     config = settings_store.schedule_config(session)
@@ -360,6 +376,56 @@ def _org_sync_due(session: Session) -> bool:
         .limit(1)
     )
     return last_sync is None or last_sync < cutoff
+
+
+def _report_email_due(session: Session) -> bool:
+    """At most once every ~7 days, judged by the last report email attempt.
+
+    Both a successful send and a skip (SMTP not configured) count, so a report
+    that is enabled but cannot be sent is attempted once a week, not every cycle.
+    """
+    from app.models.audit import AuditLogEntry
+
+    last = session.scalar(
+        select(AuditLogEntry.occurred_at)
+        .where(AuditLogEntry.action.in_(["report.emailed", "report.email_skipped"]))
+        .order_by(AuditLogEntry.occurred_at.desc())
+        .limit(1)
+    )
+    return last is None or last < utcnow() - timedelta(days=7)
+
+
+def _send_weekly_report(session: Session) -> bool:
+    """Send the weekly report. Returns True if it was emailed, False if skipped
+    because SMTP is not configured."""
+    from app.services import delivery, reporting_service
+
+    config = delivery.load_config(session)
+    if not config.email_enabled:
+        # Enabled in settings but SMTP not configured: record it so the admin sees
+        # why no report arrived, and do not retry until the next due window.
+        record_audit(
+            session,
+            action="report.email_skipped",
+            actor=AuditActor.system("reporter"),
+            target_type="report",
+            detail="Weekly report is enabled but SMTP is not configured.",
+        )
+        return False
+    report = reporting_service.build_report(session)
+    delivery.send_report_email(
+        config=config,
+        subject="Weekly credit governance report",
+        text_body=reporting_service.report_as_text(report),
+    )
+    record_audit(
+        session,
+        action="report.emailed",
+        actor=AuditActor.system("reporter"),
+        target_type="report",
+        detail=f"Weekly report emailed to {len(config.smtp_recipients)} recipient(s).",
+    )
+    return True
 
 
 def _retention_due(session: Session) -> bool:

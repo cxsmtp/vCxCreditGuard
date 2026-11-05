@@ -38,6 +38,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "webhook_url": settings_store.KEY_WEBHOOK_URL,
     "ui_accent": settings_store.KEY_UI_ACCENT,
     "self_service_requests": settings_store.KEY_SELF_SERVICE_REQUESTS,
+    "report_email_enabled": settings_store.KEY_REPORT_EMAIL_ENABLED,
 }
 
 _SECRET_FIELDS: dict[str, str] = {
@@ -77,6 +78,7 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         ui_accent=settings_store.ui_accent(db),
         allowed_accents=list(settings_store.ALLOWED_ACCENTS),
         self_service_requests=settings_store.self_service_requests_enabled(db),
+        report_email_enabled=settings_store.report_email_enabled(db),
         current_schedule_description=scheduler.describe_schedule(),
     )
 

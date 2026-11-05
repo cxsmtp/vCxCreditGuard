@@ -472,6 +472,18 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
               }
             />
           </Card>
+          <Card
+            title="Scheduled report"
+            description="Email a weekly summary report to the notification recipients."
+          >
+            <Toggle
+              checked={value("report_email_enabled") ?? false}
+              disabled={!isAdmin}
+              onChange={(next) => set({ report_email_enabled: next })}
+              label="Email the weekly report"
+              description="Sends the Reports summary to the configured notification recipients once a week. Needs SMTP configured below. Admins can also send it on demand from the Reports page."
+            />
+          </Card>
           <AttributionCard
             isAdmin={isAdmin}
             subjects={unresolved.data ?? []}

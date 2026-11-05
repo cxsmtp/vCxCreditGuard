@@ -58,6 +58,10 @@ ALLOWED_ACCENTS: tuple[str, ...] = ("default", "teal", "violet", "amber", "rose"
 # deliberate choice an admin makes rather than something viewers get silently.
 KEY_SELF_SERVICE_REQUESTS = "requests.self_service"
 
+# Scheduled report email: when on, a weekly summary report is emailed to the
+# configured notification recipients. Off by default; needs SMTP configured.
+KEY_REPORT_EMAIL_ENABLED = "reports.weekly_email"
+
 SECRET_KEYS: dict[str, str] = {
     KEY_SMTP_PASSWORD: PURPOSE_SMTP_PASSWORD,
     KEY_WEBHOOK_SECRET: PURPOSE_WEBHOOK_SECRET,
@@ -79,6 +83,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_NOTIFY_MIN_SEVERITY: "warning",
     KEY_UI_ACCENT: "default",
     KEY_SELF_SERVICE_REQUESTS: False,
+    KEY_REPORT_EMAIL_ENABLED: False,
 }
 
 
@@ -101,6 +106,11 @@ def ui_accent(session: Session) -> str:
 def self_service_requests_enabled(session: Session) -> bool:
     """Whether a viewer may submit a credit request for an admin to decide."""
     return bool(get_value(session, KEY_SELF_SERVICE_REQUESTS, DEFAULTS[KEY_SELF_SERVICE_REQUESTS]))
+
+
+def report_email_enabled(session: Session) -> bool:
+    """Whether the weekly summary report is emailed to the notification recipients."""
+    return bool(get_value(session, KEY_REPORT_EMAIL_ENABLED, DEFAULTS[KEY_REPORT_EMAIL_ENABLED]))
 
 
 def get_raw(session: Session, key: str) -> AppSetting | None:
