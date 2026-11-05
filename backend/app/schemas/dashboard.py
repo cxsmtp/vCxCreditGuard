@@ -57,6 +57,21 @@ class StatusTiles(BaseModel):
     schedule: str
 
 
+class CreditPoolInfo(BaseModel):
+    """Tenant AI credit pool vs. what the utility's budgets have claimed.
+
+    total/used/available are null when the pool has never been read - unknown,
+    not zero.
+    """
+
+    total: Decimal | None = None
+    used: Decimal | None = None
+    available: Decimal | None = None
+    collected_at: datetime | None = None
+    assigned: Decimal = Decimal("0")
+    over_allocation: Decimal | None = None
+
+
 class DashboardResponse(BaseModel):
     generated_at: datetime
     period_label: str
@@ -73,6 +88,7 @@ class DashboardResponse(BaseModel):
     top_applications: list[TopConsumerItem]
     tiles: StatusTiles
     unavailable_dimensions: list[str]
+    credit_pool: CreditPoolInfo | None = None
 
 
 class OrgEntity(BaseModel):

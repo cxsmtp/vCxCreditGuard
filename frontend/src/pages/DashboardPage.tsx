@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { ApiError, api } from "../api/client";
-import type { CycleRun, Dashboard, UnresolvedSubject } from "../api/types";
+import type { CreditPoolInfo, CycleRun, Dashboard, UnresolvedSubject } from "../api/types";
 import { BarList } from "../components/charts/BarList";
 import { BreakdownChart } from "../components/charts/BreakdownChart";
 import { TrendChart } from "../components/charts/TrendChart";
@@ -165,6 +165,8 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
         />
       </div>
 
+      <CreditPoolCard pool={data.credit_pool} />
+
       <div className="grid gap-6 lg:grid-cols-3">
         <Card
           title="Credits consumed over time"
@@ -216,6 +218,115 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
         {formatNumber(tiles.limits_configured)}, of which {formatNumber(tiles.limits_enforcing)}{" "}
         {tiles.limits_enforcing === 1 ? "enforces" : "enforce"}.
       </p>
+    </div>
+  );
+}
+
+function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
+  if (!pool) return null;
+
+  const known = pool.total !== null;
+  const total = known ? Number(pool.total) : 0;
+  const used = pool.used !== null ? Number(pool.used) : null;
+  const assigned = Number(pool.assigned);
+  const over = pool.over_allocation !== null;
+
+  // Bar segments as a share of the pool. Floor the scale at 1 so a genuine
+  // total of 0 (a real zero, not "unknown") can never produce 0/0 = NaN widths.
+  const scale = Math.max(known ? total : Math.max(assigned, used ?? 0), 1);
+  const pct = (value: number) => `${Math.min(100, Math.max(0, (value / scale) * 100))}%`;
+
+  const figure = (v: string | null) => (v === null ? "—" : formatCredits(v));
+
+  return (
+    <div className="mb-6">
+      <Card
+        title="Credit pool"
+        description="The tenant's AI credit balance against what your budgets have claimed."
+      >
+        <div className="mb-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
+          <PoolFigure label="Total granted" value={figure(pool.total)} />
+          <PoolFigure label="Used" value={figure(pool.used)} />
+          <PoolFigure label="Available" value={figure(pool.available)} />
+          <PoolFigure
+            label="Assigned to budgets"
+            value={formatCredits(pool.assigned)}
+            tone={over ? "critical" : "neutral"}
+          />
+        </div>
+
+        <div
+          className="relative h-3 w-full overflow-hidden rounded-full"
+          style={{ background: "var(--surface-raised)" }}
+          role="img"
+          aria-label={`Used ${figure(pool.used)}, assigned ${formatCredits(pool.assigned)}${
+            known ? `, of ${figure(pool.total)} total` : ""
+          }`}
+        >
+          {used !== null && (
+            <div
+              className="absolute inset-y-0 left-0"
+              style={{ width: pct(used), background: "var(--status-good)" }}
+            />
+          )}
+          {/* Assigned marker: where the sum of budgets sits on the pool. */}
+          <div
+            className="absolute inset-y-0"
+            style={{
+              left: pct(assigned),
+              width: "2px",
+              background: over ? "var(--status-critical)" : "var(--text-secondary)",
+            }}
+          />
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs" style={{ color: "var(--text-muted)" }}>
+          <span>
+            <span className="mr-1 inline-block h-2 w-2 rounded-full align-middle" style={{ background: "var(--status-good)" }} />
+            Used
+          </span>
+          <span>
+            <span className="mr-1 inline-block h-2 w-2 rounded-full align-middle" style={{ background: "var(--text-secondary)" }} />
+            Assigned to budgets
+          </span>
+          {pool.collected_at && <span>Balance read {formatRelative(pool.collected_at)}</span>}
+          {!known && <span>Tenant balance not read yet — showing budget allocation only.</span>}
+        </div>
+
+        {over && (
+          <div className="mt-3">
+            <InfoNote tone="warning">
+              Your budgets assign {formatCredits(pool.assigned)} credits, which is{" "}
+              {formatCredits(pool.over_allocation)} more than the {figure(pool.total)} the tenant
+              was granted. Reduce a budget or raise the tenant's credit pool.
+            </InfoNote>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function PoolFigure({
+  label,
+  value,
+  tone = "neutral",
+}: {
+  label: string;
+  value: string;
+  tone?: "neutral" | "critical";
+}) {
+  return (
+    <div>
+      <div className="text-xs" style={{ color: "var(--text-muted)" }}>
+        {label}
+      </div>
+      <div
+        className="text-lg font-semibold tabular"
+        style={{ color: tone === "critical" ? "var(--status-critical)" : "var(--text-primary)" }}
+      >
+        {value}
+      </div>
     </div>
   );
 }

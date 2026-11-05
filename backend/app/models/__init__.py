@@ -19,6 +19,7 @@ from app.models.org import (
     CxUser,
 )
 from app.models.usage import (
+    CreditBalanceSnapshot,
     DimensionState,
     SchedulerLock,
     SchedulerRun,
@@ -31,6 +32,7 @@ __all__ = [
     "AppSetting",
     "AuditLogEntry",
     "Base",
+    "CreditBalanceSnapshot",
     "CreditLimit",
     "CxApplication",
     "CxApplicationProject",

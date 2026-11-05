@@ -24,7 +24,7 @@ from app.models.audit import AuditLogEntry, Notification
 from app.models.auth import LoginAttempt
 from app.models.enums import EnforcementStatus
 from app.models.limits import EnforcementAction, LimitPeriodState
-from app.models.usage import SchedulerRun, UsageRecord, UsageSnapshot
+from app.models.usage import CreditBalanceSnapshot, SchedulerRun, UsageRecord, UsageSnapshot
 from app.services import auth as auth_service
 from app.services.audit import AuditActor, record_audit
 
@@ -45,6 +45,7 @@ class RetentionResult:
     notifications: int = 0
     audit_entries: int = 0
     scheduler_runs: int = 0
+    credit_balances: int = 0
     sessions: int = 0
     login_attempts: int = 0
     enforcement_actions: int = 0
@@ -57,6 +58,7 @@ class RetentionResult:
             + self.notifications
             + self.audit_entries
             + self.scheduler_runs
+            + self.credit_balances
             + self.sessions
             + self.login_attempts
             + self.enforcement_actions
@@ -69,6 +71,7 @@ class RetentionResult:
             "notifications": self.notifications,
             "audit_entries": self.audit_entries,
             "scheduler_runs": self.scheduler_runs,
+            "credit_balances": self.credit_balances,
             "sessions": self.sessions,
             "login_attempts": self.login_attempts,
             "enforcement_actions": self.enforcement_actions,
@@ -91,6 +94,7 @@ def prune(
     result.usage_snapshots, result.usage_records = _prune_snapshots(session, cutoff)
     result.notifications = _prune_notifications(session, cutoff)
     result.scheduler_runs = _delete_where(session, SchedulerRun, SchedulerRun.started_at < cutoff)
+    result.credit_balances = _prune_credit_balances(session, cutoff)
     result.enforcement_actions = _prune_enforcement(session, cutoff)
     result.sessions = auth_service.purge_expired_sessions(session)
     # Rate limit counters are only meaningful for a minute, but the rows never
@@ -117,6 +121,20 @@ def prune(
         )
     session.flush()
     return result
+
+
+def _prune_credit_balances(session: Session, cutoff) -> int:
+    """Drop credit balance snapshots older than the window, but always keep the
+    most recent one so the last known good pool balance survives any window."""
+    latest_id = session.scalar(
+        select(CreditBalanceSnapshot.id).order_by(
+            CreditBalanceSnapshot.collected_at.desc(), CreditBalanceSnapshot.id.desc()
+        )
+    )
+    condition = CreditBalanceSnapshot.collected_at < cutoff
+    if latest_id is not None:
+        condition = condition & (CreditBalanceSnapshot.id != latest_id)
+    return _delete_where(session, CreditBalanceSnapshot, condition)
 
 
 def _prune_snapshots(session: Session, cutoff) -> tuple[int, int]:

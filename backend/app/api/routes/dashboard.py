@@ -20,6 +20,7 @@ from app.schemas.dashboard import (
     ActionBreakdownItem,
     AuditEntryResponse,
     AuditListResponse,
+    CreditPoolInfo,
     DashboardResponse,
     MapSubjectRequest,
     MeResponse,
@@ -76,6 +77,17 @@ def _to_consumer(consumer) -> TopConsumerItem:  # type: ignore[no-untyped-def]
         credits_used_in_period=consumer.credits_used_in_period,
         status=consumer.status,
         resolved=consumer.resolved,
+    )
+
+
+def _pool_info(pool) -> CreditPoolInfo:  # type: ignore[no-untyped-def]
+    return CreditPoolInfo(
+        total=pool.total,
+        used=pool.used,
+        available=pool.available,
+        collected_at=pool.collected_at,
+        assigned=pool.assigned,
+        over_allocation=pool.over_allocation,
     )
 
 
@@ -168,6 +180,7 @@ def get_dashboard(
             schedule=scheduler.describe_schedule(),
         ),
         unavailable_dimensions=dashboard_service.unavailable_dimensions(db),
+        credit_pool=_pool_info(dashboard_service.credit_pool(db)),
     )
 
 

@@ -153,6 +153,25 @@ class UnresolvedSubject(Base):
     suggestions: Mapped[list | None] = mapped_column(JSONColumn)
 
 
+class CreditBalanceSnapshot(Base):
+    """The tenant's AI credit pool as Checkmarx reported it at one moment.
+
+    Written by the cycle from ``GET /api/credits/info``. Every figure is
+    nullable because an unknown balance must never be stored as zero; a cycle
+    that cannot read the pool simply writes no row, and the last good snapshot
+    keeps standing.
+    """
+
+    __tablename__ = "credit_balance_snapshot"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    collected_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, index=True)
+    total_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    used_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    available_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    raw: Mapped[dict | None] = mapped_column(JSONColumn)
+
+
 class DimensionState(Base):
     """Whether a ``viewBy`` dimension is actually available on this tenant.
 
