@@ -284,12 +284,21 @@ export interface AuditEntry {
   after: Record<string, unknown> | null;
   detail: string | null;
   ip_address: string | null;
+  entry_hash: string | null;
 }
 
 export interface AuditList {
   items: AuditEntry[];
   total: number;
   actions: string[];
+}
+
+export interface AuditChainResult {
+  ok: boolean;
+  entries_checked: number;
+  tip: string | null;
+  broken_at_id: number | null;
+  reason: string | null;
 }
 
 export interface AppSettings {

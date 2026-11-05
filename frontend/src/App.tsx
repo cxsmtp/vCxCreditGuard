@@ -127,7 +127,7 @@ export function App() {
           path="/notifications"
           element={<NotificationsPage isAdmin={isAdmin} onUnreadChange={setUnread} />}
         />
-        <Route path="/audit" element={<AuditPage />} />
+        <Route path="/audit" element={<AuditPage isAdmin={isAdmin} />} />
         <Route
           path="/settings"
           element={<SettingsPage isAdmin={isAdmin} onSettingsSaved={loadMe} />}

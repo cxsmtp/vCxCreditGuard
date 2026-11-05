@@ -12,12 +12,13 @@ from app.models.enums import EnforcementStatus, LimitStatus, RunStatus
 from app.models.limits import EnforcementAction, LimitPeriodState
 from app.models.usage import SchedulerRun, UnresolvedSubject
 from app.schemas.limits import (
+    AuditChainResponse,
     CycleRunResponse,
     DiagnosticCheckResponse,
     DiagnosticsResponse,
     SchedulerStatusResponse,
 )
-from app.services import demo_service, settings_store
+from app.services import audit_chain, demo_service, settings_store
 from app.services import diagnostics as diagnostics_service
 from app.services import notifications as notification_service
 from app.services.audit import record_audit
@@ -181,4 +182,21 @@ def diagnostics(ctx: CurrentUser, db: DbSession) -> DiagnosticsResponse:
             )
             for check in report.checks
         ],
+    )
+
+
+@router.get("/audit/verify", response_model=AuditChainResponse)
+def verify_audit_chain(ctx: AdminUser, db: DbSession) -> AuditChainResponse:
+    """Re-walk the audit hash chain and report whether it is intact.
+
+    Read-only, and deliberately not itself audited: verifying must not append to
+    the very chain it inspects. A broken result names the first offending entry.
+    """
+    result = audit_chain.verify_chain(db)
+    return AuditChainResponse(
+        ok=result.ok,
+        entries_checked=result.entries_checked,
+        tip=result.tip,
+        broken_at_id=result.broken_at_id,
+        reason=result.reason,
     )

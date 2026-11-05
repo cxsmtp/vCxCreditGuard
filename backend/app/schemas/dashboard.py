@@ -114,6 +114,7 @@ class AuditEntryResponse(BaseModel):
     after: dict | None
     detail: str | None
     ip_address: str | None
+    entry_hash: str | None = None
 
 
 class AuditListResponse(BaseModel):

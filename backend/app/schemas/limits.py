@@ -196,3 +196,13 @@ class DiagnosticsResponse(BaseModel):
     generated_at: datetime
     overall: str
     checks: list[DiagnosticCheckResponse]
+
+
+class AuditChainResponse(BaseModel):
+    """Result of re-walking the audit hash chain to prove it is intact."""
+
+    ok: bool
+    entries_checked: int
+    tip: str | None
+    broken_at_id: int | None = None
+    reason: str | None = None

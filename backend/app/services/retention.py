@@ -25,6 +25,7 @@ from app.models.auth import LoginAttempt
 from app.models.enums import EnforcementStatus
 from app.models.limits import EnforcementAction, LimitPeriodState
 from app.models.usage import CreditBalanceSnapshot, SchedulerRun, UsageRecord, UsageSnapshot
+from app.services import audit_chain
 from app.services import auth as auth_service
 from app.services.audit import AuditActor, record_audit
 
@@ -119,6 +120,11 @@ def prune(
                 f"{result.audit_entries} audit entries were included in the prune."
             ),
         )
+    # Pruning the oldest audit rows leaves the earliest survivor pointing at a
+    # hash no row carries any more. Record that boundary so the hash-chain
+    # verifier can tell a legitimate prune from a deletion.
+    if result.audit_entries:
+        audit_chain.record_prune_checkpoint(session)
     session.flush()
     return result
 
@@ -231,7 +237,18 @@ def _prune_login_attempts(session: Session) -> int:
 
 
 def _prune_audit(session: Session, cutoff) -> int:
-    return _delete_where(session, AuditLogEntry, AuditLogEntry.occurred_at < cutoff)
+    # Delete a contiguous prefix by id, not simply ``occurred_at < cutoff``. The
+    # hash chain and its single checkpoint assume the removed rows are the oldest
+    # ones in a continuous block; were a row's timestamp ever backdated so its id
+    # order and time order disagreed, a bare time filter could leave a gap and
+    # make the verifier flag a legitimate prune as tampering. Everything up to the
+    # newest row older than the cutoff goes, which keeps the chain a clean prefix.
+    boundary_id = session.scalar(
+        select(func.max(AuditLogEntry.id)).where(AuditLogEntry.occurred_at < cutoff)
+    )
+    if boundary_id is None:
+        return 0
+    return _delete_where(session, AuditLogEntry, AuditLogEntry.id <= boundary_id)
 
 
 def _delete_where(session: Session, model, condition) -> int:  # type: ignore[no-untyped-def]

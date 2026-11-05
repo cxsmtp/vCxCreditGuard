@@ -319,6 +319,7 @@ def list_audit(
                 after=row.after,
                 detail=row.detail,
                 ip_address=row.ip_address,
+                entry_hash=row.entry_hash,
             )
             for row in rows
         ],
