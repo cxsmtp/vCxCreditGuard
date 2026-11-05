@@ -426,4 +426,13 @@ class TestHealth:
         assert body["status"] == "ok"
         assert body["database"] is True
         assert body["checkmarx_connection_configured"] is False
-        assert set(body) == {"status", "version", "database", "checkmarx_connection_configured"}
+        # scheduler_alive is a terse watchdog flag (ops hardening); it must not leak
+        # any internal detail beyond the boolean.
+        assert body["scheduler_alive"] in (True, False)
+        assert set(body) == {
+            "status",
+            "version",
+            "database",
+            "checkmarx_connection_configured",
+            "scheduler_alive",
+        }
