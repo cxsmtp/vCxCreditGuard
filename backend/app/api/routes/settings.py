@@ -40,6 +40,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "self_service_requests": settings_store.KEY_SELF_SERVICE_REQUESTS,
     "report_email_enabled": settings_store.KEY_REPORT_EMAIL_ENABLED,
     "credit_unit_cost": settings_store.KEY_CREDIT_UNIT_COST,
+    "demo_mode": settings_store.KEY_DEMO_MODE,
 }
 
 _SECRET_FIELDS: dict[str, str] = {
@@ -81,6 +82,7 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         self_service_requests=settings_store.self_service_requests_enabled(db),
         report_email_enabled=settings_store.report_email_enabled(db),
         credit_unit_cost=settings_store.credit_unit_cost(db),
+        demo_mode=settings_store.demo_mode(db),
         current_schedule_description=scheduler.describe_schedule(),
     )
 

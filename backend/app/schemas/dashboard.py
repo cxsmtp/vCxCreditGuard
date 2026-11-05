@@ -191,6 +191,8 @@ class SettingsResponse(BaseModel):
     report_email_enabled: bool = False
     # Monetary cost of one credit for chargeback (0 means cost unknown).
     credit_unit_cost: float = 0.0
+    # Demo mode: synthetic data, enforcement suppressed, UI marked as demo.
+    demo_mode: bool = False
     current_schedule_description: str
 
 
@@ -218,6 +220,7 @@ class SettingsUpdateRequest(StrictModel):
     self_service_requests: bool | None = None
     report_email_enabled: bool | None = None
     credit_unit_cost: float | None = Field(default=None, ge=0, le=1_000_000)
+    demo_mode: bool | None = None
 
     @field_validator("schedule_mode")
     @classmethod
@@ -279,4 +282,6 @@ class MeResponse(BaseModel):
     # Whether this user may submit credit requests: always true for an admin,
     # and for a viewer only when self-service is enabled.
     can_request_credits: bool = False
+    # Demo mode, so the SPA can show the demo banner.
+    demo_mode: bool = False
     extra: dict[str, Any] = Field(default_factory=dict)

@@ -193,6 +193,39 @@ def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> Cyc
 def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: bool) -> None:
     actor = AuditActor.system("scheduler")
 
+    # Demo mode: touch no live tenant - no sync, ingestion or enforcement. Still
+    # evaluate the seeded data with no client (so demo limits get period state and
+    # warnings without any Checkmarx write), and still deliver notifications and
+    # prune, so demo mode can run indefinitely without undelivered mail or
+    # unbounded run history.
+    if settings_store.demo_mode(session):
+        result.steps["demo"] = {"active": True}
+        try:
+            result.steps["evaluate"] = evaluation.evaluate_all(
+                session, client=None, actor=actor
+            ).as_stats()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Demo evaluation failed")
+            result.steps["evaluate"] = {"ok": False, "error": str(exc)}
+        try:
+            result.steps["deliver"] = delivery.deliver_pending(session).as_stats()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Notification delivery failed")
+            result.steps["deliver"] = {"ok": False, "error": str(exc)}
+        try:
+            if _retention_due(session):
+                result.steps["retention"] = retention.prune(
+                    session,
+                    retention_days=int(
+                        settings_store.get_value(session, settings_store.KEY_RETENTION_DAYS) or 365
+                    ),
+                    actor=actor,
+                ).as_stats()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Retention pruning failed")
+            result.steps["retention"] = {"ok": False, "error": str(exc)}
+        return
+
     try:
         client: CheckmarxClient | None = connection_service.get_client(session)
     except NotConfiguredError as exc:

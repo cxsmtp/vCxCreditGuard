@@ -30,6 +30,7 @@ export interface Me {
   setup_required: boolean;
   ui_accent: string;
   can_request_credits: boolean;
+  demo_mode: boolean;
 }
 
 export type RequestStatus = "pending" | "approved" | "denied";
@@ -317,6 +318,7 @@ export interface AppSettings {
   self_service_requests: boolean;
   report_email_enabled: boolean;
   credit_unit_cost: number;
+  demo_mode: boolean;
   current_schedule_description: string;
 }
 

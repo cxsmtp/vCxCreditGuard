@@ -17,9 +17,9 @@ from app.schemas.limits import (
     DiagnosticsResponse,
     SchedulerStatusResponse,
 )
+from app.services import demo_service, settings_store
 from app.services import diagnostics as diagnostics_service
 from app.services import notifications as notification_service
-from app.services import settings_store
 from app.services.audit import record_audit
 from app.services.cycle import run_cycle
 
@@ -124,6 +124,48 @@ def scheduler_status(ctx: CurrentUser, db: DbSession) -> SchedulerStatusResponse
         unread_notifications=notification_service.unread_count(db),
         unresolved_subjects=unresolved,
     )
+
+
+@router.get("/demo")
+def demo_status(ctx: CurrentUser, db: DbSession) -> dict[str, bool]:
+    return {"demo_mode": settings_store.demo_mode(db), "seeded": demo_service.is_seeded(db)}
+
+
+@router.post("/demo/seed")
+def demo_seed(ctx: AdminUser, db: DbSession) -> dict[str, bool]:
+    """Populate the synthetic demo dataset and enter demo mode.
+
+    Entering demo mode is coupled to seeding on purpose: it stops the cycle from
+    reading the demo usage snapshots as if they were live and enforcing against
+    entities that do not exist in Checkmarx.
+    """
+    demo_service.seed(db)
+    settings_store.set_value(db, settings_store.KEY_DEMO_MODE, True)
+    record_audit(
+        db,
+        action="demo.seeded",
+        actor=ctx.actor,
+        target_type="demo",
+        detail="Synthetic demo data seeded; demo mode on.",
+    )
+    db.commit()
+    return {"demo_mode": True, "seeded": True}
+
+
+@router.post("/demo/clear")
+def demo_clear(ctx: AdminUser, db: DbSession) -> dict[str, bool]:
+    """Remove the synthetic demo dataset and leave demo mode (back to live)."""
+    demo_service.clear(db)
+    settings_store.set_value(db, settings_store.KEY_DEMO_MODE, False)
+    record_audit(
+        db,
+        action="demo.cleared",
+        actor=ctx.actor,
+        target_type="demo",
+        detail="Synthetic demo data cleared; demo mode off.",
+    )
+    db.commit()
+    return {"demo_mode": False, "seeded": False}
 
 
 @router.get("/diagnostics", response_model=DiagnosticsResponse)

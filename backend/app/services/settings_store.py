@@ -67,6 +67,16 @@ KEY_REPORT_EMAIL_ENABLED = "reports.weekly_email"
 # credits without a currency amount.
 KEY_CREDIT_UNIT_COST = "reports.credit_unit_cost"
 
+# Demo mode: when on, the UI is clearly marked as demo and real enforcement is
+# suppressed (no writes to Checkmarx), so the product can be trialled with the
+# seeded synthetic dataset without touching a live tenant.
+KEY_DEMO_MODE = "demo.enabled"
+
+# Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
+# so it can never collide with a real Checkmarx lookback window, and so the read
+# path can hide demo snapshots whenever demo mode is off.
+DEMO_PERIOD_PARAM = "__demo__"
+
 SECRET_KEYS: dict[str, str] = {
     KEY_SMTP_PASSWORD: PURPOSE_SMTP_PASSWORD,
     KEY_WEBHOOK_SECRET: PURPOSE_WEBHOOK_SECRET,
@@ -90,6 +100,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_SELF_SERVICE_REQUESTS: False,
     KEY_REPORT_EMAIL_ENABLED: False,
     KEY_CREDIT_UNIT_COST: 0.0,
+    KEY_DEMO_MODE: False,
 }
 
 
@@ -117,6 +128,11 @@ def self_service_requests_enabled(session: Session) -> bool:
 def report_email_enabled(session: Session) -> bool:
     """Whether the weekly summary report is emailed to the notification recipients."""
     return bool(get_value(session, KEY_REPORT_EMAIL_ENABLED, DEFAULTS[KEY_REPORT_EMAIL_ENABLED]))
+
+
+def demo_mode(session: Session) -> bool:
+    """Whether demo mode is on (synthetic data, enforcement suppressed)."""
+    return bool(get_value(session, KEY_DEMO_MODE, DEFAULTS[KEY_DEMO_MODE]))
 
 
 def credit_unit_cost(session: Session) -> float:

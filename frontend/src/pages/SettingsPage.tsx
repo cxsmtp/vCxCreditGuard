@@ -33,7 +33,13 @@ import { useResource } from "../hooks/useResource";
 import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 
-export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
+export function SettingsPage({
+  isAdmin,
+  onSettingsSaved,
+}: {
+  isAdmin: boolean;
+  onSettingsSaved?: () => Promise<unknown>;
+}) {
   const toast = useToast();
   const location = useLocation();
 
@@ -80,6 +86,9 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
       setDraft({});
       toast.success(`Settings saved. Schedule is now ${updated.current_schedule_description}.`);
       await status.reload();
+      // Refresh the bootstrap profile so shell-level state (the demo banner,
+      // the accent) reflects the save without a manual reload.
+      await onSettingsSaved?.();
     } catch (caught) {
       setError(caught instanceof ApiError ? caught.message : "Could not save the settings.");
     } finally {
@@ -499,6 +508,16 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
               </Field>
             </div>
           </Card>
+          {isAdmin && (
+            <DemoCard
+              enabled={value("demo_mode") ?? false}
+              onToggle={(next) => set({ demo_mode: next })}
+              onChanged={async () => {
+                await settings.reload();
+                await onSettingsSaved?.();
+              }}
+            />
+          )}
           <AttributionCard
             isAdmin={isAdmin}
             subjects={unresolved.data ?? []}
@@ -1138,6 +1157,84 @@ function AccountsCard() {
         onConfirm={remove}
         onCancel={() => setDeleting(null)}
       />
+    </Card>
+  );
+}
+
+/* -------------------------------------------------------------------- demo */
+
+function DemoCard({
+  enabled,
+  onToggle,
+  onChanged,
+}: {
+  enabled: boolean;
+  onToggle: (next: boolean) => void;
+  onChanged: () => Promise<unknown>;
+}) {
+  const toast = useToast();
+  const status = useResource<{ demo_mode: boolean; seeded: boolean }>(
+    (signal) => api.get("/api/ops/demo", undefined, signal),
+    [],
+  );
+  const [running, setRunning] = useState<"seed" | "clear" | null>(null);
+
+  async function run(path: "seed" | "clear") {
+    setRunning(path);
+    try {
+      await api.post(`/api/ops/demo/${path}`);
+      toast.success(
+        path === "seed"
+          ? "Demo data seeded and demo mode turned on."
+          : "Demo data cleared and demo mode turned off.",
+      );
+      await status.reload();
+      // Seeding/clearing flips demo mode server-side; refresh the toggle and the
+      // app banner so they match.
+      await onChanged();
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "The demo action failed.");
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  const busy = running !== null;
+
+  return (
+    <Card
+      title="Demo mode"
+      description="Explore CxCreditGuard with synthetic data. In demo mode the scheduler makes no change in Checkmarx, and demo data is never read as live."
+    >
+      <div className="flex flex-col gap-4">
+        <Toggle
+          checked={enabled}
+          onChange={onToggle}
+          label="Demo mode"
+          description={
+            enabled
+              ? "On. The app is marked as demo and automated cycles touch no live tenant. Save to apply."
+              : "Off. Live data and normal enforcement. Save after changing."
+          }
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" onClick={() => run("seed")} loading={running === "seed"} disabled={busy}>
+            Seed demo data
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => run("clear")}
+            loading={running === "clear"}
+            disabled={busy}
+          >
+            Clear demo data
+          </Button>
+          <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+            {status.data?.seeded ? "Demo data is present." : "No demo data seeded."}
+          </span>
+        </div>
+      </div>
     </Card>
   );
 }

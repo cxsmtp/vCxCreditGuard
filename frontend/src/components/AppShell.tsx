@@ -190,6 +190,20 @@ export function AppShell({
         )}
       </header>
 
+      {me.demo_mode && (
+        <div
+          className="border-b px-4 py-2 text-center text-xs font-medium sm:px-6"
+          style={{
+            background: "var(--status-warning)",
+            color: "#1a1205",
+            borderColor: "var(--status-serious)",
+          }}
+        >
+          Demo mode: showing synthetic data. Enforcement is suppressed, so nothing is changed in
+          Checkmarx.
+        </div>
+      )}
+
       {me.role === "viewer" && (
         <div
           className="border-b border-hairline px-4 py-2 text-center text-xs sm:px-6"

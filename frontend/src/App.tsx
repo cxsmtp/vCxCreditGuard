@@ -128,7 +128,10 @@ export function App() {
           element={<NotificationsPage isAdmin={isAdmin} onUnreadChange={setUnread} />}
         />
         <Route path="/audit" element={<AuditPage />} />
-        <Route path="/settings" element={<SettingsPage isAdmin={isAdmin} />} />
+        <Route
+          path="/settings"
+          element={<SettingsPage isAdmin={isAdmin} onSettingsSaved={loadMe} />}
+        />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </AppShell>
