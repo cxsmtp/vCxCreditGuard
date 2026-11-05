@@ -8,6 +8,8 @@ from fastapi import APIRouter, HTTPException, status
 
 from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.schemas.reports import (
+    ChargebackResponse,
+    ChargebackRowResponse,
     ImpactResponse,
     ProjectionResponse,
     ReportEmailResult,
@@ -76,6 +78,27 @@ def report_summary(ctx: CurrentUser, db: DbSession) -> ReportResponse:
 @router.get("/projection", response_model=list[ProjectionResponse])
 def projection(ctx: CurrentUser, db: DbSession) -> list[ProjectionResponse]:
     return [_projection_to_response(p) for p in reporting_service.forward_projection(db)]
+
+
+@router.get("/chargeback", response_model=ChargebackResponse)
+def chargeback(ctx: CurrentUser, db: DbSession) -> ChargebackResponse:
+    """Current-period consumption grouped by the business unit on each limit."""
+    result = reporting_service.chargeback(db)
+    return ChargebackResponse(
+        generated_at=result.generated_at,
+        unit_cost=result.unit_cost,
+        currency_known=result.currency_known,
+        unassigned_limits=result.unassigned_limits,
+        rows=[
+            ChargebackRowResponse(
+                business_unit=row.business_unit,
+                limits=row.limits,
+                credits_used=row.credits_used,
+                estimated_cost=row.estimated_cost,
+            )
+            for row in result.rows
+        ],
+    )
 
 
 @router.post("/email", response_model=ReportEmailResult)

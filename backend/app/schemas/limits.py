@@ -32,6 +32,7 @@ class LimitCreateRequest(StrictModel):
     custom_period_start: datetime | None = None
     custom_period_end: datetime | None = None
     notes: str | None = Field(default=None, max_length=1024)
+    business_unit: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def _check_custom_period(self) -> LimitCreateRequest:
@@ -58,6 +59,7 @@ class LimitUpdateRequest(StrictModel):
     custom_period_start: datetime | None = None
     custom_period_end: datetime | None = None
     notes: str | None = Field(default=None, max_length=1024)
+    business_unit: str | None = Field(default=None, max_length=128)
 
 
 class LimitPeriodStateResponse(BaseModel):
@@ -93,6 +95,7 @@ class LimitResponse(BaseModel):
     count_existing_usage: bool
     exempt: bool
     notes: str | None
+    business_unit: str | None = None
     created_at: datetime
     updated_at: datetime
     current_period: LimitPeriodStateResponse | None = None
@@ -103,6 +106,8 @@ class ExemptionCreateRequest(StrictModel):
     entity_type: EntityType
     entity_id: str = Field(min_length=1, max_length=64)
     reason: str | None = Field(default=None, max_length=512)
+    # When set, this is a time-boxed override that auto-expires.
+    expires_at: datetime | None = None
 
 
 class ExemptionResponse(BaseModel):
@@ -111,6 +116,7 @@ class ExemptionResponse(BaseModel):
     entity_id: str
     entity_label: str | None
     reason: str | None
+    expires_at: datetime | None = None
     created_at: datetime
 
 

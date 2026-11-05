@@ -37,7 +37,7 @@ import {
   Toggle,
 } from "../components/ui";
 import { useResource } from "../hooks/useResource";
-import { entityLabel, formatCredits, formatPercent, periodLabel } from "../lib/format";
+import { entityLabel, formatCredits, formatDate, formatPercent, periodLabel } from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
 const ENTITY_TABS: { id: EntityType | "all"; label: string }[] = [
@@ -64,6 +64,7 @@ const LIMIT_EXPORT_COLUMNS: ExportColumn<Limit>[] = [
     value: (l) => (l.current_period?.usage_available ? Number(l.current_period.credits_used) : ""),
   },
   { key: "status", header: "Status", value: (l) => l.current_period?.status ?? "" },
+  { key: "business_unit", header: "Business unit", value: (l) => l.business_unit ?? "" },
   { key: "notes", header: "Notes", value: (l) => l.notes ?? "" },
 ];
 
@@ -79,6 +80,7 @@ interface LimitForm {
   custom_period_start: string;
   custom_period_end: string;
   notes: string;
+  business_unit: string;
 }
 
 const EMPTY_FORM: LimitForm = {
@@ -93,6 +95,7 @@ const EMPTY_FORM: LimitForm = {
   custom_period_start: "",
   custom_period_end: "",
   notes: "",
+  business_unit: "",
 };
 
 function statusBadge(limit: Limit) {
@@ -194,6 +197,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
   const [deleting, setDeleting] = useState<Limit | null>(null);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [overrideOpen, setOverrideOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const limits = useResource<Limit[]>((signal) => api.get("/api/limits", undefined, signal), []);
@@ -331,6 +335,9 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
               <>
                 <Button size="sm" onClick={() => setImportOpen(true)}>
                   Import CSV
+                </Button>
+                <Button size="sm" onClick={() => setOverrideOpen(true)}>
+                  Add override
                 </Button>
                 <Button size="sm" variant="primary" onClick={() => setCreating(true)}>
                   New limit
@@ -544,6 +551,11 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
                   <span className="font-medium">{row.entity_label ?? row.entity_id}</span>
                   <span style={{ color: "var(--text-muted)" }}>{entityLabel(row.entity_type)}</span>
                   {row.reason && <span style={{ color: "var(--text-secondary)" }}>{row.reason}</span>}
+                  {row.expires_at ? (
+                    <Badge tone="warning">Override until {formatDate(row.expires_at)}</Badge>
+                  ) : (
+                    <Badge tone="neutral">Permanent</Badge>
+                  )}
                   {isAdmin && (
                     <button
                       type="button"
@@ -569,6 +581,16 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
           onClose={() => setCreating(false)}
           onSaved={async () => {
             setCreating(false);
+            await reloadAll();
+          }}
+        />
+      )}
+
+      {overrideOpen && (
+        <OverrideDialog
+          onClose={() => setOverrideOpen(false)}
+          onSaved={async () => {
+            setOverrideOpen(false);
             await reloadAll();
           }}
         />
@@ -668,6 +690,7 @@ function LimitDialog({
           custom_period_start: limit.custom_period_start?.slice(0, 10) ?? "",
           custom_period_end: limit.custom_period_end?.slice(0, 10) ?? "",
           notes: limit.notes ?? "",
+          business_unit: limit.business_unit ?? "",
         }
       : EMPTY_FORM,
   );
@@ -742,6 +765,7 @@ function LimitDialog({
         hold_until_released: form.hold_until_released,
         count_existing_usage: form.count_existing_usage,
         notes: form.notes.trim() || null,
+        business_unit: form.business_unit.trim() || null,
       };
       if (form.period_type === "custom") {
         payload.custom_period_start = form.custom_period_start
@@ -932,6 +956,18 @@ function LimitDialog({
             />
           )}
         </div>
+
+        <Field
+          label="Business unit"
+          hint="Optional. Groups this limit's consumption on the chargeback report."
+        >
+          <Input
+            value={form.business_unit}
+            onChange={(event) => update("business_unit", event.target.value)}
+            maxLength={128}
+            placeholder="e.g. Platform, Payments"
+          />
+        </Field>
 
         <Field label="Notes" hint="Optional. Shown in the limits table.">
           <Textarea
@@ -1230,6 +1266,115 @@ function ImportDialog({
               </p>
             )}
           </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------------------------------------------------------------- override */
+
+function OverrideDialog({
+  onClose,
+  onSaved,
+}: {
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const toast = useToast();
+  const [entityType, setEntityType] = useState<EntityType>("user");
+  const [entity, setEntity] = useState<OrgEntity | null>(null);
+  const [reason, setReason] = useState("");
+  const [temporary, setTemporary] = useState(true);
+  const [expiresAt, setExpiresAt] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function save() {
+    if (!entity) {
+      setError("Choose an entity first.");
+      return;
+    }
+    let expiresIso: string | null = null;
+    if (temporary) {
+      if (!expiresAt) {
+        setError("Set an expiry, or turn off the temporary override.");
+        return;
+      }
+      const parsed = new Date(expiresAt);
+      if (Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
+        setError("The expiry must be a date in the future.");
+        return;
+      }
+      expiresIso = parsed.toISOString();
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post("/api/exemptions", {
+        entity_type: entity.entity_type,
+        entity_id: entity.entity_id,
+        reason: reason.trim() || null,
+        expires_at: expiresIso,
+      });
+      toast.success(
+        temporary
+          ? "Temporary override added. It lifts any restriction now and expires automatically."
+          : "Permanent exemption added.",
+      );
+      await onSaved();
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "Could not add the override.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open
+      title="Add an override"
+      description="Exempt an entity from enforcement. A temporary override lifts any restriction now and is removed automatically when it expires."
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={save} loading={busy} disabled={!entity}>
+            Add override
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-5">
+        {error && <ErrorNote>{error}</ErrorNote>}
+        <EntityPicker
+          entityType={entityType}
+          onEntityTypeChange={setEntityType}
+          selected={entity}
+          onSelect={setEntity}
+          disabled={busy}
+        />
+        <Field label="Reason" hint="Recorded on the override and in the audit log.">
+          <Input value={reason} onChange={(event) => setReason(event.target.value)} maxLength={512} />
+        </Field>
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={temporary}
+            onChange={(event) => setTemporary(event.target.checked)}
+          />
+          Temporary override (auto-expires)
+        </label>
+        {temporary && (
+          <Field label="Expires at" required>
+            <Input
+              type="datetime-local"
+              value={expiresAt}
+              onChange={(event) => setExpiresAt(event.target.value)}
+            />
+          </Field>
         )}
       </div>
     </Modal>

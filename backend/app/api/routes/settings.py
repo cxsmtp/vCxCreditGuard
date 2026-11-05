@@ -39,6 +39,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "ui_accent": settings_store.KEY_UI_ACCENT,
     "self_service_requests": settings_store.KEY_SELF_SERVICE_REQUESTS,
     "report_email_enabled": settings_store.KEY_REPORT_EMAIL_ENABLED,
+    "credit_unit_cost": settings_store.KEY_CREDIT_UNIT_COST,
 }
 
 _SECRET_FIELDS: dict[str, str] = {
@@ -79,6 +80,7 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         allowed_accents=list(settings_store.ALLOWED_ACCENTS),
         self_service_requests=settings_store.self_service_requests_enabled(db),
         report_email_enabled=settings_store.report_email_enabled(db),
+        credit_unit_cost=settings_store.credit_unit_cost(db),
         current_schedule_description=scheduler.describe_schedule(),
     )
 

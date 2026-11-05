@@ -49,3 +49,18 @@ class ReportEmailResult(BaseModel):
     sent: bool
     recipients: int
     message: str
+
+
+class ChargebackRowResponse(BaseModel):
+    business_unit: str
+    limits: int
+    credits_used: Decimal
+    estimated_cost: Decimal | None
+
+
+class ChargebackResponse(BaseModel):
+    generated_at: datetime
+    unit_cost: float
+    currency_known: bool
+    unassigned_limits: int
+    rows: list[ChargebackRowResponse]

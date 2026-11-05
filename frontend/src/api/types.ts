@@ -189,6 +189,7 @@ export interface Limit {
   count_existing_usage: boolean;
   exempt: boolean;
   notes: string | null;
+  business_unit: string | null;
   created_at: string;
   updated_at: string;
   current_period: LimitPeriodState | null;
@@ -201,7 +202,23 @@ export interface Exemption {
   entity_id: string;
   entity_label: string | null;
   reason: string | null;
+  expires_at: string | null;
   created_at: string;
+}
+
+export interface ChargebackRow {
+  business_unit: string;
+  limits: number;
+  credits_used: string;
+  estimated_cost: string | null;
+}
+
+export interface Chargeback {
+  generated_at: string;
+  unit_cost: number;
+  currency_known: boolean;
+  unassigned_limits: number;
+  rows: ChargebackRow[];
 }
 
 export interface OrgEntity {
@@ -299,6 +316,7 @@ export interface AppSettings {
   allowed_accents: string[];
   self_service_requests: boolean;
   report_email_enabled: boolean;
+  credit_unit_cost: number;
   current_schedule_description: string;
 }
 

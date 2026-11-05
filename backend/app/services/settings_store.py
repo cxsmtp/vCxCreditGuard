@@ -62,6 +62,11 @@ KEY_SELF_SERVICE_REQUESTS = "requests.self_service"
 # configured notification recipients. Off by default; needs SMTP configured.
 KEY_REPORT_EMAIL_ENABLED = "reports.weekly_email"
 
+# Chargeback: the monetary cost of one credit, used only to put a figure next to
+# per-business-unit consumption. 0 means "cost unknown"; the report then shows
+# credits without a currency amount.
+KEY_CREDIT_UNIT_COST = "reports.credit_unit_cost"
+
 SECRET_KEYS: dict[str, str] = {
     KEY_SMTP_PASSWORD: PURPOSE_SMTP_PASSWORD,
     KEY_WEBHOOK_SECRET: PURPOSE_WEBHOOK_SECRET,
@@ -84,6 +89,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_UI_ACCENT: "default",
     KEY_SELF_SERVICE_REQUESTS: False,
     KEY_REPORT_EMAIL_ENABLED: False,
+    KEY_CREDIT_UNIT_COST: 0.0,
 }
 
 
@@ -111,6 +117,16 @@ def self_service_requests_enabled(session: Session) -> bool:
 def report_email_enabled(session: Session) -> bool:
     """Whether the weekly summary report is emailed to the notification recipients."""
     return bool(get_value(session, KEY_REPORT_EMAIL_ENABLED, DEFAULTS[KEY_REPORT_EMAIL_ENABLED]))
+
+
+def credit_unit_cost(session: Session) -> float:
+    """Monetary cost of one credit for chargeback, or 0.0 when unset/invalid."""
+    value = get_value(session, KEY_CREDIT_UNIT_COST, DEFAULTS[KEY_CREDIT_UNIT_COST])
+    try:
+        cost = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return cost if cost >= 0 else 0.0
 
 
 def get_raw(session: Session, key: str) -> AppSetting | None:

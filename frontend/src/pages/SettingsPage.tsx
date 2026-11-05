@@ -483,6 +483,21 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
               label="Email the weekly report"
               description="Sends the Reports summary to the configured notification recipients once a week. Needs SMTP configured below. Admins can also send it on demand from the Reports page."
             />
+            <div className="mt-4">
+              <Field
+                label="Credit unit cost (for chargeback)"
+                hint="Monetary cost of one credit. 0 shows chargeback in credits only, with no currency amount."
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step="0.0001"
+                  disabled={!isAdmin}
+                  value={String(value("credit_unit_cost") ?? 0)}
+                  onChange={(event) => set({ credit_unit_cost: Number(event.target.value) })}
+                />
+              </Field>
+            </div>
           </Card>
           <AttributionCard
             isAdmin={isAdmin}

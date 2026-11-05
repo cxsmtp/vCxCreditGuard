@@ -292,6 +292,20 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
         result.steps["grant_expiry"] = {"ok": False, "error": str(exc)}
         _warn(session, "grant_expiry", str(exc))
 
+    # Step 2d: expire time-boxed overrides before evaluation, so an entity whose
+    # override has lapsed is enforced again this cycle. Never fatal.
+    try:
+        from app.services import limits_service
+
+        expired = limits_service.expire_overrides(session)
+        result.steps["override_expiry"] = {"ok": True, "expired": expired}
+    except Exception as exc:  # noqa: BLE001 - override expiry must not fail the cycle
+        logger.exception("Override expiry failed")
+        result.errors.append(f"override_expiry: {exc}")
+        result.status = RunStatus.PARTIAL
+        result.steps["override_expiry"] = {"ok": False, "error": str(exc)}
+        _warn(session, "override_expiry", str(exc))
+
     # Step 3: evaluation and enforcement. Runs even when ingestion failed, using
     # the last good snapshot, but a failed ingestion means no new breach can be
     # discovered from data we did not receive.

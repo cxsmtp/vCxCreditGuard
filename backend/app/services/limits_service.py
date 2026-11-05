@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
+from app.db.base import utcnow
 from app.models.enums import EntityType
 from app.models.limits import CreditLimit, Exemption, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
@@ -48,11 +49,16 @@ AUDITED_FIELDS = (
     "hold_until_released",
     "count_existing_usage",
     "notes",
+    "business_unit",
 )
 
 
 class LimitError(ValueError):
     """The requested limit change is not valid."""
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +75,7 @@ class LimitInput:
     custom_period_start: datetime | None = None
     custom_period_end: datetime | None = None
     notes: str | None = None
+    business_unit: str | None = None
 
 
 def resolve_entity_label(session: Session, *, entity_type: str, entity_id: str) -> str | None:
@@ -138,6 +145,7 @@ def create_limit(session: Session, *, data: LimitInput, actor: AuditActor) -> Cr
         hold_until_released=data.hold_until_released,
         count_existing_usage=data.count_existing_usage,
         notes=data.notes,
+        business_unit=data.business_unit,
         created_by_id=actor.actor_id,
     )
     session.add(limit)
@@ -301,6 +309,7 @@ def _snapshot(limit: CreditLimit) -> dict[str, Any]:
         "hold_until_released": limit.hold_until_released,
         "count_existing_usage": limit.count_existing_usage,
         "notes": limit.notes,
+        "business_unit": limit.business_unit,
     }
 
 
@@ -322,14 +331,40 @@ def add_exemption(
     entity_id: str,
     reason: str | None,
     actor: AuditActor,
+    expires_at: datetime | None = None,
     client: CheckmarxClient | None = None,
 ) -> Exemption:
+    if expires_at is not None and expires_at <= utcnow():
+        raise LimitError("An override's expiry must be in the future.")
     existing = session.scalar(
         select(Exemption).where(
             Exemption.entity_type == entity_type, Exemption.entity_id == entity_id
         )
     )
     if existing is not None:
+        # Let an admin extend or re-scope an existing override rather than silently
+        # keeping the old one. No need to lift restrictions here: an entity that
+        # became exempt while the connection was healthy has none to lift, because
+        # enforcement skips exempt entities. (A restriction left in place because
+        # the first exemption was created while Checkmarx was unreachable is a
+        # separate, pre-existing gap the next healthy cycle does not re-lift.)
+        before = {"expires_at": _iso(existing.expires_at), "reason": existing.reason}
+        if expires_at != existing.expires_at or (reason and reason != existing.reason):
+            existing.expires_at = expires_at
+            if reason:
+                existing.reason = reason
+            session.flush()
+            record_audit(
+                session,
+                action="exemption.updated",
+                actor=actor,
+                target_type="exemption",
+                target_id=str(existing.id),
+                target_label=existing.entity_label or existing.entity_id,
+                before=before,
+                after={"expires_at": _iso(existing.expires_at), "reason": existing.reason},
+                detail="Override re-scoped.",
+            )
         return existing
 
     exemption = Exemption(
@@ -337,6 +372,7 @@ def add_exemption(
         entity_id=entity_id,
         entity_label=resolve_entity_label(session, entity_type=entity_type, entity_id=entity_id),
         reason=reason,
+        expires_at=expires_at,
         created_by_id=actor.actor_id,
     )
     session.add(exemption)
@@ -388,3 +424,34 @@ def remove_exemption(session: Session, *, exemption: Exemption, actor: AuditActo
     )
     session.delete(exemption)
     session.flush()
+
+
+def expire_overrides(session: Session, *, now: datetime | None = None) -> int:
+    """Remove time-boxed overrides (exemptions) whose expiry has passed.
+
+    Nothing to lift: removing an exemption only restores the ability to enforce,
+    so the next evaluation re-applies a restriction if the entity is still over
+    budget. Returns the number removed.
+    """
+    moment = now or utcnow()
+    expired = list(
+        session.scalars(
+            select(Exemption).where(
+                Exemption.expires_at.is_not(None), Exemption.expires_at < moment
+            )
+        )
+    )
+    actor = AuditActor.system("override-expiry")
+    for exemption in expired:
+        record_audit(
+            session,
+            action="exemption.expired",
+            actor=actor,
+            target_type="exemption",
+            target_id=str(exemption.id),
+            target_label=exemption.entity_label or exemption.entity_id,
+            detail="Temporary override expired; normal enforcement resumes.",
+        )
+        session.delete(exemption)
+    session.flush()
+    return len(expired)

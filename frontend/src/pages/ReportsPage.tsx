@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 import { api, ApiError } from "../api/client";
-import type { Projection, ReportSummary } from "../api/types";
+import type { Chargeback, ChargebackRow, Projection, ReportSummary } from "../api/types";
 import { ExportMenu } from "../components/ExportMenu";
 import { StatTile } from "../components/StatTile";
 import {
@@ -36,6 +36,10 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
   const toast = useToast();
   const report = useResource<ReportSummary>(
     (signal) => api.get("/api/reports/summary", undefined, signal),
+    [],
+  );
+  const chargeback = useResource<Chargeback>(
+    (signal) => api.get("/api/reports/chargeback", undefined, signal),
     [],
   );
   const [emailing, setEmailing] = useState(false);
@@ -184,8 +188,99 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
               </Table>
             )}
           </Card>
+
+          <ChargebackCard data={chargeback.data} error={chargeback.error} loading={chargeback.initialLoading} />
         </div>
       )}
     </div>
+  );
+}
+
+const CHARGEBACK_COLUMNS: ExportColumn<ChargebackRow>[] = [
+  { key: "bu", header: "Business unit", value: (r) => r.business_unit },
+  { key: "limits", header: "Limits", value: (r) => r.limits },
+  { key: "credits", header: "Credits used", value: (r) => Number(r.credits_used) },
+  { key: "cost", header: "Estimated cost", value: (r) => (r.estimated_cost == null ? "" : Number(r.estimated_cost)) },
+];
+
+function ChargebackCard({
+  data,
+  error,
+  loading,
+}: {
+  data: Chargeback | null;
+  error: string | null;
+  loading: boolean;
+}) {
+  return (
+    <Card
+      title="Chargeback by business unit"
+      description="Current-period consumption attributed to the business unit set on each limit."
+      padded={false}
+      actions={
+        data && data.rows.length > 0 ? (
+          <ExportMenu
+            rows={data.rows}
+            columns={CHARGEBACK_COLUMNS}
+            filenameBase="cxcreditguard-chargeback"
+            title="CxCreditGuard chargeback"
+          />
+        ) : undefined
+      }
+    >
+      {loading ? (
+        <div className="flex items-center gap-2 px-5 py-6 text-sm" style={{ color: "var(--text-secondary)" }}>
+          <Spinner size={14} /> Loading
+        </div>
+      ) : error ? (
+        <div className="p-5">
+          <ErrorNote>{error}</ErrorNote>
+        </div>
+      ) : !data || data.rows.length === 0 ? (
+        <EmptyState
+          title="No business units assigned"
+          description="Set a business unit on a limit (on the Limits page) to attribute its consumption here."
+        />
+      ) : (
+        <>
+          <Table>
+            <thead>
+              <tr>
+                <Th>Business unit</Th>
+                <Th align="right">Limits</Th>
+                <Th align="right">Credits used</Th>
+                {data.currency_known && <Th align="right">Estimated cost</Th>}
+              </tr>
+            </thead>
+            <tbody>
+              {data.rows.map((row) => (
+                <tr key={row.business_unit}>
+                  <Td className="font-medium">{row.business_unit}</Td>
+                  <Td align="right" className="tabular">{row.limits}</Td>
+                  <Td align="right" className="tabular">{formatCredits(row.credits_used)}</Td>
+                  {data.currency_known && (
+                    <Td align="right" className="tabular">
+                      {row.estimated_cost == null ? "—" : formatCredits(row.estimated_cost)}
+                    </Td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+          <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-3 text-xs" style={{ color: "var(--text-muted)" }}>
+            <span>
+              {data.currency_known
+                ? `Estimated at ${data.unit_cost} per credit.`
+                : "Set a credit unit cost on the Settings page to show an estimated cost."}
+            </span>
+            {data.unassigned_limits > 0 && (
+              <span>
+                {data.unassigned_limits} limit(s) have no business unit and are not attributed.
+              </span>
+            )}
+          </div>
+        </>
+      )}
+    </Card>
   );
 }

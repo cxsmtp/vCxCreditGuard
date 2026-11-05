@@ -189,6 +189,8 @@ class SettingsResponse(BaseModel):
     self_service_requests: bool = False
     # Whether a weekly summary report is emailed to the notification recipients.
     report_email_enabled: bool = False
+    # Monetary cost of one credit for chargeback (0 means cost unknown).
+    credit_unit_cost: float = 0.0
     current_schedule_description: str
 
 
@@ -215,6 +217,7 @@ class SettingsUpdateRequest(StrictModel):
     ui_accent: str | None = Field(default=None, max_length=16)
     self_service_requests: bool | None = None
     report_email_enabled: bool | None = None
+    credit_unit_cost: float | None = Field(default=None, ge=0, le=1_000_000)
 
     @field_validator("schedule_mode")
     @classmethod

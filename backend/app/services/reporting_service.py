@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.db.base import utcnow
 from app.models.enums import EnforcementStatus, LimitStatus
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
-from app.services import enforcement, evaluation
+from app.services import enforcement, evaluation, settings_store
 from app.services.periods import PeriodError, current_window
 
 # A day in seconds, as a Decimal, for burn-rate arithmetic.
@@ -265,6 +265,90 @@ def build_report(session: Session, *, now: datetime | None = None) -> Report:
         projections=projections,
         impact=impact,
         breaching_soon=sum(1 for p in projections if p.will_breach),
+    )
+
+
+@dataclass(slots=True)
+class ChargebackRow:
+    business_unit: str
+    limits: int
+    credits_used: Decimal
+    estimated_cost: Decimal | None
+
+
+@dataclass(slots=True)
+class Chargeback:
+    generated_at: datetime
+    unit_cost: float
+    currency_known: bool
+    unassigned_limits: int
+    rows: list[ChargebackRow] = field(default_factory=list)
+
+
+def chargeback(session: Session, *, now: datetime | None = None) -> Chargeback:
+    """Current-period consumption grouped by the business unit on each limit.
+
+    Only governed entities (those with a limit) are attributed, and each limit's
+    own current-period usage is counted once. A credit unit cost, when set, turns
+    credits into an estimated monetary chargeback figure.
+    """
+    moment = now or utcnow()
+    index = evaluation.UsageIndex(session)
+    unit_cost = settings_store.credit_unit_cost(session)
+    totals: dict[str, dict[str, object]] = {}
+    unassigned = 0
+
+    for limit in session.scalars(select(CreditLimit).where(CreditLimit.is_active.is_(True))):
+        bu = (limit.business_unit or "").strip()
+        if not bu:
+            unassigned += 1
+            continue
+        reported_total, available = index.reported_total(limit)
+        if not available:
+            used = Decimal("0")
+        else:
+            try:
+                window = current_window(limit, moment)
+            except PeriodError:
+                used = Decimal("0")
+            else:
+                state = session.scalar(
+                    select(LimitPeriodState).where(
+                        LimitPeriodState.limit_id == limit.id,
+                        LimitPeriodState.period_key == window.key,
+                    )
+                )
+                baseline = (
+                    state.baseline_credits
+                    if state is not None
+                    else evaluation.baseline_for(
+                        limit, window=window, reported_total=reported_total, available=available
+                    )
+                )
+                used = max(Decimal("0"), reported_total - baseline)
+        bucket = totals.setdefault(bu, {"limits": 0, "used": Decimal("0")})
+        bucket["limits"] = int(bucket["limits"]) + 1  # type: ignore[call-overload]
+        bucket["used"] = Decimal(bucket["used"]) + used  # type: ignore[arg-type]
+
+    currency_known = unit_cost > 0
+    rows = [
+        ChargebackRow(
+            business_unit=bu,
+            limits=int(data["limits"]),  # type: ignore[arg-type]
+            credits_used=Decimal(data["used"]),  # type: ignore[arg-type]
+            estimated_cost=(
+                (Decimal(data["used"]) * Decimal(str(unit_cost))) if currency_known else None  # type: ignore[arg-type]
+            ),
+        )
+        for bu, data in totals.items()
+    ]
+    rows.sort(key=lambda r: r.credits_used, reverse=True)
+    return Chargeback(
+        generated_at=moment,
+        unit_cost=unit_cost,
+        currency_known=currency_known,
+        unassigned_limits=unassigned,
+        rows=rows,
     )
 
 

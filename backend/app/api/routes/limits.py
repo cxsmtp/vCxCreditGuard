@@ -114,6 +114,7 @@ def _to_response(db: Session, limit: CreditLimit) -> LimitResponse:
         count_existing_usage=limit.count_existing_usage,
         exempt=exempt,
         notes=limit.notes,
+        business_unit=limit.business_unit,
         created_at=limit.created_at,
         updated_at=limit.updated_at,
         current_period=period_response,
@@ -161,6 +162,7 @@ def create_limit(payload: LimitCreateRequest, ctx: AdminUser, db: DbSession) -> 
                 custom_period_start=payload.custom_period_start,
                 custom_period_end=payload.custom_period_end,
                 notes=payload.notes,
+                business_unit=payload.business_unit,
             ),
             actor=ctx.actor,
         )
@@ -341,6 +343,7 @@ def list_exemptions(ctx: CurrentUser, db: DbSession) -> list[ExemptionResponse]:
             entity_id=row.entity_id,
             entity_label=row.entity_label,
             reason=row.reason,
+            expires_at=row.expires_at,
             created_at=row.created_at,
         )
         for row in rows
@@ -351,14 +354,22 @@ def list_exemptions(ctx: CurrentUser, db: DbSession) -> list[ExemptionResponse]:
 def create_exemption(
     payload: ExemptionCreateRequest, ctx: AdminUser, db: DbSession
 ) -> ExemptionResponse:
-    exemption = limits_service.add_exemption(
-        db,
-        entity_type=payload.entity_type,
-        entity_id=payload.entity_id,
-        reason=payload.reason,
-        actor=ctx.actor,
-        client=_optional_client(db),
-    )
+    try:
+        exemption = limits_service.add_exemption(
+            db,
+            entity_type=payload.entity_type,
+            entity_id=payload.entity_id,
+            reason=payload.reason,
+            expires_at=payload.expires_at,
+            actor=ctx.actor,
+            client=_optional_client(db),
+        )
+    except limits_service.LimitError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_override", "message": str(exc)},
+        ) from exc
     db.commit()
     return ExemptionResponse(
         id=exemption.id,
@@ -366,6 +377,7 @@ def create_exemption(
         entity_id=exemption.entity_id,
         entity_label=exemption.entity_label,
         reason=exemption.reason,
+        expires_at=exemption.expires_at,
         created_at=exemption.created_at,
     )
 

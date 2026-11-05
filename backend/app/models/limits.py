@@ -71,6 +71,8 @@ class CreditLimit(Base, TimestampMixin):
     hold_until_released: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     notes: Mapped[str | None] = mapped_column(String(1024))
+    # Optional cost centre / business unit for chargeback reporting.
+    business_unit: Mapped[str | None] = mapped_column(String(128))
     created_by_id: Mapped[int | None] = mapped_column(
         ForeignKey("utility_user.id", ondelete="SET NULL")
     )
@@ -111,6 +113,9 @@ class Exemption(Base, TimestampMixin):
     entity_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     entity_label: Mapped[str | None] = mapped_column(String(512))
     reason: Mapped[str | None] = mapped_column(String(512))
+    # When set, this is a time-boxed override: the governance cycle removes it
+    # once it has passed, and normal enforcement resumes. Null means permanent.
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     created_by_id: Mapped[int | None] = mapped_column(
         ForeignKey("utility_user.id", ondelete="SET NULL")
     )
