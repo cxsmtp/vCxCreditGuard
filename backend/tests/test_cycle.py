@@ -291,9 +291,7 @@ class TestCreditBalance:
         assert result.steps["credits"]["changed"] is True
         with session_scope() as session:
             rows = list(
-                session.scalars(
-                    select(CreditBalanceSnapshot).order_by(CreditBalanceSnapshot.id)
-                )
+                session.scalars(select(CreditBalanceSnapshot).order_by(CreditBalanceSnapshot.id))
             )
         assert len(rows) == 2
         assert rows[-1].used_credits == Decimal("250")
