@@ -90,7 +90,7 @@ class CreditLimit(Base, TimestampMixin):
     )
 
     __table_args__ = (
-        UniqueConstraint("entity_type", "entity_id", name="entity"),
+        UniqueConstraint("entity_type", "entity_id", name="uq_credit_limit_entity"),
         CheckConstraint("credit_limit >= 0", name="credit_limit_non_negative"),
         CheckConstraint(
             "warning_threshold_pct >= 1 AND warning_threshold_pct <= 100",
@@ -120,7 +120,7 @@ class Exemption(Base, TimestampMixin):
         ForeignKey("utility_user.id", ondelete="SET NULL")
     )
 
-    __table_args__ = (UniqueConstraint("entity_type", "entity_id", name="entity"),)
+    __table_args__ = (UniqueConstraint("entity_type", "entity_id", name="uq_exemption_entity"),)
 
 
 class LimitPeriodState(Base):
