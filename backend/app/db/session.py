@@ -47,12 +47,14 @@ def build_engine(url: str) -> Engine:
 
         @event.listens_for(engine, "connect")
         def _sqlite_pragmas(dbapi_connection, _record):  # type: ignore[no-untyped-def]
-            # The driver's own transaction handling starts a transaction lazily
-            # and does not know about SAVEPOINT: a savepoint that is the first
-            # write then begins, and on release commits, a transaction of its
-            # own. Turning it off and issuing BEGIN ourselves (below) gives
-            # SQLite the same transaction and savepoint semantics as PostgreSQL.
-            dbapi_connection.isolation_level = None
+            # The driver's default transaction handling is kept on purpose: it
+            # opens a transaction at the first write, not at the first read. A
+            # request that reads and then writes (every authenticated request
+            # slides its session expiry) therefore takes the write lock afresh
+            # and queues on busy_timeout. Opening the transaction at the first
+            # read instead would pin a snapshot, and SQLite fails such a
+            # transaction outright, with no waiting, if anyone else commits
+            # before it writes.
             cursor = dbapi_connection.cursor()
             # WAL lets readers run while a single writer holds the lock, so the
             # scheduler's writes do not block dashboard reads, and concurrent
@@ -65,10 +67,6 @@ def build_engine(url: str) -> Engine:
             # this single-node, low-concurrency deployment.
             cursor.execute("PRAGMA busy_timeout=30000")
             cursor.close()
-
-        @event.listens_for(engine, "begin")
-        def _sqlite_begin(connection):  # type: ignore[no-untyped-def]
-            connection.exec_driver_sql("BEGIN")
 
         return engine
 

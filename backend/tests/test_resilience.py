@@ -1058,6 +1058,31 @@ class TestHungCycle:
             assert session.get(SchedulerLock, cycle.LOCK_NAME).heartbeat_at == old
 
 
+@sqlite_only
+class TestReadThenWriteUnderConcurrency:
+    def test_a_request_that_reads_then_writes_waits_instead_of_failing(self, db: Session) -> None:
+        """Every authenticated request reads its session and then updates it. If
+        another request commits in between, this one must still succeed: on
+        SQLite a transaction that pinned a snapshot at its first read would fail
+        outright instead."""
+        limit = harsh_limit(db, credit_limit=10)
+
+        reader = get_session_factory()()
+        writer = get_session_factory()()
+        try:
+            assert reader.get(CreditLimit, limit.id).credit_limit == 10  # reads first
+            writer.get(CreditLimit, limit.id).notes = "someone else commits meanwhile"
+            writer.commit()
+            reader.get(CreditLimit, limit.id).credit_limit = 11  # then writes
+            reader.commit()
+        finally:
+            reader.close()
+            writer.close()
+        with session_scope() as session:
+            fresh = session.get(CreditLimit, limit.id)
+            assert fresh.credit_limit == 11
+
+
 class TestBusyDatabase:
     def test_a_lock_timeout_is_a_retryable_503_not_an_opaque_500(
         self, admin_client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -1167,10 +1192,8 @@ class TestNotifyDedupe:
         finally:
             other.close()
 
-    def test_a_savepoint_does_not_commit_the_callers_transaction(self, db: Session) -> None:
-        """On SQLite a savepoint used to start, and then commit, its own
-        transaction when it was the first write: the notification outlived the
-        caller's rollback."""
+    def test_a_notification_is_rolled_back_with_its_caller(self, db: Session) -> None:
+        """It belongs to the caller's transaction, and must not outlive it."""
         notifications.notify(
             db, category="sync_error", severity=Severity.ERROR, title="rolled back", dedupe_key="r"
         )

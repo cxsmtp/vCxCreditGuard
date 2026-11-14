@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
@@ -52,31 +51,46 @@ def notify(
         if existing is not None:
             return None
 
-    notification = Notification(
-        created_at=utcnow(),
-        severity=severity,
-        category=category,
-        entity_type=entity_type,
-        entity_id=entity_id,
-        entity_label=entity_label,
-        title=title[:256],
-        body=body,
-        dedupe_key=dedupe_key,
-        enforcement_action_id=enforcement_action_id,
-    )
-    # A savepoint, so that losing a race on the dedupe key undoes only this insert.
-    # A plain rollback here would silently discard everything the caller had done
-    # in its transaction so far - an enforcement record, an approval - because a
-    # notification happened to be a duplicate.
-    try:
-        with session.begin_nested():
-            session.add(notification)
-            session.flush()
-    except IntegrityError:
-        # Lost a race on the dedupe key. That is the correct outcome, not an error.
+    values = {
+        "created_at": utcnow(),
+        "severity": severity,
+        "category": category,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "entity_label": entity_label,
+        "title": title[:256],
+        "body": body,
+        "dedupe_key": dedupe_key,
+        "enforcement_action_id": enforcement_action_id,
+    }
+    if dedupe_key is None:
+        notification = Notification(**values)
+        session.add(notification)
+        session.flush()
+        return notification
+
+    # Another writer can insert the same key between the check above and this
+    # insert. The insert therefore ignores a conflict instead of raising: an
+    # error here would have to be rolled back, and rolling back would discard
+    # everything the caller had done in its transaction so far - an enforcement
+    # record, an approval - because a notification happened to be a duplicate.
+    new_id = session.execute(
+        _insert_ignoring_conflict(session).values(**values).returning(Notification.__table__.c.id)
+    ).scalar()
+    if new_id is None:
+        # Nothing was inserted: the key was taken in the meantime.
         logger.debug("Notification %s was already recorded by another writer", dedupe_key)
         return None
-    return notification
+    return session.get(Notification, new_id)
+
+
+def _insert_ignoring_conflict(session: Session):  # type: ignore[no-untyped-def]
+    """INSERT ... ON CONFLICT DO NOTHING, in the dialect's own spelling."""
+    if session.get_bind().dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    return dialect_insert(Notification.__table__).on_conflict_do_nothing()
 
 
 def unread_count(session: Session) -> int:
