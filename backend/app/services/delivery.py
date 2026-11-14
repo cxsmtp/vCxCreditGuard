@@ -343,30 +343,46 @@ def _transmit(
     factory = smtp_factory or _default_smtp_factory
     try:
         server = factory(config.smtp_host or "", config.smtp_port, SMTP_TIMEOUT_SECONDS)
+    except DeliveryError:
+        raise
+    except ssl.SSLCertVerificationError as exc:
+        raise DeliveryError(
+            "the mail server's TLS certificate could not be verified "
+            f"({getattr(exc, 'verify_message', None) or exc}). If it is signed by a private "
+            "CA, set CXCG_SMTP_CA_FILE to that CA's certificate."
+        ) from exc
     except (OSError, smtplib.SMTPException) as exc:
         raise DeliveryError(
             f"could not connect to {config.smtp_host}: {type(exc).__name__}"
         ) from exc
 
+    # Port 465 is TLS from the first byte (see _default_smtp_factory), so there
+    # is no STARTTLS step and the connection already counts as encrypted.
+    implicit_tls = config.smtp_port == IMPLICIT_TLS_PORT
     try:
-        if config.smtp_use_tls:
+        if config.smtp_use_tls and not implicit_tls:
             # With a verifying context. Without one the certificate is not
             # checked at all, and anyone on the path can pose as the mail server
             # and collect the password and every notification.
             server.starttls(context=_tls_context())
         if config.smtp_username and config.smtp_password:
-            if not config.smtp_use_tls:
+            if not (config.smtp_use_tls or implicit_tls):
                 raise DeliveryError(
                     "refusing to send the SMTP password without TLS; turn on STARTTLS "
                     "or remove the credentials"
                 )
             server.login(config.smtp_username, config.smtp_password)
         server.send_message(message)
-    except ssl.SSLError as exc:
+    except ssl.SSLCertVerificationError as exc:
         raise DeliveryError(
             "the mail server's TLS certificate could not be verified "
-            f"({getattr(exc, 'reason', None) or getattr(exc, 'verify_message', None) or exc}). "
-            "If it is signed by a private CA, set CXCG_SMTP_CA_FILE to that CA's certificate."
+            f"({getattr(exc, 'verify_message', None) or exc}). If it is signed by a private "
+            "CA, set CXCG_SMTP_CA_FILE to that CA's certificate; the name in the certificate "
+            "must match the SMTP host configured here."
+        ) from exc
+    except ssl.SSLError as exc:
+        raise DeliveryError(
+            f"a secure connection to the mail server could not be set up ({exc})"
         ) from exc
     except smtplib.SMTPAuthenticationError as exc:
         raise DeliveryError("SMTP authentication was rejected") from exc
@@ -425,7 +441,13 @@ def send_direct_email(
     _transmit(message, config=config, smtp_factory=smtp_factory)
 
 
+IMPLICIT_TLS_PORT = 465
+
+
 def _default_smtp_factory(host: str, port: int, timeout: float) -> smtplib.SMTP:
+    if port == IMPLICIT_TLS_PORT:
+        # "SMTPS": the server expects TLS before anything else is said.
+        return smtplib.SMTP_SSL(host=host, port=port, timeout=timeout, context=_tls_context())
     return smtplib.SMTP(host=host, port=port, timeout=timeout)
 
 
@@ -436,7 +458,12 @@ def _tls_context() -> ssl.SSLContext:
     one (an internal relay with an internally issued certificate).
     """
     ca_file = get_settings().smtp_ca_file
-    return ssl.create_default_context(cafile=str(ca_file) if ca_file else None)
+    try:
+        return ssl.create_default_context(cafile=str(ca_file) if ca_file else None)
+    except (OSError, ssl.SSLError) as exc:
+        raise DeliveryError(
+            f"CXCG_SMTP_CA_FILE ({ca_file}) could not be read as a CA certificate: {exc}"
+        ) from exc
 
 
 # -------------------------------------------------------------------- webhook

@@ -50,8 +50,8 @@ service on port 8000. Two requirements:
 The app throttles sign-ins and writes the audit log by client address, so that
 address must come from something trusted, not from a header the client can set.
 The bundled nginx overwrites `X-Forwarded-For` with the address it saw, and
-`docker-compose.yml` sets `CXCG_TRUSTED_PROXY_HOPS=1` so the app believes
-exactly that one entry.
+`docker-compose.yml` sets `CXCG_TRUSTED_PROXY_HOPS=1` (in the file itself, not
+from `.env`) so the app believes exactly that one entry.
 
 If you put a load balancer or ingress **in front of** this nginx, nginx would
 see the balancer's address for every client. In that case:
@@ -59,7 +59,8 @@ see the balancer's address for every client. In that case:
 1. In `nginx.conf`, change `proxy_set_header X-Forwarded-For $remote_addr;` to
    `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` so the entry
    your balancer added is kept, and scope `limit_req` to the forwarded address.
-2. Set `CXCG_TRUSTED_PROXY_HOPS=2` (one for the balancer, one for nginx).
+2. Change `CXCG_TRUSTED_PROXY_HOPS` to `"2"` in `docker-compose.yml` (one for the
+   balancer, one for nginx).
 3. Make sure the balancer itself appends the client address and that nothing
    can reach nginx except through it.
 

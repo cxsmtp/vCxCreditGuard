@@ -64,6 +64,7 @@ export function SettingsPage({
   );
 
   const [draft, setDraft] = useState<SettingsDraft>({});
+  const [removeWebhook, setRemoveWebhook] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -87,16 +88,22 @@ export function SettingsPage({
     setDraft((existing) => ({ ...existing, ...patch }));
   }
 
-  const dirty = Object.keys(draft).length > 0;
+  // Keys cleared back to undefined are not changes.
+  const changes = Object.fromEntries(
+    Object.entries(draft).filter(([, fieldValue]) => fieldValue !== undefined),
+  ) as SettingsDraft;
+  if (removeWebhook && changes.webhook_url === undefined) changes.webhook_url = "";
+  const dirty = Object.keys(changes).length > 0;
 
   async function save() {
     setBusy(true);
     setError(null);
     try {
-      const updated = await api.put<AppSettings>("/api/settings", draft);
+      const updated = await api.put<AppSettings>("/api/settings", changes);
       settings.setData(updated);
       applyAccent(updated.ui_accent);
       setDraft({});
+      setRemoveWebhook(false);
       toast.success(`Settings saved. Schedule is now ${updated.current_schedule_description}.`);
       await status.reload();
       // Refresh the bootstrap profile so shell-level state (the demo banner,
@@ -450,10 +457,13 @@ export function SettingsPage({
                 }
               >
                 <Input
-                  type="password"
+                  type="text"
+                  name="cxcg-webhook-url"
                   value={draft.webhook_url ?? ""}
                   disabled={!isAdmin}
-                  onChange={(event) => set({ webhook_url: event.target.value })}
+                  // Emptying the box is "leave it as it is", not "remove it":
+                  // removal is the explicit control below.
+                  onChange={(event) => set({ webhook_url: event.target.value || undefined })}
                   placeholder={
                     current.webhook_url_configured
                       ? `•••••••• (${current.webhook_host ?? "configured"})`
@@ -462,17 +472,17 @@ export function SettingsPage({
                   spellCheck={false}
                   autoComplete="off"
                 />
-                {isAdmin && current.webhook_url_configured && draft.webhook_url === undefined && (
-                  <button
-                    type="button"
-                    className="mt-1.5 text-xs underline"
-                    style={{ color: "var(--text-secondary)" }}
-                    onClick={() => set({ webhook_url: "" })}
-                  >
-                    Remove the webhook
-                  </button>
-                )}
               </Field>
+              {isAdmin && current.webhook_url_configured && (
+                <div className="sm:col-span-2">
+                  <Toggle
+                    checked={removeWebhook}
+                    onChange={setRemoveWebhook}
+                    label="Remove the stored webhook when saving"
+                    description="Stops posting notifications to it. Leave off to keep it, or type a new URL above to replace it."
+                  />
+                </div>
+              )}
               <Field
                 label="Webhook signing secret"
                 hint={

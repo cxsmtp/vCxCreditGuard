@@ -34,9 +34,12 @@ def upgrade() -> None:
     )
     # One-time recovery codes for two factor authentication (digests only).
     op.add_column("utility_user", sa.Column("totp_recovery_codes", sa.JSON(), nullable=True))
+    # Last accepted authenticator time step, so a code cannot be replayed.
+    op.add_column("utility_user", sa.Column("totp_last_step", sa.Integer(), nullable=True))
 
 
 def downgrade() -> None:
+    op.drop_column("utility_user", "totp_last_step")
     op.drop_column("utility_user", "totp_recovery_codes")
     op.drop_column("login_attempt", "locked_until")
     op.drop_column("login_attempt", "failure_count")

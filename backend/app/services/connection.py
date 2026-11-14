@@ -204,6 +204,45 @@ def decrypt_api_key(connection: CxConnection) -> str:
     return api_key
 
 
+def warn_if_untrusted(session: Session) -> bool:
+    """Say so, loudly, if the stored connection points somewhere not allowed.
+
+    Tenant URLs are restricted to checkmarx.net and CXCG_CX_ALLOWED_HOSTS. A
+    deployment that was pointed at a dedicated host before that rule existed
+    stops being governed after upgrading until the host is allowed; without
+    this it would only show up as failed cycles. Returns True if it warned.
+    """
+    from app.checkmarx.regions import UntrustedHostError
+    from app.models.enums import Severity
+    from app.services import notifications
+
+    connection = get_connection(session)
+    if connection is None:
+        return False
+    try:
+        _check_trusted(connection.iam_base_url, what="stored identity (IAM) URL")
+        _check_trusted(connection.api_base_url, what="stored platform API URL")
+    except UntrustedHostError as exc:
+        logger.error("The Checkmarx One connection is blocked: %s", exc)
+        connection.status = ConnectionStatus.FAILED
+        connection.last_error = str(exc)[:2000]
+        connection.last_failure_at = utcnow()
+        notifications.notify(
+            session,
+            category=notifications.CATEGORY_SYNC_ERROR,
+            severity=Severity.CRITICAL,
+            title="The Checkmarx One connection is blocked",
+            body=(
+                f"{exc}\n\nNothing is being synchronised, evaluated or enforced until this "
+                "is resolved."
+            ),
+            dedupe_key=f"untrusted-host:{utcnow().strftime('%Y-%m-%d')}",
+        )
+        session.flush()
+        return True
+    return False
+
+
 _subject_cache: tuple[str, str | None] | None = None
 
 

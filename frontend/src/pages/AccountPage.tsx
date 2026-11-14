@@ -154,7 +154,7 @@ export function PasswordChangeRequired({
 
 type TwoFactorStep =
   | { name: "idle" }
-  | { name: "password"; purpose: "enable" | "disable" }
+  | { name: "password"; purpose: "enable" | "disable" | "codes" }
   | { name: "scan"; enrollment: TotpEnrollResult }
   | { name: "codes"; codes: string[] };
 
@@ -184,6 +184,12 @@ function TwoFactorCard({ me, onChanged }: { me: Me; onChanged: () => Promise<unk
         });
         setPassword("");
         setStep({ name: "scan", enrollment });
+      } else if (step.purpose === "codes") {
+        const result = await api.post<TotpConfirmResult>("/api/auth/totp/recovery-codes", {
+          current_password: password,
+        });
+        setPassword("");
+        setStep({ name: "codes", codes: result.recovery_codes });
       } else {
         await api.post<MessageResponse>("/api/auth/totp/disable", { current_password: password });
         toast.success("Two factor authentication turned off.");
@@ -229,9 +235,20 @@ function TwoFactorCard({ me, onChanged }: { me: Me; onChanged: () => Promise<unk
             device, sign in with one of your recovery codes, or ask another administrator to reset
             two factor for your account.
           </p>
-          <Button variant="secondary" onClick={() => setStep({ name: "password", purpose: "disable" })}>
-            Turn off two factor
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="secondary"
+              onClick={() => setStep({ name: "password", purpose: "codes" })}
+            >
+              New recovery codes
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={() => setStep({ name: "password", purpose: "disable" })}
+            >
+              Turn off two factor
+            </Button>
+          </div>
         </div>
       ) : (
         <div className="flex flex-col items-start gap-3">
@@ -335,8 +352,10 @@ function TwoFactorCard({ me, onChanged }: { me: Me; onChanged: () => Promise<unk
       <Modal
         open={step.name === "codes"}
         title="Save your recovery codes"
-        description="Each code signs you in once, in place of the authenticator code, if you lose your device. They are shown only now."
-        onClose={close}
+        description="Each code signs you in once, in place of the authenticator code, if you lose your device. They are shown only now, and any earlier codes no longer work."
+        // Not dismissable by Escape or a stray click: the codes cannot be shown
+        // again, so leaving has to be a deliberate press of the button below.
+        onClose={() => undefined}
         footer={
           <>
             {step.name === "codes" && (

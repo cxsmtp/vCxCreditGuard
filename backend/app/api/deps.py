@@ -61,9 +61,13 @@ def client_ip(request: Request) -> str:
     hops = get_settings().trusted_proxy_hops
     if hops <= 0:
         return peer
+    # Every X-Forwarded-For line, in order: some proxies add their entry as a
+    # separate header line rather than appending to the existing one, and
+    # reading only the first line would then return the client's own claim.
     entries = [
         entry.strip()
-        for entry in request.headers.get("X-Forwarded-For", "").split(",")
+        for line in request.headers.getlist("X-Forwarded-For")
+        for entry in line.split(",")
         if entry.strip()
     ]
     if len(entries) < hops:

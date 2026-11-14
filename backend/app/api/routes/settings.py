@@ -67,7 +67,10 @@ def _webhook_host(db) -> str | None:  # type: ignore[no-untyped-def]
     url = settings_store.get_secret(db, settings_store.KEY_WEBHOOK_URL)
     if not url:
         return None
-    return urlsplit(url).hostname
+    try:
+        return urlsplit(url).hostname
+    except ValueError:
+        return None
 
 
 def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
@@ -177,9 +180,10 @@ def update_settings(
 
     for field, value in changes.items():
         if field in _SECRET_FIELDS:
-            # An empty string clears the secret; None means "leave it alone".
-            settings_store.set_secret(db, _SECRET_FIELDS[field], value or None)
-            audited_changes[field] = "set" if value else "cleared"
+            # An empty (or blank) string clears the secret; None means "leave it alone".
+            secret_value = value.strip() if isinstance(value, str) else value
+            settings_store.set_secret(db, _SECRET_FIELDS[field], secret_value or None)
+            audited_changes[field] = "set" if secret_value else "cleared"
             continue
         key = _PUBLIC_FIELDS.get(field)
         if key is None:

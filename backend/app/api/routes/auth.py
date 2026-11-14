@@ -24,6 +24,7 @@ from app.schemas.auth import (
 )
 from app.services import auth as auth_service
 from app.services import delivery as delivery_service
+from app.services.audit import record_audit
 from app.services.delivery import DeliveryConfig
 
 logger = logging.getLogger(__name__)
@@ -139,8 +140,10 @@ def change_password(
     payload: ChangePasswordRequest,
     ctx: CurrentUser,
     db: DbSession,
+    response: Response,
+    settings: AppSettings,
 ) -> MessageResponse:
-    _require_current_password(ctx, db, payload.current_password)
+    _require_current_password(ctx, db, payload.current_password, response, settings)
     try:
         auth_service.set_password(
             db, user=ctx.user, new_password=payload.new_password, actor=ctx.actor
@@ -285,11 +288,17 @@ def reset_password(
     return MessageResponse(message="Password set. Sign in with your new password.")
 
 
-def _require_current_password(ctx: CurrentUser, db: DbSession, password: str) -> None:
+def _require_current_password(
+    ctx: CurrentUser, db: DbSession, password: str, response: Response, settings: AppSettings
+) -> None:
     """Re-check the password before a change to how the account is protected."""
     try:
         correct = auth_service.confirm_current_password(
-            db, user=ctx.user, password=password, ip_address=ctx.ip_address or "unknown"
+            db,
+            user=ctx.user,
+            password=password,
+            ip_address=ctx.ip_address or "unknown",
+            actor=ctx.actor,
         )
     except auth_service.RateLimited as exc:
         db.commit()
@@ -298,7 +307,15 @@ def _require_current_password(ctx: CurrentUser, db: DbSession, password: str) ->
             detail={"code": "rate_limited", "message": str(exc)},
             headers={"Retry-After": str(exc.retry_after_seconds)},
         ) from exc
-    db.commit()  # keep the attempt counted even when the password was wrong
+    except auth_service.ReauthLocked as exc:
+        # Every session for the account was just ended, this one included.
+        db.commit()
+        clear_auth_cookies(response, settings=settings)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "signed_out", "message": str(exc)},
+        ) from exc
+    db.commit()  # keep the attempt counted and audited even when the password was wrong
     if not correct:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -307,7 +324,13 @@ def _require_current_password(ctx: CurrentUser, db: DbSession, password: str) ->
 
 
 @router.post("/totp/enroll", response_model=TotpEnrollResponse)
-def enroll_totp(payload: ReauthRequest, ctx: CurrentUser, db: DbSession) -> TotpEnrollResponse:
+def enroll_totp(
+    payload: ReauthRequest,
+    ctx: CurrentUser,
+    db: DbSession,
+    response: Response,
+    settings: AppSettings,
+) -> TotpEnrollResponse:
     if ctx.user.totp_enabled:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -316,7 +339,7 @@ def enroll_totp(payload: ReauthRequest, ctx: CurrentUser, db: DbSession) -> Totp
                 "message": "Two factor authentication is already enabled. Disable it first.",
             },
         )
-    _require_current_password(ctx, db, payload.current_password)
+    _require_current_password(ctx, db, payload.current_password, response, settings)
     secret, uri = auth_service.provision_totp(db, user=ctx.user)
     db.commit()
     return TotpEnrollResponse(secret=secret, otpauth_uri=uri)
@@ -326,22 +349,87 @@ def enroll_totp(payload: ReauthRequest, ctx: CurrentUser, db: DbSession) -> Totp
 def confirm_totp(
     payload: TotpConfirmRequest, ctx: CurrentUser, db: DbSession
 ) -> TotpConfirmResponse:
+    """Finish an enrolment started with /totp/enroll.
+
+    Only valid while an enrolment is pending. Once two factor is on this answers
+    409: otherwise a session alone could guess codes here without limit and, on
+    a hit, replace the owner's recovery codes with its own.
+    """
+    if ctx.user.totp_enabled or not ctx.user.totp_secret_encrypted:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "no_pending_enrolment",
+                "message": "There is no two factor set-up waiting to be confirmed.",
+            },
+        )
+    try:
+        auth_service.throttle(
+            db, bucket=f"totp-confirm:{ctx.user.id}", ip_address=ctx.ip_address or "unknown"
+        )
+    except auth_service.RateLimited as exc:
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "rate_limited", "message": str(exc)},
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
     codes = auth_service.confirm_totp(db, user=ctx.user, code=payload.code, actor=ctx.actor)
+    db.commit()
     if codes is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_totp", "message": "That code did not match. Try again."},
         )
-    db.commit()
     return TotpConfirmResponse(
         message="Two factor authentication enabled. Save your recovery codes now.",
         recovery_codes=codes,
     )
 
 
+@router.post("/totp/recovery-codes", response_model=TotpConfirmResponse)
+def regenerate_recovery_codes(
+    payload: ReauthRequest,
+    ctx: CurrentUser,
+    db: DbSession,
+    response: Response,
+    settings: AppSettings,
+) -> TotpConfirmResponse:
+    """Replace the recovery codes (for example after using some, or losing them)."""
+    if not ctx.user.totp_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "totp_not_enabled",
+                "message": "Two factor authentication is not enabled for this account.",
+            },
+        )
+    _require_current_password(ctx, db, payload.current_password, response, settings)
+    codes = auth_service.issue_recovery_codes(db, user=ctx.user)
+    record_audit(
+        db,
+        action="account.recovery_codes_regenerated",
+        actor=ctx.actor,
+        target_type="utility_user",
+        target_id=str(ctx.user.id),
+        target_label=ctx.user.username,
+    )
+    db.commit()
+    return TotpConfirmResponse(
+        message="New recovery codes issued. The previous ones no longer work.",
+        recovery_codes=codes,
+    )
+
+
 @router.post("/totp/disable", response_model=MessageResponse)
-def remove_totp(payload: ReauthRequest, ctx: CurrentUser, db: DbSession) -> MessageResponse:
-    _require_current_password(ctx, db, payload.current_password)
+def remove_totp(
+    payload: ReauthRequest,
+    ctx: CurrentUser,
+    db: DbSession,
+    response: Response,
+    settings: AppSettings,
+) -> MessageResponse:
+    _require_current_password(ctx, db, payload.current_password, response, settings)
     auth_service.disable_totp(db, user=ctx.user, actor=ctx.actor)
     db.commit()
     return MessageResponse(message="Two factor authentication disabled.")

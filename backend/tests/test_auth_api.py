@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import httpx
 import pyotp
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -356,7 +358,11 @@ class TestTotp:
         assert without_code.status_code == httpx.codes.UNAUTHORIZED
         assert without_code.json()["detail"]["code"] == "totp_required"
 
-        with_code = login(client, "admin", ADMIN_PASSWORD, pyotp.TOTP(secret).now())
+        # The code used to confirm cannot be used again; the next one can.
+        replayed = login(client, "admin", ADMIN_PASSWORD, pyotp.TOTP(secret).now())
+        assert replayed.status_code == httpx.codes.UNAUTHORIZED
+        next_code = pyotp.TOTP(secret).at(datetime.now(UTC) + timedelta(seconds=30))
+        with_code = login(client, "admin", ADMIN_PASSWORD, next_code)
         assert with_code.status_code == httpx.codes.OK
 
     def test_wrong_confirmation_code_does_not_enable_totp(
@@ -401,15 +407,70 @@ class TestTotp:
         assert wrong.status_code == httpx.codes.BAD_REQUEST
         assert admin_client.get("/api/auth/session").json()["totp_enabled"] is True
 
-    def test_password_rechecks_are_throttled(self, admin_client: TestClient) -> None:
+    def test_repeated_wrong_passwords_end_the_session(
+        self, admin_client: TestClient, db: Session
+    ) -> None:
+        """Guessing the password from inside a session is cut off: after a few
+        misses every session is ended and the guessing has to continue at the
+        sign-in form, with its lockouts."""
         statuses = [
             admin_client.post(
                 "/api/auth/totp/enroll", json={"current_password": f"guess-{n}"}
             ).status_code
-            for n in range(14)
+            for n in range(5)
+        ]
+        assert statuses[:4] == [httpx.codes.BAD_REQUEST] * 4
+        assert statuses[4] == httpx.codes.UNAUTHORIZED
+        assert admin_client.get("/api/auth/session").status_code == httpx.codes.UNAUTHORIZED
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(AuditLogEntry)
+                .where(AuditLogEntry.action == "auth.reauth_failed")
+            )
+            == 5
+        )
+
+    def test_confirm_is_refused_once_two_factor_is_on(self, admin_client: TestClient) -> None:
+        """Otherwise a session alone could guess codes here and, on a hit, swap
+        the owner's recovery codes for its own."""
+        secret, _codes = _enable_totp(admin_client)
+        later = pyotp.TOTP(secret).at(datetime.now(UTC) + timedelta(seconds=30))
+        response = admin_client.post("/api/auth/totp/confirm", json={"code": later})
+        assert response.status_code == httpx.codes.CONFLICT
+
+    def test_confirm_guesses_are_throttled(self, admin_client: TestClient) -> None:
+        admin_client.post("/api/auth/totp/enroll", json=REAUTH)
+        statuses = [
+            admin_client.post("/api/auth/totp/confirm", json={"code": "000000"}).status_code
+            for _ in range(13)
         ]
         assert statuses[0] == httpx.codes.BAD_REQUEST
         assert statuses[-1] == httpx.codes.TOO_MANY_REQUESTS
+
+    def test_a_code_cannot_be_used_twice(
+        self, admin_client: TestClient, client: TestClient
+    ) -> None:
+        secret, _codes = _enable_totp(admin_client)
+        admin_client.post("/api/auth/logout")
+        code = pyotp.TOTP(secret).at(datetime.now(UTC) + timedelta(seconds=30))
+        assert login(client, "admin", ADMIN_PASSWORD, code).status_code == httpx.codes.OK
+        client.post("/api/auth/logout")
+        again = login(client, "admin", ADMIN_PASSWORD, code)
+        assert again.status_code == httpx.codes.UNAUTHORIZED
+
+    def test_recovery_codes_can_be_replaced_with_the_password(
+        self, admin_client: TestClient
+    ) -> None:
+        _secret, old_codes = _enable_totp(admin_client)
+        refused = admin_client.post(
+            "/api/auth/totp/recovery-codes", json={"current_password": "nope"}
+        )
+        assert refused.status_code == httpx.codes.BAD_REQUEST
+        replaced = admin_client.post("/api/auth/totp/recovery-codes", json=REAUTH)
+        assert replaced.status_code == httpx.codes.OK
+        new_codes = replaced.json()["recovery_codes"]
+        assert len(new_codes) == 10 and not set(new_codes) & set(old_codes)
 
 
 class TestRecoveryCodes:
@@ -479,6 +540,21 @@ class TestAdminTotpReset:
         assert viewer_user.totp_recovery_codes is None
         assert "account.totp_reset" in db.scalars(select(AuditLogEntry.action)).all()
 
+    def test_an_admin_cannot_use_admin_powers_on_their_own_account(
+        self, admin_client: TestClient, admin_user: UtilityUser
+    ) -> None:
+        """Both would let a session alone - no password - take the account over:
+        drop its second factor, then set a new password with a reset code."""
+        _enable_totp(admin_client)
+        reset = admin_client.post(f"/api/accounts/{admin_user.id}/totp/reset")
+        assert reset.status_code == httpx.codes.BAD_REQUEST
+        assert reset.json()["detail"]["code"] == "own_account"
+        assert admin_client.get("/api/auth/session").json()["totp_enabled"] is True
+
+        code = admin_client.post(f"/api/accounts/{admin_user.id}/reset-password")
+        assert code.status_code == httpx.codes.BAD_REQUEST
+        assert code.json()["detail"]["code"] == "own_account"
+
     def test_a_viewer_cannot_reset_anyones_authenticator(
         self, viewer_client: TestClient, viewer_user: UtilityUser
     ) -> None:
@@ -526,6 +602,19 @@ class TestForcedPasswordChange:
 
         assert login(client, "newbie", "Wd3$hN8^bYc5-Jf1").status_code == httpx.codes.OK
         assert client.get("/api/limits").status_code == httpx.codes.OK
+
+    def test_the_temporary_password_cannot_be_chosen_again(
+        self, admin_client: TestClient, client: TestClient
+    ) -> None:
+        self._temporary_account(admin_client)
+        login(client, "newbie", "Xk7!vQ2#mTz9@Lr4")
+        same = client.post(
+            "/api/auth/password",
+            json={"current_password": "Xk7!vQ2#mTz9@Lr4", "new_password": "Xk7!vQ2#mTz9@Lr4"},
+        )
+        assert same.status_code == httpx.codes.BAD_REQUEST
+        assert "different" in " ".join(same.json()["detail"]["problems"])
+        assert client.get("/api/limits").status_code == httpx.codes.FORBIDDEN
 
 
 class TestAuditTrail:

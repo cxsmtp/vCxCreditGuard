@@ -30,6 +30,9 @@ class UtilityUser(Base, TimestampMixin):
     # SHA-256 digests of the unused one-time recovery codes issued when two
     # factor authentication was enabled. Each is removed as it is used.
     totp_recovery_codes: Mapped[list | None] = mapped_column(JSONColumn)
+    # The time step of the last authenticator code accepted, so a code cannot be
+    # used twice within its validity window.
+    totp_last_step: Mapped[int | None] = mapped_column(Integer)
 
     failed_login_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)

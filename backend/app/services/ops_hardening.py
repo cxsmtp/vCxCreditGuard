@@ -397,6 +397,13 @@ def restore_config_backup(session: Session, *, data: Any, actor: AuditActor) -> 
         if key in _SETTING_FIELD_BY_KEY:
             settings_store.set_value(session, key, value)
             restored_settings += 1
+    # Backups made before the webhook URL was treated as a secret carry it in
+    # the clear. Honour it (stored encrypted) rather than silently dropping the
+    # webhook; newer backups never contain it.
+    legacy_webhook = settings_in.get(settings_store.KEY_WEBHOOK_URL)
+    if isinstance(legacy_webhook, str) and legacy_webhook.strip():
+        settings_store.set_secret(session, settings_store.KEY_WEBHOOK_URL, legacy_webhook.strip())
+        restored_settings += 1
 
     created = updated = 0
     for row in _dict_list(data.get("limits"), "limits"):

@@ -147,6 +147,17 @@ def admin_reset_password(user_id: int, ctx: AdminUser, db: DbSession) -> AdminRe
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "inactive", "message": "Re-enable the account before resetting it."},
         )
+    if user.id == ctx.user.id:
+        # A reset code for your own account would let a session alone - someone
+        # at an unlocked screen, a stolen cookie - set a new password without
+        # knowing the old one.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "own_account",
+                "message": "Change your own password on the Account page, with your current one.",
+            },
+        )
     token = auth_service.admin_issue_reset_token(db, user=user, actor=ctx.actor)
     expires_at = utcnow() + auth_service.PASSWORD_RESET_TTL
     db.commit()
@@ -163,13 +174,25 @@ def reset_totp(user_id: int, ctx: AdminUser, db: DbSession) -> MessageResponse:
     user = db.get(UtilityUser, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such account.")
+    if user.id == ctx.user.id:
+        # Turning off your own second factor needs your password (Account page).
+        # Allowing it here would let a session alone remove it.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "own_account",
+                "message": (
+                    "Turn off your own two factor on the Account page. If you have lost "
+                    "your device, use a recovery code or ask another administrator."
+                ),
+            },
+        )
     if not user.totp_enabled and not user.totp_secret_encrypted:
         return MessageResponse(
             message=f"Two factor authentication is not enabled for {user.username}."
         )
     auth_service.disable_totp(db, user=user, actor=ctx.actor, action="account.totp_reset")
-    if user.id != ctx.user.id:
-        auth_service.revoke_all_sessions(db, user_id=user.id)
+    auth_service.revoke_all_sessions(db, user_id=user.id)
     db.commit()
     return MessageResponse(message=f"Two factor authentication reset for {user.username}.")
 

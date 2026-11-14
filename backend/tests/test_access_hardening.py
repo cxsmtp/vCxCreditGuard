@@ -14,7 +14,7 @@ from app.core.config import get_settings, reset_settings_cache
 from app.models import AuditLogEntry, UtilityUser
 from app.models.auth import LoginAttempt
 from app.services import auth as auth_service
-from tests.conftest import ADMIN_PASSWORD
+from tests.conftest import ADMIN_PASSWORD, postgres_only
 
 
 def _request(peer: str, forwarded: str | None = None) -> Request:
@@ -557,3 +557,389 @@ class TestMailServerIsVerified:
                 smtp_factory=Plain,
             )
         assert calls == []
+
+
+# ----------------------------------------------------------------------------
+# Findings from the independent security review
+# ----------------------------------------------------------------------------
+
+
+class TestUpgradeStartUp:
+    """The real start-up order, on a database written by an older version."""
+
+    def _start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app import main
+
+        monkeypatch.setattr(main, "upgrade_to_head", lambda *_a, **_k: None)
+        main._startup(get_settings())
+
+    @pytest.mark.parametrize("stored", ['"https://hooks.chat.example/T0/B0/tok"', "null", '""'])
+    def test_a_webhook_url_stored_in_the_clear_does_not_stop_the_app_starting(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch, stored: str
+    ) -> None:
+        from app.models.connection import AppSetting
+        from app.services import master_key, settings_store
+
+        db.add(AppSetting(key=settings_store.KEY_WEBHOOK_URL, value=stored, is_secret=False))
+        db.commit()
+
+        self._start(monkeypatch)  # used to raise "master key is not the one..."
+
+        db.expire_all()
+        assert db.get(AppSetting, master_key.CHECK_KEY) is not None
+        row = db.get(AppSetting, settings_store.KEY_WEBHOOK_URL)
+        assert row.is_secret is True
+        expected = "https://hooks.chat.example/T0/B0/tok" if "hooks" in stored else None
+        assert settings_store.get_secret(db, settings_store.KEY_WEBHOOK_URL) == expected
+
+    def test_a_connection_on_a_host_that_is_no_longer_allowed_is_reported(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.models import Notification
+        from app.models.enums import ConnectionStatus
+        from app.services import connection as connection_service
+        from app.services.audit import AuditActor
+        from tests.conftest import make_api_key
+
+        connection = connection_service.save_connection(
+            db, api_key=make_api_key(), actor=AuditActor.system("test")
+        )
+        connection.api_base_url = "https://ast.dedicated.example/api"  # set before the rule
+        db.commit()
+
+        self._start(monkeypatch)
+
+        db.expire_all()
+        assert connection_service.get_connection(db).status == ConnectionStatus.FAILED
+        alert = db.scalar(select(Notification).where(Notification.title.like("%is blocked")))
+        assert alert is not None and "CXCG_CX_ALLOWED_HOSTS" in alert.body
+
+    def test_two_factor_secrets_are_part_of_the_key_check(
+        self, db: Session, admin_user: UtilityUser, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import base64
+
+        from app.core import crypto
+        from app.core.config import ConfigError
+        from app.services import master_key
+
+        auth_service.provision_totp(db, user=admin_user)
+        db.commit()
+        monkeypatch.setenv("CXCG_MASTER_KEY", base64.b64encode(bytes(range(1, 33))).decode())
+        reset_settings_cache()
+        crypto.reset_secret_box()
+        with pytest.raises(ConfigError):
+            master_key.verify_master_key(db)
+
+
+class TestForwardedHeaderLines:
+    def test_a_proxy_that_adds_its_own_header_line_is_still_the_one_believed(
+        self, one_trusted_proxy: None
+    ) -> None:
+        """Some proxies add a second X-Forwarded-For line instead of appending."""
+        request = Request(
+            {
+                "type": "http",
+                "client": ("172.18.0.3", 1234),
+                "headers": [
+                    (b"x-forwarded-for", b"6.6.6.6"),  # sent by the client
+                    (b"x-forwarded-for", b"203.0.113.7"),  # added by the proxy
+                ],
+            }
+        )
+        assert client_ip(request) == "203.0.113.7"
+
+    def test_a_forged_header_cannot_dodge_the_throttle_behind_a_proxy(
+        self, one_trusted_proxy: None, db: Session, admin_user: UtilityUser
+    ) -> None:
+        outcomes = []
+        for n in range(8):
+            ip = client_ip(_request("172.18.0.3", f"198.51.100.{n}, 203.0.113.7"))
+            try:
+                auth_service.authenticate(db, username="admin", password="x", ip_address=ip)
+            except auth_service.AuthError as exc:
+                outcomes.append(type(exc))
+            db.commit()
+        assert auth_service.AccountLocked in outcomes
+
+
+class TestAccountWideLock:
+    def _age_account_failures(self, db: Session, username: str = "admin") -> None:
+        from datetime import timedelta
+
+        row = db.scalar(
+            select(LoginAttempt).where(
+                LoginAttempt.identifier == username,
+                LoginAttempt.ip_address == auth_service.ACCOUNT_WIDE,
+            )
+        )
+        row.last_attempt_at = row.last_attempt_at - auth_service.ACCOUNT_FAILURE_WINDOW * 2
+        for source in db.scalars(
+            select(LoginAttempt).where(
+                LoginAttempt.identifier == username,
+                LoginAttempt.ip_address != auth_service.ACCOUNT_WIDE,
+            )
+        ):
+            source.locked_until = None
+            source.window_started_at = source.window_started_at - timedelta(hours=3)
+        db.commit()
+
+    def test_one_patient_address_never_locks_the_owner_out(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        """It waits out its own lockout and tries again, for days."""
+        settings = get_settings()
+        needed = settings.login_max_attempts * auth_service.ACCOUNT_LOCK_MULTIPLIER
+        for _ in range(needed // settings.login_max_attempts + 3):
+            _fail(db, ip="203.0.113.50", times=settings.login_max_attempts)
+            self._age_account_failures(db)
+
+        user = auth_service.authenticate(
+            db, username="admin", password=ADMIN_PASSWORD, ip_address="198.51.100.4"
+        )
+        assert user.id == admin_user.id
+
+    def test_the_owner_at_a_known_address_gets_in_during_a_distributed_attack(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        settings = get_settings()
+        auth_service.issue_session(db, user=admin_user, ip_address="198.51.100.4")
+        db.commit()
+        per_address = settings.login_max_attempts - 1
+        needed = settings.login_max_attempts * auth_service.ACCOUNT_LOCK_MULTIPLIER
+        for n in range(-(-needed // per_address)):
+            _fail(db, ip=f"203.0.113.{n}", times=per_address)
+
+        # A stranger with the right password is still held off...
+        with pytest.raises(auth_service.AccountLocked):
+            auth_service.authenticate(
+                db, username="admin", password=ADMIN_PASSWORD, ip_address="192.0.2.99"
+            )
+        db.rollback()
+        # ...but not the owner where they have signed in before.
+        assert auth_service.authenticate(
+            db, username="admin", password=ADMIN_PASSWORD, ip_address="198.51.100.4"
+        )
+
+    def test_the_account_wide_lock_does_not_reveal_which_usernames_exist(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        settings = get_settings()
+        per_address = settings.login_max_attempts - 1
+        needed = settings.login_max_attempts * auth_service.ACCOUNT_LOCK_MULTIPLIER
+        for username in ("admin", "nobody"):
+            for n in range(-(-needed // per_address)):
+                _fail(db, ip=f"203.0.113.{n}", times=per_address, username=username)
+            with pytest.raises(auth_service.AccountLocked):
+                auth_service.authenticate(
+                    db, username=username, password="whatever", ip_address="192.0.2.77"
+                )
+            db.rollback()
+
+    def test_a_disabled_account_is_only_revealed_to_someone_with_the_password(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        admin_user.is_active = False
+        db.commit()
+        with pytest.raises(auth_service.InvalidCredentials):
+            auth_service.authenticate(db, username="admin", password="wrong", ip_address="1.1.1.1")
+        db.commit()
+        with pytest.raises(auth_service.AccountDisabled):
+            auth_service.authenticate(
+                db, username="admin", password=ADMIN_PASSWORD, ip_address="1.1.1.1"
+            )
+
+    def test_an_ipv6_client_is_throttled_as_its_whole_network(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        assert auth_service.throttle_address("2001:db8:1:2:aaaa::1") == "2001:db8:1:2::/64"
+        assert auth_service.throttle_address("203.0.113.7") == "203.0.113.7"
+        assert auth_service.throttle_address("testclient") == "testclient"
+
+        outcomes = []
+        for n in range(get_settings().login_max_attempts + 1):
+            try:
+                auth_service.authenticate(
+                    db, username="admin", password="x", ip_address=f"2001:db8:1:2::{n + 1:x}"
+                )
+            except auth_service.AuthError as exc:
+                outcomes.append(type(exc))
+            db.commit()
+        assert outcomes[-1] is auth_service.AccountLocked
+
+
+class TestRecoveryCodeStorage:
+    def test_codes_are_long_and_stored_keyed_not_merely_hashed(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        import hashlib
+
+        codes = auth_service.issue_recovery_codes(db, user=admin_user)
+        raw = codes[0].replace("-", "")
+        assert len(raw) * 4 >= 80  # bits
+        stored = admin_user.totp_recovery_codes
+        assert hashlib.sha256(raw.encode()).hexdigest() not in stored
+        assert auth_service.use_recovery_code(db, user=admin_user, code=codes[0]) is True
+        assert auth_service.use_recovery_code(db, user=admin_user, code=codes[0]) is False
+
+
+class TestOldBackups:
+    def test_a_backup_from_before_the_webhook_was_a_secret_still_restores_it(
+        self, db: Session
+    ) -> None:
+        from app.models.connection import AppSetting
+        from app.services import ops_hardening, settings_store
+        from app.services.audit import AuditActor
+
+        backup = {
+            "backup_version": 1,
+            "settings": {settings_store.KEY_WEBHOOK_URL: SLACK_STYLE_URL},
+            "limits": [],
+            "exemptions": [],
+        }
+        ops_hardening.restore_config_backup(db, data=backup, actor=AuditActor.system("test"))
+        db.commit()
+        assert settings_store.get_secret(db, settings_store.KEY_WEBHOOK_URL) == SLACK_STYLE_URL
+        assert db.get(AppSetting, settings_store.KEY_WEBHOOK_URL).is_secret is True
+        assert "s3cr3tPathToken" not in str(ops_hardening.export_config_backup(db))
+
+
+class TestImplicitTls:
+    def test_port_465_uses_tls_from_the_first_byte(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import smtplib
+        import ssl
+
+        from app.services import delivery
+
+        made: dict[str, object] = {}
+
+        class FakeSmtps:
+            def __init__(self, host, port, timeout, context) -> None:
+                made.update(host=host, port=port, context=context)
+
+        monkeypatch.setattr(smtplib, "SMTP_SSL", FakeSmtps)
+        delivery._default_smtp_factory("smtp.example.com", 465, 5.0)
+        assert made["port"] == 465
+        assert isinstance(made["context"], ssl.SSLContext)
+        assert made["context"].verify_mode == ssl.CERT_REQUIRED
+
+    def test_no_starttls_and_credentials_allowed_on_465(self) -> None:
+        from app.services import delivery
+
+        calls: list[str] = []
+
+        class Server:
+            def __init__(self, *_args) -> None:
+                pass
+
+            def starttls(self, *, context=None) -> None:
+                calls.append("starttls")
+
+            def login(self, *_args) -> None:
+                calls.append("login")
+
+            def send_message(self, _message) -> None:
+                calls.append("send")
+
+            def quit(self) -> None:
+                pass
+
+        config = TestMailServerIsVerified()._config(smtp_port=465, smtp_use_tls=False)
+        delivery.send_report_email(config=config, subject="s", text_body="b", smtp_factory=Server)
+        assert calls == ["login", "send"]
+
+    def test_a_missing_ca_file_is_explained(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.services import delivery
+
+        monkeypatch.setenv("CXCG_SMTP_CA_FILE", "/nonexistent/ca.pem")
+        reset_settings_cache()
+        with pytest.raises(delivery.DeliveryError, match="CXCG_SMTP_CA_FILE"):
+            delivery._tls_context()
+
+
+class TestMalformedUrls:
+    @pytest.mark.parametrize("url", ["https://[bad", "https://eu.ast.checkmarx.net:notaport/api"])
+    def test_a_malformed_tenant_url_is_refused_not_a_server_error(self, url: str) -> None:
+        from app.checkmarx.regions import UntrustedHostError, check_tenant_url
+
+        with pytest.raises(UntrustedHostError):
+            check_tenant_url(url, what="platform API URL")
+
+    def test_a_blank_webhook_url_is_not_stored_as_configured(
+        self, admin_client: TestClient
+    ) -> None:
+        body = admin_client.put("/api/settings", json={"webhook_url": "   "}).json()
+        assert body["webhook_url_configured"] is False
+
+
+class TestResetSecrets:
+    def test_it_clears_stored_secrets_and_lets_a_new_key_start(
+        self, db: Session, admin_user: UtilityUser, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import base64
+
+        from app.core import crypto
+        from app.models import CreditLimit
+        from app.models.connection import AppSetting
+        from app.services import connection as connection_service
+        from app.services import master_key, settings_store
+        from app.services.audit import AuditActor
+        from scripts import reset_secrets
+        from tests.conftest import make_api_key
+
+        connection_service.save_connection(
+            db, api_key=make_api_key(), actor=AuditActor.system("test")
+        )
+        settings_store.set_secret(db, settings_store.KEY_SMTP_PASSWORD, "mail-password")
+        auth_service.provision_totp(db, user=admin_user)
+        db.add(CreditLimit(entity_type="user", entity_id="u1", credit_limit=5))
+        master_key.verify_master_key(db)
+        db.commit()
+
+        # The key is lost; a new one is configured.
+        monkeypatch.setenv("CXCG_MASTER_KEY", base64.b64encode(bytes(range(1, 33))).decode())
+        reset_settings_cache()
+        crypto.reset_secret_box()
+
+        assert reset_secrets.main([]) == 2  # refuses without --yes
+        assert reset_secrets.main(["--yes"]) == 0
+
+        db.expire_all()
+        assert connection_service.get_connection(db) is None
+        assert db.get(AppSetting, settings_store.KEY_SMTP_PASSWORD) is None
+        assert admin_user.totp_secret_encrypted is None
+        assert db.scalar(select(CreditLimit)) is not None  # everything else is kept
+        master_key.verify_master_key(db)  # and the app can start with the new key
+
+
+@postgres_only
+class TestRecoveryCodeRace:
+    def test_two_simultaneous_sign_ins_cannot_both_spend_one_code(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        """On PostgreSQL both used to read the code as unused."""
+        import threading
+
+        from app.db.session import get_session_factory
+
+        codes = auth_service.issue_recovery_codes(db, user=admin_user)
+        db.commit()
+        barrier = threading.Barrier(2)
+        results: list[bool] = []
+
+        def spend() -> None:
+            session = get_session_factory()()
+            try:
+                user = session.get(UtilityUser, admin_user.id)
+                barrier.wait(timeout=10)
+                results.append(auth_service.use_recovery_code(session, user=user, code=codes[0]))
+                session.commit()
+            finally:
+                session.close()
+
+        threads = [threading.Thread(target=spend) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        assert sorted(results) == [False, True]

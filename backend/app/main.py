@@ -35,6 +35,7 @@ from app.core.config import ConfigError, Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.migrate import upgrade_to_head
 from app.db.session import session_scope
+from app.services import connection as connection_service
 from app.services import settings_store
 from app.services.auth import bootstrap_admin_if_needed
 from app.services.master_key import verify_master_key
@@ -54,6 +55,7 @@ def _startup(settings: Settings) -> None:
         # cycle failed to read the Checkmarx API key.
         verify_master_key(db)
         settings_store.encrypt_legacy_secrets(db)
+        connection_service.warn_if_untrusted(db)
         bootstrap_admin_if_needed(db, settings)
 
 

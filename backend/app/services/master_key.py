@@ -22,9 +22,11 @@ from app.core.config import ConfigError
 from app.core.crypto import (
     PURPOSE_CX_API_KEY,
     PURPOSE_KEY_CHECK,
+    PURPOSE_TOTP_SECRET,
     DecryptionError,
     get_secret_box,
 )
+from app.models.auth import UtilityUser
 from app.models.connection import AppSetting, CxConnection
 from app.services import settings_store
 
@@ -37,7 +39,9 @@ _WRONG_KEY = (
     "The master key (CXCG_MASTER_KEY / CXCG_MASTER_KEY_FILE) is not the one this database "
     "was encrypted with, so the stored Checkmarx API key and notification secrets cannot "
     "be read. Start with the original key. If that key is lost, the stored secrets are "
-    "unrecoverable: see the runbook section on master key loss for how to reset them."
+    "unrecoverable: run `python -m scripts.reset_secrets --yes` in the container to clear "
+    "them, then start again and re-enter the API key and notification secrets (see "
+    '"Losing the master key" in the README).'
 )
 
 
@@ -79,6 +83,16 @@ def _stored_secrets(session: Session) -> list[tuple[str, str]]:
         found.append((connection.api_key_encrypted, PURPOSE_CX_API_KEY))
     for key, purpose in settings_store.SECRET_KEYS.items():
         row = session.get(AppSetting, key)
-        if row is not None and row.value:
+        # A row not flagged as secret is a value an older version stored in the
+        # clear (it is encrypted later in start-up). It is not ciphertext, so
+        # failing to decrypt it says nothing about the key.
+        if row is not None and row.value and row.is_secret:
             found.append((row.value, purpose))
+    for ciphertext in session.scalars(
+        select(UtilityUser.totp_secret_encrypted)
+        .where(UtilityUser.totp_secret_encrypted.is_not(None))
+        .limit(5)
+    ):
+        if ciphertext:
+            found.append((ciphertext, PURPOSE_TOTP_SECRET))
     return found

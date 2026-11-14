@@ -114,8 +114,12 @@ def check_tenant_url(
     Allowed: HTTPS to a host under ``checkmarx.net``, or under a suffix the
     operator listed in ``CXCG_CX_ALLOWED_HOSTS`` (for dedicated deployments).
     """
-    parts = urlsplit(url.strip())
-    host = (parts.hostname or "").lower()
+    try:
+        parts = urlsplit(url.strip())
+        host = (parts.hostname or "").lower()
+        _ = parts.port  # raises for a malformed port
+    except ValueError as exc:
+        raise UntrustedHostError(f"The {what} is not a valid URL.") from exc
     if parts.scheme not in ("https", "http") or not host:
         raise UntrustedHostError(f"The {what} must be an https:// URL.")
     if parts.scheme == "http" and not allow_plain_http:

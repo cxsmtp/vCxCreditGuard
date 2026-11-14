@@ -632,9 +632,11 @@ with regression tests in `backend/tests/test_security_hardening.py`:
    password guessing attempt can still see them.
 
 Two things were considered and deliberately left as they are, both documented at
-the code: the webhook target check is not a general egress control, and
-`X-Forwarded-For` is trusted for rate limiting and logging but never for
-authorisation.
+the code: the webhook target check is not a general egress control, and the
+client address (used for sign-in throttling and the audit log, never for
+authorisation) is read from `X-Forwarded-For` only as far as
+`CXCG_TRUSTED_PROXY_HOPS` proxies vouch for it; with the default of 0 the header
+is ignored.
 
 ### Threat model notes
 
