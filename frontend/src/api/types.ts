@@ -31,6 +31,8 @@ export interface Me {
   ui_accent: string;
   can_request_credits: boolean;
   demo_mode: boolean;
+  /** Why new restrictions are not being applied, or null when they are. */
+  enforcement_paused: string | null;
 }
 
 export type RequestStatus = "pending" | "approved" | "denied";
@@ -334,6 +336,12 @@ export interface AppSettings {
   automation_enabled: boolean;
   auto_approve_max_increase: number;
   auto_approve_expiry_days: number;
+  enforcement_paused: boolean;
+  enforcement_pause_reason: string | null;
+  /** Limits that may start restricting in one cycle before enforcement stops itself. 0 = no ceiling. */
+  max_new_enforcements_per_cycle: number;
+  /** Comma separated tenant role names whose holders are never restricted. */
+  protected_roles: string;
   current_schedule_description: string;
 }
 

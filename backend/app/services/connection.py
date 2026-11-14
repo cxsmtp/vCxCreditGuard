@@ -204,6 +204,29 @@ def decrypt_api_key(connection: CxConnection) -> str:
     return api_key
 
 
+_subject_cache: tuple[str, str | None] | None = None
+
+
+def api_key_subject(session: Session) -> str | None:
+    """The tenant user id the stored API key belongs to, if it can be read.
+
+    Cached per stored key: it is asked for on every enforcement plan.
+    """
+    global _subject_cache
+    connection = get_connection(session)
+    if connection is None or not connection.api_key_encrypted:
+        return None
+    cache_key = connection.api_key_encrypted
+    if _subject_cache is not None and _subject_cache[0] == cache_key:
+        return _subject_cache[1]
+    try:
+        subject = parse_api_key(decrypt_api_key(connection)).subject
+    except Exception:  # noqa: BLE001 - an unreadable key protects nobody, and is reported elsewhere
+        subject = None
+    _subject_cache = (cache_key, subject)
+    return subject
+
+
 # --------------------------------------------------------------- client cache
 
 _cache_lock = threading.Lock()

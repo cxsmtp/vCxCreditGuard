@@ -48,7 +48,7 @@ from app.models.enums import (
 )
 from app.models.limits import CreditLimit, EnforcementAction, Exemption
 from app.models.org import CxApplicationProject, CxProject, CxProjectGroup, CxUser
-from app.services import notifications
+from app.services import notifications, settings_store
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -149,6 +149,26 @@ def is_exempt(session: Session, *, entity_type: str, entity_id: str) -> bool:
     )
 
 
+# ----------------------------------------------------------------- protection
+
+
+class ProtectedTarget(Exception):  # noqa: N818 - a decision, not an error
+    """This target must not be restricted, whatever its usage."""
+
+
+def protected_user_ids(session: Session) -> frozenset[str]:
+    """Tenant users the utility never restricts.
+
+    The account the stored API key belongs to: the utility acts as that user,
+    so taking its roles away could cut off the utility's own access to the
+    tenant - including its ability to give anyone's access back.
+    """
+    from app.services import connection as connection_service
+
+    subject = connection_service.api_key_subject(session)
+    return frozenset({subject}) if subject else frozenset()
+
+
 # --------------------------------------------------------------------- planning
 
 
@@ -177,6 +197,8 @@ def plan_targets(session: Session, *, entity_type: str, entity_id: str) -> list[
     """Every concrete change a breach of this limit implies, exemptions removed."""
     if entity_type == EntityType.USER:
         if is_exempt(session, entity_type=EntityType.USER, entity_id=entity_id):
+            return []
+        if entity_id in protected_user_ids(session):
             return []
         user = session.get(CxUser, entity_id)
         return [
@@ -266,8 +288,9 @@ def apply_enforcement(
     resolver = resolver or RoleResolver(client)
     targets = plan_targets(session, entity_type=limit.entity_type, entity_id=limit.entity_id)
     if not targets:
-        outcome.skipped.append("no targets to restrict (all exempt, or no projects linked)")
+        outcome.skipped.append("no targets to restrict (exempt, protected, or no projects linked)")
         return outcome
+    protected_roles = settings_store.enforcement_guard(session).protected_roles
 
     for target in targets:
         # Lock order: never wait on a target lock while holding anything in the
@@ -284,6 +307,7 @@ def apply_enforcement(
                 actor=actor,
                 resolver=resolver,
                 outcome=outcome,
+                protected_roles=protected_roles,
             )
     return outcome
 
@@ -298,6 +322,7 @@ def _enforce_target(
     actor: AuditActor,
     resolver: RoleResolver,
     outcome: EnforcementOutcome,
+    protected_roles: frozenset[str] = frozenset(),
 ) -> None:
     """Restrict one target, or verify an existing restriction. Caller holds its lock.
 
@@ -391,14 +416,22 @@ def _enforce_target(
     write_attempted = False
     try:
         # Phase 1: read the tenant's current state. Nothing is changed yet.
-        captured = _capture(session, client, target=target, resolver=resolver)
+        captured = _capture(
+            session, client, target=target, resolver=resolver, protected_roles=protected_roles
+        )
         # Phase 2: make the intent and the undo snapshot durable. If an earlier
         # attempt's write may have landed without being recorded, its snapshot
         # holds the true "before" state and is merged in rather than overwritten
-        # by what is, by now, possibly an already-restricted state. The snapshot
-        # is marked "outcome unknown" until the write's result is recorded, so a
-        # process that stops in between leaves a row that can still be undone.
-        snapshot = _merge_snapshots(earlier, captured.snapshot)
+        # by what is, by now, possibly an already-restricted state. The same
+        # goes for another limit that already restricts this target: what we
+        # just read is the state *it* left, and what must eventually be given
+        # back is what was there before either. The snapshot is marked "outcome
+        # unknown" until the write's result is recorded, so a process that stops
+        # in between leaves a row that can still be undone.
+        snapshot = captured.snapshot
+        for sibling in _siblings_in_force(session, action):
+            snapshot = _merge_snapshots(_settled(sibling.undo_snapshot), snapshot)
+        snapshot = _merge_snapshots(earlier, snapshot)
         snapshot[OUTCOME_UNKNOWN] = True
         action.undo_snapshot = snapshot
         action.status = EnforcementStatus.PENDING
@@ -406,6 +439,39 @@ def _enforce_target(
         # Phase 3: change the tenant. No transaction is open during this call.
         write_attempted = True
         captured.apply()
+    except ProtectedTarget as exc:
+        # A decision, not a failure: nothing is changed, the admin is told once,
+        # and the cycle is not marked as degraded for honouring its own rule.
+        message = str(exc)[:2000]
+        first_report = previous_error != message
+        action.status = EnforcementStatus.FAILED
+        action.error = message
+        session.flush()
+        outcome.skipped.append(f"{target.kind} on {target.target_label}: {exc}")
+        notifications.notify(
+            session,
+            category=notifications.CATEGORY_ENFORCEMENT,
+            severity=Severity.WARNING,
+            title=f"{target.target_label} is over budget but protected",
+            body=str(exc),
+            entity_type=limit.entity_type,
+            entity_id=limit.entity_id,
+            entity_label=limit.entity_label,
+            dedupe_key=notifications.protected_key(action.id),
+            enforcement_action_id=action.id,
+        )
+        if first_report:
+            record_audit(
+                session,
+                action="enforcement.protected",
+                actor=actor,
+                target_type=target.target_type,
+                target_id=target.target_id,
+                target_label=target.target_label,
+                detail=str(exc),
+            )
+        session.commit()
+        return
     except CheckmarxError as exc:
         if action.undo_snapshot is not None and (
             not write_attempted or isinstance(exc, _DEFINITE_REJECTIONS)
@@ -586,6 +652,7 @@ def _capture(
     *,
     target: Target,
     resolver: RoleResolver,
+    protected_roles: frozenset[str] = frozenset(),
 ) -> _Captured:
     """Read the state a restriction is about to change. Makes no change itself."""
     if target.kind == EnforcementKind.REMOVE_USER_ROLES:
@@ -594,6 +661,19 @@ def _capture(
             client, user_id=target.target_id, client_uuid=client_uuid
         )
         current_names = {role.name for role in current}
+        # Judged on the roles just read from the tenant, plus what the last sync
+        # recorded (which also covers roles held outside the platform client).
+        user = session.get(CxUser, target.target_id)
+        held = {name.lower() for name in current_names} | {
+            str(name).lower() for name in ((user.role_names if user else None) or [])
+        }
+        shielding = sorted(held & protected_roles)
+        if shielding:
+            raise ProtectedTarget(
+                f"{target.target_label} holds a protected role ({', '.join(shielding)}), so "
+                "their AI access is not removed automatically. Raise it with them, or "
+                "change the protected roles on the Settings page."
+            )
         to_remove = [role for role in current if role.name in iam.AI_ROLE_NAMES]
 
         def remove_roles() -> None:
@@ -655,10 +735,18 @@ def _capture(
             # The real, current severities (captured before disabling) - this is
             # what a Restore must reproduce, including MEDIUM/LOW if configured.
             severities_before = read
+        elif project.pr_remediation_severities is not None:
+            # The tenant cannot be read, but the last sync recorded the setting.
+            # Used as it is, empty included: "already off" must restore to off.
+            severities_before = list(project.pr_remediation_severities)
         else:
-            # No read support on the tenant: fall back to the cached or default set.
-            severities_before = list(
-                project.pr_remediation_severities or platform.DEFAULT_PR_SEVERITIES
+            # Nothing says what the setting is now, so nothing could put it back
+            # afterwards. A restriction that cannot be undone faithfully is not
+            # applied; Auto Triage on the same project is unaffected.
+            raise CheckmarxError(
+                "The current PR triage and remediation setting for this repository "
+                "could not be read, so it was left unchanged: it could not have been "
+                "restored to what it was."
             )
 
         def disable_pr_remediation() -> None:
@@ -863,6 +951,33 @@ def _took_something(snapshot: dict[str, Any] | None) -> bool:
     )
 
 
+def _settled(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A snapshot without its bookkeeping marker."""
+    if not snapshot:
+        return None
+    return {key: value for key, value in snapshot.items() if key != OUTCOME_UNKNOWN}
+
+
+def _siblings_in_force(session: Session, action: EnforcementAction) -> list[EnforcementAction]:
+    """Other actions, from other limits, restricting the same thing on the same target.
+
+    A user can be over a personal limit and a group limit at once; a project can
+    sit under a project limit and an application limit. Each limit has its own
+    action row, but the tenant holds a single state, and there is one true
+    "before" to give back when the last of them lets go.
+    """
+    rows = session.scalars(
+        select(EnforcementAction).where(
+            EnforcementAction.target_type == action.target_type,
+            EnforcementAction.target_id == action.target_id,
+            EnforcementAction.kind == action.kind,
+            EnforcementAction.id != action.id,
+            EnforcementAction.status.in_(RESTORABLE_STATUSES),
+        )
+    )
+    return [row for row in rows if may_be_in_force(row)]
+
+
 def may_be_in_force(action: EnforcementAction) -> bool:
     """True if the tenant is, or may be, restricted because of this action."""
     if action.status == EnforcementStatus.APPLIED:
@@ -914,8 +1029,49 @@ def _restore_action_locked(
         return False
 
     was_applied = action.status == EnforcementStatus.APPLIED
-    snapshot = {k: v for k, v in (action.undo_snapshot or {}).items() if k != OUTCOME_UNKNOWN}
+    snapshot = _settled(action.undo_snapshot) or {}
     resolver = resolver or RoleResolver(client)
+
+    siblings = _siblings_in_force(session, action)
+    if siblings and reason != ADMIN_REASON:
+        # Another limit still restricts this target, so nothing is given back in
+        # Checkmarx yet. What this action knows about the original state is
+        # handed to the ones that remain, so the last to be lifted returns all
+        # of it - not just whatever it happened to see when it was applied.
+        for sibling in siblings:
+            merged = _merge_snapshots(snapshot, _settled(sibling.undo_snapshot) or snapshot)
+            if _outcome_unknown(sibling.undo_snapshot):
+                merged[OUTCOME_UNKNOWN] = True
+            sibling.undo_snapshot = merged
+        action.status = EnforcementStatus.REVERSED
+        action.reversed_at = utcnow()
+        action.reversed_by_id = actor.actor_id
+        action.reversal_reason = reason
+        action.undo_snapshot = snapshot
+        action.error = None
+        session.flush()
+        record_audit(
+            session,
+            action="enforcement.reversed",
+            actor=actor,
+            target_type=action.target_type,
+            target_id=action.target_id,
+            target_label=action.target_label,
+            before={"kind": action.kind, "restricted": True},
+            after={"kind": action.kind, "restricted": True, "still_restricted_by": len(siblings)},
+            detail=(
+                f"This limit no longer restricts {action.target_label} ({reason}), but "
+                f"{len(siblings)} other limit(s) still do, so nothing was changed in "
+                "Checkmarx One."
+            ),
+        )
+        session.commit()
+        return True
+    if siblings:
+        # An admin's Restore means "give this back now", whichever limits took
+        # it: all of them are lifted together, from their combined snapshot.
+        for sibling in siblings:
+            snapshot = _merge_snapshots(_settled(sibling.undo_snapshot), snapshot)
 
     # Record the intent before touching the tenant. If the access is given back
     # and the process stops before saying so, the row still reads "restricted";
@@ -963,12 +1119,13 @@ def _restore_action_locked(
         session.commit()
         raise
 
-    action.status = EnforcementStatus.REVERSED
-    action.reversed_at = utcnow()
-    action.reversed_by_id = actor.actor_id
-    action.reversal_reason = reason
-    action.undo_snapshot = snapshot
-    action.error = None
+    for lifted in (action, *siblings):
+        lifted.status = EnforcementStatus.REVERSED
+        lifted.reversed_at = utcnow()
+        lifted.reversed_by_id = actor.actor_id
+        lifted.reversal_reason = reason
+        lifted.undo_snapshot = snapshot
+        lifted.error = None
     session.flush()
 
     record_audit(
@@ -980,14 +1137,7 @@ def _restore_action_locked(
         target_label=action.target_label,
         before={"kind": action.kind, "restricted": True},
         after=snapshot,
-        detail=(
-            f"Access restored ({reason})."
-            if was_applied
-            else (
-                f"A restriction whose outcome was never confirmed was undone to be safe "
-                f"({reason}): its previous state was put back."
-            )
-        ),
+        detail=_reversal_detail(reason, was_applied=was_applied, also_lifted=len(siblings)),
     )
     notifications.notify(
         session,
@@ -1005,6 +1155,18 @@ def _restore_action_locked(
     # audit chain's lock is never held while talking to Checkmarx.
     session.commit()
     return True
+
+
+def _reversal_detail(reason: str, *, was_applied: bool, also_lifted: int) -> str:
+    if not was_applied:
+        return (
+            "A restriction whose outcome was never confirmed was undone to be safe "
+            f"({reason}): its previous state was put back."
+        )
+    detail = f"Access restored ({reason})."
+    if also_lifted:
+        detail += f" {also_lifted} other limit(s) restricting it were lifted too."
+    return detail
 
 
 def _undo(

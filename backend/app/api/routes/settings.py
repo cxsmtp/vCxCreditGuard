@@ -44,6 +44,9 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "automation_enabled": settings_store.KEY_AUTOMATION_ENABLED,
     "auto_approve_max_increase": settings_store.KEY_AUTO_APPROVE_MAX_INCREASE,
     "auto_approve_expiry_days": settings_store.KEY_AUTO_APPROVE_EXPIRY_DAYS,
+    "enforcement_paused": settings_store.KEY_ENFORCEMENT_PAUSED,
+    "max_new_enforcements_per_cycle": settings_store.KEY_MAX_NEW_ENFORCEMENTS,
+    "protected_roles": settings_store.KEY_PROTECTED_ROLES,
 }
 
 _SECRET_FIELDS: dict[str, str] = {
@@ -70,6 +73,7 @@ def _webhook_host(db) -> str | None:  # type: ignore[no-untyped-def]
 def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
     values = settings_store.all_public_settings(db)
     policy = settings_store.automation_policy(db)
+    guard = settings_store.enforcement_guard(db)
     return SettingsResponse(
         scheduler_enabled=bool(values.get(settings_store.KEY_SCHEDULER_ENABLED, True)),
         schedule_mode=str(values.get(settings_store.KEY_SCHEDULE_MODE) or "interval"),
@@ -103,6 +107,10 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         automation_enabled=policy.enabled,
         auto_approve_max_increase=policy.auto_approve_max_increase,
         auto_approve_expiry_days=policy.auto_approve_expiry_days,
+        enforcement_paused=guard.paused,
+        enforcement_pause_reason=guard.pause_reason if guard.paused else None,
+        max_new_enforcements_per_cycle=guard.max_new_per_cycle,
+        protected_roles=", ".join(sorted(guard.protected_roles)),
         current_schedule_description=scheduler.describe_schedule(),
     )
 
@@ -181,6 +189,14 @@ def update_settings(
             )
         settings_store.set_value(db, key, value)
         audited_changes[field] = value
+        if field == "enforcement_paused":
+            # Pausing by hand records who; resuming clears whatever reason the
+            # pause carried (the safety ceiling's, or an earlier admin's).
+            settings_store.set_value(
+                db,
+                settings_store.KEY_ENFORCEMENT_PAUSE_REASON,
+                f"Paused by {ctx.actor.actor_name}." if value else None,
+            )
 
     after = _read(db).model_dump(exclude={"current_schedule_description"})
     record_audit(

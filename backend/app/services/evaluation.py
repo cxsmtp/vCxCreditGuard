@@ -52,7 +52,7 @@ from app.models.enums import (
 )
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
 from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
-from app.services import enforcement, ingestion, notifications
+from app.services import enforcement, ingestion, notifications, settings_store
 from app.services.audit import AuditActor, record_audit
 from app.services.periods import PeriodError, PeriodWindow, current_window, describe_window
 
@@ -83,6 +83,11 @@ class EvaluationResult:
     monitor_only: int = 0
     restored: int = 0
     unavailable: int = 0
+    # Breached, enforcing limits whose restriction was not applied because
+    # enforcement is paused (by an admin, or by the safety ceiling).
+    deferred: int = 0
+    # Why new restrictions are not being applied this cycle, or None if they are.
+    enforcement_paused: str | None = None
     errors: list[str] = field(default_factory=list)
     evaluations: list[LimitEvaluation] = field(default_factory=list)
 
@@ -95,6 +100,8 @@ class EvaluationResult:
             "monitor_only": self.monitor_only,
             "restored": self.restored,
             "usage_unavailable": self.unavailable,
+            "deferred": self.deferred,
+            "enforcement_paused": self.enforcement_paused,
             "errors": self.errors,
         }
 
@@ -209,6 +216,10 @@ def evaluate_all(
 
     if client is not None:
         _lift_unjustified_restrictions(session, client, actor=actor, result=result)
+        # Decided once, before anything is restricted: either the whole cycle
+        # may apply new restrictions or none of it may. Giving access back is
+        # never held up by this.
+        result.enforcement_paused = _enforcement_hold(session, moment=moment, actor=actor)
 
     limit_ids = list(
         session.scalars(
@@ -231,6 +242,7 @@ def evaluate_all(
                 actor=actor,
                 resolver=resolver,
                 result=result,
+                hold=result.enforcement_paused,
             )
         except PeriodError as exc:
             session.rollback()
@@ -265,6 +277,86 @@ def evaluate_all(
         result.evaluations.append(evaluation)
 
     return result
+
+
+def _enforcement_hold(session: Session, *, moment: datetime, actor: AuditActor) -> str | None:
+    """Why no new restriction may be applied this cycle, or None if they may.
+
+    Two things hold enforcement: an admin pausing it, and the safety ceiling. The
+    ceiling is on how many limits may *start* restricting in a single cycle.
+    People run out of budget one at a time; dozens of limits tipping over in the
+    same few minutes is what a bad usage read, a mis-imported file or a wrong
+    period looks like. When that happens nothing at all is restricted, and
+    enforcement stays paused until an admin has looked and resumed it.
+    """
+    guard = settings_store.enforcement_guard(session)
+    if guard.paused:
+        return guard.pause_reason or "Paused by an administrator."
+    if guard.max_new_per_cycle <= 0:
+        return None
+
+    starting = _limits_about_to_start_restricting(session, moment)
+    if len(starting) <= guard.max_new_per_cycle:
+        return None
+
+    examples = ", ".join(starting[:5]) + ("..." if len(starting) > 5 else "")
+    reason = (
+        f"Stopped automatically: {len(starting)} limits were about to start restricting "
+        f"in one cycle, more than the safety ceiling of {guard.max_new_per_cycle}. "
+        f"Nothing was restricted."
+    )
+    settings_store.set_value(session, settings_store.KEY_ENFORCEMENT_PAUSED, True)
+    settings_store.set_value(session, settings_store.KEY_ENFORCEMENT_PAUSE_REASON, reason)
+    notifications.notify(
+        session,
+        category=notifications.CATEGORY_ENFORCEMENT,
+        severity=Severity.CRITICAL,
+        title="Enforcement paused: too many limits breached at once",
+        body=(
+            f"{reason}\n\nAffected: {examples}\n\nCheck the Simulation page: if the "
+            "figures are wrong (a bad usage read, a wrong period, a mistaken import), fix "
+            "that first. If they are right, raise the ceiling on the Settings page and "
+            "resume enforcement there. Access that is already restricted stays restricted, "
+            "and restrictions that are no longer justified are still lifted."
+        ),
+        dedupe_key=f"breaker:{moment.strftime('%Y-%m-%d')}",
+    )
+    record_audit(
+        session,
+        action="enforcement.paused",
+        actor=actor,
+        target_type="settings",
+        after={"limits_about_to_restrict": len(starting), "ceiling": guard.max_new_per_cycle},
+        detail=reason,
+    )
+    session.commit()
+    logger.error(reason)
+    return reason
+
+
+def _limits_about_to_start_restricting(session: Session, moment: datetime) -> list[str]:
+    """Labels of the limits that would apply a restriction they do not already hold."""
+    from app.services import preview_service
+
+    held = {
+        (action.limit_id, action.kind, action.target_id)
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES)
+            )
+        )
+        if enforcement.may_be_in_force(action)
+    }
+    starting: list[str] = []
+    for row in preview_service.dry_run(session, now=moment).rows:
+        if not row.would_enforce or row.blast is None:
+            continue
+        if any(
+            (row.limit_id, target.kind, target.target_id) not in held
+            for target in row.blast.targets
+        ):
+            starting.append(row.entity_label or row.entity_id)
+    return starting
 
 
 def _lift_unjustified_restrictions(
@@ -346,6 +438,7 @@ def _evaluate_one(
     actor: AuditActor,
     resolver: enforcement.RoleResolver | None,
     result: EvaluationResult,
+    hold: str | None = None,
 ) -> LimitEvaluation:
     window = current_window(limit, moment)
     reported_total, available = index.reported_total(limit)
@@ -445,6 +538,12 @@ def _evaluate_one(
             evaluation.note = "Monitor only, no action taken."
         elif client is None:
             evaluation.note = "No Checkmarx connection available, enforcement deferred."
+        elif hold is not None:
+            # Nothing new is restricted, and existing restrictions are left as
+            # they are (not re-asserted) until enforcement resumes.
+            evaluation.note = f"Enforcement is paused, so no restriction was applied. {hold}"
+            if not _has_active_enforcement(session, limit.id, window.key):
+                result.deferred += 1
         else:
             outcome = enforcement.apply_enforcement(
                 session,

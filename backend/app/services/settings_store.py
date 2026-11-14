@@ -87,6 +87,17 @@ KEY_AUTOMATION_ENABLED = "automation.enabled"
 KEY_AUTO_APPROVE_MAX_INCREASE = "automation.auto_approve_max_increase"
 KEY_AUTO_APPROVE_EXPIRY_DAYS = "automation.auto_approve_expiry_days"
 
+# Enforcement safety. ``paused`` stops new restrictions (restores still happen);
+# the cycle sets it itself, with a reason, when more limits than
+# ``max_new_enforcements_per_cycle`` would start restricting in one cycle - a
+# sign of bad data or a mistake far more often than of that many people
+# overspending in the same few minutes. ``protected_roles`` are tenant roles
+# whose holders are never restricted.
+KEY_ENFORCEMENT_PAUSED = "enforcement.paused"
+KEY_ENFORCEMENT_PAUSE_REASON = "enforcement.pause_reason"
+KEY_MAX_NEW_ENFORCEMENTS = "enforcement.max_new_enforcements_per_cycle"
+KEY_PROTECTED_ROLES = "enforcement.protected_roles"
+
 # Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
 # so it can never collide with a real Checkmarx lookback window, and so the read
 # path can hide demo snapshots whenever demo mode is off.
@@ -123,6 +134,10 @@ DEFAULTS: dict[str, Any] = {
     KEY_AUTOMATION_ENABLED: False,
     KEY_AUTO_APPROVE_MAX_INCREASE: 0,
     KEY_AUTO_APPROVE_EXPIRY_DAYS: 0,
+    KEY_ENFORCEMENT_PAUSED: False,
+    KEY_ENFORCEMENT_PAUSE_REASON: None,
+    KEY_MAX_NEW_ENFORCEMENTS: 25,
+    KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
 }
 
 
@@ -187,6 +202,34 @@ def automation_policy(session: Session) -> AutomationPolicy:
         ),
         auto_approve_expiry_days=_non_negative_int(
             get_value(session, KEY_AUTO_APPROVE_EXPIRY_DAYS), 0
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EnforcementGuard:
+    """The safety settings around applying restrictions, normalised."""
+
+    paused: bool
+    pause_reason: str | None
+    # 0 means no ceiling.
+    max_new_per_cycle: int
+    protected_roles: frozenset[str]
+
+
+def enforcement_guard(session: Session) -> EnforcementGuard:
+    roles = get_value(session, KEY_PROTECTED_ROLES, DEFAULTS[KEY_PROTECTED_ROLES])
+    reason = get_value(session, KEY_ENFORCEMENT_PAUSE_REASON)
+    return EnforcementGuard(
+        paused=bool(get_value(session, KEY_ENFORCEMENT_PAUSED, False)),
+        pause_reason=reason if isinstance(reason, str) and reason else None,
+        max_new_per_cycle=_non_negative_int(
+            get_value(session, KEY_MAX_NEW_ENFORCEMENTS), DEFAULTS[KEY_MAX_NEW_ENFORCEMENTS]
+        ),
+        protected_roles=frozenset(
+            name.strip().lower()
+            for name in str(roles or "").replace(";", ",").split(",")
+            if name.strip()
         ),
     )
 

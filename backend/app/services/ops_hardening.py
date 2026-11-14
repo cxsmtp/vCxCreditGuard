@@ -342,6 +342,8 @@ _SETTING_FIELD_BY_KEY: dict[str, str] = {
     settings_store.KEY_DEMO_MODE: "demo_mode",
     settings_store.KEY_AUTOMATION_ENABLED: "automation_enabled",
     settings_store.KEY_AUTO_APPROVE_MAX_INCREASE: "auto_approve_max_increase",
+    settings_store.KEY_MAX_NEW_ENFORCEMENTS: "max_new_enforcements_per_cycle",
+    settings_store.KEY_PROTECTED_ROLES: "protected_roles",
     settings_store.KEY_AUTO_APPROVE_EXPIRY_DAYS: "auto_approve_expiry_days",
 }
 

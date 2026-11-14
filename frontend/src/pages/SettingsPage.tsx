@@ -517,6 +517,63 @@ export function SettingsPage({
               }
             />
           </Card>
+          <div id="enforcement-safety">
+            <Card
+              title="Enforcement safety"
+              description="Guard rails around restricting access in Checkmarx One. They apply to every enforcing limit."
+            >
+              {current.enforcement_paused && (
+                <div className="mb-4">
+                  <InfoNote tone="warning">
+                    Enforcement is paused. {current.enforcement_pause_reason} Limits are still
+                    monitored and access that is no longer restricted for a reason is still given
+                    back, but nobody new is restricted until you resume.
+                  </InfoNote>
+                </div>
+              )}
+              <Toggle
+                checked={value("enforcement_paused") ?? false}
+                disabled={!isAdmin}
+                onChange={(next) => set({ enforcement_paused: next })}
+                label="Pause enforcement"
+                description="Stops new restrictions straight away without changing any limit. Existing restrictions stay as they are; restores continue. Turn off to resume."
+              />
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <Field
+                  label="Safety ceiling (limits per cycle)"
+                  hint="If more limits than this would start restricting in a single cycle, none are restricted and enforcement pauses itself until an admin resumes it. That many breaches at once usually means bad data, not real spending. 0 removes the ceiling."
+                >
+                  <Input
+                    type="number"
+                    min={0}
+                    step="1"
+                    disabled={!isAdmin}
+                    value={String(value("max_new_enforcements_per_cycle") ?? 25)}
+                    onChange={(event) =>
+                      set({
+                        max_new_enforcements_per_cycle: Math.max(
+                          0,
+                          Math.floor(Number(event.target.value)),
+                        ),
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Protected roles"
+                  hint="Comma separated Checkmarx One role names. A user holding any of them is never restricted automatically; an admin is told instead. The account your API key belongs to is always protected."
+                >
+                  <Input
+                    disabled={!isAdmin}
+                    value={value("protected_roles") ?? ""}
+                    onChange={(event) => set({ protected_roles: event.target.value })}
+                    placeholder="ast-admin, iam-admin"
+                    spellCheck={false}
+                  />
+                </Field>
+              </div>
+            </Card>
+          </div>
           <Card
             title="Hands-off automation"
             description="Let the governance cycle approve routine credit requests on its own, so small, safe raises do not wait for an admin."

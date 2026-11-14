@@ -201,6 +201,13 @@ class SettingsResponse(BaseModel):
     automation_enabled: bool = False
     auto_approve_max_increase: int = 0
     auto_approve_expiry_days: int = 0
+    # Enforcement safety: paused (by an admin or by the ceiling), the ceiling on
+    # limits that may start restricting in one cycle (0 = none), and tenant
+    # roles whose holders are never restricted.
+    enforcement_paused: bool = False
+    enforcement_pause_reason: str | None = None
+    max_new_enforcements_per_cycle: int = 25
+    protected_roles: str = ""
     current_schedule_description: str
 
 
@@ -232,6 +239,9 @@ class SettingsUpdateRequest(StrictModel):
     automation_enabled: bool | None = None
     auto_approve_max_increase: int | None = Field(default=None, ge=0, le=10_000_000)
     auto_approve_expiry_days: int | None = Field(default=None, ge=0, le=3650)
+    enforcement_paused: bool | None = None
+    max_new_enforcements_per_cycle: int | None = Field(default=None, ge=0, le=100_000)
+    protected_roles: str | None = Field(default=None, max_length=1024)
 
     @field_validator("schedule_mode")
     @classmethod
@@ -295,4 +305,7 @@ class MeResponse(BaseModel):
     can_request_credits: bool = False
     # Demo mode, so the SPA can show the demo banner.
     demo_mode: bool = False
+    # Why new restrictions are not being applied, when they are not (paused by
+    # an admin or by the safety ceiling). None when enforcement is running.
+    enforcement_paused: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)

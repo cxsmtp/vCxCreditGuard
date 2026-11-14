@@ -153,6 +153,11 @@ def enforcement_failed_key(action_id: int, day: str) -> str:
     return f"enforcefail:{action_id}:{day}"
 
 
+def protected_key(action_id: int) -> str:
+    """One "over budget but protected" notice per limit, target and period."""
+    return f"protected:{action_id}"
+
+
 def restore_failed_key(action_id: int, day: str) -> str:
     """One "could not restore" alert per action per day, however often it is retried."""
     return f"restorefail:{action_id}:{day}"
