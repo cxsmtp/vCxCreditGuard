@@ -118,6 +118,8 @@ class DryRunRow:
     would_enforce: bool
     blast: BlastRadius | None
     note: str | None = None
+    # The budget period the projection is for (None when the period is misconfigured).
+    period_key: str | None = None
 
 
 @dataclass(slots=True)
@@ -270,7 +272,16 @@ def _project_one(
             blast = blast_radius(session, entity_type=limit.entity_type, entity_id=limit.entity_id)
             would_enforce = blast.total_actions > 0
             if not would_enforce:
-                note = "Would breach, but there is nothing to restrict (no linked projects)."
+                protected = (
+                    enforcement.protection_reason(session, limit.entity_id)
+                    if limit.entity_type == "user"
+                    else None
+                )
+                note = (
+                    f"Would breach, but this user is not restricted because {protected}."
+                    if protected
+                    else "Would breach, but there is nothing to restrict (no linked projects)."
+                )
             elif not connection_configured:
                 note = (
                     "Would breach and enforce, but no Checkmarx connection is configured, "
@@ -292,4 +303,5 @@ def _project_one(
         would_enforce=would_enforce,
         blast=blast,
         note=note,
+        period_key=window.key,
     )

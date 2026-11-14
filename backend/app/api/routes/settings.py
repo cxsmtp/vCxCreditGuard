@@ -46,6 +46,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "auto_approve_expiry_days": settings_store.KEY_AUTO_APPROVE_EXPIRY_DAYS,
     "enforcement_paused": settings_store.KEY_ENFORCEMENT_PAUSED,
     "max_new_enforcements_per_cycle": settings_store.KEY_MAX_NEW_ENFORCEMENTS,
+    "max_new_targets_per_cycle": settings_store.KEY_MAX_NEW_TARGETS,
     "protected_roles": settings_store.KEY_PROTECTED_ROLES,
 }
 
@@ -113,6 +114,7 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         enforcement_paused=guard.paused,
         enforcement_pause_reason=guard.pause_reason if guard.paused else None,
         max_new_enforcements_per_cycle=guard.max_new_per_cycle,
+        max_new_targets_per_cycle=guard.max_new_targets_per_cycle,
         protected_roles=", ".join(sorted(guard.protected_roles)),
         current_schedule_description=scheduler.describe_schedule(),
     )
@@ -191,16 +193,23 @@ def update_settings(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={"code": "unknown_setting", "message": f"{field} cannot be changed."},
             )
+        if field == "enforcement_paused":
+            was_paused = settings_store.enforcement_guard(db).paused
+            if value and not was_paused:
+                # Pausing by hand records who. An existing pause keeps its own
+                # reason (the safety ceiling's explanation is worth more).
+                settings_store.set_value(
+                    db,
+                    settings_store.KEY_ENFORCEMENT_PAUSE_REASON,
+                    f"Paused by {ctx.actor.actor_name}.",
+                )
+            elif not value and was_paused:
+                # Resuming means an admin has looked at what was held back: that
+                # batch goes through once, without tripping the ceiling again.
+                settings_store.set_value(db, settings_store.KEY_ENFORCEMENT_PAUSE_REASON, None)
+                settings_store.set_value(db, settings_store.KEY_CEILING_WAIVED_ONCE, True)
         settings_store.set_value(db, key, value)
         audited_changes[field] = value
-        if field == "enforcement_paused":
-            # Pausing by hand records who; resuming clears whatever reason the
-            # pause carried (the safety ceiling's, or an earlier admin's).
-            settings_store.set_value(
-                db,
-                settings_store.KEY_ENFORCEMENT_PAUSE_REASON,
-                f"Paused by {ctx.actor.actor_name}." if value else None,
-            )
 
     after = _read(db).model_dump(exclude={"current_schedule_description"})
     record_audit(

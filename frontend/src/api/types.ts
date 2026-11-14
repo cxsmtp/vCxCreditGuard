@@ -340,6 +340,8 @@ export interface AppSettings {
   enforcement_pause_reason: string | null;
   /** Limits that may start restricting in one cycle before enforcement stops itself. 0 = no ceiling. */
   max_new_enforcements_per_cycle: number;
+  /** The same ceiling counted in users and projects. 0 = no ceiling. */
+  max_new_targets_per_cycle: number;
   /** Comma separated tenant role names whose holders are never restricted. */
   protected_roles: string;
   current_schedule_description: string;

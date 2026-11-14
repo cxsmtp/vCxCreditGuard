@@ -318,7 +318,9 @@ def _limit_input(row: dict[str, Any]) -> limits_service.LimitInput:
 # restore: secret keys (SMTP/webhook secrets) are deliberately absent, so they
 # can never be exported or set from a backup. Includes the non-secret delivery
 # destinations (SMTP host/from/recipients) so a backup is enough to
-# rebuild an instance's configuration.
+# rebuild an instance's configuration. The enforcement safety settings (pause,
+# ceilings, protected roles) are deliberately not here: a restore imports limits,
+# which is exactly when those guard rails must not be quietly loosened.
 _SETTING_FIELD_BY_KEY: dict[str, str] = {
     settings_store.KEY_SCHEDULER_ENABLED: "scheduler_enabled",
     settings_store.KEY_SCHEDULE_MODE: "schedule_mode",
@@ -342,8 +344,6 @@ _SETTING_FIELD_BY_KEY: dict[str, str] = {
     settings_store.KEY_DEMO_MODE: "demo_mode",
     settings_store.KEY_AUTOMATION_ENABLED: "automation_enabled",
     settings_store.KEY_AUTO_APPROVE_MAX_INCREASE: "auto_approve_max_increase",
-    settings_store.KEY_MAX_NEW_ENFORCEMENTS: "max_new_enforcements_per_cycle",
-    settings_store.KEY_PROTECTED_ROLES: "protected_roles",
     settings_store.KEY_AUTO_APPROVE_EXPIRY_DAYS: "auto_approve_expiry_days",
 }
 

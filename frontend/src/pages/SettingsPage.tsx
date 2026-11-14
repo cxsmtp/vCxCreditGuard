@@ -546,9 +546,9 @@ export function SettingsPage({
                 disabled={!isAdmin}
                 onChange={(next) => set({ enforcement_paused: next })}
                 label="Pause enforcement"
-                description="Stops new restrictions straight away without changing any limit. Existing restrictions stay as they are; restores continue. Turn off to resume."
+                description="Stops new restrictions straight away without changing any limit. Existing restrictions stay as they are; restores continue. Turning it off resumes enforcement: whatever was held back is applied on the next cycle, so check the Simulation page first."
               />
-              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <div className="mt-4 grid gap-4 sm:grid-cols-3">
                 <Field
                   label="Safety ceiling (limits per cycle)"
                   hint="If more limits than this would start restricting in a single cycle, none are restricted and enforcement pauses itself until an admin resumes it. That many breaches at once usually means bad data, not real spending. 0 removes the ceiling."
@@ -562,6 +562,26 @@ export function SettingsPage({
                     onChange={(event) =>
                       set({
                         max_new_enforcements_per_cycle: Math.max(
+                          0,
+                          Math.floor(Number(event.target.value)),
+                        ),
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Safety ceiling (users and projects)"
+                  hint="The same safeguard counted in what would be restricted: one application or group limit can take many projects with it. 0 removes the ceiling."
+                >
+                  <Input
+                    type="number"
+                    min={0}
+                    step="1"
+                    disabled={!isAdmin}
+                    value={String(value("max_new_targets_per_cycle") ?? 100)}
+                    onChange={(event) =>
+                      set({
+                        max_new_targets_per_cycle: Math.max(
                           0,
                           Math.floor(Number(event.target.value)),
                         ),

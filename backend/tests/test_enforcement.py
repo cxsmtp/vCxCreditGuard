@@ -597,7 +597,9 @@ class TestFailureHandling:
 
     def test_one_failing_target_does_not_block_the_others(self, db: Session) -> None:
         tenant = populated_tenant()
-        tenant.fail_paths["/repos-manager/"] = 500
+        # The setting can be read, but Checkmarx refuses to change it.
+        for method in ("PUT", "PATCH", "POST"):
+            tenant.fail_requests[(method, "/repos-manager/")] = 500
         tenant_obj, client = setup_tenant(db, tenant)
         limit = make_limit(db, entity_type=EntityType.PROJECT, entity_id="proj-api")
 

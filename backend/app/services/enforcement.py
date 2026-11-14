@@ -152,8 +152,26 @@ def is_exempt(session: Session, *, entity_type: str, entity_id: str) -> bool:
 # ----------------------------------------------------------------- protection
 
 
-class ProtectedTarget(Exception):  # noqa: N818 - a decision, not an error
+class NotRestricted(Exception):  # noqa: N818 - a decision, not an error
+    """This target is deliberately left alone. Nothing was changed.
+
+    ``title`` is what the admin is told, once; the message says why.
+    """
+
+    def __init__(self, message: str, *, title: str) -> None:
+        super().__init__(message)
+        self.title = title
+
+
+class ProtectedTarget(NotRestricted):
     """This target must not be restricted, whatever its usage."""
+
+    def __init__(self, message: str, *, label: str | None = None) -> None:
+        super().__init__(message, title=f"{label or 'A user'} is over budget but protected")
+
+
+# Recorded on an action lifted because its target turned out to be protected.
+PROTECTED_REASON = "protected"
 
 
 def protected_user_ids(session: Session) -> frozenset[str]:
@@ -167,6 +185,50 @@ def protected_user_ids(session: Session) -> frozenset[str]:
 
     subject = connection_service.api_key_subject(session)
     return frozenset({subject}) if subject else frozenset()
+
+
+def protection_reason(
+    session: Session,
+    user_id: str,
+    *,
+    protected_roles: frozenset[str] | None = None,
+    live_roles: set[str] | None = None,
+) -> str | None:
+    """Why this tenant user is never restricted, or None if they may be.
+
+    Judged on what the last sync recorded about the user and, where the caller
+    has just read them from the tenant, on their roles as they are now.
+    """
+    if user_id in protected_user_ids(session):
+        return "it is the account the Checkmarx One API key belongs to"
+    if protected_roles is None:
+        protected_roles = settings_store.enforcement_guard(session).protected_roles
+    if not protected_roles:
+        return None
+    user = session.get(CxUser, user_id)
+    held = {str(name).lower() for name in ((user.role_names if user else None) or [])}
+    held |= {name.lower() for name in (live_roles or set())}
+    shielding = sorted(held & protected_roles)
+    if shielding:
+        return f"they hold a protected role ({', '.join(shielding)})"
+    return None
+
+
+def target_released(session: Session, action: EnforcementAction) -> str | None:
+    """A reason this action's *target* should not be restricted by anyone.
+
+    Distinct from the limit no longer applying: when the target itself is exempt
+    or protected, every limit restricting it has to let go, not just this one.
+    """
+    if action.target_type == TARGET_USER:
+        if is_exempt(session, entity_type=EntityType.USER, entity_id=action.target_id):
+            return EXEMPTED_REASON
+        if protection_reason(session, action.target_id) is not None:
+            return PROTECTED_REASON
+        return None
+    if is_exempt(session, entity_type=EntityType.PROJECT, entity_id=action.target_id):
+        return EXEMPTED_REASON
+    return None
 
 
 # --------------------------------------------------------------------- planning
@@ -198,7 +260,7 @@ def plan_targets(session: Session, *, entity_type: str, entity_id: str) -> list[
     if entity_type == EntityType.USER:
         if is_exempt(session, entity_type=EntityType.USER, entity_id=entity_id):
             return []
-        if entity_id in protected_user_ids(session):
+        if protection_reason(session, entity_id) is not None:
             return []
         user = session.get(CxUser, entity_id)
         return [
@@ -286,11 +348,42 @@ def apply_enforcement(
         return outcome
 
     resolver = resolver or RoleResolver(client)
+    protected_roles = settings_store.enforcement_guard(session).protected_roles
+    if limit.entity_type == EntityType.USER:
+        why = protection_reason(session, limit.entity_id, protected_roles=protected_roles)
+        if why is not None:
+            label = limit.entity_label or limit.entity_id
+            outcome.skipped.append(f"{label} is protected: {why}")
+            raised = notifications.notify(
+                session,
+                category=notifications.CATEGORY_ENFORCEMENT,
+                severity=Severity.WARNING,
+                title=f"{label} is over budget but protected",
+                body=(
+                    f"{label} has gone over their credit limit, but their AI access is "
+                    f"not removed automatically because {why}. Raise it with them, or "
+                    "change the protected roles on the Settings page."
+                ),
+                entity_type=limit.entity_type,
+                entity_id=limit.entity_id,
+                entity_label=limit.entity_label,
+                dedupe_key=notifications.protected_key(limit.id, period_key),
+            )
+            if raised is not None:
+                record_audit(
+                    session,
+                    action="enforcement.protected",
+                    actor=actor,
+                    target_type=TARGET_USER,
+                    target_id=limit.entity_id,
+                    target_label=label,
+                    detail=f"Over budget in {period_key}, not restricted: {why}.",
+                )
+            return outcome
     targets = plan_targets(session, entity_type=limit.entity_type, entity_id=limit.entity_id)
     if not targets:
-        outcome.skipped.append("no targets to restrict (exempt, protected, or no projects linked)")
+        outcome.skipped.append("no targets to restrict (exempt, or no projects linked)")
         return outcome
-    protected_roles = settings_store.enforcement_guard(session).protected_roles
 
     for target in targets:
         # Lock order: never wait on a target lock while holding anything in the
@@ -439,7 +532,7 @@ def _enforce_target(
         # Phase 3: change the tenant. No transaction is open during this call.
         write_attempted = True
         captured.apply()
-    except ProtectedTarget as exc:
+    except NotRestricted as exc:
         # A decision, not a failure: nothing is changed, the admin is told once,
         # and the cycle is not marked as degraded for honouring its own rule.
         message = str(exc)[:2000]
@@ -452,18 +545,18 @@ def _enforce_target(
             session,
             category=notifications.CATEGORY_ENFORCEMENT,
             severity=Severity.WARNING,
-            title=f"{target.target_label} is over budget but protected",
+            title=exc.title,
             body=str(exc),
             entity_type=limit.entity_type,
             entity_id=limit.entity_id,
             entity_label=limit.entity_label,
-            dedupe_key=notifications.protected_key(action.id),
+            dedupe_key=notifications.not_restricted_key(action.id),
             enforcement_action_id=action.id,
         )
         if first_report:
             record_audit(
                 session,
-                action="enforcement.protected",
+                action="enforcement.not_restricted",
                 actor=actor,
                 target_type=target.target_type,
                 target_id=target.target_id,
@@ -586,6 +679,20 @@ def _verify_applied(
         # breached and enforcing again, so its reason no longer holds.
         action.reversal_reason = None
         action.reversed_by_id = None
+    if target.target_type == TARGET_USER and protection_reason(session, target.target_id):
+        # Protected since the restriction was applied (given an admin role, or
+        # this is now the API key's own account): give the access back rather
+        # than keep taking it away.
+        _restore_action_locked(
+            session,
+            client,
+            action=action,
+            actor=actor,
+            reason=PROTECTED_REASON,
+            resolver=resolver,
+        )
+        outcome.skipped.append(f"{target.target_label} is now protected; restriction lifted")
+        return
     session.commit()  # nothing held open while we wait on Checkmarx
     try:
         reasserted = _reconcile(session, client, action=action, target=target, resolver=resolver)
@@ -661,18 +768,17 @@ def _capture(
             client, user_id=target.target_id, client_uuid=client_uuid
         )
         current_names = {role.name for role in current}
-        # Judged on the roles just read from the tenant, plus what the last sync
-        # recorded (which also covers roles held outside the platform client).
-        user = session.get(CxUser, target.target_id)
-        held = {name.lower() for name in current_names} | {
-            str(name).lower() for name in ((user.role_names if user else None) or [])
-        }
-        shielding = sorted(held & protected_roles)
-        if shielding:
+        # The plan already left out anyone the last sync showed as protected;
+        # this catches a role granted since then.
+        why = protection_reason(
+            session, target.target_id, protected_roles=protected_roles, live_roles=current_names
+        )
+        if why is not None:
             raise ProtectedTarget(
-                f"{target.target_label} holds a protected role ({', '.join(shielding)}), so "
-                "their AI access is not removed automatically. Raise it with them, or "
-                "change the protected roles on the Settings page."
+                f"{target.target_label}'s AI access is not removed automatically because "
+                f"{why}. Raise it with them, or change the protected roles on the "
+                "Settings page.",
+                label=target.target_label,
             )
         to_remove = [role for role in current if role.name in iam.AI_ROLE_NAMES]
 
@@ -743,10 +849,12 @@ def _capture(
             # Nothing says what the setting is now, so nothing could put it back
             # afterwards. A restriction that cannot be undone faithfully is not
             # applied; Auto Triage on the same project is unaffected.
-            raise CheckmarxError(
-                "The current PR triage and remediation setting for this repository "
-                "could not be read, so it was left unchanged: it could not have been "
-                "restored to what it was."
+            raise NotRestricted(
+                f"The PR triage and remediation setting for {target.target_label}'s "
+                "repository cannot be read from Checkmarx One, so it was left unchanged: "
+                "it could not have been restored to what it was. Auto Triage on the "
+                "project is restricted as normal.",
+                title=f"{target.target_label}: PR triage and remediation left unchanged",
             )
 
         def disable_pr_remediation() -> None:
@@ -967,13 +1075,16 @@ def _siblings_in_force(session: Session, action: EnforcementAction) -> list[Enfo
     "before" to give back when the last of them lets go.
     """
     rows = session.scalars(
-        select(EnforcementAction).where(
+        select(EnforcementAction)
+        .where(
             EnforcementAction.target_type == action.target_type,
             EnforcementAction.target_id == action.target_id,
             EnforcementAction.kind == action.kind,
             EnforcementAction.id != action.id,
             EnforcementAction.status.in_(RESTORABLE_STATUSES),
         )
+        # Another session may have changed them since this one last looked.
+        .execution_options(populate_existing=True)
     )
     return [row for row in rows if may_be_in_force(row)]
 
@@ -1033,7 +1144,11 @@ def _restore_action_locked(
     resolver = resolver or RoleResolver(client)
 
     siblings = _siblings_in_force(session, action)
-    if siblings and reason != ADMIN_REASON:
+    # An admin's Restore, or the target itself becoming exempt or protected,
+    # means nobody may restrict it: every limit holding it lets go together.
+    # Anything else is about this one limit, and the others keep their hold.
+    release_target = reason == ADMIN_REASON or target_released(session, action) is not None
+    if siblings and not release_target:
         # Another limit still restricts this target, so nothing is given back in
         # Checkmarx yet. What this action knows about the original state is
         # handed to the ones that remain, so the last to be lifted returns all
@@ -1068,8 +1183,8 @@ def _restore_action_locked(
         session.commit()
         return True
     if siblings:
-        # An admin's Restore means "give this back now", whichever limits took
-        # it: all of them are lifted together, from their combined snapshot.
+        # Given back now, whichever limits took it: all of them are lifted
+        # together, from their combined snapshot.
         for sibling in siblings:
             snapshot = _merge_snapshots(_settled(sibling.undo_snapshot), snapshot)
 

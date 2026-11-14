@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -236,8 +237,9 @@ class TestProtectedIdentities:
         assert has_ai_roles(tenant, "user-harsh")
         assert not [r for r in tenant.requests if r[0] == "DELETE"]
 
-        action = db.scalar(select(EnforcementAction))
-        assert enforcement.may_be_in_force(action) is False
+        # Nothing was attempted, so there is nothing that could be "in force"...
+        assert db.scalar(select(func.count()).select_from(EnforcementAction)) == 0
+        # ...and the admin is told once, not every cycle.
         notices = list(
             db.scalars(select(Notification).where(Notification.title.like("%but protected")))
         )
@@ -250,6 +252,64 @@ class TestProtectedIdentities:
             )
             == 1
         )
+
+    def test_the_simulation_does_not_claim_a_protected_user_will_be_restricted(
+        self, db: Session
+    ) -> None:
+        from app.services import preview_service
+
+        tenant = _with_admin_role(populated_tenant(), "user-harsh")
+        tenant, client = synced(db, tenant)
+        limit_on(db, "user-harsh")
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        ingestion.ingest_usage(db, client)
+
+        projection = preview_service.dry_run(db, now=AUGUST)
+        assert projection.would_enforce_count == 0 and projection.affected_users == 0
+        assert "protected role" in projection.rows[0].note
+
+    def test_a_role_granted_since_the_last_sync_is_still_honoured(self, db: Session) -> None:
+        """The plan is made from the last sync; the tenant is asked again at the
+        moment of restricting."""
+        tenant, client = synced(db)
+        tenant.role_mappings["user-harsh"] = [*ALL_ROLES, "ast-admin"]
+        ALL_ROLES["ast-admin"] = "b2660f23-52cb-4361-9d49-7abae5e520fd"
+        try:
+            limit = limit_on(db, "user-harsh")
+            outcome = enforcement.apply_enforcement(
+                db, client, limit=limit, period_key=PERIOD, actor=ACTOR
+            )
+        finally:
+            del ALL_ROLES["ast-admin"]
+        assert outcome.applied == [] and outcome.failed == []
+        assert has_ai_roles(tenant, "user-harsh")
+        action = db.scalar(select(EnforcementAction))
+        assert enforcement.may_be_in_force(action) is False
+
+    def test_someone_restricted_and_then_made_an_administrator_is_released(
+        self, db: Session
+    ) -> None:
+        tenant, client = synced(db)
+        limit = limit_on(db, "user-harsh")
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        assert not has_ai_roles(tenant, "user-harsh")
+
+        # They are given the administrator role; the next sync records it.
+        _with_admin_role(tenant, "user-harsh")
+        org_sync.sync_org_model(db, client)
+        db.commit()
+
+        result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert result.restored == 1
+        assert has_ai_roles(tenant, "user-harsh")
+        action = db.scalar(select(EnforcementAction))
+        db.refresh(action)
+        assert action.status == EnforcementStatus.REVERSED
+        assert action.reversal_reason == enforcement.PROTECTED_REASON
+        # And it is not taken away again on later cycles.
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert has_ai_roles(tenant, "user-harsh")
 
     def test_the_protected_roles_are_configurable(self, db: Session) -> None:
         tenant = _with_admin_role(populated_tenant(), "user-harsh")
@@ -283,7 +343,15 @@ class TestChangesThatCouldNotBeUndone:
         assert [a.kind for a in outcome.applied] == [EnforcementKind.DISABLE_AUTO_TRIAGE]
         # ...but the repository setting is untouched rather than guessed at.
         assert tenant.repo_severities["repo-1"] == ["CRITICAL", "HIGH"]
-        assert any("could not be read" in note for note in outcome.failed)
+        # A decision, not a failure: reported once, and not as a degraded cycle.
+        assert outcome.failed == []
+        assert any("cannot be read" in note for note in outcome.skipped)
+        for _ in range(3):
+            enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        notices = list(
+            db.scalars(select(Notification).where(Notification.title.like("%left unchanged")))
+        )
+        assert len(notices) == 1 and notices[0].severity == Severity.WARNING
 
     def test_a_recorded_off_setting_is_restored_to_off(self, db: Session) -> None:
         """It used to be restored to the defaults, switching on something that
@@ -380,3 +448,255 @@ class TestSeveralLimitsOnOneTarget:
         other = self._triage_action(db, app_limit)
         assert other.status == EnforcementStatus.REVERSED
         assert other.reversal_reason == enforcement.ADMIN_REASON
+
+
+# ----------------------------------------------------------------------------
+# Findings from the independent review of the guard rails
+# ----------------------------------------------------------------------------
+
+
+class TestExemptingATargetHeldByTwoLimits:
+    def test_the_project_is_released_by_every_limit_holding_it(self, db: Session) -> None:
+        """Exempting it used to lift the project limit's action on paper only,
+        because the application's limit still held it - and nothing ever lifted
+        that one, as an exempt project is no longer in the application's plan."""
+        from app.services import limits_service
+
+        tenant, client = synced(db)
+        project_limit = limit_on(db, "proj-api", entity_type=EntityType.PROJECT)
+        app_limit = limit_on(db, "app-payments", entity_type=EntityType.APPLICATION)
+        for limit in (project_limit, app_limit):
+            enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        assert tenant.auto_triage["proj-api"]["enabled"] is False
+
+        limits_service.add_exemption(
+            db,
+            entity_type=EntityType.PROJECT,
+            entity_id="proj-api",
+            reason="release week",
+            actor=ACTOR,
+            client=client,
+        )
+        db.commit()
+
+        assert tenant.auto_triage["proj-api"]["enabled"] is True
+        assert tenant.repo_severities["repo-1"] == ["CRITICAL", "HIGH"]
+        # The application's other project is still restricted by its limit.
+        assert tenant.auto_triage["proj-web"]["enabled"] is False
+
+    def test_the_cycle_releases_it_if_checkmarx_was_unreachable_at_the_time(
+        self, db: Session
+    ) -> None:
+        from app.services import limits_service
+
+        tenant, client = synced(db)
+        app_limit = limit_on(db, "app-payments", entity_type=EntityType.APPLICATION)
+        enforcement.apply_enforcement(db, client, limit=app_limit, period_key=PERIOD, actor=ACTOR)
+        limits_service.add_exemption(
+            db,
+            entity_type=EntityType.PROJECT,
+            entity_id="proj-api",
+            reason="release week",
+            actor=ACTOR,
+            client=None,  # no connection when the exemption was created
+        )
+        db.commit()
+        assert tenant.auto_triage["proj-api"]["enabled"] is False
+
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert tenant.auto_triage["proj-api"]["enabled"] is True
+
+
+class TestCeilingCountsOnlyWhatWouldReallyChange:
+    def _two_breached(self, db: Session):
+        tenant, client = breach_two_users(db)
+        set_ceiling(db, 2)
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert not has_ai_roles(tenant, "user-harsh") and not has_ai_roles(tenant, "user-sean")
+        set_ceiling(db, 1)
+        return tenant, client
+
+    def test_limits_an_admin_restored_this_period_do_not_count(self, db: Session) -> None:
+        tenant, client = self._two_breached(db)
+        for action in db.scalars(select(EnforcementAction)):
+            enforcement.restore_action(
+                db, client, action=action, actor=ACTOR, reason=enforcement.ADMIN_REASON
+            )
+        # Both are still over budget and enforcing, but the cycle will not touch
+        # them again this period - so nothing is "about to start".
+        for _ in range(2):
+            result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+            assert result.enforcement_paused is None and result.deferred == 0
+        assert settings_store.enforcement_guard(db).paused is False
+
+    def test_limits_that_were_tried_and_refused_do_not_count(self, db: Session) -> None:
+        tenant, client = breach_two_users(db)
+        tenant.fail_requests[("DELETE", "/role-mappings/")] = 403
+        set_ceiling(db, 2)
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        set_ceiling(db, 1)
+        # Retried every cycle, but they already had their turn under the ceiling.
+        result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert result.enforcement_paused is None
+
+    def test_protected_users_do_not_count(self, db: Session) -> None:
+        tenant = _with_admin_role(_with_admin_role(populated_tenant(), "user-harsh"), "user-sean")
+        tenant, client = synced(db, tenant)
+        limit_on(db, "user-harsh")
+        limit_on(db, "user-sean")
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Sean Casey", credits=60)
+        ingestion.ingest_usage(db, client)
+        set_ceiling(db, 1)
+        result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert result.enforcement_paused is None and result.deferred == 0
+
+    def test_one_limit_taking_too_many_projects_with_it_also_trips(self, db: Session) -> None:
+        """Counted in limits, an application over a hundred projects is one."""
+        tenant, client = synced(db)
+        limit_on(db, "app-payments", entity_type=EntityType.APPLICATION)
+        settings_store.set_value(db, settings_store.KEY_MAX_NEW_TARGETS, 1)
+        db.commit()
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)  # baseline
+        tenant.set_entity_credits(
+            view="application", name="Payments", credits=500, entity_id="app-payments"
+        )
+        ingestion.ingest_usage(db, client)
+
+        result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert result.enforcement_paused and "2 users and projects" in result.enforcement_paused
+        assert tenant.auto_triage["proj-api"]["enabled"] is True
+
+
+class TestResuming:
+    def test_resuming_lets_the_held_batch_through_once(
+        self, admin_client: TestClient, db: Session
+    ) -> None:
+        tenant, client = breach_two_users(db)
+        set_ceiling(db, 1)
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert settings_store.enforcement_guard(db).paused is True
+
+        # Still two limits over, still a ceiling of one. The admin has looked,
+        # and resumes without changing anything else.
+        resumed = admin_client.put("/api/settings", json={"enforcement_paused": False})
+        assert resumed.json()["enforcement_paused"] is False
+        db.expire_all()
+
+        result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert result.enforcement_paused is None and result.enforced == 2
+        assert not has_ai_roles(tenant, "user-harsh") and not has_ai_roles(tenant, "user-sean")
+        # The waiver was for that batch only.
+        assert settings_store.enforcement_guard(db).ceiling_waived_once is False
+
+    def test_every_trip_is_announced_even_twice_in_a_day(self, db: Session) -> None:
+        from datetime import timedelta
+
+        tenant, client = breach_two_users(db)
+        set_ceiling(db, 1)
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        settings_store.set_value(db, settings_store.KEY_ENFORCEMENT_PAUSED, False)
+        db.commit()
+        evaluation.evaluate_all(db, client=client, now=AUGUST + timedelta(minutes=15), actor=ACTOR)
+        alerts = db.scalar(
+            select(func.count())
+            .select_from(Notification)
+            .where(Notification.title.like("Enforcement paused%"))
+        )
+        assert alerts == 2
+
+    def test_pausing_again_keeps_the_ceilings_explanation(
+        self, admin_client: TestClient, db: Session
+    ) -> None:
+        tenant, client = breach_two_users(db)
+        set_ceiling(db, 1)
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        body = admin_client.put("/api/settings", json={"enforcement_paused": True}).json()
+        assert "safety ceiling" in body["enforcement_pause_reason"]
+
+
+class TestPauseIsImmediate:
+    def test_a_pause_pressed_mid_cycle_stops_the_rest_of_that_cycle(self, db: Session) -> None:
+        tenant, client = breach_two_users(db)
+
+        def pause_after_the_first_restriction(request: httpx.Request) -> None:
+            if request.method == "DELETE" and "/role-mappings/" in request.url.path:
+                from app.db.session import session_scope
+
+                with session_scope() as other:
+                    settings_store.set_value(other, settings_store.KEY_ENFORCEMENT_PAUSED, True)
+                tenant.on_request = None
+
+        tenant.on_request = pause_after_the_first_restriction
+        result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+
+        assert result.enforced == 1 and result.deferred == 1
+        restricted = [u for u in ("user-harsh", "user-sean") if not has_ai_roles(tenant, u)]
+        assert len(restricted) == 1
+
+    def test_the_breach_notice_does_not_claim_a_restriction_while_paused(self, db: Session) -> None:
+        tenant, client = breach_two_users(db)
+        settings_store.set_value(db, settings_store.KEY_ENFORCEMENT_PAUSED, True)
+        db.commit()
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        notice = db.scalar(
+            select(Notification).where(Notification.title.like("%reached its credit limit"))
+        )
+        assert "enforcement is paused" in notice.body
+        assert "being restricted now" not in notice.body
+
+    def test_a_failing_safety_check_holds_rather_than_enforcing_blind(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant, client = breach_two_users(db)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("could not project the cycle")
+
+        monkeypatch.setattr(evaluation, "_about_to_start_restricting", boom)
+        result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert result.enforced == 0 and result.evaluated == 2
+        assert has_ai_roles(tenant, "user-harsh")
+        assert any("safety check" in error for error in result.errors)
+
+
+class TestProtectionAppliesAfterTheFact:
+    def test_the_api_keys_account_is_released_if_it_was_already_restricted(
+        self, db: Session
+    ) -> None:
+        tenant, client = synced(db)
+        limit = limit_on(db, "user-harsh")
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        assert not has_ai_roles(tenant, "user-harsh")
+
+        # The connection is then switched to a key that belongs to that user.
+        connection_service.save_connection(
+            db, api_key=make_api_key(subject="user-harsh"), actor=ACTOR
+        )
+        db.commit()
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        assert has_ai_roles(tenant, "user-harsh")
+
+
+class TestBackupsDoNotLoosenTheGuard:
+    def test_a_restore_leaves_the_safety_settings_alone(self, db: Session) -> None:
+        from app.services import ops_hardening
+
+        exported = ops_hardening.export_config_backup(db)
+        assert not any(key.startswith("enforcement.") for key in exported["settings"])
+
+        backup = {
+            "backup_version": 1,
+            "settings": {
+                settings_store.KEY_MAX_NEW_ENFORCEMENTS: 0,
+                settings_store.KEY_PROTECTED_ROLES: "",
+                settings_store.KEY_ENFORCEMENT_PAUSED: False,
+            },
+            "limits": [],
+            "exemptions": [],
+        }
+        ops_hardening.restore_config_backup(db, data=backup, actor=ACTOR)
+        db.commit()
+        guard = settings_store.enforcement_guard(db)
+        assert guard.max_new_per_cycle == 25 and "ast-admin" in guard.protected_roles

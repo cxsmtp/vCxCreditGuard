@@ -96,6 +96,12 @@ KEY_AUTO_APPROVE_EXPIRY_DAYS = "automation.auto_approve_expiry_days"
 KEY_ENFORCEMENT_PAUSED = "enforcement.paused"
 KEY_ENFORCEMENT_PAUSE_REASON = "enforcement.pause_reason"
 KEY_MAX_NEW_ENFORCEMENTS = "enforcement.max_new_enforcements_per_cycle"
+# The same ceiling counted in users and projects rather than limits: one group
+# or application limit can restrict hundreds of projects on its own.
+KEY_MAX_NEW_TARGETS = "enforcement.max_new_targets_per_cycle"
+# Set when an admin resumes enforcement: the batch they have just looked at is
+# let through once, and the ceilings apply again from the following cycle.
+KEY_CEILING_WAIVED_ONCE = "enforcement.ceiling_waived_once"
 KEY_PROTECTED_ROLES = "enforcement.protected_roles"
 
 # Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
@@ -137,6 +143,8 @@ DEFAULTS: dict[str, Any] = {
     KEY_ENFORCEMENT_PAUSED: False,
     KEY_ENFORCEMENT_PAUSE_REASON: None,
     KEY_MAX_NEW_ENFORCEMENTS: 25,
+    KEY_MAX_NEW_TARGETS: 100,
+    KEY_CEILING_WAIVED_ONCE: False,
     KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
 }
 
@@ -214,6 +222,9 @@ class EnforcementGuard:
     pause_reason: str | None
     # 0 means no ceiling.
     max_new_per_cycle: int
+    max_new_targets_per_cycle: int
+    # True for the one cycle after an admin resumes enforcement.
+    ceiling_waived_once: bool
     protected_roles: frozenset[str]
 
 
@@ -226,6 +237,10 @@ def enforcement_guard(session: Session) -> EnforcementGuard:
         max_new_per_cycle=_non_negative_int(
             get_value(session, KEY_MAX_NEW_ENFORCEMENTS), DEFAULTS[KEY_MAX_NEW_ENFORCEMENTS]
         ),
+        max_new_targets_per_cycle=_non_negative_int(
+            get_value(session, KEY_MAX_NEW_TARGETS), DEFAULTS[KEY_MAX_NEW_TARGETS]
+        ),
+        ceiling_waived_once=bool(get_value(session, KEY_CEILING_WAIVED_ONCE, False)),
         protected_roles=frozenset(
             name.strip().lower()
             for name in str(roles or "").replace(";", ",").split(",")

@@ -172,9 +172,14 @@ def enforcement_failed_key(action_id: int, day: str) -> str:
     return f"enforcefail:{action_id}:{day}"
 
 
-def protected_key(action_id: int) -> str:
-    """One "over budget but protected" notice per limit, target and period."""
-    return f"protected:{action_id}"
+def protected_key(limit_id: int, period_key: str) -> str:
+    """One "over budget but protected" notice per limit and period."""
+    return f"protected:{limit_id}:{period_key}"
+
+
+def not_restricted_key(action_id: int) -> str:
+    """One "deliberately left unchanged" notice per limit, target and period."""
+    return f"notrestricted:{action_id}"
 
 
 def restore_failed_key(action_id: int, day: str) -> str:

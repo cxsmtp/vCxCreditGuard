@@ -207,6 +207,7 @@ class SettingsResponse(BaseModel):
     enforcement_paused: bool = False
     enforcement_pause_reason: str | None = None
     max_new_enforcements_per_cycle: int = 25
+    max_new_targets_per_cycle: int = 100
     protected_roles: str = ""
     current_schedule_description: str
 
@@ -241,6 +242,7 @@ class SettingsUpdateRequest(StrictModel):
     auto_approve_expiry_days: int | None = Field(default=None, ge=0, le=3650)
     enforcement_paused: bool | None = None
     max_new_enforcements_per_cycle: int | None = Field(default=None, ge=0, le=100_000)
+    max_new_targets_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
     protected_roles: str | None = Field(default=None, max_length=1024)
 
     @field_validator("schedule_mode")
