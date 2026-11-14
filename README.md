@@ -875,6 +875,11 @@ these, because each one can stop something that used to work:
   bootstrap admin, an account an admin creates with a password, an account
   recovered from the command line) is asked to choose its own before anything
   else.
+- **Scan viewing.** A restriction no longer removes `view-scans`, only the AI
+  roles. Anyone restricted by an earlier version gets `view-scans` back at the
+  first cycle after the upgrade; it shows in the audit log as
+  `enforcement.narrowed`. This happens once, so removing the role from someone
+  yourself in Checkmarx One afterwards sticks.
 - **Automatic approvals.** The auto-approve threshold is now a budget per
   30 days, per entity and per requester, not a size per request. Several small
   requests no longer add up past it.

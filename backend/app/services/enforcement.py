@@ -320,6 +320,11 @@ class RoleResolver:
             self._client_uuid = iam.resolve_platform_client_uuid(self._client)
         return self._client_uuid
 
+    def all_roles(self) -> dict[str, iam.RoleRef]:
+        if self._roles is None:
+            self._roles = iam.fetch_client_roles(self._client, client_uuid=self.client_uuid)
+        return self._roles
+
     def ai_roles(self) -> dict[str, iam.RoleRef]:
         if self._roles is None:
             self._roles = iam.fetch_client_roles(self._client, client_uuid=self.client_uuid)
@@ -650,62 +655,6 @@ def _enforce_target(
     session.commit()
 
 
-def _give_back_roles_outside_the_restriction(
-    session: Session,
-    client: CheckmarxClient,
-    *,
-    action: EnforcementAction,
-    target: Target,
-    actor: AuditActor,
-    resolver: RoleResolver,
-) -> None:
-    """Return roles an earlier version removed that a restriction no longer covers.
-
-    A restriction used to take the scan-viewing role as well as the AI roles.
-    Someone restricted back then is still without it, and would stay so until
-    their whole restriction is lifted. This gives it back once, and takes it
-    out of the undo snapshot so it is not this tool's business again: if an
-    admin later removes the role in Checkmarx One on purpose, it stays removed.
-    """
-    if action.kind != EnforcementKind.REMOVE_USER_ROLES:
-        return
-    snapshot = dict(action.undo_snapshot or {})
-    removed = [role for role in snapshot.get("removed_roles") or [] if isinstance(role, dict)]
-    outside = [
-        role
-        for role in removed
-        if role.get("name") not in iam.AI_ROLE_NAMES
-        and isinstance(role.get("id"), str)
-        and isinstance(role.get("name"), str)
-    ]
-    if not outside:
-        return
-    client_uuid = snapshot.get("client_uuid") or resolver.client_uuid
-    iam.add_user_client_roles(
-        client,
-        user_id=target.target_id,
-        client_uuid=client_uuid,
-        roles=[iam.RoleRef(id=role["id"], name=role["name"]) for role in outside],
-    )
-    names = sorted(role["name"] for role in outside)
-    snapshot["removed_roles"] = [role for role in removed if role not in outside]
-    action.undo_snapshot = snapshot
-    record_audit(
-        session,
-        action="enforcement.narrowed",
-        actor=actor,
-        target_type=target.target_type,
-        target_id=target.target_id,
-        target_label=target.target_label,
-        after={"kind": str(target.kind), "roles_returned": names},
-        detail=(
-            f"{target.target_label} was given back {', '.join(names)}: a restriction now "
-            "removes only the AI roles. The AI roles stay removed."
-        ),
-    )
-    session.commit()
-
-
 def _verify_applied(
     session: Session,
     client: CheckmarxClient,
@@ -751,9 +700,6 @@ def _verify_applied(
         return
     session.commit()  # nothing held open while we wait on Checkmarx
     try:
-        _give_back_roles_outside_the_restriction(
-            session, client, action=action, target=target, actor=actor, resolver=resolver
-        )
         reasserted = _reconcile(session, client, action=action, target=target, resolver=resolver)
     except CheckmarxError as exc:
         logger.warning(
@@ -1001,8 +947,8 @@ def _reconcile(
     it drifted back on in Checkmarx One.
 
     Returns True when the restriction had to be re-asserted, False when it still
-    holds. The original ``undo_snapshot`` is deliberately left untouched so a future
-    restore still puts back the exact pre-restriction state.
+    holds. The ``undo_snapshot`` is left untouched here so a future restore still
+    puts back the exact pre-restriction state.
     """
     snapshot = action.undo_snapshot or {}
     kind = action.kind
@@ -1146,6 +1092,125 @@ def _siblings_in_force(session: Session, action: EnforcementAction) -> list[Enfo
         .execution_options(populate_existing=True)
     )
     return [row for row in rows if may_be_in_force(row)]
+
+
+def _roles_outside_the_restriction(action: EnforcementAction) -> list[dict[str, str]]:
+    """Roles this action's snapshot says were removed that a restriction no longer covers."""
+    removed = (action.undo_snapshot or {}).get("removed_roles") or []
+    return [
+        role
+        for role in removed
+        if isinstance(role, dict)
+        and isinstance(role.get("name"), str)
+        and role["name"] not in iam.AI_ROLE_NAMES
+    ]
+
+
+def return_roles_outside_the_restriction(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    actor: AuditActor,
+    resolver: RoleResolver | None = None,
+) -> int:
+    """Give back roles an earlier version removed that a restriction no longer covers.
+
+    A restriction used to take the scan-viewing role as well as the AI roles.
+    Someone restricted back then is still without it, and would stay so until
+    every restriction on them is lifted. This returns it, once per user, and
+    takes it out of every undo snapshot that holds it, so it is not this tool's
+    business again: an admin who later removes the role in Checkmarx One on
+    purpose is not undone, by a later cycle or by a later Restore.
+
+    It runs as its own pass over every restriction that is or may be in force,
+    whatever the state of the limit behind it - paused, held from an earlier
+    period, not currently breached - because none of those is a reason to keep
+    withholding a role the restriction should never have taken. The AI roles
+    stay removed. Returns how many users were given something back.
+    """
+    by_user: dict[str, list[int]] = {}
+    for action in session.scalars(
+        select(EnforcementAction)
+        .where(
+            EnforcementAction.kind == EnforcementKind.REMOVE_USER_ROLES,
+            EnforcementAction.status.in_(RESTORABLE_STATUSES),
+        )
+        .order_by(EnforcementAction.id)
+    ):
+        if may_be_in_force(action) and _roles_outside_the_restriction(action):
+            by_user.setdefault(action.target_id, []).append(action.id)
+    if not by_user:
+        return 0
+
+    resolver = resolver or RoleResolver(client)
+    returned = 0
+    for user_id, action_ids in by_user.items():
+        session.commit()  # never wait on a target lock with anything open in the database
+        with _target_lock(TARGET_USER, user_id):
+            actions = [
+                action
+                for action_id in action_ids
+                if (action := session.get(EnforcementAction, action_id, populate_existing=True))
+                is not None
+                and may_be_in_force(action)
+                and _roles_outside_the_restriction(action)
+            ]
+            if not actions:
+                continue
+            label = actions[0].target_label or user_id
+            wanted: dict[str, dict[str, str]] = {}
+            for action in actions:
+                for role in _roles_outside_the_restriction(action):
+                    wanted.setdefault(role["name"], role)
+            client_uuid = (actions[0].undo_snapshot or {}).get("client_uuid")
+            session.commit()  # nothing held open while we wait on Checkmarx
+            try:
+                # The id in an old snapshot may be stale; the role's name is what
+                # identifies it. A role that no longer exists cannot be returned.
+                known = resolver.all_roles()
+                roles = [known[name] for name in sorted(wanted) if name in known]
+                iam.add_user_client_roles(
+                    client,
+                    user_id=user_id,
+                    client_uuid=client_uuid or resolver.client_uuid,
+                    roles=roles,
+                )
+            except CheckmarxError as exc:
+                logger.warning(
+                    "Could not give %s back to %s this cycle: %s",
+                    ", ".join(sorted(wanted)),
+                    label,
+                    exc,
+                )
+                continue
+            for action in actions:
+                snapshot = dict(action.undo_snapshot or {})
+                snapshot["removed_roles"] = [
+                    role
+                    for role in snapshot.get("removed_roles") or []
+                    if not (isinstance(role, dict) and role.get("name") in wanted)
+                ]
+                action.undo_snapshot = snapshot
+            names = [role.name for role in roles]
+            gone = sorted(set(wanted) - set(names))
+            record_audit(
+                session,
+                action="enforcement.narrowed",
+                actor=actor,
+                target_type=TARGET_USER,
+                target_id=user_id,
+                target_label=label,
+                after={"roles_returned": names, "roles_no_longer_in_tenant": gone},
+                detail=(
+                    f"A restriction now removes only the AI roles, so {label} was given back "
+                    f"{', '.join(names) or 'nothing (the role no longer exists)'}. "
+                    "The AI roles stay removed."
+                ),
+            )
+            session.commit()
+            if names:
+                returned += 1
+    return returned
 
 
 def may_be_in_force(action: EnforcementAction) -> bool:

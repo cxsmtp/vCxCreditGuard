@@ -216,6 +216,13 @@ def evaluate_all(
 
     if client is not None:
         _lift_unjustified_restrictions(session, client, actor=actor, result=result)
+        try:
+            enforcement.return_roles_outside_the_restriction(
+                session, client, actor=actor, resolver=resolver
+            )
+        except Exception as exc:  # noqa: BLE001 - a housekeeping pass must not stop the cycle
+            session.rollback()
+            logger.warning("Could not return roles outside the restriction: %s", exc)
         # Decided once, before anything is restricted: either the whole cycle
         # may apply new restrictions or none of it may. Giving access back is
         # never held up by this.

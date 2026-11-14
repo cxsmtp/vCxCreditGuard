@@ -431,53 +431,6 @@ class TestReconciliation:
         assert len(out2.reconciled) == 1
         assert not any(r in tenant.role_mappings["user-harsh"] for r in AI_ROLE_NAMES)
 
-    def test_scan_viewing_taken_by_an_earlier_version_is_given_back_once(self, db: Session) -> None:
-        """Restrictions used to remove view-scans too. Someone restricted then
-        gets it back at the next cycle, while their AI roles stay removed."""
-        from app.models import AuditLogEntry
-        from tests.fake_tenant import ALL_ROLES
-
-        tenant, client = setup_tenant(db)
-        limit = make_limit(db, entity_type=EntityType.USER, entity_id="user-harsh")
-        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
-        db.commit()
-
-        # As the earlier version left things: the role gone, and in the snapshot.
-        action = db.scalar(select(EnforcementAction))
-        tenant.role_mappings["user-harsh"].remove("view-scans")
-        snapshot = dict(action.undo_snapshot)
-        snapshot["removed_roles"] = [
-            *snapshot["removed_roles"],
-            {"id": ALL_ROLES["view-scans"], "name": "view-scans"},
-        ]
-        action.undo_snapshot = snapshot
-        db.commit()
-
-        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
-        db.commit()
-
-        assert "view-scans" in tenant.role_mappings["user-harsh"]
-        assert not any(r in tenant.role_mappings["user-harsh"] for r in AI_ROLE_NAMES)
-        db.refresh(action)
-        assert {r["name"] for r in action.undo_snapshot["removed_roles"]} == set(AI_ROLE_NAMES)
-        assert action.status == EnforcementStatus.APPLIED
-        narrowed = db.scalars(
-            select(AuditLogEntry).where(AuditLogEntry.action == "enforcement.narrowed")
-        ).all()
-        assert len(narrowed) == 1
-
-        # Once only: an admin who then removes the role on purpose is not undone.
-        tenant.role_mappings["user-harsh"].remove("view-scans")
-        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
-        db.commit()
-        assert "view-scans" not in tenant.role_mappings["user-harsh"]
-
-        # And the eventual restore returns exactly the AI roles.
-        assert enforcement.restore_action(db, client, action=action, actor=ACTOR) is True
-        db.commit()
-        assert all(r in tenant.role_mappings["user-harsh"] for r in AI_ROLE_NAMES)
-        assert "view-scans" not in tenant.role_mappings["user-harsh"]
-
     def test_pr_remediation_drift_is_reasserted(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
         limit = make_limit(db, entity_type=EntityType.PROJECT, entity_id="proj-api")
@@ -725,3 +678,129 @@ def test_restore_for_limit_reverses_every_target(db: Session) -> None:
     assert tenant.auto_triage["proj-api"]["enabled"] is True
     assert tenant.auto_triage["proj-web"]["enabled"] is True
     assert tenant.repo_severities["repo-1"] == ["CRITICAL", "HIGH"]
+
+
+class TestScanViewingIsReturned:
+    """Restrictions used to remove view-scans as well as the AI roles. Whoever
+    was restricted then gets it back, once, and it stays out of the snapshots."""
+
+    def _legacy_restriction(self, db: Session, tenant, client) -> EnforcementAction:
+        """A restriction as the earlier version left it: view-scans gone from
+        the tenant and recorded in the undo snapshot, under a stale role id."""
+        limit = make_limit(db, entity_type=EntityType.USER, entity_id="user-harsh")
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        action = db.scalar(select(EnforcementAction))
+        tenant.role_mappings["user-harsh"].remove("view-scans")
+        snapshot = dict(action.undo_snapshot)
+        snapshot["removed_roles"] = [
+            *snapshot["removed_roles"],
+            {"id": "an-id-from-before-the-role-was-recreated", "name": "view-scans"},
+        ]
+        action.undo_snapshot = snapshot
+        db.commit()
+        return action
+
+    def _narrowed(self, db: Session) -> int:
+        from app.models import AuditLogEntry
+
+        return len(
+            db.scalars(
+                select(AuditLogEntry).where(AuditLogEntry.action == "enforcement.narrowed")
+            ).all()
+        )
+
+    def test_it_is_given_back_once_and_the_ai_roles_stay_removed(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        action = self._legacy_restriction(db, tenant, client)
+
+        assert enforcement.return_roles_outside_the_restriction(db, client, actor=ACTOR) == 1
+        db.commit()
+
+        assert "view-scans" in tenant.role_mappings["user-harsh"]
+        assert not any(r in tenant.role_mappings["user-harsh"] for r in AI_ROLE_NAMES)
+        db.refresh(action)
+        assert {r["name"] for r in action.undo_snapshot["removed_roles"]} == set(AI_ROLE_NAMES)
+        assert action.status == EnforcementStatus.APPLIED
+        assert self._narrowed(db) == 1
+
+        # Once only: an admin who then removes the role on purpose is not undone,
+        # by a later cycle or by the eventual restore.
+        tenant.role_mappings["user-harsh"].remove("view-scans")
+        assert enforcement.return_roles_outside_the_restriction(db, client, actor=ACTOR) == 0
+        assert enforcement.restore_action(db, client, action=action, actor=ACTOR) is True
+        db.commit()
+        assert all(r in tenant.role_mappings["user-harsh"] for r in AI_ROLE_NAMES)
+        assert "view-scans" not in tenant.role_mappings["user-harsh"]
+        assert self._narrowed(db) == 1
+
+    def test_every_row_restricting_the_user_lets_go_of_it_together(self, db: Session) -> None:
+        """A restriction held over from an earlier period is a second row with
+        the same snapshot. Left alone, it would hand view-scans to every later
+        row, and so back to the user, again and again."""
+        tenant, client = setup_tenant(db)
+        first = self._legacy_restriction(db, tenant, client)
+        limit = db.get(CreditLimit, first.limit_id)
+        enforcement.apply_enforcement(db, client, limit=limit, period_key="2026-09", actor=ACTOR)
+        db.commit()
+        rows = db.scalars(select(EnforcementAction).order_by(EnforcementAction.id)).all()
+        assert len(rows) == 2
+        assert all("view-scans" in str(row.undo_snapshot["removed_roles"]) for row in rows)
+
+        assert enforcement.return_roles_outside_the_restriction(db, client, actor=ACTOR) == 1
+        db.commit()
+        for row in rows:
+            db.refresh(row)
+            assert {r["name"] for r in row.undo_snapshot["removed_roles"]} == set(AI_ROLE_NAMES)
+        assert self._narrowed(db) == 1
+
+        # The admin removes it on purpose; a third period's row must not bring it back.
+        tenant.role_mappings["user-harsh"].remove("view-scans")
+        enforcement.apply_enforcement(db, client, limit=limit, period_key="2026-10", actor=ACTOR)
+        db.commit()
+        assert enforcement.return_roles_outside_the_restriction(db, client, actor=ACTOR) == 0
+        for row in db.scalars(select(EnforcementAction)).all():
+            enforcement.restore_action(db, client, action=row, actor=ACTOR)
+        db.commit()
+        assert "view-scans" not in tenant.role_mappings["user-harsh"]
+        assert all(r in tenant.role_mappings["user-harsh"] for r in AI_ROLE_NAMES)
+
+    def test_a_cycle_returns_it_even_while_enforcement_is_paused(self, db: Session) -> None:
+        """Nothing about a pause, or a limit that is not breached this period,
+        is a reason to keep withholding a role that should not have been taken."""
+        from app.services import evaluation, settings_store
+
+        tenant, client = setup_tenant(db)
+        self._legacy_restriction(db, tenant, client)
+        settings_store.set_value(db, settings_store.KEY_ENFORCEMENT_PAUSED, True)
+        db.commit()
+
+        evaluation.evaluate_all(db, client=client, actor=ACTOR)
+        db.commit()
+
+        # Returned by the pass itself (its audit entry), not as a side effect of
+        # some restore that happened to replay the old snapshot.
+        assert "view-scans" in tenant.role_mappings["user-harsh"]
+        assert self._narrowed(db) == 1
+
+    def test_a_failed_attempt_is_retried_and_does_not_disturb_the_restriction(
+        self, db: Session
+    ) -> None:
+        tenant, client = setup_tenant(db)
+        action = self._legacy_restriction(db, tenant, client)
+        limit = db.get(CreditLimit, action.limit_id)
+
+        tenant.fail_requests[("POST", "role-mappings")] = 503
+        assert enforcement.return_roles_outside_the_restriction(db, client, actor=ACTOR) == 0
+        db.refresh(action)
+        assert "view-scans" in str(action.undo_snapshot["removed_roles"])  # still owed
+        # The drift check for the same user still runs.
+        tenant.role_mappings["user-harsh"].append(AI_ROLE_NAMES[0])
+        out = enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        assert len(out.reconciled) == 1
+        assert not any(r in tenant.role_mappings["user-harsh"] for r in AI_ROLE_NAMES)
+
+        tenant.fail_requests.clear()
+        assert enforcement.return_roles_outside_the_restriction(db, client, actor=ACTOR) == 1
+        assert "view-scans" in tenant.role_mappings["user-harsh"]
