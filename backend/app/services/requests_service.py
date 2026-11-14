@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
@@ -43,9 +43,46 @@ class RequestInput:
     reason: str | None = None
 
 
-def create_request(session: Session, *, data: RequestInput, actor: AuditActor) -> CreditRequest:
+# Automatic approvals are capped in total over this long, per entity and per
+# requester, not just per request.
+AUTO_APPROVE_WINDOW = timedelta(days=30)
+# How many undecided requests one non-admin may have open at once.
+MAX_PENDING_PER_REQUESTER = 5
+
+
+def create_request(
+    session: Session, *, data: RequestInput, actor: AuditActor, is_admin: bool = True
+) -> CreditRequest:
     if data.requested_limit < 0:
         raise RequestError("A requested limit cannot be negative.")
+    # One open request per entity: a second one adds nothing an admin can act
+    # on, and a stream of them is how a queue gets flooded.
+    duplicate = session.scalar(
+        select(CreditRequest.id).where(
+            CreditRequest.entity_type == str(data.entity_type),
+            CreditRequest.entity_id == data.entity_id,
+            CreditRequest.status == RequestStatus.PENDING,
+        )
+    )
+    if duplicate is not None:
+        raise RequestError(
+            "There is already a request waiting for a decision on this entity "
+            f"(#{duplicate}). It has to be decided before another can be filed."
+        )
+    if not is_admin and actor.actor_id is not None:
+        open_requests = session.scalar(
+            select(func.count())
+            .select_from(CreditRequest)
+            .where(
+                CreditRequest.requested_by_id == actor.actor_id,
+                CreditRequest.status == RequestStatus.PENDING,
+            )
+        )
+        if int(open_requests or 0) >= MAX_PENDING_PER_REQUESTER:
+            raise RequestError(
+                f"You already have {MAX_PENDING_PER_REQUESTER} requests waiting for a "
+                "decision. Wait for those before filing more."
+            )
     now = utcnow()
     request = CreditRequest(
         entity_type=str(data.entity_type),
@@ -110,6 +147,7 @@ def approve_request(
     expires_at: datetime | None = None,
     note: str | None = None,
     client: CheckmarxClient | None = None,
+    auto_approved_increase: int | None = None,
 ) -> CreditRequest:
     """Grant the request and apply the budget to the entity's limit.
 
@@ -191,6 +229,7 @@ def approve_request(
     request.decided_by_name = actor.actor_name
     request.decided_at = utcnow()
     request.decision_note = note or None
+    request.auto_approved_increase = auto_approved_increase
     session.flush()
 
     window = f" until {expires_at.isoformat()}" if expires_at else ""
@@ -289,8 +328,28 @@ def auto_decide_pending(
         existing = _existing_limit(session, request)
         current = existing.credit_limit if existing is not None else 0
         increase = request.requested_limit - current
-        # Only auto-approve a genuine raise whose size is within the cap.
+        # Only auto-approve a genuine raise whose size is within the cap...
         if increase <= 0 or increase > policy.auto_approve_max_increase:
+            left_pending += 1
+            continue
+        # ...and only while the cap also holds for everything automation has
+        # already granted recently, to this entity and at this requester's
+        # asking. Otherwise the same small raise, requested again each cycle,
+        # walks a budget up without limit, and anyone allowed to file requests
+        # can do that for any entity they like.
+        allowance = policy.auto_approve_max_increase - max(
+            _auto_granted_recently(
+                session,
+                CreditRequest.entity_type == request.entity_type,
+                CreditRequest.entity_id == request.entity_id,
+            ),
+            _auto_granted_recently(
+                session, CreditRequest.requested_by_id == request.requested_by_id
+            )
+            if request.requested_by_id is not None
+            else 0,
+        )
+        if increase > allowance:
             left_pending += 1
             continue
 
@@ -317,6 +376,7 @@ def auto_decide_pending(
                     f"cap{window}."
                 ),
                 client=client,
+                auto_approved_increase=increase,
             )
             session.commit()
         except Exception:
@@ -352,6 +412,18 @@ def auto_decide_pending(
         "left_pending": left_pending,
         "failed": failed,
     }
+
+
+def _auto_granted_recently(session: Session, *conditions) -> int:  # type: ignore[no-untyped-def]
+    """Credits automation has granted, within the window, to the matching requests."""
+    total = session.scalar(
+        select(func.coalesce(func.sum(CreditRequest.auto_approved_increase), 0)).where(
+            CreditRequest.auto_approved_increase.is_not(None),
+            CreditRequest.decided_at >= utcnow() - AUTO_APPROVE_WINDOW,
+            *conditions,
+        )
+    )
+    return int(total or 0)
 
 
 class GrantExpiryError(RuntimeError):

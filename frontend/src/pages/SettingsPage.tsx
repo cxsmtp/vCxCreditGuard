@@ -598,7 +598,7 @@ export function SettingsPage({
             <div className="mt-4 grid gap-4 sm:grid-cols-2">
               <Field
                 label="Auto-approve cap (credits)"
-                hint="Largest increase over the current budget to approve automatically. 0 approves nothing, even when the switch is on."
+                hint="The most that is approved automatically for one entity, and at one requester's asking, in any 30 days - in total, not per request. A request that would go over it waits for an admin. 0 approves nothing, even when the switch is on."
               >
                 <Input
                   type="number"

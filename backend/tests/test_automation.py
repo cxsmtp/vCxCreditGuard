@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -139,33 +140,100 @@ class TestAutoApproval:
 
 
 class TestCapCannotCompound:
-    def test_only_one_request_per_entity_is_auto_approved_per_cycle(self, db: Session) -> None:
-        # Two per-cap requests for the SAME entity must not compound past the cap
-        # in one cycle (each is individually within the 600 cap).
+    def test_a_second_request_for_an_entity_waits_for_the_first_to_be_decided(
+        self, db: Session
+    ) -> None:
         _request(db, entity_id="u1", requested=500)
-        _request(db, entity_id="u1", requested=1000)
+        with pytest.raises(requests_service.RequestError, match="already a request"):
+            _request(db, entity_id="u1", requested=1000)
+
+    def test_the_cap_is_on_the_total_granted_over_time_not_on_each_request(
+        self, db: Session
+    ) -> None:
+        """The same small raise, asked for again each cycle, used to walk a
+        budget up without limit."""
         _enable(db, cap=600)
-        db.commit()
-
-        stats = requests_service.auto_decide_pending(db)
-        assert stats["auto_approved"] == 1
-        assert stats["left_pending"] == 1
-        # The entity's limit rose by at most the cap, not the sum of both asks.
-        limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "u1"))
-        assert limit is not None and limit.credit_limit <= 600
-
-    def test_a_later_cycle_can_grant_again_within_the_cap(self, db: Session) -> None:
         _request(db, entity_id="u1", requested=100)
-        _enable(db, cap=600)
         db.commit()
         requests_service.auto_decide_pending(db)
         db.commit()
-        # A fresh request next cycle is measured against the new budget and may grant.
-        _request(db, entity_id="u1", requested=650)  # +550 over 100, within 600
+
+        # +550 on top of the +100 already granted would make 650: over the cap.
+        over = _request(db, entity_id="u1", requested=650)
         db.commit()
-        requests_service.auto_decide_pending(db)
+        stats = requests_service.auto_decide_pending(db)
+        assert stats["auto_approved"] == 0 and stats["left_pending"] == 1
+        db.refresh(over)
+        assert over.status == RequestStatus.PENDING
+        requests_service.deny_request(db, request=over, actor=ACTOR)
+        db.commit()
+
+        # +500 makes exactly 600 in total: allowed, and that uses it up.
+        _request(db, entity_id="u1", requested=600)
+        db.commit()
+        assert requests_service.auto_decide_pending(db)["auto_approved"] == 1
+        db.commit()
+        _request(db, entity_id="u1", requested=601)
+        db.commit()
+        assert requests_service.auto_decide_pending(db)["auto_approved"] == 0
         limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "u1"))
-        assert limit is not None and limit.credit_limit == 650
+        assert limit.credit_limit == 600
+
+    def test_the_allowance_comes_back_after_the_window(self, db: Session) -> None:
+        _enable(db, cap=600)
+        _request(db, entity_id="u1", requested=600)
+        db.commit()
+        requests_service.auto_decide_pending(db)
+        db.commit()
+        for granted in db.scalars(select(CreditRequest)):
+            granted.decided_at = granted.decided_at - requests_service.AUTO_APPROVE_WINDOW * 2
+        db.commit()
+
+        _request(db, entity_id="u1", requested=900)
+        db.commit()
+        assert requests_service.auto_decide_pending(db)["auto_approved"] == 1
+
+    def test_one_requester_cannot_collect_the_cap_once_per_entity(
+        self, db: Session, viewer_user
+    ) -> None:
+        """Anyone allowed to file requests can file them for any entity, so the
+        total a single requester obtains automatically is capped too."""
+        _enable(db, cap=600)
+        viewer = AuditActor.admin(viewer_user)
+        for entity_id in ("u1", "u2", "u3"):
+            requests_service.create_request(
+                db,
+                data=requests_service.RequestInput(
+                    entity_type=EntityType.USER, entity_id=entity_id, requested_limit=400
+                ),
+                actor=viewer,
+                is_admin=False,
+            )
+        db.commit()
+        stats = requests_service.auto_decide_pending(db)
+        # 400 for the first; the second would take this requester to 800.
+        assert stats["auto_approved"] == 1 and stats["left_pending"] == 2
+
+    def test_a_non_admin_cannot_flood_the_queue(self, db: Session, viewer_user) -> None:
+        viewer = AuditActor.admin(viewer_user)
+        for n in range(requests_service.MAX_PENDING_PER_REQUESTER):
+            requests_service.create_request(
+                db,
+                data=requests_service.RequestInput(
+                    entity_type=EntityType.USER, entity_id=f"u{n}", requested_limit=10
+                ),
+                actor=viewer,
+                is_admin=False,
+            )
+        with pytest.raises(requests_service.RequestError, match="waiting for a decision"):
+            requests_service.create_request(
+                db,
+                data=requests_service.RequestInput(
+                    entity_type=EntityType.USER, entity_id="one-too-many", requested_limit=10
+                ),
+                actor=viewer,
+                is_admin=False,
+            )
 
 
 class TestPerRequestIsolation:

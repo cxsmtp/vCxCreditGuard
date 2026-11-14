@@ -54,6 +54,11 @@ AUDITED_FIELDS = (
 )
 
 
+# Far above any real budget, and comfortably inside a 32-bit integer column: a
+# larger number in an imported file used to fail the whole import on PostgreSQL.
+MAX_CREDIT_LIMIT = 1_000_000_000
+
+
 class LimitError(ValueError):
     """The requested limit change is not valid."""
 
@@ -97,6 +102,8 @@ def resolve_entity_label(session: Session, *, entity_type: str, entity_id: str) 
 def _validate(session: Session, data: LimitInput) -> None:
     if data.credit_limit < 0:
         raise LimitError("A credit limit cannot be negative.")
+    if data.credit_limit > MAX_CREDIT_LIMIT:
+        raise LimitError(f"A credit limit cannot be more than {MAX_CREDIT_LIMIT:,}.")
     if not 1 <= data.warning_threshold_pct <= 100:
         raise LimitError("The warning threshold must be between 1 and 100 percent.")
     if data.period_type == "custom":

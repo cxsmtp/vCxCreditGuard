@@ -36,7 +36,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app import __version__
@@ -165,14 +165,30 @@ def meets_threshold(severity: str, minimum: str) -> bool:
 def pending_notifications(
     session: Session, *, config: DeliveryConfig, limit: int = DEFAULT_BATCH
 ) -> list[Notification]:
-    """Undelivered notifications at or above the configured severity, oldest first."""
-    rows = session.scalars(
-        select(Notification)
-        .where(Notification.delivery.is_(None))
-        .order_by(Notification.created_at)
-        .limit(limit * 4)
+    """Undelivered notifications at or above the configured severity, oldest first.
+
+    Anything below the threshold is marked as skipped first. Left undelivered it
+    would sit at the front of the queue for ever, and once enough of it had
+    built up, the oldest rows fetched each cycle would all be ones that are
+    never sent - and nothing above the threshold would go out again.
+    """
+    deliverable = [
+        severity for severity in SEVERITY_RANK if meets_threshold(severity, config.min_severity)
+    ]
+    session.execute(
+        update(Notification)
+        .where(Notification.delivery.is_(None), Notification.severity.notin_(deliverable))
+        .values(delivery={"skipped": "below the delivery threshold"})
+        .execution_options(synchronize_session=False)
     )
-    return [row for row in rows if meets_threshold(row.severity, config.min_severity)][:limit]
+    return list(
+        session.scalars(
+            select(Notification)
+            .where(Notification.delivery.is_(None), Notification.severity.in_(deliverable))
+            .order_by(Notification.created_at, Notification.id)
+            .limit(limit)
+        )
+    )
 
 
 def deliver_pending(

@@ -8,6 +8,7 @@ and warned again next period if it happens again.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from sqlalchemy import func, select
@@ -46,6 +47,7 @@ def notify(
     checked here, because two scheduler processes racing on the same condition
     must not produce two rows.
     """
+    dedupe_key = _bounded_key(dedupe_key)
     if dedupe_key is not None:
         existing = session.scalar(select(Notification).where(Notification.dedupe_key == dedupe_key))
         if existing is not None:
@@ -57,7 +59,7 @@ def notify(
         "category": category,
         "entity_type": entity_type,
         "entity_id": entity_id,
-        "entity_label": entity_label,
+        "entity_label": entity_label[:512] if entity_label else entity_label,
         "title": title[:256],
         "body": body,
         "dedupe_key": dedupe_key,
@@ -82,6 +84,23 @@ def notify(
         logger.debug("Notification %s was already recorded by another writer", dedupe_key)
         return None
     return session.get(Notification, new_id)
+
+
+DEDUPE_KEY_LENGTH = 160
+
+
+def _bounded_key(key: str | None) -> str | None:
+    """A dedupe key that fits its column, without two long keys colliding.
+
+    Keys are built from identifiers that can be long (an e-mail address used as
+    a subject, say). Cutting one off would make different conditions share a
+    key, and all but the first would be silently dropped; so the tail of an
+    over-long key is replaced by a digest of the whole of it.
+    """
+    if key is None or len(key) <= DEDUPE_KEY_LENGTH:
+        return key
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    return f"{key[: DEDUPE_KEY_LENGTH - 33]}~{digest}"
 
 
 def _insert_ignoring_conflict(session: Session):  # type: ignore[no-untyped-def]

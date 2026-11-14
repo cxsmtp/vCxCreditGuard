@@ -271,6 +271,10 @@ class CreditRequest(Base):
     previous_limit: Mapped[int | None] = mapped_column(Integer)
     expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     reverted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Set when hands-off automation approved the request, with the size of the
+    # raise it granted over the budget then in force. Summed per entity and per
+    # requester to cap what automation hands out over time, not just per request.
+    auto_approved_increase: Mapped[int | None] = mapped_column(Integer)
 
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
 

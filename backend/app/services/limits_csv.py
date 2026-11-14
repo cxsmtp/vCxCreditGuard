@@ -385,6 +385,8 @@ def _row_to_input(row: dict[str, str]) -> limits_service.LimitInput:
         raise ValueError("entity_id is required")
 
     credit_limit = _parse_int(row.get("credit_limit"), "credit_limit")
+    if credit_limit > limits_service.MAX_CREDIT_LIMIT:
+        raise ValueError(f"credit_limit cannot be more than {limits_service.MAX_CREDIT_LIMIT:,}")
     if credit_limit < 0:
         raise ValueError("credit_limit cannot be negative")
 

@@ -88,6 +88,7 @@ def create_request(
                 reason=payload.reason,
             ),
             actor=ctx.actor,
+            is_admin=ctx.is_admin,
         )
     except requests_service.RequestError as exc:
         raise HTTPException(

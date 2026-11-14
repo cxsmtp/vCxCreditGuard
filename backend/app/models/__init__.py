@@ -5,6 +5,7 @@ both discover tables through ``Base.metadata``.
 """
 
 from app.db.base import Base
+from app.db.length_guard import install_length_guards  # noqa: E402
 from app.models.audit import AuditLogEntry, Notification
 from app.models.auth import LoginAttempt, PasswordResetToken, UtilitySession, UtilityUser
 from app.models.connection import AppSetting, CxConnection
@@ -33,6 +34,9 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
+
+# Once every model is known: see app/db/length_guard.py.
+install_length_guards(Base)
 
 __all__ = [
     "AppSetting",
