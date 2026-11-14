@@ -156,15 +156,16 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
             {needsTotp && (
               <>
                 <InfoNote>
-                  Enter the six digit code from your authenticator app to finish signing in.
+                  Enter the six digit code from your authenticator app to finish signing in. If
+                  you have lost the device, enter one of your recovery codes instead.
                 </InfoNote>
-                <Field label="Authentication code" required>
+                <Field label="Authentication or recovery code" required>
                   <Input
                     value={totpCode}
                     onChange={(event) => setTotpCode(event.target.value)}
-                    inputMode="numeric"
                     autoComplete="one-time-code"
-                    maxLength={8}
+                    maxLength={32}
+                    spellCheck={false}
                     autoFocus
                     required
                   />

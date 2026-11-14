@@ -9,15 +9,17 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 
 from app.api.cookies import clear_auth_cookies, set_auth_cookies
 from app.api.deps import AppSettings, CurrentUser, DbSession, client_ip, user_agent
-from app.core.passwords import PasswordPolicyError, verify_password
+from app.core.passwords import PasswordPolicyError
 from app.schemas.auth import (
     ChangePasswordRequest,
     ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
+    ReauthRequest,
     ResetPasswordRequest,
     SessionInfo,
     TotpConfirmRequest,
+    TotpConfirmResponse,
     TotpEnrollResponse,
 )
 from app.services import auth as auth_service
@@ -138,11 +140,7 @@ def change_password(
     ctx: CurrentUser,
     db: DbSession,
 ) -> MessageResponse:
-    if not verify_password(ctx.user.password_hash, payload.current_password):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "wrong_password", "message": "Current password is incorrect."},
-        )
+    _require_current_password(ctx, db, payload.current_password)
     try:
         auth_service.set_password(
             db, user=ctx.user, new_password=payload.new_password, actor=ctx.actor
@@ -287,8 +285,29 @@ def reset_password(
     return MessageResponse(message="Password set. Sign in with your new password.")
 
 
+def _require_current_password(ctx: CurrentUser, db: DbSession, password: str) -> None:
+    """Re-check the password before a change to how the account is protected."""
+    try:
+        correct = auth_service.confirm_current_password(
+            db, user=ctx.user, password=password, ip_address=ctx.ip_address or "unknown"
+        )
+    except auth_service.RateLimited as exc:
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "rate_limited", "message": str(exc)},
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+    db.commit()  # keep the attempt counted even when the password was wrong
+    if not correct:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "wrong_password", "message": "Current password is incorrect."},
+        )
+
+
 @router.post("/totp/enroll", response_model=TotpEnrollResponse)
-def enroll_totp(ctx: CurrentUser, db: DbSession) -> TotpEnrollResponse:
+def enroll_totp(payload: ReauthRequest, ctx: CurrentUser, db: DbSession) -> TotpEnrollResponse:
     if ctx.user.totp_enabled:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -297,24 +316,32 @@ def enroll_totp(ctx: CurrentUser, db: DbSession) -> TotpEnrollResponse:
                 "message": "Two factor authentication is already enabled. Disable it first.",
             },
         )
+    _require_current_password(ctx, db, payload.current_password)
     secret, uri = auth_service.provision_totp(db, user=ctx.user)
     db.commit()
     return TotpEnrollResponse(secret=secret, otpauth_uri=uri)
 
 
-@router.post("/totp/confirm", response_model=MessageResponse)
-def confirm_totp(payload: TotpConfirmRequest, ctx: CurrentUser, db: DbSession) -> MessageResponse:
-    if not auth_service.confirm_totp(db, user=ctx.user, code=payload.code, actor=ctx.actor):
+@router.post("/totp/confirm", response_model=TotpConfirmResponse)
+def confirm_totp(
+    payload: TotpConfirmRequest, ctx: CurrentUser, db: DbSession
+) -> TotpConfirmResponse:
+    codes = auth_service.confirm_totp(db, user=ctx.user, code=payload.code, actor=ctx.actor)
+    if codes is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_totp", "message": "That code did not match. Try again."},
         )
     db.commit()
-    return MessageResponse(message="Two factor authentication enabled.")
+    return TotpConfirmResponse(
+        message="Two factor authentication enabled. Save your recovery codes now.",
+        recovery_codes=codes,
+    )
 
 
-@router.delete("/totp", response_model=MessageResponse)
-def remove_totp(ctx: CurrentUser, db: DbSession) -> MessageResponse:
+@router.post("/totp/disable", response_model=MessageResponse)
+def remove_totp(payload: ReauthRequest, ctx: CurrentUser, db: DbSession) -> MessageResponse:
+    _require_current_password(ctx, db, payload.current_password)
     auth_service.disable_totp(db, user=ctx.user, actor=ctx.actor)
     db.commit()
     return MessageResponse(message="Two factor authentication disabled.")

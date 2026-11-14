@@ -35,7 +35,9 @@ from app.core.config import ConfigError, Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.migrate import upgrade_to_head
 from app.db.session import session_scope
+from app.services import settings_store
 from app.services.auth import bootstrap_admin_if_needed
+from app.services.master_key import verify_master_key
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,10 @@ def _startup(settings: Settings) -> None:
     settings.master_key_bytes()
     upgrade_to_head(settings.database_url)
     with session_scope() as db:
+        # ...and with the wrong key it would look just as healthy while every
+        # cycle failed to read the Checkmarx API key.
+        verify_master_key(db)
+        settings_store.encrypt_legacy_secrets(db)
         bootstrap_admin_if_needed(db, settings)
 
 

@@ -178,7 +178,10 @@ class SettingsResponse(BaseModel):
     smtp_from: str | None
     smtp_recipients: str | None
     smtp_password_configured: bool
-    webhook_url: str | None
+    # The URL itself is a credential and is never returned: only whether one is
+    # set, and which host it points at.
+    webhook_url_configured: bool = False
+    webhook_host: str | None = None
     webhook_secret_configured: bool
     allowed_interval_minutes: list[int]
     # The lookback windows the consumption endpoint accepts. Anything else is a 400.

@@ -6,6 +6,7 @@ import { AppShell } from "./components/AppShell";
 import { Spinner } from "./components/ui";
 import { applyAccent } from "./lib/ui-context";
 import { useInterval } from "./hooks/useResource";
+import { AccountPage, PasswordChangeRequired } from "./pages/AccountPage";
 import { AuditPage } from "./pages/AuditPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { LimitsPage } from "./pages/LimitsPage";
@@ -107,6 +108,27 @@ export function App() {
     );
   }
 
+  // Changing the password ends every session for the account, this one
+  // included, so the only honest next screen is the sign-in page.
+  function passwordChanged() {
+    setAuthState("signedOut");
+    setMe(null);
+    applyAccent("default");
+    navigate("/");
+  }
+
+  // An account still on a temporary password can do nothing else: the server
+  // refuses every other request, so the app shows only the way out of that.
+  if (me.must_change_password) {
+    return (
+      <PasswordChangeRequired
+        username={me.username}
+        onChanged={passwordChanged}
+        onSignOut={signOut}
+      />
+    );
+  }
+
   const isAdmin = me.role === "admin";
 
   return (
@@ -131,6 +153,10 @@ export function App() {
         <Route
           path="/settings"
           element={<SettingsPage isAdmin={isAdmin} onSettingsSaved={loadMe} />}
+        />
+        <Route
+          path="/account"
+          element={<AccountPage me={me} onChanged={loadMe} onPasswordChanged={passwordChanged} />}
         />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

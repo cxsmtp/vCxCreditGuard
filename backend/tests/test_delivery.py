@@ -36,8 +36,9 @@ class FakeSmtp:
         self.quit_called = False
         FakeSmtp.instances.append(self)
 
-    def starttls(self) -> None:
+    def starttls(self, *, context=None) -> None:
         self.started_tls = True
+        self.tls_context = context
 
     def login(self, username: str, password: str) -> None:
         self.login_args = (username, password)
@@ -72,7 +73,7 @@ def configure_email(db: Session, **overrides: object) -> None:
 
 
 def configure_webhook(db: Session, *, secret: str | None = None, url: str = WEBHOOK_URL) -> None:
-    settings_store.set_value(db, settings_store.KEY_WEBHOOK_URL, url)
+    settings_store.set_secret(db, settings_store.KEY_WEBHOOK_URL, url)
     if secret:
         settings_store.set_secret(db, settings_store.KEY_WEBHOOK_SECRET, secret)
     db.commit()

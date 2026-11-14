@@ -17,7 +17,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.usage import DEFAULT_PERIOD
-from app.core.crypto import PURPOSE_SMTP_PASSWORD, PURPOSE_WEBHOOK_SECRET, get_secret_box
+from app.core.crypto import (
+    PURPOSE_SMTP_PASSWORD,
+    PURPOSE_WEBHOOK_SECRET,
+    PURPOSE_WEBHOOK_URL,
+    get_secret_box,
+)
 from app.models.connection import AppSetting
 
 logger = logging.getLogger(__name__)
@@ -90,6 +95,10 @@ DEMO_PERIOD_PARAM = "__demo__"
 SECRET_KEYS: dict[str, str] = {
     KEY_SMTP_PASSWORD: PURPOSE_SMTP_PASSWORD,
     KEY_WEBHOOK_SECRET: PURPOSE_WEBHOOK_SECRET,
+    # A chat or automation webhook URL is a credential in its own right: anyone
+    # who has it can post to the channel. It is stored encrypted, never shown
+    # back, and kept out of audit entries and backups like any other secret.
+    KEY_WEBHOOK_URL: PURPOSE_WEBHOOK_URL,
 }
 
 ALLOWED_INTERVAL_MINUTES: tuple[int, ...] = (2, 5, 15, 60)
@@ -218,7 +227,33 @@ def get_secret(session: Session, key: str) -> str | None:
     row = get_raw(session, key)
     if row is None or not row.value:
         return None
+    if not row.is_secret:
+        # Written before this setting was treated as a secret: still plain JSON.
+        # encrypt_legacy_secrets() converts these at start-up.
+        return _legacy_plaintext(row.value)
     return get_secret_box().decrypt(row.value, purpose=purpose)
+
+
+def _legacy_plaintext(value: str) -> str | None:
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, str) and decoded else None
+
+
+def encrypt_legacy_secrets(session: Session) -> int:
+    """Encrypt any secret setting that an older version stored in the clear."""
+    converted = 0
+    for key in SECRET_KEYS:
+        row = get_raw(session, key)
+        if row is None or row.is_secret:
+            continue
+        set_secret(session, key, _legacy_plaintext(row.value) if row.value else None)
+        converted += 1
+    if converted:
+        logger.info("Encrypted %d setting(s) that were previously stored in the clear", converted)
+    return converted
 
 
 def set_value(session: Session, key: str, value: Any, *, description: str | None = None) -> None:
@@ -247,6 +282,7 @@ def set_secret(session: Session, key: str, value: str | None) -> None:
         session.add(AppSetting(key=key, value=ciphertext, is_secret=True))
     else:
         row.value = ciphertext
+        row.is_secret = True
     session.flush()
 
 

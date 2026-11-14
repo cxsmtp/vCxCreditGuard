@@ -11,8 +11,20 @@ derivation always stays overridable from the Settings page.
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+
+from app.checkmarx.errors import CheckmarxError
+
+# Hosts the utility will send tenant credentials to without being told to.
+# Everything Checkmarx One hosts lives under this domain.
+DEFAULT_TRUSTED_HOST_SUFFIXES: tuple[str, ...] = ("checkmarx.net",)
+
+
+class UntrustedHostError(CheckmarxError):
+    """A tenant URL points somewhere the deployment has not agreed to talk to."""
+
 
 # iam hostname -> (region label, platform hostname)
 KNOWN_REGIONS: dict[str, tuple[str, str]] = {
@@ -76,3 +88,57 @@ def normalise_api_base_url(url: str) -> str:
     as entered.
     """
     return url.strip().rstrip("/")
+
+
+def _host_matches(host: str, suffix: str) -> bool:
+    suffix = suffix.strip().lower().lstrip(".")
+    return bool(suffix) and (host == suffix or host.endswith(f".{suffix}"))
+
+
+def check_tenant_url(
+    url: str,
+    *,
+    what: str,
+    extra_trusted_hosts: tuple[str, ...] = (),
+    allow_plain_http: bool = False,
+) -> None:
+    """Refuse a tenant URL the utility must not send credentials to.
+
+    The access token (and, for the IAM URL, the API key itself) is sent to
+    whatever host these URLs name. The IAM URL comes from an unsigned claim in
+    the pasted key and the API URL can be typed into the GUI, so neither can be
+    taken on trust: without this check, one wrong value hands the tenant's
+    credentials to another server, or turns the utility into a way of reaching
+    hosts on its own network.
+
+    Allowed: HTTPS to a host under ``checkmarx.net``, or under a suffix the
+    operator listed in ``CXCG_CX_ALLOWED_HOSTS`` (for dedicated deployments).
+    """
+    parts = urlsplit(url.strip())
+    host = (parts.hostname or "").lower()
+    if parts.scheme not in ("https", "http") or not host:
+        raise UntrustedHostError(f"The {what} must be an https:// URL.")
+    if parts.scheme == "http" and not allow_plain_http:
+        raise UntrustedHostError(
+            f"The {what} must use https://, so credentials are never sent in the clear."
+        )
+    if parts.username or parts.password:
+        raise UntrustedHostError(f"The {what} must not contain a username or password.")
+    if parts.query or parts.fragment:
+        raise UntrustedHostError(f"The {what} must not contain a query string or fragment.")
+
+    trusted = (*DEFAULT_TRUSTED_HOST_SUFFIXES, *extra_trusted_hosts)
+    if any(_host_matches(host, suffix) for suffix in trusted):
+        return
+
+    try:
+        ipaddress.ip_address(host)
+        kind = "an IP address"
+    except ValueError:
+        kind = "not a Checkmarx One host"
+    raise UntrustedHostError(
+        f"The {what} points at {host}, which is {kind}. Tenant credentials are only sent "
+        f"to hosts under {', '.join(DEFAULT_TRUSTED_HOST_SUFFIXES)} unless the deployment "
+        f"allows more. For a dedicated deployment, add the host to CXCG_CX_ALLOWED_HOSTS "
+        f"in the environment and restart."
+    )

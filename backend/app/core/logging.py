@@ -100,6 +100,9 @@ def redact(text: str) -> str:
     return _registry.scrub(text)
 
 
+_TRACEBACK_FORMATTER: Final = logging.Formatter()
+
+
 class RedactingFilter(logging.Filter):
     """Rewrites log records in place so no sink ever sees a secret.
 
@@ -118,8 +121,19 @@ class RedactingFilter(logging.Filter):
         # second log line, then strip any secret that survived interpolation.
         record.msg = redact(sanitize_log(rendered))
         record.args = None
+        # A traceback is only rendered later, by the formatter, which would then
+        # write it out unredacted: exception messages routinely quote the request
+        # that failed, headers and all. Render it here instead, so the formatter
+        # finds it already done, and redact that.
+        if record.exc_info and not record.exc_text:
+            try:
+                record.exc_text = _TRACEBACK_FORMATTER.formatException(record.exc_info)
+            except Exception:  # noqa: BLE001 - a broken log line must not break the app
+                record.exc_text = "(traceback could not be rendered)"
         if record.exc_text:
             record.exc_text = redact(record.exc_text)
+        if record.stack_info:
+            record.stack_info = redact(record.stack_info)
         return True
 
 
@@ -153,6 +167,11 @@ def configure_logging(level: str = "INFO") -> None:
                     "handlers": ["console"],
                     "propagate": False,
                 },
+                # The web server installs its own handlers for these before the
+                # app is imported. Point them at the redacting handler, or an
+                # error the server logs itself would bypass redaction entirely.
+                "uvicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
+                "uvicorn.error": {"level": "INFO", "handlers": ["console"], "propagate": False},
             },
         }
     )

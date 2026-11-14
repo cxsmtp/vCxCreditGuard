@@ -38,12 +38,14 @@ COPY backend/pyproject.toml ./
 # Python dependency versions are constrained in pyproject.toml, and pinning apk
 # --no-cache installs to exact versions is fragile across base-image updates.
 # Suppress the KICS unpinned-version findings for this build step.
+# The trailing "|| true" is parenthesised on purpose: unparenthesised it would
+# apply to the whole chain and let a failed dependency install produce an image.
 # kics-scan ignore-block
 RUN apk add --no-cache libpq \
     && apk add --no-cache --virtual .build gcc musl-dev python3-dev \
     && pip install --no-cache-dir . psycopg \
     && apk del .build \
-    && pip uninstall -y pip setuptools wheel 2>/dev/null || true
+    && (pip uninstall -y pip setuptools wheel 2>/dev/null || true)
 
 COPY backend/alembic.ini ./
 COPY backend/alembic ./alembic
@@ -82,4 +84,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 # The container listens on plain HTTP. TLS is terminated by the reverse proxy in
 # docker-compose.yml, which is the documented deployment.
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# No --forwarded-allow-ips: the app does not let the web server rewrite the
+# client address from headers. It reads X-Forwarded-For itself, and only as many
+# hops as CXCG_TRUSTED_PROXY_HOPS says are trustworthy.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]

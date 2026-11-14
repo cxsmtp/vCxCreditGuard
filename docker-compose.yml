@@ -65,6 +65,11 @@ services:
     environment:
       # Overrides .env so the bundled Postgres is used rather than SQLite.
       CXCG_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cxcg}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cxcreditguard}
+      # The bundled nginx is the one proxy in front of the app. It overwrites
+      # X-Forwarded-For with the address it saw, and the app trusts exactly that
+      # one entry for sign-in throttling and audit. Raise this only if you put
+      # another load balancer in front of nginx (see deploy/nginx/README.md).
+      CXCG_TRUSTED_PROXY_HOPS: ${CXCG_TRUSTED_PROXY_HOPS:-1}
     volumes:
       # Only used if you switch CXCG_DATABASE_URL back to SQLite.
       - app-data:/app/data

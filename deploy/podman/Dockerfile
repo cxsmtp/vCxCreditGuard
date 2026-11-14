@@ -96,4 +96,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 # The easy entrypoint generates/persists the master key and a first admin, then
 # applies migrations. Pass the real uvicorn command via CMD.
 ENTRYPOINT ["/usr/local/bin/easy-entrypoint.sh"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# No --forwarded-allow-ips: the app does not let the web server rewrite the
+# client address from headers. It reads X-Forwarded-For itself, and only as many
+# hops as CXCG_TRUSTED_PROXY_HOPS says are trustworthy.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]

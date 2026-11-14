@@ -38,6 +38,14 @@ import { downloadText, timestampedName } from "../lib/export";
 import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 
+/** Unsaved edits. The last three are write only: the server never sends the
+ * stored value back, so they exist here only while being typed. */
+type SettingsDraft = Partial<AppSettings> & {
+  smtp_password?: string;
+  webhook_secret?: string;
+  webhook_url?: string;
+};
+
 export function SettingsPage({
   isAdmin,
   onSettingsSaved,
@@ -55,7 +63,7 @@ export function SettingsPage({
     [],
   );
 
-  const [draft, setDraft] = useState<Partial<AppSettings> & { smtp_password?: string; webhook_secret?: string }>({});
+  const [draft, setDraft] = useState<SettingsDraft>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -75,7 +83,7 @@ export function SettingsPage({
   const value = <K extends keyof AppSettings>(key: K): AppSettings[K] | undefined =>
     (draft[key] as AppSettings[K] | undefined) ?? current?.[key];
 
-  function set(patch: Partial<AppSettings> & { smtp_password?: string; webhook_secret?: string }) {
+  function set(patch: SettingsDraft) {
     setDraft((existing) => ({ ...existing, ...patch }));
   }
 
@@ -433,14 +441,37 @@ export function SettingsPage({
             </Field>
 
             <div className="grid gap-4 border-t border-hairline pt-4 sm:grid-cols-2">
-              <Field label="Webhook URL" hint="A JSON payload is posted for each delivered notification.">
+              <Field
+                label="Webhook URL"
+                hint={
+                  current.webhook_url_configured
+                    ? `A webhook to ${current.webhook_host ?? "a stored URL"} is configured. The URL is not shown again; type a new one to replace it, or clear the box and save to remove it.`
+                    : "A JSON payload is posted for each delivered notification."
+                }
+              >
                 <Input
-                  value={value("webhook_url") ?? ""}
+                  type="password"
+                  value={draft.webhook_url ?? ""}
                   disabled={!isAdmin}
                   onChange={(event) => set({ webhook_url: event.target.value })}
-                  placeholder="https://hooks.example.com/cxcreditguard"
+                  placeholder={
+                    current.webhook_url_configured
+                      ? `•••••••• (${current.webhook_host ?? "configured"})`
+                      : "https://hooks.example.com/cxcreditguard"
+                  }
                   spellCheck={false}
+                  autoComplete="off"
                 />
+                {isAdmin && current.webhook_url_configured && draft.webhook_url === undefined && (
+                  <button
+                    type="button"
+                    className="mt-1.5 text-xs underline"
+                    style={{ color: "var(--text-secondary)" }}
+                    onClick={() => set({ webhook_url: "" })}
+                  >
+                    Remove the webhook
+                  </button>
+                )}
               </Field>
               <Field
                 label="Webhook signing secret"
@@ -1140,6 +1171,7 @@ function AccountsCard() {
   );
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<UtilityAccount | null>(null);
+  const [resettingTotp, setResettingTotp] = useState<UtilityAccount | null>(null);
   const [resetFor, setResetFor] = useState<
     (AdminResetResult & { username: string }) | null
   >(null);
@@ -1212,6 +1244,21 @@ function AccountsCard() {
       await accounts.reload();
     } catch (caught) {
       toast.error(caught instanceof ApiError ? caught.message : "Could not unlock the account.");
+    }
+  }
+
+  async function resetTwoFactor() {
+    if (!resettingTotp) return;
+    setBusy(true);
+    try {
+      await api.post(`/api/accounts/${resettingTotp.id}/totp/reset`);
+      toast.success(`Two factor reset for ${resettingTotp.username}.`);
+      setResettingTotp(null);
+      await accounts.reload();
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not reset two factor.");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -1307,6 +1354,16 @@ function AccountsCard() {
                         Reset password
                       </button>
                     )}
+                    {account.totp_enabled && (
+                      <button
+                        type="button"
+                        className="underline"
+                        style={{ color: "var(--text-secondary)" }}
+                        onClick={() => setResettingTotp(account)}
+                      >
+                        Reset two factor
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="underline"
@@ -1382,6 +1439,21 @@ function AccountsCard() {
         }
         onConfirm={remove}
         onCancel={() => setDeleting(null)}
+      />
+
+      <ConfirmDialog
+        open={resettingTotp !== null}
+        title="Reset two factor for this account?"
+        destructive
+        confirmLabel="Reset two factor"
+        busy={busy}
+        message={
+          resettingTotp
+            ? `Use this when ${resettingTotp.username} has lost their authenticator. Two factor is turned off for the account, its recovery codes are discarded and it is signed out everywhere. They sign in with their password and should set two factor up again straight away.`
+            : ""
+        }
+        onConfirm={resetTwoFactor}
+        onCancel={() => setResettingTotp(null)}
       />
 
       <Modal

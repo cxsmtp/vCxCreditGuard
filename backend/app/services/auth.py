@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import logging
 import secrets
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -39,6 +42,39 @@ from app.services.audit import AuditActor, record_audit
 logger = logging.getLogger(__name__)
 
 RATE_LIMIT_WINDOW_SECONDS = 60
+# The identifier of the per-address bucket that counts sign-in attempts across
+# every username. Not a valid username, so it can never collide with one.
+ANY_ACCOUNT = "*"
+# An address may try this many times the per-username allowance, across all
+# usernames, before it is throttled. Without it, varying the username would give
+# an attacker a fresh allowance (and a fresh password hash for us to compute)
+# on every request.
+ADDRESS_RATE_MULTIPLIER = 3
+# Failures from one address lock out that address. The account as a whole is
+# only locked once failures across all addresses reach this many times the
+# per-address threshold: enough to stop a distributed guessing attack, without
+# letting a single address lock the real owner out.
+ACCOUNT_LOCK_MULTIPLIER = 10
+# Password hashing is deliberately expensive. Capping how many run at once keeps
+# a burst of sign-in attempts from exhausting memory and CPU for everything else.
+MAX_CONCURRENT_VERIFICATIONS = 4
+# Two factor recovery codes: this many, each this many random bytes (shown as hex).
+RECOVERY_CODE_COUNT = 10
+RECOVERY_CODE_BYTES = 6
+VERIFICATION_WAIT_SECONDS = 5.0
+_verification_slots = threading.BoundedSemaphore(MAX_CONCURRENT_VERIFICATIONS)
+
+
+@contextmanager
+def _verification_slot() -> Iterator[None]:
+    if not _verification_slots.acquire(timeout=VERIFICATION_WAIT_SECONDS):
+        raise RateLimited(retry_after_seconds=2)
+    try:
+        yield
+    finally:
+        _verification_slots.release()
+
+
 TOTP_ISSUER = "CxCreditGuard"
 TOTP_VALID_WINDOW = 1
 # How long a password-reset token stays valid once issued.
@@ -292,6 +328,7 @@ def complete_password_reset(
     row.used_at = now
     user.failed_login_count = 0
     user.locked_until = None
+    clear_login_throttle(session, username=user.username)
     session.flush()
     record_audit(
         session,
@@ -351,8 +388,15 @@ def bootstrap_admin_if_needed(
 
 
 def _check_rate_limit(
-    session: Session, *, identifier: str, ip_address: str, settings: Settings
-) -> None:
+    session: Session,
+    *,
+    identifier: str,
+    ip_address: str,
+    settings: Settings,
+    limit: int | None = None,
+) -> LoginAttempt:
+    """Count one attempt against (identifier, address) and enforce the allowance."""
+    allowance = limit if limit is not None else settings.login_rate_limit_per_minute
     now = utcnow()
     window_start = now - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
     row = session.scalar(
@@ -361,31 +405,32 @@ def _check_rate_limit(
         )
     )
     if row is None:
-        session.add(
-            LoginAttempt(
-                identifier=identifier,
-                ip_address=ip_address,
-                window_started_at=now,
-                attempt_count=1,
-                last_attempt_at=now,
-            )
+        row = LoginAttempt(
+            identifier=identifier,
+            ip_address=ip_address,
+            window_started_at=now,
+            attempt_count=1,
+            last_attempt_at=now,
+            failure_count=0,
         )
+        session.add(row)
         session.flush()
-        return
+        return row
 
     if row.window_started_at < window_start:
         row.window_started_at = now
         row.attempt_count = 1
         row.last_attempt_at = now
         session.flush()
-        return
+        return row
 
     row.attempt_count += 1
     row.last_attempt_at = now
     session.flush()
-    if row.attempt_count > settings.login_rate_limit_per_minute:
+    if row.attempt_count > allowance:
         elapsed = (now - row.window_started_at).total_seconds()
         raise RateLimited(retry_after_seconds=max(1, int(RATE_LIMIT_WINDOW_SECONDS - elapsed)))
+    return row
 
 
 def throttle(
@@ -400,20 +445,45 @@ def throttle(
     _check_rate_limit(session, identifier=bucket[:128], ip_address=ip_address, settings=settings)
 
 
-def _lockout_seconds(failed_count: int, settings: Settings) -> int:
+def _lockout_seconds(failed_count: int, settings: Settings, *, threshold: int | None = None) -> int:
     """Exponential backoff once the attempt threshold is passed."""
-    over = max(0, failed_count - settings.login_max_attempts)
-    delay = settings.login_lockout_base_seconds * (2**over)
+    over = max(0, failed_count - (threshold or settings.login_max_attempts))
+    delay = settings.login_lockout_base_seconds * (2 ** min(over, 30))
     return int(min(delay, settings.login_lockout_max_seconds))
 
 
-def _register_failure(session: Session, user: UtilityUser, settings: Settings) -> None:
-    user.failed_login_count += 1
-    if user.failed_login_count >= settings.login_max_attempts:
-        user.locked_until = utcnow() + timedelta(
-            seconds=_lockout_seconds(user.failed_login_count, settings)
+def _register_failure(
+    session: Session, source: LoginAttempt, user: UtilityUser | None, settings: Settings
+) -> None:
+    """Record a failed sign-in against its source, and against the account.
+
+    The source (this username from this address) is locked out quickly. The
+    account itself only locks after far more failures than one address can
+    produce, so an attacker who knows a username cannot keep its owner out.
+    """
+    now = utcnow()
+    source.failure_count = (source.failure_count or 0) + 1
+    if source.failure_count >= settings.login_max_attempts:
+        source.locked_until = now + timedelta(
+            seconds=_lockout_seconds(source.failure_count, settings)
         )
+    if user is not None:
+        user.failed_login_count += 1
+        account_threshold = settings.login_max_attempts * ACCOUNT_LOCK_MULTIPLIER
+        if user.failed_login_count >= account_threshold:
+            user.locked_until = now + timedelta(
+                seconds=_lockout_seconds(
+                    user.failed_login_count, settings, threshold=account_threshold
+                )
+            )
     session.flush()
+
+
+def clear_login_throttle(session: Session, *, username: str) -> None:
+    """Forget every per-address lockout for this username (unlock, password reset)."""
+    session.execute(
+        delete(LoginAttempt).where(LoginAttempt.identifier == username.strip().lower()[:128])
+    )
 
 
 def authenticate(
@@ -429,14 +499,41 @@ def authenticate(
     """Verify credentials, returning the user or raising an AuthError subclass."""
     settings = settings or get_settings()
     identifier = username.strip().lower()[:128]
-    _check_rate_limit(session, identifier=identifier, ip_address=ip_address, settings=settings)
+    # Per address across all usernames first, then per username from this address.
+    _check_rate_limit(
+        session,
+        identifier=ANY_ACCOUNT,
+        ip_address=ip_address,
+        settings=settings,
+        limit=settings.login_rate_limit_per_minute * ADDRESS_RATE_MULTIPLIER,
+    )
+    source = _check_rate_limit(
+        session, identifier=identifier, ip_address=ip_address, settings=settings
+    )
 
     actor = AuditActor.anonymous(ip_address=ip_address, user_agent=user_agent)
     user = get_user_by_username(session, identifier)
 
+    # The source lockout applies whether or not the account exists, so being
+    # locked out says nothing about which usernames are real.
+    if source.locked_until is not None and source.locked_until > utcnow():
+        retry_after = max(1, int((source.locked_until - utcnow()).total_seconds()))
+        record_audit(
+            session,
+            action="auth.login_blocked",
+            actor=actor,
+            target_type="utility_user",
+            target_id=str(user.id) if user is not None else None,
+            target_label=identifier,
+            detail=f"Sign-ins from this address are locked for another {retry_after}s.",
+        )
+        raise AccountLocked(retry_after_seconds=retry_after)
+
     if user is None:
         # Constant work for unknown accounts.
-        verify_password(_DUMMY_HASH, password)
+        with _verification_slot():
+            verify_password(_DUMMY_HASH, password)
+        _register_failure(session, source, None, settings)
         record_audit(
             session,
             action="auth.login_failed",
@@ -472,8 +569,10 @@ def authenticate(
         )
         raise AccountLocked(retry_after_seconds=retry_after)
 
-    if not verify_password(user.password_hash, password):
-        _register_failure(session, user, settings)
+    with _verification_slot():
+        password_ok = verify_password(user.password_hash, password)
+    if not password_ok:
+        _register_failure(session, source, user, settings)
         record_audit(
             session,
             action="auth.login_failed",
@@ -491,8 +590,21 @@ def authenticate(
             # password was already verified, so this cannot be used as an oracle
             # by anyone who does not already know the password.
             raise TotpRequired
-        if not verify_totp(user, totp_code):
-            _register_failure(session, user, settings)
+        if verify_totp(user, totp_code):
+            pass
+        elif use_recovery_code(session, user=user, code=totp_code):
+            remaining = len(user.totp_recovery_codes or [])
+            record_audit(
+                session,
+                action="auth.recovery_code_used",
+                actor=actor,
+                target_type="utility_user",
+                target_id=str(user.id),
+                target_label=user.username,
+                detail=f"Signed in with a one-time recovery code. {remaining} left.",
+            )
+        else:
+            _register_failure(session, source, user, settings)
             record_audit(
                 session,
                 action="auth.login_failed",
@@ -510,6 +622,8 @@ def authenticate(
     user.failed_login_count = 0
     user.locked_until = None
     user.last_login_at = utcnow()
+    source.failure_count = 0
+    source.locked_until = None
     session.flush()
     record_audit(
         session,
@@ -640,15 +754,55 @@ def provision_totp(session: Session, *, user: UtilityUser) -> tuple[str, str]:
 def verify_totp(user: UtilityUser, code: str) -> bool:
     if not user.totp_secret_encrypted or not code:
         return False
-    secret = get_secret_box().decrypt(user.totp_secret_encrypted, purpose=PURPOSE_TOTP_SECRET)
-    return pyotp.TOTP(secret).verify(code.strip().replace(" ", ""), valid_window=TOTP_VALID_WINDOW)
-
-
-def confirm_totp(session: Session, *, user: UtilityUser, code: str, actor: AuditActor) -> bool:
-    if not verify_totp(user, code):
+    candidate = code.strip().replace(" ", "")
+    if not candidate.isdigit():
         return False
-    user.totp_enabled = True
+    secret = get_secret_box().decrypt(user.totp_secret_encrypted, purpose=PURPOSE_TOTP_SECRET)
+    return pyotp.TOTP(secret).verify(candidate, valid_window=TOTP_VALID_WINDOW)
+
+
+def _normalise_recovery_code(code: str) -> str:
+    return "".join(ch for ch in code.lower() if ch.isalnum())
+
+
+def issue_recovery_codes(session: Session, *, user: UtilityUser) -> list[str]:
+    """Replace the user's recovery codes and return the new ones, once.
+
+    Only digests are stored. Each code works a single time in place of the
+    authenticator code, so a lost or broken phone does not lock the account.
+    """
+    codes = [secrets.token_hex(RECOVERY_CODE_BYTES) for _ in range(RECOVERY_CODE_COUNT)]
+    user.totp_recovery_codes = [hash_token(code) for code in codes]
     session.flush()
+    # Shown in groups of four so they can be read and typed without mistakes.
+    return ["-".join(code[i : i + 4] for i in range(0, len(code), 4)) for code in codes]
+
+
+def use_recovery_code(session: Session, *, user: UtilityUser, code: str) -> bool:
+    """Consume a recovery code. True if it was valid; it cannot be used again."""
+    candidate = _normalise_recovery_code(code)
+    stored = list(user.totp_recovery_codes or [])
+    if len(candidate) != RECOVERY_CODE_BYTES * 2 or not stored:
+        return False
+    match = next((digest for digest in stored if tokens_equal(digest, candidate)), None)
+    if match is None:
+        return False
+    stored.remove(match)
+    # A new list object, so the JSON column is seen as changed.
+    user.totp_recovery_codes = stored
+    session.flush()
+    return True
+
+
+def confirm_totp(
+    session: Session, *, user: UtilityUser, code: str, actor: AuditActor
+) -> list[str] | None:
+    """Turn two factor authentication on. Returns the recovery codes, or None if
+    the code did not match."""
+    if not verify_totp(user, code):
+        return None
+    user.totp_enabled = True
+    codes = issue_recovery_codes(session, user=user)
     record_audit(
         session,
         action="account.totp_enabled",
@@ -657,18 +811,36 @@ def confirm_totp(session: Session, *, user: UtilityUser, code: str, actor: Audit
         target_id=str(user.id),
         target_label=user.username,
     )
-    return True
+    return codes
 
 
-def disable_totp(session: Session, *, user: UtilityUser, actor: AuditActor) -> None:
+def disable_totp(
+    session: Session, *, user: UtilityUser, actor: AuditActor, action: str = "account.totp_disabled"
+) -> None:
     user.totp_enabled = False
     user.totp_secret_encrypted = None
+    user.totp_recovery_codes = None
     session.flush()
     record_audit(
         session,
-        action="account.totp_disabled",
+        action=action,
         actor=actor,
         target_type="utility_user",
         target_id=str(user.id),
         target_label=user.username,
     )
+
+
+def confirm_current_password(
+    session: Session, *, user: UtilityUser, password: str, ip_address: str
+) -> bool:
+    """Re-check the signed-in user's password before a sensitive change.
+
+    A session cookie alone is not enough to change how an account is protected:
+    someone at an unlocked screen, or holding a stolen session, could otherwise
+    enrol their own authenticator and lock the owner out. Attempts are throttled
+    like sign-ins. Raises :class:`RateLimited` when exceeded.
+    """
+    throttle(session, bucket=f"reauth:{user.id}", ip_address=ip_address)
+    with _verification_slot():
+        return verify_password(user.password_hash, password)

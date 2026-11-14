@@ -27,7 +27,9 @@ KEY_BYTES: Final = 32
 PURPOSE_CX_API_KEY: Final = "cx-api-key"
 PURPOSE_SMTP_PASSWORD: Final = "smtp-password"
 PURPOSE_WEBHOOK_SECRET: Final = "webhook-secret"
+PURPOSE_WEBHOOK_URL: Final = "webhook-url"
 PURPOSE_TOTP_SECRET: Final = "totp-secret"
+PURPOSE_KEY_CHECK: Final = "master-key-check"
 
 
 class DecryptionError(RuntimeError):

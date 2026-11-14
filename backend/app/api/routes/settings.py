@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -35,7 +36,6 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "smtp_use_tls": settings_store.KEY_SMTP_USE_TLS,
     "smtp_from": settings_store.KEY_SMTP_FROM,
     "smtp_recipients": settings_store.KEY_SMTP_RECIPIENTS,
-    "webhook_url": settings_store.KEY_WEBHOOK_URL,
     "ui_accent": settings_store.KEY_UI_ACCENT,
     "self_service_requests": settings_store.KEY_SELF_SERVICE_REQUESTS,
     "report_email_enabled": settings_store.KEY_REPORT_EMAIL_ENABLED,
@@ -49,10 +49,22 @@ _PUBLIC_FIELDS: dict[str, str] = {
 _SECRET_FIELDS: dict[str, str] = {
     "smtp_password": settings_store.KEY_SMTP_PASSWORD,
     "webhook_secret": settings_store.KEY_WEBHOOK_SECRET,
+    # Write only, like the others: a webhook URL lets its holder post to the
+    # channel, so it is never sent back to the browser or written to the audit log.
+    "webhook_url": settings_store.KEY_WEBHOOK_URL,
 }
 
 # Fields whose value is never echoed back into the audit log.
 _REDACT_IN_AUDIT = frozenset(_SECRET_FIELDS)
+
+
+def _webhook_host(db) -> str | None:  # type: ignore[no-untyped-def]
+    """Just the host of the configured webhook, so an admin can tell which one it
+    is without the secret part of the URL ever leaving the server."""
+    url = settings_store.get_secret(db, settings_store.KEY_WEBHOOK_URL)
+    if not url:
+        return None
+    return urlsplit(url).hostname
 
 
 def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
@@ -75,7 +87,8 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         smtp_from=values.get(settings_store.KEY_SMTP_FROM),
         smtp_recipients=values.get(settings_store.KEY_SMTP_RECIPIENTS),
         smtp_password_configured=bool(values.get(f"{settings_store.KEY_SMTP_PASSWORD}.configured")),
-        webhook_url=values.get(settings_store.KEY_WEBHOOK_URL),
+        webhook_url_configured=bool(values.get(f"{settings_store.KEY_WEBHOOK_URL}.configured")),
+        webhook_host=_webhook_host(db),
         webhook_secret_configured=bool(
             values.get(f"{settings_store.KEY_WEBHOOK_SECRET}.configured")
         ),

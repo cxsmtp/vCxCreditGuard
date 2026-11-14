@@ -8,7 +8,7 @@ from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, UniqueConstr
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
-from app.db.types import UTCDateTime
+from app.db.types import JSONColumn, UTCDateTime
 from app.models.enums import UtilityRole
 
 
@@ -27,6 +27,9 @@ class UtilityUser(Base, TimestampMixin):
     # TOTP secret is encrypted at rest with purpose "totp-secret".
     totp_secret_encrypted: Mapped[str | None] = mapped_column(String(512))
     totp_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # SHA-256 digests of the unused one-time recovery codes issued when two
+    # factor authentication was enabled. Each is removed as it is used.
+    totp_recovery_codes: Mapped[list | None] = mapped_column(JSONColumn)
 
     failed_login_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
@@ -101,5 +104,12 @@ class LoginAttempt(Base):
     window_started_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_attempt_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    # Consecutive failed sign-ins from this address for this username, and the
+    # lockout they earned. Kept per source so that one address guessing passwords
+    # locks itself out, not the account's real owner signing in from elsewhere.
+    failure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     __table_args__ = (UniqueConstraint("identifier", "ip_address", name="identifier_ip"),)

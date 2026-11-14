@@ -317,7 +317,7 @@ def _limit_input(row: dict[str, Any]) -> limits_service.LimitInput:
 # the settings form. This map is the single whitelist for both export and
 # restore: secret keys (SMTP/webhook secrets) are deliberately absent, so they
 # can never be exported or set from a backup. Includes the non-secret delivery
-# destinations (SMTP host/from/recipients, webhook URL) so a backup is enough to
+# destinations (SMTP host/from/recipients) so a backup is enough to
 # rebuild an instance's configuration.
 _SETTING_FIELD_BY_KEY: dict[str, str] = {
     settings_store.KEY_SCHEDULER_ENABLED: "scheduler_enabled",
@@ -334,7 +334,6 @@ _SETTING_FIELD_BY_KEY: dict[str, str] = {
     settings_store.KEY_SMTP_USE_TLS: "smtp_use_tls",
     settings_store.KEY_SMTP_FROM: "smtp_from",
     settings_store.KEY_SMTP_RECIPIENTS: "smtp_recipients",
-    settings_store.KEY_WEBHOOK_URL: "webhook_url",
     settings_store.KEY_NOTIFY_MIN_SEVERITY: "notify_min_severity",
     settings_store.KEY_UI_ACCENT: "ui_accent",
     settings_store.KEY_SELF_SERVICE_REQUESTS: "self_service_requests",

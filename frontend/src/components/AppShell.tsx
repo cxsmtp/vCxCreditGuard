@@ -144,10 +144,15 @@ export function AppShell({
             )}
             <ThemeToggle />
             <div className="hidden items-center gap-2 sm:flex">
-              <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+              <Link
+                to="/account"
+                className="text-xs underline-offset-2 hover:underline"
+                style={{ color: "var(--text-secondary)" }}
+                title="Your account: password and two factor authentication"
+              >
                 {me.username}
                 {me.role === "viewer" && " (viewer)"}
-              </span>
+              </Link>
               <Button size="sm" variant="secondary" onClick={onSignOut}>
                 Sign out
               </Button>

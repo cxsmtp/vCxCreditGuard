@@ -153,6 +153,27 @@ def admin_reset_password(user_id: int, ctx: AdminUser, db: DbSession) -> AdminRe
     return AdminResetResponse(reset_token=token, expires_at=expires_at)
 
 
+@router.post("/{user_id}/totp/reset", response_model=MessageResponse)
+def reset_totp(user_id: int, ctx: AdminUser, db: DbSession) -> MessageResponse:
+    """Turn off two factor authentication for someone who has lost their device.
+
+    Their sessions are ended and their recovery codes discarded; they sign in with
+    their password and can enrol a new authenticator.
+    """
+    user = db.get(UtilityUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such account.")
+    if not user.totp_enabled and not user.totp_secret_encrypted:
+        return MessageResponse(
+            message=f"Two factor authentication is not enabled for {user.username}."
+        )
+    auth_service.disable_totp(db, user=user, actor=ctx.actor, action="account.totp_reset")
+    if user.id != ctx.user.id:
+        auth_service.revoke_all_sessions(db, user_id=user.id)
+    db.commit()
+    return MessageResponse(message=f"Two factor authentication reset for {user.username}.")
+
+
 @router.post("/{user_id}/unlock", response_model=MessageResponse)
 def unlock_account(user_id: int, ctx: AdminUser, db: DbSession) -> MessageResponse:
     user = db.get(UtilityUser, user_id)
@@ -161,6 +182,9 @@ def unlock_account(user_id: int, ctx: AdminUser, db: DbSession) -> MessageRespon
     before = {"locked_until": user.locked_until, "failed_login_count": user.failed_login_count}
     user.locked_until = None
     user.failed_login_count = 0
+    # Also forget the per-address lockouts, or the account would look unlocked
+    # while its owner still could not sign in from the address that failed.
+    auth_service.clear_login_throttle(db, username=user.username)
     db.flush()
     record_audit(
         db,

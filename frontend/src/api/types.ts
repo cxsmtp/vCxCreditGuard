@@ -318,7 +318,10 @@ export interface AppSettings {
   smtp_from: string | null;
   smtp_recipients: string | null;
   smtp_password_configured: boolean;
-  webhook_url: string | null;
+  /** The URL itself is a credential and is never sent back: only whether one
+   * is set and which host it points at. */
+  webhook_url_configured: boolean;
+  webhook_host: string | null;
   webhook_secret_configured: boolean;
   allowed_interval_minutes: number[];
   allowed_usage_periods: string[];
@@ -398,6 +401,17 @@ export interface UtilityAccount {
 
 export interface MessageResponse {
   message: string;
+}
+
+export interface TotpEnrollResult {
+  secret: string;
+  otpauth_uri: string;
+}
+
+export interface TotpConfirmResult {
+  message: string;
+  /** Shown once. Each signs in a single time in place of an authenticator code. */
+  recovery_codes: string[];
 }
 
 export interface AdminResetResult {

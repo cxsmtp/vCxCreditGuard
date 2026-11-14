@@ -1,0 +1,559 @@
+"""Sign-in abuse resistance: client addresses, lockouts and throttles."""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from starlette.requests import Request
+
+from app.api.deps import client_ip
+from app.core.config import get_settings, reset_settings_cache
+from app.models import AuditLogEntry, UtilityUser
+from app.models.auth import LoginAttempt
+from app.services import auth as auth_service
+from tests.conftest import ADMIN_PASSWORD
+
+
+def _request(peer: str, forwarded: str | None = None) -> Request:
+    headers = [(b"x-forwarded-for", forwarded.encode())] if forwarded is not None else []
+    return Request({"type": "http", "client": (peer, 1234), "headers": headers})
+
+
+@pytest.fixture
+def one_trusted_proxy(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CXCG_TRUSTED_PROXY_HOPS", "1")
+    reset_settings_cache()
+    yield
+    reset_settings_cache()
+
+
+class TestClientAddress:
+    def test_the_header_is_ignored_when_no_proxy_is_trusted(self) -> None:
+        assert get_settings().trusted_proxy_hops == 0
+        assert client_ip(_request("10.0.0.9", "1.2.3.4")) == "10.0.0.9"
+
+    def test_the_proxys_own_entry_is_used_not_the_clients_claim(
+        self, one_trusted_proxy: None
+    ) -> None:
+        # The client sent "1.2.3.4"; the proxy appended the address it really saw.
+        assert client_ip(_request("172.18.0.3", "1.2.3.4, 203.0.113.7")) == "203.0.113.7"
+
+    def test_a_single_overwritten_entry_is_used(self, one_trusted_proxy: None) -> None:
+        assert client_ip(_request("172.18.0.3", "203.0.113.7")) == "203.0.113.7"
+
+    def test_a_request_that_bypassed_the_proxy_falls_back_to_the_peer(
+        self, one_trusted_proxy: None
+    ) -> None:
+        assert client_ip(_request("10.0.0.9")) == "10.0.0.9"
+
+    def test_two_hops_reads_two_places_from_the_right(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CXCG_TRUSTED_PROXY_HOPS", "2")
+        reset_settings_cache()
+        forwarded = "9.9.9.9, 203.0.113.7, 10.1.1.1"
+        assert client_ip(_request("172.18.0.3", forwarded)) == "203.0.113.7"
+
+    def test_a_forged_header_cannot_dodge_the_sign_in_throttle(
+        self, client: TestClient, admin_user: UtilityUser
+    ) -> None:
+        """Every attempt claims a new address; all are counted against the real one."""
+        statuses = [
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "wrong"},
+                headers={"X-Forwarded-For": f"198.51.100.{n}"},
+            ).status_code
+            for n in range(8)
+        ]
+        assert httpx.codes.LOCKED in statuses
+
+    def test_a_forged_header_does_not_reach_the_audit_log(
+        self, client: TestClient, admin_user: UtilityUser, db: Session
+    ) -> None:
+        client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "wrong"},
+            headers={"X-Forwarded-For": "6.6.6.6"},
+        )
+        entry = db.scalar(select(AuditLogEntry).where(AuditLogEntry.action == "auth.login_failed"))
+        assert entry is not None and entry.ip_address != "6.6.6.6"
+
+
+def _fail(db: Session, *, ip: str, times: int, username: str = "admin") -> None:
+    for _ in range(times):
+        with pytest.raises(auth_service.AuthError):
+            auth_service.authenticate(db, username=username, password="wrong", ip_address=ip)
+        db.commit()
+
+
+class TestLockoutCannotBeUsedAgainstTheOwner:
+    def test_failures_from_one_address_lock_that_address_only(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        _fail(db, ip="203.0.113.50", times=get_settings().login_max_attempts)
+
+        # The attacker's address is locked out...
+        with pytest.raises(auth_service.AccountLocked):
+            auth_service.authenticate(
+                db, username="admin", password=ADMIN_PASSWORD, ip_address="203.0.113.50"
+            )
+        db.rollback()
+        # ...but the owner, elsewhere, signs in normally.
+        user = auth_service.authenticate(
+            db, username="admin", password=ADMIN_PASSWORD, ip_address="198.51.100.4"
+        )
+        assert user.id == admin_user.id
+        db.refresh(admin_user)
+        assert admin_user.locked_until is None
+
+    def test_the_account_still_locks_under_a_distributed_attack(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        settings = get_settings()
+        per_address = settings.login_max_attempts - 1  # stay under each address's lock
+        needed = settings.login_max_attempts * auth_service.ACCOUNT_LOCK_MULTIPLIER
+        addresses = -(-needed // per_address)
+        for n in range(addresses):
+            _fail(db, ip=f"203.0.113.{n}", times=per_address)
+
+        db.refresh(admin_user)
+        assert admin_user.locked_until is not None
+        with pytest.raises(auth_service.AccountLocked):
+            auth_service.authenticate(
+                db, username="admin", password=ADMIN_PASSWORD, ip_address="198.51.100.4"
+            )
+
+    def test_a_lockout_does_not_reveal_whether_the_account_exists(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        attempts = get_settings().login_max_attempts
+        _fail(db, ip="203.0.113.1", times=attempts, username="admin")
+        _fail(db, ip="203.0.113.2", times=attempts, username="nobody")
+        for ip, username in (("203.0.113.1", "admin"), ("203.0.113.2", "nobody")):
+            with pytest.raises(auth_service.AccountLocked):
+                auth_service.authenticate(db, username=username, password="x", ip_address=ip)
+            db.rollback()
+
+    def test_a_successful_sign_in_clears_the_sources_failures(
+        self, db: Session, admin_user: UtilityUser
+    ) -> None:
+        _fail(db, ip="203.0.113.9", times=get_settings().login_max_attempts - 1)
+        auth_service.authenticate(
+            db, username="admin", password=ADMIN_PASSWORD, ip_address="203.0.113.9"
+        )
+        db.commit()
+        row = db.scalar(
+            select(LoginAttempt).where(
+                LoginAttempt.identifier == "admin", LoginAttempt.ip_address == "203.0.113.9"
+            )
+        )
+        assert row.failure_count == 0 and row.locked_until is None
+
+    def test_unlocking_an_account_also_unlocks_the_address_that_failed(
+        self, admin_client: TestClient, viewer_user: UtilityUser, db: Session
+    ) -> None:
+        _fail(db, ip="203.0.113.77", times=get_settings().login_max_attempts, username="viewer")
+        response = admin_client.post(f"/api/accounts/{viewer_user.id}/unlock")
+        assert response.status_code == httpx.codes.OK
+        db.expire_all()
+        assert db.scalar(select(LoginAttempt).where(LoginAttempt.identifier == "viewer")) is None
+
+
+class TestThrottles:
+    def test_varying_the_username_does_not_reset_the_allowance(self, db: Session) -> None:
+        settings = get_settings()
+        allowance = settings.login_rate_limit_per_minute * auth_service.ADDRESS_RATE_MULTIPLIER
+        outcomes: list[type] = []
+        for n in range(allowance + 2):
+            try:
+                auth_service.authenticate(
+                    db, username=f"guess-{n}", password="x", ip_address="203.0.113.200"
+                )
+            except auth_service.AuthError as exc:
+                outcomes.append(type(exc))
+            db.commit()
+        assert outcomes[0] is auth_service.InvalidCredentials
+        assert outcomes[-1] is auth_service.RateLimited
+
+    def test_password_hashing_is_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(auth_service, "VERIFICATION_WAIT_SECONDS", 0.01)
+        held = [
+            auth_service._verification_slots.acquire(timeout=1)
+            for _ in range(auth_service.MAX_CONCURRENT_VERIFICATIONS)
+        ]
+        try:
+            assert all(held)
+            with pytest.raises(auth_service.RateLimited), auth_service._verification_slot():
+                pass
+        finally:
+            for _ in held:
+                auth_service._verification_slots.release()
+        # And it is usable again once the others finish.
+        with auth_service._verification_slot():
+            pass
+
+
+class TestTenantUrlsAreRestricted:
+    """Tenant credentials are only ever sent to hosts the deployment trusts."""
+
+    def _save(self, db: Session, **kwargs):
+        from app.services import connection as connection_service
+        from app.services.audit import AuditActor
+
+        return connection_service.save_connection(db, actor=AuditActor.system("test"), **kwargs)
+
+    def test_a_checkmarx_host_is_accepted(self, db: Session) -> None:
+        from tests.conftest import make_api_key
+
+        connection = self._save(db, api_key=make_api_key())
+        assert connection.api_base_url == "https://eu.ast.checkmarx.net/api"
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            "https://attacker.example/api",
+            "https://169.254.169.254/latest/meta-data",
+            "https://localhost:8443/api",
+            "https://eu.ast.checkmarx.net.attacker.example/api",
+            "https://notcheckmarx.net/api",
+            "https://user:pw@eu.ast.checkmarx.net/api",
+            "https://eu.ast.checkmarx.net/api?next=1",
+        ],
+    )
+    def test_an_api_url_elsewhere_is_refused(self, db: Session, override: str) -> None:
+        from app.checkmarx.regions import UntrustedHostError
+        from app.services import connection as connection_service
+        from tests.conftest import make_api_key
+
+        with pytest.raises(UntrustedHostError):
+            self._save(db, api_key=make_api_key(), api_base_url_override=override)
+        db.rollback()
+        assert connection_service.get_connection(db) is None
+
+    def test_a_key_naming_an_untrusted_identity_server_is_refused(self, db: Session) -> None:
+        """The issuer is an unsigned claim: a crafted key must not pick where the
+        utility sends its credentials."""
+        from app.checkmarx.regions import UntrustedHostError
+        from tests.conftest import make_api_key
+
+        crafted = make_api_key(iam_base_url="https://iam.attacker.example")
+        with pytest.raises(UntrustedHostError):
+            self._save(
+                db, api_key=crafted, api_base_url_override="https://eu.ast.checkmarx.net/api"
+            )
+
+    def test_plain_http_is_refused_in_production(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.checkmarx.regions import UntrustedHostError, check_tenant_url
+
+        with pytest.raises(UntrustedHostError):
+            check_tenant_url("http://eu.ast.checkmarx.net/api", what="platform API URL")
+
+    def test_the_operator_can_allow_a_dedicated_host(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.conftest import make_api_key
+
+        monkeypatch.setenv("CXCG_CX_ALLOWED_HOSTS", "cx.corp.example, other.example")
+        reset_settings_cache()
+        connection = self._save(
+            db, api_key=make_api_key(), api_base_url_override="https://ast.cx.corp.example/api"
+        )
+        assert connection.api_base_url == "https://ast.cx.corp.example/api"
+
+    def test_a_stored_untrusted_url_is_not_called(self, db: Session) -> None:
+        from app.checkmarx.regions import UntrustedHostError
+        from app.services import connection as connection_service
+        from tests.conftest import make_api_key
+
+        connection = self._save(db, api_key=make_api_key())
+        connection.api_base_url = "https://attacker.example/api"  # e.g. edited in the database
+        db.commit()
+        connection_service.reset_client_cache()
+        with pytest.raises(UntrustedHostError):
+            connection_service.get_client(db)
+
+    def test_the_api_reports_an_untrusted_host_clearly(self, admin_client: TestClient) -> None:
+        from tests.conftest import make_api_key
+
+        response = admin_client.put(
+            "/api/connection",
+            json={"api_key": make_api_key(), "api_base_url": "https://attacker.example/api"},
+        )
+        assert response.status_code == httpx.codes.BAD_REQUEST, response.text
+        assert response.json()["detail"]["code"] == "untrusted_host"
+        assert "CXCG_CX_ALLOWED_HOSTS" in response.json()["detail"]["message"]
+
+
+class TestTracebacksAreRedacted:
+    def test_a_secret_quoted_in_an_exception_does_not_reach_the_log(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import logging
+
+        from app.core.logging import configure_logging, register_secret, unregister_secret
+
+        secret = "s3cr3t-webhook-signing-value-123456"
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiIsImV4cCI6MTB9.c2lnbmF0dXJlLXZhbHVl"
+        register_secret(secret)
+        configure_logging("INFO")
+        try:
+            try:
+                raise RuntimeError(f"POST failed: Authorization: Bearer {jwt} signed with {secret}")
+            except RuntimeError:
+                logging.getLogger("app.test").exception("Delivery failed")
+        finally:
+            unregister_secret(secret)
+        out = capsys.readouterr().out
+        assert "Traceback" in out and "RuntimeError" in out
+        assert secret not in out and jwt not in out
+
+
+class TestMasterKeyCheck:
+    def test_first_start_records_a_check_value(self, db: Session) -> None:
+        from app.models.connection import AppSetting
+        from app.services import master_key
+
+        master_key.verify_master_key(db)
+        db.commit()
+        row = db.get(AppSetting, master_key.CHECK_KEY)
+        assert row is not None and row.is_secret and master_key.CHECK_VALUE not in row.value
+        # And a later start with the same key passes.
+        master_key.verify_master_key(db)
+
+    def _switch_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import base64
+
+        from app.core import crypto
+
+        monkeypatch.setenv("CXCG_MASTER_KEY", base64.b64encode(bytes(range(1, 33))).decode())
+        reset_settings_cache()
+        crypto.reset_secret_box()
+
+    def test_a_different_key_is_refused(self, db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.core.config import ConfigError
+        from app.services import master_key
+
+        master_key.verify_master_key(db)
+        db.commit()
+        self._switch_key(monkeypatch)
+        with pytest.raises(ConfigError, match="master key"):
+            master_key.verify_master_key(db)
+
+    def test_an_upgrade_with_the_wrong_key_is_refused_before_vouching_for_it(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A database from before the check existed, started with the wrong key."""
+        from app.core.config import ConfigError
+        from app.models.connection import AppSetting
+        from app.services import connection as connection_service
+        from app.services import master_key
+        from app.services.audit import AuditActor
+        from tests.conftest import make_api_key
+
+        connection_service.save_connection(
+            db, api_key=make_api_key(), actor=AuditActor.system("test")
+        )
+        db.commit()
+        self._switch_key(monkeypatch)
+        with pytest.raises(ConfigError):
+            master_key.verify_master_key(db)
+        db.rollback()
+        assert db.get(AppSetting, master_key.CHECK_KEY) is None
+
+    def test_the_app_refuses_to_start_with_the_wrong_key(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app import main
+        from app.core.config import ConfigError
+        from app.services import master_key
+
+        master_key.verify_master_key(db)
+        db.commit()
+        self._switch_key(monkeypatch)
+        monkeypatch.setattr(main, "upgrade_to_head", lambda *_a, **_k: None)
+        app = main.create_app(get_settings(), run_scheduler=False)
+        with pytest.raises(ConfigError), TestClient(app):
+            pass
+
+
+SLACK_STYLE_URL = "https://hooks.chat.example/services/T000/B000/s3cr3tPathToken123456"
+
+
+class TestWebhookUrlIsASecret:
+    def test_it_is_never_returned_stored_in_the_clear_audited_or_backed_up(
+        self, admin_client: TestClient, db: Session
+    ) -> None:
+        from app.models.connection import AppSetting
+        from app.services import ops_hardening, settings_store
+
+        saved = admin_client.put("/api/settings", json={"webhook_url": SLACK_STYLE_URL})
+        assert saved.status_code == httpx.codes.OK, saved.text
+        body = saved.json()
+        assert "webhook_url" not in body
+        assert body["webhook_url_configured"] is True
+        assert body["webhook_host"] == "hooks.chat.example"
+        assert "s3cr3tPathToken" not in saved.text
+
+        row = db.get(AppSetting, settings_store.KEY_WEBHOOK_URL)
+        assert row.is_secret is True and "s3cr3tPathToken" not in row.value
+        # It still works: delivery reads the real value.
+        assert settings_store.get_secret(db, settings_store.KEY_WEBHOOK_URL) == SLACK_STYLE_URL
+
+        audit = db.scalar(select(AuditLogEntry).where(AuditLogEntry.action == "settings.updated"))
+        assert "s3cr3tPathToken" not in f"{audit.before}{audit.after}{audit.detail}"
+        assert "s3cr3tPathToken" not in str(ops_hardening.export_config_backup(db))
+        assert "s3cr3tPathToken" not in admin_client.get("/api/ops/backup").text
+
+    def test_a_viewer_cannot_see_it(self, db: Session, viewer_client: TestClient) -> None:
+        from app.services import settings_store
+
+        settings_store.set_secret(db, settings_store.KEY_WEBHOOK_URL, SLACK_STYLE_URL)
+        db.commit()
+        assert "s3cr3tPathToken" not in viewer_client.get("/api/settings").text
+
+    def test_an_empty_value_clears_it(self, admin_client: TestClient) -> None:
+        admin_client.put("/api/settings", json={"webhook_url": SLACK_STYLE_URL})
+        cleared = admin_client.put("/api/settings", json={"webhook_url": ""})
+        assert cleared.json()["webhook_url_configured"] is False
+        assert cleared.json()["webhook_host"] is None
+
+    def test_a_url_stored_in_the_clear_by_an_older_version_is_encrypted_at_start_up(
+        self, db: Session
+    ) -> None:
+        import json
+
+        from app.models.connection import AppSetting
+        from app.services import delivery, settings_store
+
+        db.add(
+            AppSetting(
+                key=settings_store.KEY_WEBHOOK_URL,
+                value=json.dumps(SLACK_STYLE_URL),
+                is_secret=False,
+            )
+        )
+        db.commit()
+        # Usable even before conversion...
+        assert delivery.load_config(db).webhook_url == SLACK_STYLE_URL
+
+        assert settings_store.encrypt_legacy_secrets(db) == 1
+        db.commit()
+        row = db.get(AppSetting, settings_store.KEY_WEBHOOK_URL)
+        assert row.is_secret is True and "s3cr3tPathToken" not in row.value
+        # ...and after it, and converting twice is harmless.
+        assert delivery.load_config(db).webhook_url == SLACK_STYLE_URL
+        assert settings_store.encrypt_legacy_secrets(db) == 0
+
+
+class TestMailServerIsVerified:
+    def _config(self, **overrides):
+        from app.services.delivery import DeliveryConfig
+
+        values = {
+            "min_severity": "warning",
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "smtp_username": "cxcg",
+            "smtp_password": "mail-password-123",
+            "smtp_use_tls": True,
+            "smtp_from": "cxcg@example.com",
+            "smtp_recipients": ("ops@example.com",),
+            "webhook_url": None,
+            "webhook_secret": None,
+            "tenant_name": "acme",
+        }
+        values.update(overrides)
+        return DeliveryConfig(**values)
+
+    def test_starttls_verifies_the_certificate_and_hostname(self) -> None:
+        import ssl
+
+        from app.services import delivery
+
+        seen: dict[str, object] = {}
+
+        class Server:
+            def __init__(self, *_args) -> None:
+                pass
+
+            def starttls(self, *, context=None) -> None:
+                seen["context"] = context
+
+            def login(self, *_args) -> None:
+                seen["login"] = True
+
+            def send_message(self, _message) -> None:
+                seen["sent"] = True
+
+            def quit(self) -> None:
+                pass
+
+        delivery.send_report_email(
+            config=self._config(), subject="s", text_body="b", smtp_factory=Server
+        )
+        context = seen["context"]
+        assert isinstance(context, ssl.SSLContext)
+        assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname is True
+        assert seen["login"] and seen["sent"]
+
+    def test_an_unverifiable_certificate_stops_the_send_before_the_password(self) -> None:
+        import ssl
+
+        from app.services import delivery
+
+        calls: list[str] = []
+
+        class Impostor:
+            def __init__(self, *_args) -> None:
+                pass
+
+            def starttls(self, *, context=None) -> None:
+                raise ssl.SSLCertVerificationError(1, "certificate verify failed: self-signed")
+
+            def login(self, *_args) -> None:
+                calls.append("login")
+
+            def send_message(self, _message) -> None:
+                calls.append("send")
+
+            def quit(self) -> None:
+                pass
+
+        with pytest.raises(delivery.DeliveryError, match="CXCG_SMTP_CA_FILE"):
+            delivery.send_report_email(
+                config=self._config(), subject="s", text_body="b", smtp_factory=Impostor
+            )
+        assert calls == []
+
+    def test_the_password_is_never_sent_without_tls(self) -> None:
+        from app.services import delivery
+
+        calls: list[str] = []
+
+        class Plain:
+            def __init__(self, *_args) -> None:
+                pass
+
+            def login(self, *_args) -> None:
+                calls.append("login")
+
+            def send_message(self, _message) -> None:
+                calls.append("send")
+
+            def quit(self) -> None:
+                pass
+
+        with pytest.raises(delivery.DeliveryError, match="without TLS"):
+            delivery.send_report_email(
+                config=self._config(smtp_use_tls=False),
+                subject="s",
+                text_body="b",
+                smtp_factory=Plain,
+            )
+        assert calls == []

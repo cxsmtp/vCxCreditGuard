@@ -27,6 +27,7 @@ import ipaddress
 import json
 import logging
 import smtplib
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -39,6 +40,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import __version__
+from app.core.config import get_settings
 from app.core.logging import register_secret
 from app.models.audit import Notification
 from app.models.connection import CxConnection
@@ -125,9 +127,11 @@ def load_config(session: Session) -> DeliveryConfig:
     )
     password = settings_store.get_secret(session, settings_store.KEY_SMTP_PASSWORD)
     secret = settings_store.get_secret(session, settings_store.KEY_WEBHOOK_SECRET)
-    # Registered so neither can appear in a log line even by accident.
+    webhook_url = settings_store.get_secret(session, settings_store.KEY_WEBHOOK_URL)
+    # Registered so none of them can appear in a log line even by accident.
     register_secret(password)
     register_secret(secret)
+    register_secret(webhook_url)
 
     connection = session.scalar(select(CxConnection).limit(1))
     return DeliveryConfig(
@@ -142,7 +146,7 @@ def load_config(session: Session) -> DeliveryConfig:
         smtp_use_tls=bool(settings_store.get_value(session, settings_store.KEY_SMTP_USE_TLS)),
         smtp_from=_string(settings_store.get_value(session, settings_store.KEY_SMTP_FROM)),
         smtp_recipients=recipients,
-        webhook_url=_string(settings_store.get_value(session, settings_store.KEY_WEBHOOK_URL)),
+        webhook_url=_string(webhook_url),
         webhook_secret=secret,
         tenant_name=connection.tenant_name if connection else None,
     )
@@ -346,10 +350,24 @@ def _transmit(
 
     try:
         if config.smtp_use_tls:
-            server.starttls()
+            # With a verifying context. Without one the certificate is not
+            # checked at all, and anyone on the path can pose as the mail server
+            # and collect the password and every notification.
+            server.starttls(context=_tls_context())
         if config.smtp_username and config.smtp_password:
+            if not config.smtp_use_tls:
+                raise DeliveryError(
+                    "refusing to send the SMTP password without TLS; turn on STARTTLS "
+                    "or remove the credentials"
+                )
             server.login(config.smtp_username, config.smtp_password)
         server.send_message(message)
+    except ssl.SSLError as exc:
+        raise DeliveryError(
+            "the mail server's TLS certificate could not be verified "
+            f"({getattr(exc, 'reason', None) or getattr(exc, 'verify_message', None) or exc}). "
+            "If it is signed by a private CA, set CXCG_SMTP_CA_FILE to that CA's certificate."
+        ) from exc
     except smtplib.SMTPAuthenticationError as exc:
         raise DeliveryError("SMTP authentication was rejected") from exc
     except (OSError, smtplib.SMTPException) as exc:
@@ -409,6 +427,16 @@ def send_direct_email(
 
 def _default_smtp_factory(host: str, port: int, timeout: float) -> smtplib.SMTP:
     return smtplib.SMTP(host=host, port=port, timeout=timeout)
+
+
+def _tls_context() -> ssl.SSLContext:
+    """Verify the mail server's certificate and hostname.
+
+    Trusts the system CAs, plus a private CA when CXCG_SMTP_CA_FILE points at
+    one (an internal relay with an internally issued certificate).
+    """
+    ca_file = get_settings().smtp_ca_file
+    return ssl.create_default_context(cafile=str(ca_file) if ca_file else None)
 
 
 # -------------------------------------------------------------------- webhook

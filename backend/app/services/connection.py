@@ -18,8 +18,9 @@ from sqlalchemy.orm import Session
 from app.checkmarx.apikey import ParsedApiKey, parse_api_key
 from app.checkmarx.client import CheckmarxClient
 from app.checkmarx.errors import CheckmarxError, NotConfiguredError
-from app.checkmarx.regions import derive_api_base_url, normalise_api_base_url
+from app.checkmarx.regions import check_tenant_url, derive_api_base_url, normalise_api_base_url
 from app.checkmarx.token import TokenManager
+from app.core.config import get_settings
 from app.core.crypto import PURPOSE_CX_API_KEY, get_secret_box
 from app.core.logging import register_secret
 from app.db.base import utcnow
@@ -81,6 +82,16 @@ def get_connection(session: Session) -> CxConnection | None:
     return session.get(CxConnection, CONNECTION_ID)
 
 
+def _check_trusted(url: str, *, what: str) -> None:
+    settings = get_settings()
+    check_tenant_url(
+        url,
+        what=what,
+        extra_trusted_hosts=settings.cx_trusted_hosts,
+        allow_plain_http=not settings.is_production,
+    )
+
+
 def _resolve_api_base_url(parsed: ParsedApiKey, override: str | None) -> tuple[str, bool]:
     if override and override.strip():
         return normalise_api_base_url(override), True
@@ -114,6 +125,10 @@ def save_connection(
         )
 
     api_base_url, overridden = _resolve_api_base_url(parsed, api_base_url_override)
+    # Checked before anything is stored or any request is made: the IAM URL is an
+    # unsigned claim inside the pasted key, and the API URL may have been typed in.
+    _check_trusted(parsed.iam_base_url, what="identity (IAM) URL in this API key")
+    _check_trusted(api_base_url, what="platform API URL")
     ciphertext = get_secret_box().encrypt(api_key.strip(), purpose=PURPOSE_CX_API_KEY)
 
     connection = get_connection(session)
@@ -166,6 +181,7 @@ def set_api_base_url(session: Session, *, api_base_url: str, actor: AuditActor) 
     if connection is None:
         raise NotConfiguredError("No Checkmarx connection has been configured yet.")
     before = {"api_base_url": connection.api_base_url}
+    _check_trusted(normalise_api_base_url(api_base_url), what="platform API URL")
     connection.api_base_url = normalise_api_base_url(api_base_url)
     connection.api_base_url_overridden = True
     session.flush()
@@ -246,8 +262,13 @@ def get_client(session: Session) -> CheckmarxClient:
         if _cached_token_manager is not None:
             _cached_token_manager.close()
 
+        # Re-checked whenever a client is built, not only when the connection is
+        # saved, so a stored URL the deployment does not trust is never called.
+        _check_trusted(connection.iam_base_url, what="stored identity (IAM) URL")
+        _check_trusted(connection.api_base_url, what="stored platform API URL")
         api_key = decrypt_api_key(connection)
         parsed = parse_api_key(api_key)
+        _check_trusted(parsed.iam_base_url, what="identity (IAM) URL in the stored API key")
         _cached_token_manager = TokenManager(api_key=api_key, token_endpoint=parsed.token_endpoint)
         _cached_client = CheckmarxClient(
             api_base_url=connection.api_base_url,
