@@ -200,7 +200,10 @@ def _scheduler_check(session: Session, moment: datetime, *, include_detail: bool
 
 
 def _usage_check(session: Session, moment: datetime) -> Check:
-    latest = session.scalar(select(func.max(UsageSnapshot.collected_at)))
+    # A held read is one that was not believed, so it does not count as ingestion.
+    latest = session.scalar(
+        select(func.max(UsageSnapshot.collected_at)).where(UsageSnapshot.held_reason.is_(None))
+    )
     if latest is None:
         return Check(
             "usage", "Usage data", WARN, "No consumption has been ingested from Checkmarx yet."

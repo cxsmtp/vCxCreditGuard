@@ -145,12 +145,15 @@ def approve_request(
             superseded.previous_limit if superseded is not None else existing.credit_limit
         )
         if target != existing.credit_limit:
+            # lift=False: the restriction is lifted at the very end, once the
+            # whole approval is written, so the approval commits as one unit.
             limits_service.update_limit(
                 session,
                 limit=existing,
                 changes={"credit_limit": target},
                 actor=actor,
                 client=client,
+                lift=False,
             )
         existing.granted_by_request_id = request.id
     else:
@@ -204,6 +207,10 @@ def approve_request(
         },
         detail=f"Granted {target} credits{window}.",
     )
+    if existing is not None:
+        # Unblock the entity now rather than at the next cycle. This commits the
+        # approval above as a whole before it talks to Checkmarx.
+        limits_service.lift_unjustified_restrictions(session, client, limit=existing, actor=actor)
     return request
 
 
@@ -293,30 +300,32 @@ def auto_decide_pending(
             else None
         )
         window = f" for {policy.auto_approve_expiry_days} day(s)" if expires_at is not None else ""
-        # Isolate each grant in a savepoint so one failure (e.g. the client call
-        # that lifts a restriction) rolls back only that request and the batch
-        # continues, rather than half-applying a grant or poisoning the cycle.
+        # Each grant is its own transaction, so one failure rolls back only that
+        # request and the batch continues, rather than half-applying a grant or
+        # poisoning the cycle. (Not a savepoint: lifting a restriction commits as
+        # it goes, which a savepoint cannot contain.)
+        request_id = request.id
         try:
-            with session.begin_nested():
-                approve_request(
-                    session,
-                    request=request,
-                    actor=actor,
-                    expires_at=expires_at,
-                    note=(
-                        f"Auto-approved by hands-off automation: an increase of {increase} "
-                        f"credit(s) is within the {policy.auto_approve_max_increase}-credit "
-                        f"cap{window}."
-                    ),
-                    client=client,
-                )
+            approve_request(
+                session,
+                request=request,
+                actor=actor,
+                expires_at=expires_at,
+                note=(
+                    f"Auto-approved by hands-off automation: an increase of {increase} "
+                    f"credit(s) is within the {policy.auto_approve_max_increase}-credit "
+                    f"cap{window}."
+                ),
+                client=client,
+            )
+            session.commit()
         except Exception:
-            logger.exception("Auto-approval of credit request %s failed", request.id)
+            session.rollback()
+            logger.exception("Auto-approval of credit request %s failed", request_id)
             failed += 1
             continue
 
-        # Raised after the grant is safely committed to its savepoint, and kept
-        # out of it so the notify dedupe path can never roll the grant back.
+        # Raised after the grant is safely committed.
         notifications.notify(
             session,
             category="automation",
@@ -332,6 +341,7 @@ def auto_decide_pending(
             entity_label=request.entity_label,
             dedupe_key=f"auto-approve:{request.id}",
         )
+        session.commit()
         granted_entities.add(entity_key)
         approved += 1
 
@@ -342,6 +352,10 @@ def auto_decide_pending(
         "left_pending": left_pending,
         "failed": failed,
     }
+
+
+class GrantExpiryError(RuntimeError):
+    """Some expired grants could not be rolled back this time."""
 
 
 def revert_expired_grants(
@@ -371,47 +385,66 @@ def revert_expired_grants(
             CreditRequest.expires_at < moment,
         )
     )
+    failures: list[str] = []
     for request in list(rows):
-        existing = _existing_limit(session, request)
-        unchanged = existing is not None and existing.granted_by_request_id == request.id
-        if unchanged:
-            if request.previous_limit is None:
-                limits_service.delete_limit(session, limit=existing, actor=actor, client=client)
-            else:
-                limits_service.update_limit(
-                    session,
-                    limit=existing,
-                    changes={"credit_limit": request.previous_limit},
-                    actor=actor,
-                    client=client,
-                )
-            reverted += 1
-            record_audit(
-                session,
-                action="credit_request.expired",
-                actor=actor,
-                target_type="credit_request",
-                target_id=str(request.id),
-                target_label=request.entity_label or request.entity_id,
-                detail=(
-                    f"Temporary grant expired; budget restored to "
-                    f"{request.previous_limit if request.previous_limit is not None else 'none'}."
-                ),
-            )
-        else:
-            # The limit was changed (or removed) since the grant, so there is
-            # nothing safe to undo. Record that we stood down.
-            record_audit(
-                session,
-                action="credit_request.expired",
-                actor=actor,
-                target_type="credit_request",
-                target_id=str(request.id),
-                target_label=request.entity_label or request.entity_id,
-                detail=(
-                    "Temporary grant expired; the limit had changed since, so it was left as is."
-                ),
-            )
-        request.reverted = True
-    session.flush()
+        # One transaction per grant: a rollback that cannot be completed (Checkmarx
+        # refusing to lift a restriction, say) is retried next cycle and does not
+        # stop the other expired grants from being rolled back.
+        request_id = request.id
+        try:
+            if _revert_one_grant(session, request, actor=actor, client=client):
+                reverted += 1
+            session.commit()
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            logger.exception("Rolling back expired grant %s failed", request_id)
+            failures.append(f"request {request_id}: {exc}")
+    if failures:
+        raise GrantExpiryError(
+            f"{len(failures)} expired grant(s) could not be rolled back and will be "
+            f"retried: {'; '.join(failures)}"
+        )
     return reverted
+
+
+def _revert_one_grant(
+    session: Session,
+    request: CreditRequest,
+    *,
+    actor: AuditActor,
+    client: CheckmarxClient | None,
+) -> bool:
+    """Roll back one expired grant. Returns True if the budget was changed."""
+    existing = _existing_limit(session, request)
+    unchanged = existing is not None and existing.granted_by_request_id == request.id
+    if unchanged:
+        if request.previous_limit is None:
+            limits_service.delete_limit(session, limit=existing, actor=actor, client=client)
+        else:
+            limits_service.update_limit(
+                session,
+                limit=existing,
+                changes={"credit_limit": request.previous_limit},
+                actor=actor,
+                client=client,
+            )
+        detail = (
+            f"Temporary grant expired; budget restored to "
+            f"{request.previous_limit if request.previous_limit is not None else 'none'}."
+        )
+    else:
+        # The limit was changed (or removed) since the grant, so there is
+        # nothing safe to undo. Record that we stood down.
+        detail = "Temporary grant expired; the limit had changed since, so it was left as is."
+    record_audit(
+        session,
+        action="credit_request.expired",
+        actor=actor,
+        target_type="credit_request",
+        target_id=str(request.id),
+        target_label=request.entity_label or request.entity_id,
+        detail=detail,
+    )
+    request.reverted = True
+    session.flush()
+    return unchanged

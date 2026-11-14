@@ -11,6 +11,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import OperationalError
 
 from app import __version__, scheduler
 from app.api.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
@@ -127,6 +128,31 @@ def _register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": {"code": "misconfigured", "message": str(exc)}},
+        )
+
+    @app.exception_handler(OperationalError)
+    async def _database_busy(request: Request, exc: OperationalError) -> JSONResponse:
+        # A lock or statement timeout, or the database being briefly unreachable.
+        # That is "try again in a moment", not a fault in the request, so it gets
+        # a 503 with Retry-After rather than an opaque 500.
+        request_id = getattr(request.state, "request_id", "unknown")
+        logger.warning(
+            "Database busy or unavailable on %s %s (request %s): %s",
+            request.method,
+            request.url.path,
+            request_id,
+            str(exc.orig).splitlines()[0] if exc.orig else exc,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "5"},
+            content={
+                "detail": {
+                    "code": "database_busy",
+                    "message": "The service is busy. Please try again in a few seconds.",
+                    "request_id": request_id,
+                }
+            },
         )
 
     @app.exception_handler(Exception)

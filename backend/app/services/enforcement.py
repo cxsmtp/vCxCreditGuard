@@ -21,6 +21,8 @@ so an exempt project inside a breached application is left alone.
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,7 +31,14 @@ from sqlalchemy.orm import Session
 
 from app.checkmarx import iam, platform
 from app.checkmarx.client import CheckmarxClient
-from app.checkmarx.errors import CheckmarxError
+from app.checkmarx.errors import (
+    CheckmarxAuthError,
+    CheckmarxError,
+    CheckmarxNotFoundError,
+    CheckmarxPermissionError,
+    CheckmarxRateLimitError,
+    CheckmarxResponseError,
+)
 from app.db.base import utcnow
 from app.models.enums import (
     EnforcementKind,
@@ -54,6 +63,42 @@ DISABLED_SEVERITIES: list[str] = []
 # added. Unlike a manual admin restore (reason "admin"), this is conditional on
 # the exemption: once the exemption is removed the next cycle can restrict again.
 EXEMPTED_REASON = "exempted"
+# An administrator pressed Restore. The one reversal that is not conditional: the
+# cycle does not re-apply the restriction for the rest of the period.
+ADMIN_REASON = "admin"
+
+# Snapshot key: True from the moment a tenant write is about to be attempted
+# until its result is recorded. See may_be_in_force.
+OUTCOME_UNKNOWN = "outcome_unknown"
+# Answers that mean Checkmarx did not make the change. Anything else (a timeout,
+# a dropped connection, a 5xx) leaves the outcome in doubt.
+_DEFINITE_REJECTIONS = (
+    CheckmarxAuthError,
+    CheckmarxPermissionError,
+    CheckmarxNotFoundError,
+    CheckmarxRateLimitError,
+    CheckmarxResponseError,
+)
+
+
+# One lock per restricted target, held across "read tenant state, commit intent,
+# change the tenant, commit outcome". Without it a manual Restore and the cycle's
+# drift check can interleave: the admin gives the roles back, the cycle (still
+# seeing the action as applied) removes them again as "drift", the admin's commit
+# then records the action as reversed - restored on paper, restricted in fact.
+# In-process is sufficient because the utility runs as a single process (one
+# uvicorn worker, with the scheduler as a thread inside it); see docs/operations.
+_target_locks: dict[str, threading.RLock] = {}
+_target_locks_guard = threading.Lock()
+
+
+def _target_lock(target_type: str, target_id: str) -> threading.RLock:
+    key = f"{target_type}:{target_id}"
+    with _target_locks_guard:
+        lock = _target_locks.get(key)
+        if lock is None:
+            lock = _target_locks[key] = threading.RLock()
+        return lock
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,128 +270,176 @@ def apply_enforcement(
         return outcome
 
     for target in targets:
-        key = idempotency_key(
+        # Lock order: never wait on a target lock while holding anything in the
+        # database. Whoever holds the target lock needs the database to record
+        # its outcome, so waiting on it with a write open would stall both.
+        session.commit()
+        with _target_lock(target.target_type, target.target_id):
+            _enforce_target(
+                session,
+                client,
+                limit=limit,
+                period_key=period_key,
+                target=target,
+                actor=actor,
+                resolver=resolver,
+                outcome=outcome,
+            )
+    return outcome
+
+
+def _enforce_target(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    limit: CreditLimit,
+    period_key: str,
+    target: Target,
+    actor: AuditActor,
+    resolver: RoleResolver,
+    outcome: EnforcementOutcome,
+) -> None:
+    """Restrict one target, or verify an existing restriction. Caller holds its lock.
+
+    Every tenant write is bracketed by commits: the intent and the undo snapshot
+    are durable *before* Checkmarx is changed, and the outcome is committed right
+    after. A crash in between leaves a PENDING row that still carries the snapshot,
+    so the next cycle completes the action and Restore can still give back exactly
+    what was taken. Committing after each audit row also means the audit chain's
+    lock is never held across a network call.
+    """
+    key = idempotency_key(
+        limit_id=limit.id,
+        period_key=period_key,
+        kind=str(target.kind),
+        target_id=target.target_id,
+    )
+    action = session.scalar(
+        select(EnforcementAction).where(EnforcementAction.idempotency_key == key)
+    )
+    if action is not None:
+        # A manual Restore may have committed a change to this row while we
+        # waited for the target lock; never act on the stale copy.
+        session.refresh(action)
+
+    if action is not None and action.status == EnforcementStatus.APPLIED:
+        _verify_applied(
+            session,
+            client,
+            limit=limit,
+            period_key=period_key,
+            target=target,
+            action=action,
+            actor=actor,
+            resolver=resolver,
+            outcome=outcome,
+        )
+        return
+
+    if action is not None and action.status == EnforcementStatus.REVERSED:
+        if action.reversal_reason != ADMIN_REASON:
+            # Lifted automatically: because an exemption was granted, the budget
+            # was raised, or the limit stopped enforcing. The limit is breached
+            # and enforcing again now (and the target is not exempt, or it would
+            # not be in the plan), so whatever lifted it no longer holds and the
+            # breach restricts it again rather than leaving it unlocked for the
+            # rest of the period. Only an admin's own Restore is left alone.
+            action.error = None
+            action.reversed_at = None
+            action.reversed_by_id = None
+            action.reversal_reason = None
+            # Its old snapshot was already replayed by that restore, so it says
+            # nothing about what is about to be taken away now.
+            action.undo_snapshot = None
+            action.status = EnforcementStatus.PENDING
+        else:
+            # An admin restored access during this period. Respect that decision
+            # instead of fighting them every cycle.
+            outcome.skipped.append(
+                f"{target.kind} on {target.target_label} was restored by an admin this period"
+            )
+            return
+
+    if action is None:
+        action = EnforcementAction(
+            idempotency_key=key,
+            kind=str(target.kind),
+            status=EnforcementStatus.PENDING,
+            entity_type=limit.entity_type,
+            entity_id=limit.entity_id,
+            entity_label=limit.entity_label,
+            target_type=target.target_type,
+            target_id=target.target_id,
+            target_label=target.target_label,
             limit_id=limit.id,
             period_key=period_key,
-            kind=str(target.kind),
-            target_id=target.target_id,
+            created_at=utcnow(),
+            attempts=0,
         )
-        action = session.scalar(
-            select(EnforcementAction).where(EnforcementAction.idempotency_key == key)
-        )
-        if action is not None and action.status == EnforcementStatus.APPLIED:
-            # Already restricted, but re-verify: a manual (or automated) change in
-            # Checkmarx One could have re-enabled the feature or re-granted a role.
-            # Re-assert the restriction if it has drifted rather than assume it holds.
-            reasserted = False
-            try:
-                reasserted = _reconcile(
-                    session, client, action=action, target=target, resolver=resolver
-                )
-            except CheckmarxError as exc:
-                logger.warning(
-                    "Could not verify %s on %s this cycle: %s",
-                    target.kind,
-                    target.target_label,
-                    exc,
-                )
-                outcome.skipped.append(
-                    f"{target.kind} on {target.target_label} could not be "
-                    f"verified this cycle: {exc}"
-                )
-                continue
-            if reasserted:
-                outcome.reconciled.append(action)
-                record_audit(
-                    session,
-                    action="enforcement.reconciled",
-                    actor=actor,
-                    target_type=target.target_type,
-                    target_id=target.target_id,
-                    target_label=target.target_label,
-                    after={"kind": str(target.kind), "restricted": True},
-                    detail=(
-                        f"A previously applied restriction on {target.target_label} "
-                        "drifted back on in Checkmarx One and was re-asserted."
-                    ),
-                )
-                notifications.notify(
-                    session,
-                    category=notifications.CATEGORY_ENFORCEMENT,
-                    severity=Severity.WARNING,
-                    title=_reconciled_title(action),
-                    body=_reconciled_body(action),
-                    entity_type=limit.entity_type,
-                    entity_id=limit.entity_id,
-                    entity_label=limit.entity_label,
-                    dedupe_key=notifications.reconcile_key(action.id, period_key),
-                    enforcement_action_id=action.id,
-                )
-            else:
-                outcome.skipped.append(
-                    f"{target.kind} on {target.target_label} already applied "
-                    "and verified in Checkmarx"
-                )
-            continue
-        if action is not None and action.status == EnforcementStatus.REVERSED:
-            if action.reversal_reason == EXEMPTED_REASON:
-                # The restriction was lifted because an exemption was granted, and
-                # this target is in the plan only because it is exempt no longer
-                # (exemptions are filtered out above). So the exemption that lifted
-                # it is gone and the breach should restrict it again rather than
-                # leave it unlocked for the rest of the period.
-                action.error = None
-                action.reversed_at = None
-                action.reversed_by_id = None
-                action.reversal_reason = None
-            else:
-                # An admin restored access during this period. Respect that decision
-                # instead of fighting them every cycle.
-                outcome.skipped.append(
-                    f"{target.kind} on {target.target_label} was restored by an admin this period"
-                )
-                continue
+        session.add(action)
+    # Column defaults are applied at INSERT, so a freshly constructed row still
+    # has None here until it is flushed.
+    action.attempts = (action.attempts or 0) + 1
+    # Committed, not just flushed: nothing may be left open while we wait on
+    # Checkmarx, or every other writer (a sign-in included) queues behind it.
+    session.commit()
 
-        if action is None:
-            action = EnforcementAction(
-                idempotency_key=key,
-                kind=str(target.kind),
-                status=EnforcementStatus.PENDING,
-                entity_type=limit.entity_type,
-                entity_id=limit.entity_id,
-                entity_label=limit.entity_label,
-                target_type=target.target_type,
-                target_id=target.target_id,
-                target_label=target.target_label,
-                limit_id=limit.id,
-                period_key=period_key,
-                created_at=utcnow(),
-                attempts=0,
-            )
-            session.add(action)
-        # Column defaults are applied at INSERT, so a freshly constructed row still
-        # has None here until it is flushed.
-        action.attempts = (action.attempts or 0) + 1
+    earlier = action.undo_snapshot if _outcome_unknown(action.undo_snapshot) else None
+    # What the last attempt failed with, if it failed: a retry that fails the
+    # same way is not news.
+    previous_error = action.error if action.status == EnforcementStatus.FAILED else None
+    write_attempted = False
+    try:
+        # Phase 1: read the tenant's current state. Nothing is changed yet.
+        captured = _capture(session, client, target=target, resolver=resolver)
+        # Phase 2: make the intent and the undo snapshot durable. If an earlier
+        # attempt's write may have landed without being recorded, its snapshot
+        # holds the true "before" state and is merged in rather than overwritten
+        # by what is, by now, possibly an already-restricted state. The snapshot
+        # is marked "outcome unknown" until the write's result is recorded, so a
+        # process that stops in between leaves a row that can still be undone.
+        snapshot = _merge_snapshots(earlier, captured.snapshot)
+        snapshot[OUTCOME_UNKNOWN] = True
+        action.undo_snapshot = snapshot
+        action.status = EnforcementStatus.PENDING
+        session.commit()
+        # Phase 3: change the tenant. No transaction is open during this call.
+        write_attempted = True
+        captured.apply()
+    except CheckmarxError as exc:
+        if action.undo_snapshot is not None and (
+            not write_attempted or isinstance(exc, _DEFINITE_REJECTIONS)
+        ):
+            # Checkmarx refused the change outright (or it was never sent), so
+            # nothing was taken by this attempt. Only an earlier attempt can
+            # still be in doubt.
+            settled = dict(action.undo_snapshot)
+            settled[OUTCOME_UNKNOWN] = earlier is not None
+            action.undo_snapshot = settled
+        message = str(exc)[:2000]
+        first_report = previous_error != message
+        action.status = EnforcementStatus.FAILED
+        action.error = message
         session.flush()
-
-        try:
-            snapshot = _perform(session, client, target=target, resolver=resolver)
-        except CheckmarxError as exc:
-            action.status = EnforcementStatus.FAILED
-            action.error = str(exc)[:2000]
-            session.flush()
-            outcome.failed.append(f"{target.kind} on {target.target_label}: {exc}")
-            notifications.notify(
-                session,
-                category=notifications.CATEGORY_ENFORCEMENT,
-                severity=Severity.ERROR,
-                title=f"Could not restrict {target.target_label}",
-                body=str(exc),
-                entity_type=limit.entity_type,
-                entity_id=limit.entity_id,
-                entity_label=limit.entity_label,
-                enforcement_action_id=action.id,
-            )
+        outcome.failed.append(f"{target.kind} on {target.target_label}: {exc}")
+        # The attempt is repeated every cycle for as long as the limit is
+        # breached. The admin is told once a day, and the audit log records the
+        # failure when it is new or changes, not on every retry.
+        notifications.notify(
+            session,
+            category=notifications.CATEGORY_ENFORCEMENT,
+            severity=Severity.ERROR,
+            title=f"Could not restrict {target.target_label}",
+            body=f"{exc}\n\nIt will be tried again on the next cycle.",
+            entity_type=limit.entity_type,
+            entity_id=limit.entity_id,
+            entity_label=limit.entity_label,
+            dedupe_key=notifications.enforcement_failed_key(
+                action.id, utcnow().strftime("%Y-%m-%d")
+            ),
+            enforcement_action_id=action.id,
+        )
+        if first_report:
             record_audit(
                 session,
                 action="enforcement.failed",
@@ -356,53 +449,145 @@ def apply_enforcement(
                 target_label=target.target_label,
                 detail=f"{target.kind} failed: {exc}",
             )
-            continue
+        session.commit()
+        return
 
-        action.undo_snapshot = snapshot
-        action.status = EnforcementStatus.APPLIED
-        action.applied_at = utcnow()
-        action.error = None
-        session.flush()
-        outcome.applied.append(action)
+    # Phase 4: record the outcome, and commit before anything else happens.
+    snapshot = {k: v for k, v in (action.undo_snapshot or {}).items() if k != OUTCOME_UNKNOWN}
+    action.undo_snapshot = snapshot
+    captured.mirror()
+    action.status = EnforcementStatus.APPLIED
+    action.applied_at = utcnow()
+    action.error = None
+    session.flush()
+    outcome.applied.append(action)
 
-        record_audit(
-            session,
-            action="enforcement.applied",
-            actor=actor,
-            target_type=target.target_type,
-            target_id=target.target_id,
-            target_label=target.target_label,
-            before=snapshot,
-            after={"kind": str(target.kind), "restricted": True},
-            detail=(
-                f"Limit on {limit.entity_type} {limit.entity_label or limit.entity_id} "
-                f"was breached in {period_key}."
-            ),
+    record_audit(
+        session,
+        action="enforcement.applied",
+        actor=actor,
+        target_type=target.target_type,
+        target_id=target.target_id,
+        target_label=target.target_label,
+        before=snapshot,
+        after={"kind": str(target.kind), "restricted": True},
+        detail=(
+            f"Limit on {limit.entity_type} {limit.entity_label or limit.entity_id} "
+            f"was breached in {period_key}."
+        ),
+    )
+    notifications.notify(
+        session,
+        category=notifications.CATEGORY_ENFORCEMENT,
+        severity=Severity.CRITICAL,
+        title=_enforcement_title(target),
+        body=_enforcement_body(limit, target, period_key, snapshot),
+        entity_type=limit.entity_type,
+        entity_id=limit.entity_id,
+        entity_label=limit.entity_label,
+        dedupe_key=notifications.enforcement_key(action.id),
+        enforcement_action_id=action.id,
+    )
+    session.commit()
+
+
+def _verify_applied(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    limit: CreditLimit,
+    period_key: str,
+    target: Target,
+    action: EnforcementAction,
+    actor: AuditActor,
+    resolver: RoleResolver,
+    outcome: EnforcementOutcome,
+) -> None:
+    """Already restricted: re-verify, and re-assert if it drifted back on.
+
+    A manual (or automated) change in Checkmarx One could have re-enabled the
+    feature or re-granted a role, so the restriction is checked rather than
+    assumed to hold.
+    """
+    if action.reversal_reason == ADMIN_REASON:
+        # An admin's Restore was started and did not finish. Re-asserting the
+        # restriction now would silently undo what they asked for; the cycle
+        # completes the restore instead (see evaluation's unjustified sweep).
+        outcome.skipped.append(f"{target.kind} on {target.target_label} has a restore in progress")
+        return
+    if action.reversal_reason:
+        # An automatic lift was started and did not finish, and the limit is
+        # breached and enforcing again, so its reason no longer holds.
+        action.reversal_reason = None
+        action.reversed_by_id = None
+    session.commit()  # nothing held open while we wait on Checkmarx
+    try:
+        reasserted = _reconcile(session, client, action=action, target=target, resolver=resolver)
+    except CheckmarxError as exc:
+        logger.warning(
+            "Could not verify %s on %s this cycle: %s", target.kind, target.target_label, exc
         )
-        notifications.notify(
-            session,
-            category=notifications.CATEGORY_ENFORCEMENT,
-            severity=Severity.CRITICAL,
-            title=_enforcement_title(target),
-            body=_enforcement_body(limit, target, period_key, snapshot),
-            entity_type=limit.entity_type,
-            entity_id=limit.entity_id,
-            entity_label=limit.entity_label,
-            dedupe_key=notifications.enforcement_key(action.id),
-            enforcement_action_id=action.id,
+        outcome.skipped.append(
+            f"{target.kind} on {target.target_label} could not be verified this cycle: {exc}"
         )
+        return
+    if not reasserted:
+        outcome.skipped.append(
+            f"{target.kind} on {target.target_label} already applied and verified in Checkmarx"
+        )
+        return
 
-    return outcome
+    outcome.reconciled.append(action)
+    record_audit(
+        session,
+        action="enforcement.reconciled",
+        actor=actor,
+        target_type=target.target_type,
+        target_id=target.target_id,
+        target_label=target.target_label,
+        after={"kind": str(target.kind), "restricted": True},
+        detail=(
+            f"A previously applied restriction on {target.target_label} "
+            "drifted back on in Checkmarx One and was re-asserted."
+        ),
+    )
+    notifications.notify(
+        session,
+        category=notifications.CATEGORY_ENFORCEMENT,
+        severity=Severity.WARNING,
+        title=_reconciled_title(action),
+        body=_reconciled_body(action),
+        entity_type=limit.entity_type,
+        entity_id=limit.entity_id,
+        entity_label=limit.entity_label,
+        dedupe_key=notifications.reconcile_key(action.id, period_key),
+        enforcement_action_id=action.id,
+    )
+    session.commit()
 
 
-def _perform(
+@dataclass(frozen=True, slots=True)
+class _Captured:
+    """The tenant's state before a restriction, and how to apply the restriction.
+
+    ``snapshot`` is what Restore needs. ``apply`` performs the tenant write and
+    touches no database state; ``mirror`` updates the local copy of the project's
+    AI settings once the write has succeeded.
+    """
+
+    snapshot: dict[str, Any]
+    apply: Callable[[], None]
+    mirror: Callable[[], None]
+
+
+def _capture(
     session: Session,
     client: CheckmarxClient,
     *,
     target: Target,
     resolver: RoleResolver,
-) -> dict[str, Any]:
-    """Make the change and return the snapshot needed to undo it."""
+) -> _Captured:
+    """Read the state a restriction is about to change. Makes no change itself."""
     if target.kind == EnforcementKind.REMOVE_USER_ROLES:
         client_uuid = resolver.client_uuid
         current = iam.fetch_user_client_roles(
@@ -410,34 +595,51 @@ def _perform(
         )
         current_names = {role.name for role in current}
         to_remove = [role for role in current if role.name in iam.AI_ROLE_NAMES]
-        iam.remove_user_client_roles(
-            client, user_id=target.target_id, client_uuid=client_uuid, roles=to_remove
+
+        def remove_roles() -> None:
+            if to_remove:
+                iam.remove_user_client_roles(
+                    client, user_id=target.target_id, client_uuid=client_uuid, roles=to_remove
+                )
+
+        return _Captured(
+            snapshot={
+                "kind": str(target.kind),
+                "client_uuid": client_uuid,
+                "removed_roles": [role.as_payload() for role in to_remove],
+                "roles_before": sorted(current_names),
+            },
+            apply=remove_roles,
+            mirror=lambda: None,
         )
-        return {
-            "kind": str(target.kind),
-            "client_uuid": client_uuid,
-            "removed_roles": [role.as_payload() for role in to_remove],
-            "roles_before": sorted(current_names),
-        }
 
     project = session.get(CxProject, target.target_id)
 
     if target.kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
         state = platform.get_auto_triage(client, project_id=target.target_id)
-        if state.enabled:
-            platform.set_auto_triage(
-                client, project_id=target.target_id, enabled=False, config=state.config
-            )
-        if project is not None:
-            project.auto_triage_enabled = False
-            project.auto_triage_config = state.config or None
-            project.ai_state_checked_at = utcnow()
-        return {
-            "kind": str(target.kind),
-            # False here means it was already off, so restore leaves it off.
-            "enabled_before": bool(state.enabled),
-            "config_before": state.config or {},
-        }
+
+        def disable_auto_triage() -> None:
+            if state.enabled:
+                platform.set_auto_triage(
+                    client, project_id=target.target_id, enabled=False, config=state.config
+                )
+
+        def mirror_auto_triage() -> None:
+            if project is not None:
+                project.auto_triage_enabled = False
+                project.auto_triage_config = state.config or None
+                project.ai_state_checked_at = utcnow()
+
+        return _Captured(
+            snapshot={
+                "kind": str(target.kind),
+                # False here means it was already off, so restore leaves it off.
+                "enabled_before": bool(state.enabled),
+                "config_before": state.config or {},
+            },
+            apply=disable_auto_triage,
+            mirror=mirror_auto_triage,
+        )
 
     if target.kind == EnforcementKind.DISABLE_PR_REMEDIATION:
         if project is None or not project.repo_id:
@@ -445,8 +647,9 @@ def _perform(
                 "No repository id is known for this project, so PR triage and "
                 "remediation cannot be changed."
             )
+        repo_id = project.repo_id
         read = platform.get_pr_remediation_severities(
-            client, repo_id=project.repo_id, project_id=target.target_id
+            client, repo_id=repo_id, project_id=target.target_id
         )
         if read is not None:
             # The real, current severities (captured before disabling) - this is
@@ -457,21 +660,75 @@ def _perform(
             severities_before = list(
                 project.pr_remediation_severities or platform.DEFAULT_PR_SEVERITIES
             )
-        platform.set_pr_remediation_severities(
-            client,
-            repo_id=project.repo_id,
-            project_id=target.target_id,
-            severities=DISABLED_SEVERITIES,
+
+        def disable_pr_remediation() -> None:
+            platform.set_pr_remediation_severities(
+                client,
+                repo_id=repo_id,
+                project_id=target.target_id,
+                severities=DISABLED_SEVERITIES,
+            )
+
+        def mirror_pr_remediation() -> None:
+            project.pr_remediation_severities = []
+            project.ai_state_checked_at = utcnow()
+
+        return _Captured(
+            snapshot={
+                "kind": str(target.kind),
+                "repo_id": repo_id,
+                "severities_before": severities_before,
+            },
+            apply=disable_pr_remediation,
+            mirror=mirror_pr_remediation,
         )
-        project.pr_remediation_severities = []
-        project.ai_state_checked_at = utcnow()
-        return {
-            "kind": str(target.kind),
-            "repo_id": project.repo_id,
-            "severities_before": severities_before,
-        }
 
     raise CheckmarxError(f"Unknown enforcement kind {target.kind!r}")
+
+
+def _merge_snapshots(previous: dict[str, Any] | None, fresh: dict[str, Any]) -> dict[str, Any]:
+    """Combine the snapshot of an unfinished earlier attempt with a fresh read.
+
+    An earlier attempt may have changed the tenant and then died before saying
+    so. The fresh read then shows the *restricted* state, and taking it at face
+    value would record "nothing was removed" - Restore would succeed and give
+    nothing back. So whatever the earlier snapshot says was there is kept, and the
+    fresh read can only add to it. The bias is deliberate: when the two disagree,
+    prefer the answer that returns more access on restore.
+    """
+    if not previous or previous.get("kind") != fresh.get("kind"):
+        return fresh
+    kind = fresh.get("kind")
+
+    if kind == EnforcementKind.REMOVE_USER_ROLES:
+        roles: dict[str, dict[str, Any]] = {}
+        for source in (previous, fresh):
+            for entry in source.get("removed_roles") or []:
+                if isinstance(entry, dict) and entry.get("id") and entry.get("name"):
+                    roles[entry["name"]] = entry
+        merged = dict(fresh)
+        merged["removed_roles"] = [roles[name] for name in sorted(roles)]
+        merged["roles_before"] = sorted(
+            set(previous.get("roles_before") or []) | set(fresh.get("roles_before") or [])
+        )
+        return merged
+
+    if kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
+        if previous.get("enabled_before") and not fresh.get("enabled_before"):
+            merged = dict(fresh)
+            merged["enabled_before"] = True
+            merged["config_before"] = previous.get("config_before") or {}
+            return merged
+        return fresh
+
+    if kind == EnforcementKind.DISABLE_PR_REMEDIATION:
+        if previous.get("severities_before") and not fresh.get("severities_before"):
+            merged = dict(fresh)
+            merged["severities_before"] = previous["severities_before"]
+            return merged
+        return fresh
+
+    return fresh
 
 
 # ---------------------------------------------------------------- reconciliation
@@ -580,6 +837,42 @@ def _reconciled_body(action: EnforcementAction) -> str:
 
 # ------------------------------------------------------------------- restoring
 
+# An action that never reached APPLIED may still have changed the tenant: the
+# process can stop, or a request can time out, after Checkmarx made the change
+# and before the outcome was recorded. Its undo snapshot was committed before the
+# write and is marked OUTCOME_UNKNOWN until the result is known, so such a row
+# can still be undone, and every path that gives access back considers it. A
+# write Checkmarx refused outright is *not* in doubt and is never treated as a
+# restriction.
+_UNSETTLED = (EnforcementStatus.PENDING, EnforcementStatus.FAILED)
+RESTORABLE_STATUSES = (EnforcementStatus.APPLIED, *_UNSETTLED)
+
+
+def _outcome_unknown(snapshot: dict[str, Any] | None) -> bool:
+    return bool(snapshot and snapshot.get(OUTCOME_UNKNOWN))
+
+
+def _took_something(snapshot: dict[str, Any] | None) -> bool:
+    """Does this snapshot record anything a restore would give back?"""
+    if not snapshot:
+        return False
+    return bool(
+        snapshot.get("removed_roles")
+        or snapshot.get("enabled_before")
+        or snapshot.get("severities_before")
+    )
+
+
+def may_be_in_force(action: EnforcementAction) -> bool:
+    """True if the tenant is, or may be, restricted because of this action."""
+    if action.status == EnforcementStatus.APPLIED:
+        return True
+    return (
+        action.status in _UNSETTLED
+        and _outcome_unknown(action.undo_snapshot)
+        and _took_something(action.undo_snapshot)
+    )
+
 
 def restore_action(
     session: Session,
@@ -587,20 +880,56 @@ def restore_action(
     *,
     action: EnforcementAction,
     actor: AuditActor,
-    reason: str = "admin",
+    reason: str = ADMIN_REASON,
     resolver: RoleResolver | None = None,
 ) -> bool:
-    """Undo one enforcement action from its snapshot. Returns False if not needed."""
-    if action.status != EnforcementStatus.APPLIED:
+    """Undo one enforcement action from its snapshot. Returns False if not needed.
+
+    Runs under the target's lock and commits its outcome before releasing it, so
+    the cycle can never observe "still applied" for an action whose roles have
+    already been given back (and re-remove them as drift).
+    """
+    # Whatever the caller has written so far (its own audit row included) is made
+    # durable before waiting on the lock: see the lock order note in
+    # apply_enforcement. Callers therefore finish their own unit of work first.
+    session.commit()
+    with _target_lock(action.target_type, action.target_id):
+        return _restore_action_locked(
+            session, client, action=action, actor=actor, reason=reason, resolver=resolver
+        )
+
+
+def _restore_action_locked(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    action: EnforcementAction,
+    actor: AuditActor,
+    reason: str,
+    resolver: RoleResolver | None,
+) -> bool:
+    # The cycle may have committed a change to this row while we waited.
+    session.refresh(action)
+    if not may_be_in_force(action):
         return False
 
-    snapshot = action.undo_snapshot or {}
+    was_applied = action.status == EnforcementStatus.APPLIED
+    snapshot = {k: v for k, v in (action.undo_snapshot or {}).items() if k != OUTCOME_UNKNOWN}
     resolver = resolver or RoleResolver(client)
 
+    # Record the intent before touching the tenant. If the access is given back
+    # and the process stops before saying so, the row still reads "restricted";
+    # this mark is what stops the next cycle from taking the access away again
+    # as drift, and tells it to finish the restore instead.
+    action.reversal_reason = reason
+    action.reversed_by_id = actor.actor_id
+    session.commit()
     try:
         _undo(session, client, action=action, snapshot=snapshot, resolver=resolver)
     except CheckmarxError as exc:
-        action.error = str(exc)[:2000]
+        message = str(exc)[:2000]
+        first_report = action.error != message
+        action.error = message
         session.flush()
         notifications.notify(
             session,
@@ -608,30 +937,38 @@ def restore_action(
             severity=Severity.ERROR,
             title=f"Could not restore {action.target_label}",
             body=(
-                f"{exc}\n\nRestore it directly in Checkmarx One, then mark this action "
-                "reversed. The snapshot of the previous state is on the audit entry."
+                f"{exc}\n\nIt will be tried again on the next cycle. If it keeps failing, "
+                "restore it directly in Checkmarx One; the snapshot of the previous state "
+                "is on the audit entry."
             ),
             entity_type=action.entity_type,
             entity_id=action.entity_id,
             entity_label=action.entity_label,
+            # One notification a day per action, however many cycles retry it.
+            dedupe_key=notifications.restore_failed_key(action.id, utcnow().strftime("%Y-%m-%d")),
             enforcement_action_id=action.id,
         )
-        record_audit(
-            session,
-            action="enforcement.restore_failed",
-            actor=actor,
-            target_type=action.target_type,
-            target_id=action.target_id,
-            target_label=action.target_label,
-            before=snapshot,
-            detail=str(exc),
-        )
+        if first_report:
+            # Audited when the failure is new or changes, not on every retry.
+            record_audit(
+                session,
+                action="enforcement.restore_failed",
+                actor=actor,
+                target_type=action.target_type,
+                target_id=action.target_id,
+                target_label=action.target_label,
+                before=snapshot,
+                detail=str(exc),
+            )
+        session.commit()
         raise
 
     action.status = EnforcementStatus.REVERSED
     action.reversed_at = utcnow()
     action.reversed_by_id = actor.actor_id
     action.reversal_reason = reason
+    action.undo_snapshot = snapshot
+    action.error = None
     session.flush()
 
     record_audit(
@@ -643,7 +980,14 @@ def restore_action(
         target_label=action.target_label,
         before={"kind": action.kind, "restricted": True},
         after=snapshot,
-        detail=f"Access restored ({reason}).",
+        detail=(
+            f"Access restored ({reason})."
+            if was_applied
+            else (
+                f"A restriction whose outcome was never confirmed was undone to be safe "
+                f"({reason}): its previous state was put back."
+            )
+        ),
     )
     notifications.notify(
         session,
@@ -657,6 +1001,9 @@ def restore_action(
         dedupe_key=notifications.restoration_key(action.id),
         enforcement_action_id=action.id,
     )
+    # Committed here, inside the lock, and before any further network call so the
+    # audit chain's lock is never held while talking to Checkmarx.
+    session.commit()
     return True
 
 
@@ -736,7 +1083,7 @@ def restore_for_limit(
     """Restore every applied action for a limit, optionally for one period only."""
     query = select(EnforcementAction).where(
         EnforcementAction.limit_id == limit_id,
-        EnforcementAction.status == EnforcementStatus.APPLIED,
+        EnforcementAction.status.in_(RESTORABLE_STATUSES),
     )
     if period_key is not None:
         query = query.where(EnforcementAction.period_key == period_key)
@@ -744,7 +1091,7 @@ def restore_for_limit(
     resolver = RoleResolver(client)
     restored = 0
     first_error: CheckmarxError | None = None
-    for action in list(session.scalars(query)):
+    for action in [row for row in session.scalars(query) if may_be_in_force(row)]:
         # Attempt every action before reporting a failure: one target Checkmarx
         # rejects (a deleted user, say) must not leave the others restricted.
         try:
@@ -762,15 +1109,18 @@ def restore_for_limit(
 def active_actions_for(
     session: Session, *, entity_type: str, entity_id: str
 ) -> list[EnforcementAction]:
-    return list(
-        session.scalars(
+    """Actions restricting this entity, including any whose outcome is in doubt."""
+    return [
+        action
+        for action in session.scalars(
             select(EnforcementAction).where(
                 EnforcementAction.entity_type == entity_type,
                 EnforcementAction.entity_id == entity_id,
-                EnforcementAction.status == EnforcementStatus.APPLIED,
+                EnforcementAction.status.in_(RESTORABLE_STATUSES),
             )
         )
-    )
+        if may_be_in_force(action)
+    ]
 
 
 # --------------------------------------------------------------- message copy

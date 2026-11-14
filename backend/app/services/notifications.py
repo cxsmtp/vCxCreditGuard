@@ -64,12 +64,16 @@ def notify(
         dedupe_key=dedupe_key,
         enforcement_action_id=enforcement_action_id,
     )
-    session.add(notification)
+    # A savepoint, so that losing a race on the dedupe key undoes only this insert.
+    # A plain rollback here would silently discard everything the caller had done
+    # in its transaction so far - an enforcement record, an approval - because a
+    # notification happened to be a duplicate.
     try:
-        session.flush()
+        with session.begin_nested():
+            session.add(notification)
+            session.flush()
     except IntegrityError:
         # Lost a race on the dedupe key. That is the correct outcome, not an error.
-        session.rollback()
         logger.debug("Notification %s was already recorded by another writer", dedupe_key)
         return None
     return notification
@@ -128,6 +132,16 @@ def reconcile_key(action_id: int, period_key: str) -> str:
 
 def restoration_key(action_id: int) -> str:
     return f"restored:{action_id}"
+
+
+def enforcement_failed_key(action_id: int, day: str) -> str:
+    """One "could not restrict" alert per action per day, however often it is retried."""
+    return f"enforcefail:{action_id}:{day}"
+
+
+def restore_failed_key(action_id: int, day: str) -> str:
+    """One "could not restore" alert per action per day, however often it is retried."""
+    return f"restorefail:{action_id}:{day}"
 
 
 def sync_error_key(step: str, day: str) -> str:

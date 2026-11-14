@@ -10,6 +10,7 @@ and no ``email`` field at all.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -68,9 +69,20 @@ class FakeTenant:
     probe_fails: bool = False
     probe_calls: int = 0
     fail_paths: dict[str, int] = field(default_factory=dict)
+    # (METHOD, path fragment) -> status code: fail one kind of request only, for
+    # example writes to role mappings while reads still work.
+    fail_requests: dict[tuple[str, str], int] = field(default_factory=dict)
+    # viewBy -> status code: fail consumption for one dimension only.
+    fail_views: dict[str, int] = field(default_factory=dict)
+    # Serve an empty page from this page number on, while still advertising the
+    # full page count: a truncated answer.
+    empty_from_page: int | None = None
     page_size_override: int | None = None
     users_requires_paging: bool = False
     requests: list[tuple[str, str]] = field(default_factory=list)
+    # Called with every request before it is answered. Lets a test observe the
+    # state of the world at the exact moment the utility is talking to Checkmarx.
+    on_request: Callable[[httpx.Request], None] | None = None
 
     # ------------------------------------------------------------- convenience
 
@@ -198,9 +210,14 @@ class FakeTenant:
         path = url.path
         params = parse_qs(url.query)
         self.requests.append((request.method, path))
+        if self.on_request is not None:
+            self.on_request(request)
 
         for fragment, status_code in self.fail_paths.items():
             if fragment in path:
+                return httpx.Response(status_code, json={"message": "forced failure"})
+        for (method, fragment), status_code in self.fail_requests.items():
+            if request.method == method and fragment in path:
                 return httpx.Response(status_code, json={"message": "forced failure"})
 
         if path.endswith("/protocol/openid-connect/token"):
@@ -283,6 +300,8 @@ class FakeTenant:
 
     def _consumption_response(self, params: dict[str, list[str]]) -> httpx.Response:
         view = params.get("viewBy", ["user"])[0]
+        if view in self.fail_views:
+            return httpx.Response(self.fail_views[view], json={"message": "forced failure"})
         if view in self.unsupported_views:
             return httpx.Response(
                 400, json={"message": f"viewBy {view} is not supported on this tenant"}
@@ -303,6 +322,8 @@ class FakeTenant:
         page = int(params.get("page", ["1"])[0])
         start = (page - 1) * size
         window = rows[start : start + size]
+        if self.empty_from_page is not None and page >= self.empty_from_page:
+            window = []
         total_pages = max(1, -(-len(rows) // size)) if rows else 1
         return httpx.Response(
             200,

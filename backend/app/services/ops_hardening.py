@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from app import __version__
 from app.db.base import utcnow
-from app.models.enums import EntityType
+from app.models.enums import EntityType, RunStatus
 from app.models.limits import CreditLimit, Exemption
 from app.models.usage import SchedulerRun
 from app.services import limits_service, settings_store
@@ -58,7 +58,10 @@ class Attestation:
 
 def _applied_migration_head(session: Session) -> str | None:
     try:
-        return session.scalar(text("SELECT version_num FROM alembic_version LIMIT 1"))
+        # In a savepoint: on PostgreSQL a failed statement poisons the whole
+        # transaction, and a missing table here must not break the caller's.
+        with session.begin_nested():
+            return session.scalar(text("SELECT version_num FROM alembic_version LIMIT 1"))
     except Exception:  # noqa: BLE001 - absence of the table is not an error here
         logger.debug("Could not read the applied migration head", exc_info=True)
         return None
@@ -146,7 +149,14 @@ def watchdog_status(session: Session, *, now: datetime | None = None) -> Watchdo
     moment = now or utcnow()
     config = settings_store.schedule_config(session)
     tolerance = max(config.interval_minutes * 3, 60) * 60
-    last = session.scalar(select(SchedulerRun).order_by(SchedulerRun.started_at.desc()).limit(1))
+    # A run that was skipped because another cycle held the lock proves only that
+    # the timer fired, not that anything was governed. If the lock were stuck,
+    # such runs would keep arriving and the scheduler would look healthy for
+    # ever, so they are not counted as activity.
+    recent = session.scalars(
+        select(SchedulerRun).order_by(SchedulerRun.started_at.desc()).limit(200)
+    )
+    last = next((run for run in recent if not _skipped_for_lock(run)), None)
 
     if not config.enabled:
         return WatchdogStatus(
@@ -172,6 +182,13 @@ def watchdog_status(session: Session, *, now: datetime | None = None) -> Watchdo
     else:
         state, detail = "down", f"No cycle for {gap}s; the scheduler may have died."
     return WatchdogStatus(state, True, gap, last.started_at, last.status, tolerance, detail)
+
+
+def _skipped_for_lock(run: SchedulerRun) -> bool:
+    from app.services.cycle import LOCK_BUSY_REASON
+
+    stats = run.stats if isinstance(run.stats, dict) else {}
+    return run.status == RunStatus.SKIPPED and stats.get("reason") == LOCK_BUSY_REASON
 
 
 def scheduler_alive(session: Session, *, now: datetime | None = None) -> bool:

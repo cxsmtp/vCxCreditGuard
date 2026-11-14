@@ -178,7 +178,7 @@ def trend(session: Session, *, points: int = DEFAULT_TREND_POINTS) -> list[tuple
     rows = list(
         session.scalars(
             select(UsageSnapshot)
-            .where(UsageSnapshot.view_by == str(view))
+            .where(UsageSnapshot.view_by == str(view), UsageSnapshot.held_reason.is_(None))
             .order_by(UsageSnapshot.collected_at.desc())
             .limit(points)
         )

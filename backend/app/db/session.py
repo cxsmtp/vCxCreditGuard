@@ -19,6 +19,11 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# PostgreSQL session timeouts, in milliseconds. See build_engine.
+PG_LOCK_TIMEOUT_MS = 15_000
+PG_STATEMENT_TIMEOUT_MS = 120_000
+PG_IDLE_IN_TRANSACTION_TIMEOUT_MS = 900_000
+
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
 
@@ -42,6 +47,12 @@ def build_engine(url: str) -> Engine:
 
         @event.listens_for(engine, "connect")
         def _sqlite_pragmas(dbapi_connection, _record):  # type: ignore[no-untyped-def]
+            # The driver's own transaction handling starts a transaction lazily
+            # and does not know about SAVEPOINT: a savepoint that is the first
+            # write then begins, and on release commits, a transaction of its
+            # own. Turning it off and issuing BEGIN ourselves (below) gives
+            # SQLite the same transaction and savepoint semantics as PostgreSQL.
+            dbapi_connection.isolation_level = None
             cursor = dbapi_connection.cursor()
             # WAL lets readers run while a single writer holds the lock, so the
             # scheduler's writes do not block dashboard reads, and concurrent
@@ -55,9 +66,33 @@ def build_engine(url: str) -> Engine:
             cursor.execute("PRAGMA busy_timeout=30000")
             cursor.close()
 
+        @event.listens_for(engine, "begin")
+        def _sqlite_begin(connection):  # type: ignore[no-untyped-def]
+            connection.exec_driver_sql("BEGIN")
+
         return engine
 
-    return create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10, future=True)
+    if url.startswith("postgresql"):
+        # Server side safety nets, so a stuck session cannot hang the product:
+        #  * lock_timeout - nothing waits on a lock for longer than this; it fails
+        #    and is retried instead of queueing every request behind it.
+        #  * statement_timeout - no single statement runs away.
+        #  * idle_in_transaction_session_timeout - a transaction left open by a
+        #    thread that died or hung is ended by the server, releasing its locks.
+        # They are deliberately generous: normal work finishes in milliseconds.
+        connect_args["options"] = (
+            f"-c lock_timeout={PG_LOCK_TIMEOUT_MS} "
+            f"-c statement_timeout={PG_STATEMENT_TIMEOUT_MS} "
+            f"-c idle_in_transaction_session_timeout={PG_IDLE_IN_TRANSACTION_TIMEOUT_MS}"
+        )
+    return create_engine(
+        url,
+        connect_args=connect_args,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        future=True,
+    )
 
 
 def get_engine() -> Engine:

@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
+from app.checkmarx.errors import CheckmarxError
 from app.db.base import utcnow
 from app.models.enums import EntityType
 from app.models.limits import CreditLimit, Exemption, LimitPeriodState
@@ -55,6 +56,10 @@ AUDITED_FIELDS = (
 
 class LimitError(ValueError):
     """The requested limit change is not valid."""
+
+
+class LimitRestoreError(LimitError):
+    """The change needs a restriction lifted first, and Checkmarx refused."""
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -175,7 +180,16 @@ def update_limit(
     changes: dict[str, Any],
     actor: AuditActor,
     client: CheckmarxClient | None = None,
+    lift: bool = True,
 ) -> CreditLimit:
+    """Change a limit, then lift any restriction the change makes unjustified.
+
+    Lifting talks to Checkmarx and commits as it goes, starting with everything
+    written so far. A caller for whom this change is one step of a larger unit of
+    work (approving a request, importing a file) passes ``lift=False`` and calls
+    :func:`lift_unjustified_restrictions` itself once its own writes are done, so
+    its work is committed as a whole rather than cut in two.
+    """
     before = _snapshot(limit)
     for field, value in changes.items():
         if field not in AUDITED_FIELDS:
@@ -189,58 +203,38 @@ def update_limit(
     if "credit_limit" in changes:
         limit.granted_by_request_id = None
 
-    _validate(
-        session,
-        LimitInput(
-            entity_type=EntityType(limit.entity_type),
-            entity_id=limit.entity_id,
-            credit_limit=limit.credit_limit,
-            period_type=limit.period_type,
-            warning_threshold_pct=limit.warning_threshold_pct,
-            enforce=limit.enforce,
-            include_member_usage=limit.include_member_usage,
-            count_existing_usage=limit.count_existing_usage,
-            custom_period_start=limit.custom_period_start,
-            custom_period_end=limit.custom_period_end,
-        ),
-    )
+    try:
+        _validate(
+            session,
+            LimitInput(
+                entity_type=EntityType(limit.entity_type),
+                entity_id=limit.entity_id,
+                credit_limit=limit.credit_limit,
+                period_type=limit.period_type,
+                warning_threshold_pct=limit.warning_threshold_pct,
+                enforce=limit.enforce,
+                include_member_usage=limit.include_member_usage,
+                count_existing_usage=limit.count_existing_usage,
+                custom_period_start=limit.custom_period_start,
+                custom_period_end=limit.custom_period_end,
+            ),
+        )
+    except LimitError:
+        # The rejected values are already on the object. Drop them, or a caller
+        # that carries on after the error (a bulk edit) would commit them anyway.
+        session.expire(limit)
+        raise
     session.flush()
 
     # Anything that stops this limit from applying must release its restrictions.
     became_harmless = (before["enforce"] and not limit.enforce) or (
         before["is_active"] and not limit.is_active
     )
-    credit_increased = limit.credit_limit > before["credit_limit"]
 
-    restored = 0
-    if became_harmless:
-        restored = evaluation.restore_on_limit_change(
-            session,
-            client,
-            limit=limit,
-            actor=actor,
-            reason="limit_removed" if not limit.is_active else "limit_removed",
-        )
-    elif credit_increased and client is not None:
-        from app.models.enums import LimitStatus
-
-        states = list(
-            session.scalars(
-                select(LimitPeriodState).where(
-                    LimitPeriodState.limit_id == limit.id,
-                    LimitPeriodState.status.in_([LimitStatus.RESTRICTED, LimitStatus.BREACHED]),
-                )
-            )
-        )
-        if any(st.credits_used < Decimal(limit.credit_limit) for st in states):
-            restored = evaluation.restore_on_limit_change(
-                session,
-                client,
-                limit=limit,
-                actor=actor,
-                reason="credit_increased",
-            )
-
+    # The change and its audit entry are written first and become durable
+    # together, before Checkmarx is asked to lift anything. Restoring commits as
+    # it goes (so no lock is held while it waits on the tenant), which would
+    # otherwise leave a saved limit change with no audit entry if it then failed.
     record_audit(
         session,
         action="limit.updated",
@@ -251,16 +245,64 @@ def update_limit(
         before=before,
         after=_snapshot(limit),
         detail=(
-            f"{restored} restriction(s) lifted because this limit no longer enforces."
-            if became_harmless and restored
-            else (
-                f"{restored} restriction(s) lifted because credit limit was increased."
-                if credit_increased and restored
-                else None
-            )
+            "This limit no longer enforces, so any restriction it applied is lifted."
+            if became_harmless
+            else None
         ),
     )
+
+    if lift:
+        lift_unjustified_restrictions(session, client, limit=limit, actor=actor)
     return limit
+
+
+def lift_unjustified_restrictions(
+    session: Session,
+    client: CheckmarxClient | None,
+    *,
+    limit: CreditLimit,
+    actor: AuditActor,
+) -> int:
+    """Lift this limit's restrictions if nothing justifies them any more.
+
+    That is: the limit no longer enforces, or its budget now covers the usage it
+    was breached on. Commits everything pending first, then once per restriction
+    lifted. Returns how many were lifted.
+
+    A failure to reach Checkmarx does not undo the limit change. It is recorded
+    (audit entry and an error in the Notification Center) and the next cycle
+    tries again, so nobody stays restricted by a limit that no longer applies
+    just because Checkmarx was unreachable at this moment.
+    """
+    if client is None:
+        return 0
+    if not limit.is_active or not limit.enforce:
+        reason = "limit_removed"
+    else:
+        from app.models.enums import LimitStatus
+
+        states = session.scalars(
+            select(LimitPeriodState).where(
+                LimitPeriodState.limit_id == limit.id,
+                LimitPeriodState.status.in_([LimitStatus.RESTRICTED, LimitStatus.BREACHED]),
+            )
+        )
+        if not any(state.credits_used < Decimal(limit.credit_limit) for state in states):
+            return 0
+        reason = "credit_increased"
+
+    limit_id = limit.id
+    try:
+        return evaluation.restore_on_limit_change(
+            session, client, limit=limit, actor=actor, reason=reason
+        )
+    except CheckmarxError as exc:
+        logger.warning(
+            "Limit %s was changed but its restrictions could not be lifted yet: %s",
+            limit_id,
+            exc,
+        )
+        return 0
 
 
 def delete_limit(
@@ -270,10 +312,20 @@ def delete_limit(
     actor: AuditActor,
     client: CheckmarxClient | None = None,
 ) -> int:
-    """Remove a limit, lifting anything it restricted first."""
-    restored = evaluation.restore_on_limit_change(
-        session, client, limit=limit, actor=actor, reason="limit_removed"
-    )
+    """Remove a limit, lifting anything it restricted first.
+
+    If Checkmarx will not lift a restriction the limit is kept, so the
+    restriction never outlives the only record of why it is there.
+    """
+    try:
+        restored = evaluation.restore_on_limit_change(
+            session, client, limit=limit, actor=actor, reason="limit_removed"
+        )
+    except CheckmarxError as exc:
+        raise LimitRestoreError(
+            "The limit was not deleted because the restrictions it applied could not be "
+            f"lifted in Checkmarx One: {exc}"
+        ) from exc
     record_audit(
         session,
         action="limit.deleted",
@@ -343,11 +395,9 @@ def add_exemption(
     )
     if existing is not None:
         # Let an admin extend or re-scope an existing override rather than silently
-        # keeping the old one. No need to lift restrictions here: an entity that
-        # became exempt while the connection was healthy has none to lift, because
-        # enforcement skips exempt entities. (A restriction left in place because
-        # the first exemption was created while Checkmarx was unreachable is a
-        # separate, pre-existing gap the next healthy cycle does not re-lift.)
+        # keeping the old one. No need to lift restrictions here: enforcement
+        # skips exempt entities, and a restriction left in place because Checkmarx
+        # was unreachable when the exemption was created is lifted by the cycle.
         before = {"expires_at": _iso(existing.expires_at), "reason": existing.reason}
         if expires_at != existing.expires_at or (reason and reason != existing.reason):
             existing.expires_at = expires_at
@@ -378,23 +428,8 @@ def add_exemption(
     session.add(exemption)
     session.flush()
 
-    # An exemption that leaves an existing restriction in place would be a trap.
-    lifted = 0
-    if client is not None:
-        from app.services import enforcement
-
-        for action in enforcement.active_actions_for(
-            session, entity_type=entity_type, entity_id=entity_id
-        ):
-            if enforcement.restore_action(
-                session,
-                client,
-                action=action,
-                actor=actor,
-                reason=enforcement.EXEMPTED_REASON,
-            ):
-                lifted += 1
-
+    # Audited before anything is lifted: restoring commits as it goes, and the
+    # exemption must never be durable without its audit entry.
     record_audit(
         session,
         action="exemption.created",
@@ -403,8 +438,31 @@ def add_exemption(
         target_id=str(exemption.id),
         target_label=exemption.entity_label or entity_id,
         after={"entity_type": entity_type, "entity_id": entity_id, "reason": reason},
-        detail=f"{lifted} active restriction(s) lifted." if lifted else None,
+        detail="Any active restriction on this entity is lifted.",
     )
+
+    # An exemption that leaves an existing restriction in place would be a trap.
+    if client is not None:
+        from app.services import enforcement
+
+        for action in enforcement.active_actions_for(
+            session, entity_type=entity_type, entity_id=entity_id
+        ):
+            try:
+                enforcement.restore_action(
+                    session,
+                    client,
+                    action=action,
+                    actor=actor,
+                    reason=enforcement.EXEMPTED_REASON,
+                )
+            except CheckmarxError as exc:
+                # Recorded by restore_action, and retried by the next cycle.
+                logger.warning(
+                    "Exemption %s was created but a restriction could not be lifted yet: %s",
+                    exemption.id,
+                    exc,
+                )
     return exemption
 
 

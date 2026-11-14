@@ -58,6 +58,10 @@ class UsageSnapshot(Base):
     pages_fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Full response bodies, page by page, kept for audit and reparsing.
     raw: Mapped[list | None] = mapped_column(JSONColumn)
+    # Set when the read looked wrong (consumption collapsed against the previous
+    # read) and is being held back until later reads confirm it. A held snapshot
+    # is kept as evidence but is never the "latest" one and carries no records.
+    held_reason: Mapped[str | None] = mapped_column(Text)
 
     records: Mapped[list[UsageRecord]] = relationship(
         back_populates="snapshot", cascade="all, delete-orphan"

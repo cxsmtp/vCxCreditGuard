@@ -195,6 +195,7 @@ def import_limits(
     re-imported to adjust budgets.
     """
     result = ImportResult(dry_run=dry_run)
+    changed: list[CreditLimit] = []
     try:
         reader = csv.DictReader(io.StringIO(content))
     except csv.Error as exc:
@@ -331,7 +332,11 @@ def import_limits(
                 },
                 actor=actor,
                 client=client,
+                # Lifted after every row is applied, so the import stays all or
+                # nothing: lifting commits as it goes.
+                lift=False,
             )
+            changed.append(existing)
 
     if not dry_run:
         record_audit(
@@ -342,6 +347,14 @@ def import_limits(
             after={"created": result.created, "updated": result.updated},
             detail=f"CSV import applied {result.created + result.updated} limit(s).",
         )
+        if not result.errors:
+            # Every row is applied and audited. Lifting commits all of that as one
+            # unit before it talks to Checkmarx; a file with a bad row is rolled
+            # back by the caller instead and nothing is lifted.
+            for limit in changed:
+                limits_service.lift_unjustified_restrictions(
+                    session, client, limit=limit, actor=actor
+                )
     return result
 
 

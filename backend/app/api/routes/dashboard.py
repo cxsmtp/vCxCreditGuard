@@ -397,7 +397,10 @@ def _reattribute_latest_snapshot(db, subject_key: str, user_id: str | None) -> N
     """
     latest = db.scalar(
         select(UsageSnapshot)
-        .where(UsageSnapshot.view_by == str(UsageView.USER))
+        .where(
+            UsageSnapshot.view_by == str(UsageView.USER),
+            UsageSnapshot.held_reason.is_(None),
+        )
         .order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc())
         .limit(1)
     )

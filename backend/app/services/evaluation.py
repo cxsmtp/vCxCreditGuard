@@ -207,8 +207,20 @@ def evaluate_all(
     index = UsageIndex(session)
     resolver = enforcement.RoleResolver(client) if client is not None else None
 
-    limits = list(session.scalars(select(CreditLimit).where(CreditLimit.is_active.is_(True))))
-    for limit in limits:
+    if client is not None:
+        _lift_unjustified_restrictions(session, client, actor=actor, result=result)
+
+    limit_ids = list(
+        session.scalars(
+            select(CreditLimit.id).where(CreditLimit.is_active.is_(True)).order_by(CreditLimit.id)
+        )
+    )
+    for limit_id in limit_ids:
+        # Re-read at the start of each limit's own transaction: an admin may have
+        # edited, disabled or deleted it while earlier limits were being worked on.
+        limit = session.get(CreditLimit, limit_id, populate_existing=True)
+        if limit is None or not limit.is_active:
+            continue
         try:
             evaluation = _evaluate_one(
                 session,
@@ -221,7 +233,8 @@ def evaluate_all(
                 result=result,
             )
         except PeriodError as exc:
-            result.errors.append(f"limit {limit.id}: {exc}")
+            session.rollback()
+            result.errors.append(f"limit {limit_id}: {exc}")
             notifications.notify(
                 session,
                 category=notifications.CATEGORY_SYNC_ERROR,
@@ -231,22 +244,96 @@ def evaluate_all(
                 entity_type=limit.entity_type,
                 entity_id=limit.entity_id,
                 entity_label=limit.entity_label,
-                dedupe_key=f"badperiod:{limit.id}",
+                dedupe_key=f"badperiod:{limit_id}",
             )
+            session.commit()
             continue
         except Exception as exc:  # noqa: BLE001 - one limit must never block the rest
             # A failure on one limit (a restore that Checkmarx rejected, a deleted
             # user, a transient outage) is recorded and the loop moves on. Letting
             # it propagate would leave every later limit unevaluated, cycle after
-            # cycle, for as long as the one failure persisted.
-            logger.exception("Evaluation of limit %s failed", limit.id)
-            result.errors.append(f"limit {limit.id}: {exc}")
+            # cycle, for as long as the one failure persisted. The rollback clears
+            # whatever that limit left half-written so the next one starts clean.
+            session.rollback()
+            logger.exception("Evaluation of limit %s failed", limit_id)
+            result.errors.append(f"limit {limit_id}: {exc}")
             continue
+        # One short transaction per limit: its state is durable before the next
+        # limit starts talking to Checkmarx, and no lock outlives its own work.
+        session.commit()
         result.evaluated += 1
         result.evaluations.append(evaluation)
 
-    session.flush()
     return result
+
+
+def _lift_unjustified_restrictions(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    actor: AuditActor,
+    result: EvaluationResult,
+) -> None:
+    """Give back access that nothing justifies withholding any more.
+
+    A restriction is lifted the moment its limit is disabled, deleted or switched
+    to monitor only, or its entity is exempted. If Checkmarx was unreachable at
+    that moment the change still stands, and this is what completes it: every
+    cycle looks for restrictions whose reason has gone and lifts them. Without it
+    such a restriction would stay until someone noticed and pressed Restore.
+    """
+    actions = [
+        action
+        for action in session.scalars(
+            select(EnforcementAction)
+            .where(EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES))
+            .order_by(EnforcementAction.id)
+        )
+        if enforcement.may_be_in_force(action)
+    ]
+    if not actions:
+        return
+    resolver = enforcement.RoleResolver(client)
+    harmless_limits: dict[int, CreditLimit] = {}
+    for action in actions:
+        limit = session.get(CreditLimit, action.limit_id) if action.limit_id else None
+        if limit is not None and (not limit.is_active or not limit.enforce):
+            # Handled per limit below, so its period state is updated too.
+            harmless_limits[limit.id] = limit
+            continue
+        if action.reversal_reason == enforcement.ADMIN_REASON:
+            # An admin's Restore that did not finish (Checkmarx was unreachable,
+            # or the process stopped): complete it.
+            reason = enforcement.ADMIN_REASON
+        elif limit is None:
+            reason = "limit_removed"
+        elif enforcement.is_exempt(
+            session, entity_type=action.entity_type, entity_id=action.entity_id
+        ):
+            reason = enforcement.EXEMPTED_REASON
+        else:
+            continue
+        action_id = action.id
+        try:
+            if enforcement.restore_action(
+                session, client, action=action, actor=actor, reason=reason, resolver=resolver
+            ):
+                result.restored += 1
+        except Exception as exc:  # noqa: BLE001 - one stuck restore must not stop the cycle
+            session.rollback()
+            logger.warning("Could not lift restriction %s: %s", action_id, exc)
+            result.errors.append(f"restore {action_id}: {exc}")
+
+    for limit_id, limit in harmless_limits.items():
+        try:
+            result.restored += restore_on_limit_change(
+                session, client, limit=limit, actor=actor, reason="limit_removed"
+            )
+            session.commit()
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            logger.warning("Could not lift the restrictions of limit %s: %s", limit_id, exc)
+            result.errors.append(f"limit {limit_id}: {exc}")
 
 
 def _evaluate_one(
@@ -515,15 +602,17 @@ def _close_stale_periods(
     # The restrictions still in force from earlier periods are whatever action
     # rows say is APPLIED. The period state's own status is only a label and is
     # never trusted to decide whether someone gets their access back.
-    restricted_periods = set(
-        session.scalars(
-            select(EnforcementAction.period_key).where(
+    restricted_periods = {
+        action.period_key
+        for action in session.scalars(
+            select(EnforcementAction).where(
                 EnforcementAction.limit_id == limit.id,
                 EnforcementAction.period_key != current_key,
-                EnforcementAction.status == EnforcementStatus.APPLIED,
+                EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES),
             )
         )
-    )
+        if enforcement.may_be_in_force(action)
+    }
     open_statuses = [LimitStatus.RESTRICTED, LimitStatus.BREACHED, LimitStatus.WARNED]
     stale = list(
         session.scalars(

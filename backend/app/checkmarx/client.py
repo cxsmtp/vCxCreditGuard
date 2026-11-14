@@ -252,7 +252,10 @@ class CheckmarxClient:
                     delay = (
                         retry_after if retry_after is not None else self._backoff_seconds(attempt)
                     )
-                    self._sleep(delay)
+                    # Never sleep longer than the cap, whatever status carried the
+                    # header. A 503 with "Retry-After: 3600" must not park the cycle
+                    # (and its scheduler lock) for an hour.
+                    self._sleep(min(delay, MAX_HONOURED_RETRY_AFTER_SECONDS))
                     continue
                 if status == httpx.codes.TOO_MANY_REQUESTS:
                     raise CheckmarxRateLimitError(

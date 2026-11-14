@@ -204,9 +204,16 @@ def delete_limit(limit_id: int, ctx: AdminUser, db: DbSession) -> dict[str, obje
     limit = db.get(CreditLimit, limit_id)
     if limit is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such limit.")
-    restored = limits_service.delete_limit(
-        db, limit=limit, actor=ctx.actor, client=_optional_client(db)
-    )
+    try:
+        restored = limits_service.delete_limit(
+            db, limit=limit, actor=ctx.actor, client=_optional_client(db)
+        )
+    except limits_service.LimitRestoreError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "restore_failed", "message": str(exc)},
+        ) from exc
     db.commit()
     return {
         "message": "Limit deleted.",

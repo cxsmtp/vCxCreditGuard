@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, inspect
 
 from app.db.migrate import upgrade_to_head
 from app.models import Base
+from tests.conftest import TEST_DATABASE_URL, USING_SQLITE
 
 EXPECTED_TABLES = {
     "alembic_version",
@@ -44,7 +45,20 @@ EXPECTED_TABLES = {
 
 @pytest.fixture
 def migrated_url(tmp_path: Path) -> str:
-    url = f"sqlite:///{(tmp_path / 'migrated.db').as_posix()}"
+    """A database built by running every migration from nothing.
+
+    On PostgreSQL this is the real proof that the migrations work there: the
+    schema the test fixture built from the models is thrown away first.
+    """
+    if USING_SQLITE:
+        url = f"sqlite:///{(tmp_path / 'migrated.db').as_posix()}"
+    else:
+        url = TEST_DATABASE_URL
+        engine = create_engine(url)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
+            connection.exec_driver_sql("CREATE SCHEMA public")
+        engine.dispose()
     upgrade_to_head(url)
     return url
 

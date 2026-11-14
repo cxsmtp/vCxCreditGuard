@@ -157,6 +157,16 @@ def _prune_snapshots(session: Session, cutoff) -> tuple[int, int]:
             .limit(KEEP_RECENT_SNAPSHOTS)
         )
         keep_ids.update(recent)
+        # The newest *believed* snapshot is what limits are judged on. It is kept
+        # even if a long run of held reads has pushed it out of the recent tail.
+        believed = session.scalar(
+            select(UsageSnapshot.id)
+            .where(UsageSnapshot.view_by == view, UsageSnapshot.held_reason.is_(None))
+            .order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc())
+            .limit(1)
+        )
+        if believed is not None:
+            keep_ids.add(believed)
 
     doomed = list(
         session.scalars(

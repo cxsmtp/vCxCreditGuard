@@ -186,8 +186,11 @@ class TestAuditIntegrity:
         )
 
     def test_recent_audit_entries_survive(self, db: Session) -> None:
-        recent = add_audit(db, days_old=5)
+        # Oldest first, as an append-only log is written: pruning removes a
+        # prefix by id, so id order has to match time order.
         add_audit(db, days_old=400)
+        db.flush()
+        recent = add_audit(db, days_old=5)
         db.commit()
         retention.prune(db, retention_days=90, actor=ACTOR)
         db.commit()

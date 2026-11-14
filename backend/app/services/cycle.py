@@ -20,6 +20,9 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import threading
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -51,8 +54,17 @@ from app.services.audit import AuditActor, record_audit
 logger = logging.getLogger(__name__)
 
 LOCK_NAME = "cycle"
-# A lock older than this is assumed to belong to a process that died.
-LOCK_STALE_AFTER = timedelta(minutes=30)
+# While a cycle runs, a side thread refreshes the lock this often...
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+# ...so a lock that has been quiet for this long belongs to a process that died.
+# It is many missed heartbeats wide so a slow database cannot cause a false
+# reclaim, and short enough that a replaced container resumes within minutes.
+LOCK_STALE_AFTER = timedelta(minutes=10)
+# The heartbeat stops after this long, so a cycle that has hung (rather than
+# died) cannot hold the lock for ever. Far longer than any healthy cycle.
+MAX_CYCLE_DURATION = timedelta(hours=2)
+# Recorded on a run that did not start because another one held the lock.
+LOCK_BUSY_REASON = "a previous cycle is still running"
 
 
 @dataclass
@@ -70,6 +82,70 @@ class CycleResult:
 
 def holder_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def new_holder_id() -> str:
+    """A holder id unique to one run, not just to this process.
+
+    A manual "run now" and the scheduled job run in the same process. With a
+    per-process id, either could refresh or release the lock the other one holds.
+    """
+    return f"{holder_id()[:100]}:{uuid.uuid4().hex[:12]}"
+
+
+class _LockKeeper:
+    """Keeps the cycle lock's heartbeat fresh for as long as the cycle runs.
+
+    A cycle can legitimately run for a long time (a large tenant, a slow or rate
+    limited API). Without a heartbeat the lock would look abandoned and a second
+    cycle would start alongside the first. A side thread is used rather than
+    heartbeats between steps so that one slow step cannot starve it; the thread
+    dies with the process, which is exactly when the lock should go stale.
+    """
+
+    def __init__(
+        self,
+        holder: str,
+        *,
+        interval: float = HEARTBEAT_INTERVAL_SECONDS,
+        max_duration: timedelta = MAX_CYCLE_DURATION,
+    ) -> None:
+        self._holder = holder
+        self._interval = interval
+        self._started = utcnow()
+        self._max_duration = max_duration
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="cycle-lock-heartbeat", daemon=True)
+
+    def __enter__(self) -> _LockKeeper:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=10)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            if utcnow() - self._started > self._max_duration:
+                # A thread that is stuck, not dead, would otherwise keep the lock
+                # fresh indefinitely and no cycle would ever run again. Letting
+                # the lock go stale lets the next one start; the watchdog reports
+                # the stuck run.
+                logger.error(
+                    "The cycle has been running for more than %s; its lock is no longer "
+                    "being refreshed so a new cycle can take over",
+                    self._max_duration,
+                )
+                return
+            self.beat()
+
+    def beat(self) -> None:
+        try:
+            with session_scope() as session:
+                heartbeat(session, holder=self._holder)
+        except Exception:  # noqa: BLE001 - a missed beat is retried on the next tick
+            logger.warning("Could not refresh the cycle lock heartbeat", exc_info=True)
 
 
 # ----------------------------------------------------------------------- locking
@@ -131,13 +207,13 @@ def release_lock(session: Session, *, name: str = LOCK_NAME, holder: str | None 
 
 def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> CycleResult:
     """Run one full cycle. Never raises: every outcome is recorded on the run row."""
-    holder = holder_id()
+    holder = new_holder_id()
     result = CycleResult()
 
     with session_scope() as session:
         if not acquire_lock(session, holder=holder):
             result.status = RunStatus.SKIPPED
-            result.skipped_reason = "a previous cycle is still running"
+            result.skipped_reason = LOCK_BUSY_REASON
             run = SchedulerRun(
                 kind="cycle",
                 trigger=trigger,
@@ -161,7 +237,7 @@ def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> Cyc
             run_id = run.id
         result.run_id = run_id
 
-        with session_scope() as session:
+        with _LockKeeper(holder), session_scope() as session:
             _execute_steps(session, result, force_org_sync=force_org_sync)
 
         with session_scope() as session:
@@ -190,8 +266,74 @@ def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> Cyc
     return result
 
 
+def _run_step(
+    session: Session,
+    result: CycleResult,
+    name: str,
+    work: Callable[[], None],
+    *,
+    degrades_run: bool = True,
+) -> bool:
+    """Run one step in its own transaction. Returns True if it completed.
+
+    Each step commits when it finishes, so nothing it wrote is lost to a later
+    step's failure and no database lock outlives the step. A step that fails is
+    rolled back - which also clears a session left unusable by a database error -
+    recorded, and the cycle carries on with the steps that do not depend on it.
+
+    ``degrades_run`` is False for housekeeping (mail, pruning) whose failure is an
+    operational nuisance rather than a governance problem.
+    """
+    try:
+        work()
+        session.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001 - one step must never take the others down
+        session.rollback()
+        if isinstance(exc, CheckmarxError):
+            logger.warning("Cycle step %s failed: %s", name, exc)
+        else:
+            logger.exception("Cycle step %s failed", name)
+        result.steps[name] = {"ok": False, "error": str(exc)}
+        if degrades_run:
+            result.errors.append(f"{name}: {exc}")
+            result.status = RunStatus.PARTIAL
+            _warn_committed(session, name, str(exc))
+        return False
+
+
+def _warn_committed(session: Session, step: str, message: str) -> None:
+    """Raise the step's warning notification and commit it straight away."""
+    try:
+        _warn(session, step, message)
+        session.commit()
+    except Exception:  # noqa: BLE001 - failing to warn must not fail the cycle
+        session.rollback()
+        logger.exception("Could not record the warning for cycle step %s", step)
+
+
 def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: bool) -> None:
+    """Run the steps in order, each in its own short transaction.
+
+    Nothing is ever left open in the database while the cycle waits on Checkmarx:
+    the steps that talk to the tenant commit before each call. That matters most
+    on PostgreSQL, where a sign-in (which appends to the audit log) would
+    otherwise queue behind the whole cycle.
+    """
     actor = AuditActor.system("scheduler")
+
+    def deliver() -> None:
+        result.steps["deliver"] = delivery.deliver_pending(session).as_stats()
+
+    def prune() -> None:
+        if _retention_due(session):
+            result.steps["retention"] = retention.prune(
+                session,
+                retention_days=int(
+                    settings_store.get_value(session, settings_store.KEY_RETENTION_DAYS) or 365
+                ),
+                actor=actor,
+            ).as_stats()
 
     # Demo mode: touch no live tenant - no sync, ingestion or enforcement. Still
     # evaluate the seeded data with no client (so demo limits get period state and
@@ -200,34 +342,19 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
     # unbounded run history.
     if settings_store.demo_mode(session):
         result.steps["demo"] = {"active": True}
-        try:
+
+        def demo_evaluate() -> None:
             result.steps["evaluate"] = evaluation.evaluate_all(
                 session, client=None, actor=actor
             ).as_stats()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Demo evaluation failed")
-            result.steps["evaluate"] = {"ok": False, "error": str(exc)}
-        try:
-            result.steps["deliver"] = delivery.deliver_pending(session).as_stats()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Notification delivery failed")
-            result.steps["deliver"] = {"ok": False, "error": str(exc)}
-        try:
-            if _retention_due(session):
-                result.steps["retention"] = retention.prune(
-                    session,
-                    retention_days=int(
-                        settings_store.get_value(session, settings_store.KEY_RETENTION_DAYS) or 365
-                    ),
-                    actor=actor,
-                ).as_stats()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Retention pruning failed")
-            result.steps["retention"] = {"ok": False, "error": str(exc)}
+
+        _run_step(session, result, "evaluate", demo_evaluate, degrades_run=False)
+        _run_step(session, result, "deliver", deliver, degrades_run=False)
+        _run_step(session, result, "retention", prune, degrades_run=False)
         return
 
     try:
-        client: CheckmarxClient | None = connection_service.get_client(session)
+        client: CheckmarxClient = connection_service.get_client(session)
     except NotConfiguredError as exc:
         result.status = RunStatus.SKIPPED
         result.skipped_reason = str(exc)
@@ -235,24 +362,25 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
         return
 
     # Step 1: organisation model, only when due.
-    if force_org_sync or _org_sync_due(session):
-        try:
-            org_result = org_sync.sync_org_model(session, client, actor=actor)
-            result.steps["org_sync"] = org_result.as_stats()
-            if org_result.warnings:
-                _warn(session, "org_sync", "; ".join(org_result.warnings))
-                result.status = RunStatus.PARTIAL
-        except CheckmarxError as exc:
-            result.errors.append(f"org_sync: {exc}")
+    def sync_org() -> None:
+        org_result = org_sync.sync_org_model(session, client, actor=actor)
+        result.steps["org_sync"] = org_result.as_stats()
+        if org_result.warnings:
+            _warn(session, "org_sync", "; ".join(org_result.warnings))
             result.status = RunStatus.PARTIAL
-            result.steps["org_sync"] = {"ok": False, "error": str(exc)}
-            _warn(session, "org_sync", str(exc))
+
+    if force_org_sync or _org_sync_due(session):
+        _run_step(session, result, "org_sync", sync_org)
     else:
         result.steps["org_sync"] = {"skipped": "not due"}
 
-    # Step 2: usage ingestion.
-    usage_ok = True
-    try:
+    # Step 2: usage ingestion. Each dimension is read and stored on its own, so an
+    # outage on one does not discard the others. ``fresh`` is False when a
+    # dimension could not be read or its read was not believed; evaluation then
+    # runs on the previous snapshot.
+    usage_fresh = {"value": False}
+
+    def ingest() -> None:
         ingest_result = ingestion.ingest_usage(
             session,
             client,
@@ -260,143 +388,111 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
             page_size=settings_store.usage_page_size(session),
         )
         result.steps["ingest"] = ingest_result.as_stats()
-        for warning in ingest_result.warnings:
-            _warn(session, "ingest", warning)
-        if ingest_result.warnings:
+        problems = [*ingest_result.errors, *ingest_result.warnings]
+        if ingest_result.errors:
+            result.errors.extend(f"ingest: {error}" for error in ingest_result.errors)
+        if problems:
             result.status = RunStatus.PARTIAL
+            _warn(session, "ingest", "; ".join(problems))
         _notify_unresolved(session)
-    except CheckmarxError as exc:
-        usage_ok = False
-        result.errors.append(f"ingest: {exc}")
-        result.status = RunStatus.PARTIAL
-        result.steps["ingest"] = {"ok": False, "error": str(exc)}
-        _warn(session, "ingest", str(exc))
+        usage_fresh["value"] = ingest_result.fresh
+
+    _run_step(session, result, "ingest", ingest)
+    usage_ok = usage_fresh["value"]
 
     # Step 2b: tenant credit pool. Best-effort and never fatal - an unreachable
     # pool is unknown, so we keep the last good snapshot and record no zero. A new
     # row is written only when the balance actually changed, so a steady-state
     # tenant does not accumulate identical rows between retention prunes.
-    try:
+    def read_pool() -> None:
         balance = credits_api.fetch_credit_balance(client)
-        if balance is not None and balance.has_values():
-            latest = session.scalar(
-                select(CreditBalanceSnapshot).order_by(
-                    CreditBalanceSnapshot.collected_at.desc(), CreditBalanceSnapshot.id.desc()
-                )
-            )
-            unchanged = latest is not None and (
-                latest.total_credits == balance.total
-                and latest.used_credits == balance.used
-                and latest.available_credits == balance.available
-            )
-            if not unchanged:
-                session.add(
-                    CreditBalanceSnapshot(
-                        collected_at=utcnow(),
-                        total_credits=balance.total,
-                        used_credits=balance.used,
-                        available_credits=balance.available,
-                        raw=balance.raw,
-                    )
-                )
-            result.steps["credits"] = {
-                "ok": True,
-                "changed": not unchanged,
-                "total": str(balance.total) if balance.total is not None else None,
-                "available": str(balance.available) if balance.available is not None else None,
-            }
-        else:
+        if balance is None or not balance.has_values():
             result.steps["credits"] = {"ok": False, "reason": "unavailable"}
-    except Exception as exc:  # noqa: BLE001 - the pool read must not fail the cycle
-        logger.info("Credit balance step skipped: %s", exc)
-        result.steps["credits"] = {"ok": False, "error": str(exc)}
+            return
+        latest = session.scalar(
+            select(CreditBalanceSnapshot).order_by(
+                CreditBalanceSnapshot.collected_at.desc(), CreditBalanceSnapshot.id.desc()
+            )
+        )
+        unchanged = latest is not None and (
+            latest.total_credits == balance.total
+            and latest.used_credits == balance.used
+            and latest.available_credits == balance.available
+        )
+        if not unchanged:
+            session.add(
+                CreditBalanceSnapshot(
+                    collected_at=utcnow(),
+                    total_credits=balance.total,
+                    used_credits=balance.used,
+                    available_credits=balance.available,
+                    raw=balance.raw,
+                )
+            )
+        result.steps["credits"] = {
+            "ok": True,
+            "changed": not unchanged,
+            "total": str(balance.total) if balance.total is not None else None,
+            "available": str(balance.available) if balance.available is not None else None,
+        }
+
+    _run_step(session, result, "credits", read_pool, degrades_run=False)
 
     # Step 2c: roll back temporary credit grants whose expiry has passed, before
     # evaluation so a re-tightened budget is judged against this cycle's usage. The
     # client is passed so that removing an enforced grant also lifts any
     # restriction it caused. Never fatal: a failure here must not stop enforcement.
-    try:
+    def expire_grants() -> None:
         reverted = requests_service.revert_expired_grants(session, client=client)
         result.steps["grant_expiry"] = {"ok": True, "reverted": reverted}
-    except Exception as exc:  # noqa: BLE001 - grant rollback must not fail the cycle
-        logger.exception("Expired grant rollback failed")
-        result.errors.append(f"grant_expiry: {exc}")
-        result.status = RunStatus.PARTIAL
-        result.steps["grant_expiry"] = {"ok": False, "error": str(exc)}
-        _warn(session, "grant_expiry", str(exc))
+
+    _run_step(session, result, "grant_expiry", expire_grants)
 
     # Step 2d: expire time-boxed overrides before evaluation, so an entity whose
     # override has lapsed is enforced again this cycle. Never fatal.
-    try:
+    def expire_overrides() -> None:
         from app.services import limits_service
 
         expired = limits_service.expire_overrides(session)
         result.steps["override_expiry"] = {"ok": True, "expired": expired}
-    except Exception as exc:  # noqa: BLE001 - override expiry must not fail the cycle
-        logger.exception("Override expiry failed")
-        result.errors.append(f"override_expiry: {exc}")
-        result.status = RunStatus.PARTIAL
-        result.steps["override_expiry"] = {"ok": False, "error": str(exc)}
-        _warn(session, "override_expiry", str(exc))
+
+    _run_step(session, result, "override_expiry", expire_overrides)
 
     # Step 2e: hands-off automation. Auto-approve pending credit requests within
     # the configured cap before evaluation, so a granted budget is reflected in
     # this cycle (lifting a restriction straight away via the client). Never fatal.
-    try:
-        auto = requests_service.auto_decide_pending(session, client=client, actor=actor)
-        result.steps["automation"] = auto
-    except Exception as exc:  # noqa: BLE001 - automation must not fail the cycle
-        logger.exception("Hands-off automation failed")
-        result.errors.append(f"automation: {exc}")
-        result.status = RunStatus.PARTIAL
-        result.steps["automation"] = {"ok": False, "error": str(exc)}
-        _warn(session, "automation", str(exc))
+    def automate() -> None:
+        result.steps["automation"] = requests_service.auto_decide_pending(
+            session, client=client, actor=actor
+        )
+
+    _run_step(session, result, "automation", automate)
 
     # Step 3: evaluation and enforcement. Runs even when ingestion failed, using
     # the last good snapshot, but a failed ingestion means no new breach can be
-    # discovered from data we did not receive.
-    try:
+    # discovered from data we did not receive. Each limit is its own transaction
+    # inside this step.
+    def evaluate() -> None:
         evaluation_result = evaluation.evaluate_all(session, client=client, actor=actor)
         result.steps["evaluate"] = evaluation_result.as_stats()
         result.steps["evaluate"]["used_stale_usage"] = not usage_ok
         if evaluation_result.errors:
             result.status = RunStatus.PARTIAL
             result.errors.extend(evaluation_result.errors)
-    except Exception as exc:  # noqa: BLE001 - never let evaluation kill the cycle
-        logger.exception("Evaluation failed")
-        result.errors.append(f"evaluate: {exc}")
-        result.status = RunStatus.PARTIAL
-        result.steps["evaluate"] = {"ok": False, "error": str(exc)}
-        _warn(session, "evaluate", str(exc))
+
+    _run_step(session, result, "evaluate", evaluate)
 
     # Step 4: push notifications out. A delivery failure is never allowed to affect
     # the cycle's own status: the Notification Center already has the record, and an
     # unreachable SMTP server is not a governance failure.
-    try:
-        delivery_result = delivery.deliver_pending(session)
-        result.steps["deliver"] = delivery_result.as_stats()
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Notification delivery failed")
-        result.steps["deliver"] = {"ok": False, "error": str(exc)}
+    _run_step(session, result, "deliver", deliver, degrades_run=False)
 
     # Step 5: retention, at most once a day.
-    try:
-        if _retention_due(session):
-            retention_result = retention.prune(
-                session,
-                retention_days=int(
-                    settings_store.get_value(session, settings_store.KEY_RETENTION_DAYS) or 365
-                ),
-                actor=actor,
-            )
-            result.steps["retention"] = retention_result.as_stats()
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Retention pruning failed")
-        result.steps["retention"] = {"ok": False, "error": str(exc)}
+    _run_step(session, result, "retention", prune, degrades_run=False)
 
     # Step 6: weekly report email, when enabled and due. Never fatal: a mail
     # failure is an operational issue, not a governance one, and is recorded.
-    try:
+    def email_report() -> None:
         if settings_store.report_email_enabled(session) and _report_email_due(session):
             sent = _send_weekly_report(session)
             result.steps["report_email"] = (
@@ -406,9 +502,8 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
             )
         else:
             result.steps["report_email"] = {"skipped": "disabled or not due"}
-    except Exception as exc:  # noqa: BLE001 - a mail failure must not fail the cycle
-        logger.exception("Weekly report email failed")
-        result.steps["report_email"] = {"ok": False, "error": str(exc)}
+
+    _run_step(session, result, "report_email", email_report, degrades_run=False)
 
 
 def _org_sync_due(session: Session) -> bool:

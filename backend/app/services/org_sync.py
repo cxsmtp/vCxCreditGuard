@@ -78,9 +78,16 @@ def sync_org_model(
     result = OrgSyncResult()
     now = utcnow()
 
+    # Each entity type is fetched and then written, and committed before the next
+    # one is fetched, so nothing is left open in the database while we wait on
+    # Checkmarx. A failure part way through leaves the earlier types refreshed.
+    session.commit()
     group_index = _sync_groups(session, client, result, now)
+    session.commit()
     _sync_users(session, client, result, now, group_index)
+    session.commit()
     project_ids = _sync_projects(session, client, result, now)
+    session.commit()
     _sync_applications(session, client, result, now, project_ids)
 
     record_audit(

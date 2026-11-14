@@ -237,7 +237,10 @@ def deliver_pending(
                 _clear_attempts(notification.id)
                 notification.delivery = outcome
 
-        session.flush()
+            # Recorded as soon as it is sent. Leaving it to the end of the batch
+            # would resend everything already delivered if the process stopped
+            # part way through.
+            session.commit()
     finally:
         if owns_client:
             client.close()
