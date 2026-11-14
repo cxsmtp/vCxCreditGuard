@@ -185,8 +185,13 @@ def watchdog_status(session: Session, *, now: datetime | None = None) -> Watchdo
 
     reference = last.finished_at or last.started_at
     gap = max(0, int((moment - reference).total_seconds()))
+    since_start = max(0, int((moment - _PROCESS_STARTED_AT).total_seconds()))
     if gap <= tolerance:
         state, detail = "ok", f"Last cycle {gap}s ago."
+    elif since_start <= tolerance:
+        # The gap is downtime, not a dead scheduler: this process has only just
+        # come up and has not yet had the chance to run a cycle.
+        state, detail = "ok", f"Restarted {since_start}s ago after {gap}s without a cycle."
     elif gap <= tolerance * 3:
         state, detail = "stale", f"No cycle for {gap}s (tolerance {tolerance}s); it may be stuck."
     else:
