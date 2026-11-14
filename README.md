@@ -237,7 +237,7 @@ status, and the Settings page groups them into **Disputes**, **Auto-matched** an
 
 | Level breached | What changes |
 | -------------- | ------------ |
-| User | The AI roles (`view-risk-management`, `view-risk-management-dashboard`, `view-risk-management-tab`) and the scan-viewing role (`view-scans`) are unmapped from the user on the `ast-app` client |
+| User | The AI roles (`view-risk-management`, `view-risk-management-dashboard`, `view-risk-management-tab`) are unmapped from the user on the `ast-app` client. Nothing else is touched: whether the user can view scans (`view-scans`) stays whatever their Checkmarx permission says |
 | Project | Auto Triage is disabled via `PUT /api/ai-agents-coordinator/projects/{id}/configuration`, and PR triage and remediation is disabled by clearing `remediationSeverities` via `PATCH /api/repos-manager/repo/{repo_id}?projectId={id}` |
 | Group | Both project actions, on every project in the group |
 | Application | Both project actions, on every project in the application |

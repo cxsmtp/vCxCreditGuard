@@ -510,7 +510,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
       <div class="tablewrap"><table>
         <thead><tr><th>Level breached</th><th>What changes</th></tr></thead>
         <tbody>
-          <tr><td>User</td><td>The AI roles and the scan-viewing role are unmapped from the user on the <code>ast-app</code> client.</td></tr>
+          <tr><td>User</td><td>The AI roles are unmapped from the user on the <code>ast-app</code> client. Scan viewing is left as their Checkmarx permission has it.</td></tr>
           <tr><td>Project</td><td>Auto Triage is disabled, and PR triage &amp; remediation is disabled by clearing the remediation severities.</td></tr>
           <tr><td>Group</td><td>Both project actions, on every project in the group.</td></tr>
           <tr><td>Application</td><td>Both project actions, on every project in the application.</td></tr>

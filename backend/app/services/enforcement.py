@@ -650,6 +650,62 @@ def _enforce_target(
     session.commit()
 
 
+def _give_back_roles_outside_the_restriction(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    action: EnforcementAction,
+    target: Target,
+    actor: AuditActor,
+    resolver: RoleResolver,
+) -> None:
+    """Return roles an earlier version removed that a restriction no longer covers.
+
+    A restriction used to take the scan-viewing role as well as the AI roles.
+    Someone restricted back then is still without it, and would stay so until
+    their whole restriction is lifted. This gives it back once, and takes it
+    out of the undo snapshot so it is not this tool's business again: if an
+    admin later removes the role in Checkmarx One on purpose, it stays removed.
+    """
+    if action.kind != EnforcementKind.REMOVE_USER_ROLES:
+        return
+    snapshot = dict(action.undo_snapshot or {})
+    removed = [role for role in snapshot.get("removed_roles") or [] if isinstance(role, dict)]
+    outside = [
+        role
+        for role in removed
+        if role.get("name") not in iam.AI_ROLE_NAMES
+        and isinstance(role.get("id"), str)
+        and isinstance(role.get("name"), str)
+    ]
+    if not outside:
+        return
+    client_uuid = snapshot.get("client_uuid") or resolver.client_uuid
+    iam.add_user_client_roles(
+        client,
+        user_id=target.target_id,
+        client_uuid=client_uuid,
+        roles=[iam.RoleRef(id=role["id"], name=role["name"]) for role in outside],
+    )
+    names = sorted(role["name"] for role in outside)
+    snapshot["removed_roles"] = [role for role in removed if role not in outside]
+    action.undo_snapshot = snapshot
+    record_audit(
+        session,
+        action="enforcement.narrowed",
+        actor=actor,
+        target_type=target.target_type,
+        target_id=target.target_id,
+        target_label=target.target_label,
+        after={"kind": str(target.kind), "roles_returned": names},
+        detail=(
+            f"{target.target_label} was given back {', '.join(names)}: a restriction now "
+            "removes only the AI roles. The AI roles stay removed."
+        ),
+    )
+    session.commit()
+
+
 def _verify_applied(
     session: Session,
     client: CheckmarxClient,
@@ -695,6 +751,9 @@ def _verify_applied(
         return
     session.commit()  # nothing held open while we wait on Checkmarx
     try:
+        _give_back_roles_outside_the_restriction(
+            session, client, action=action, target=target, actor=actor, resolver=resolver
+        )
         reasserted = _reconcile(session, client, action=action, target=target, resolver=resolver)
     except CheckmarxError as exc:
         logger.warning(
