@@ -33,8 +33,9 @@ from app.api.routes import (
 )
 from app.core.config import ConfigError, Settings, get_settings
 from app.core.logging import configure_logging
+from app.db import instance_guard
 from app.db.migrate import upgrade_to_head
-from app.db.session import session_scope
+from app.db.session import get_engine, session_scope
 from app.services import connection as connection_service
 from app.services import settings_store
 from app.services.auth import bootstrap_admin_if_needed
@@ -62,14 +63,28 @@ def _startup(settings: Settings) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
-    _startup(settings)
-    if app.state.run_scheduler:
-        scheduler.start()
-    logger.info("CxCreditGuard %s started in %s mode", __version__, settings.env)
-    yield
-    if app.state.run_scheduler:
-        scheduler.shutdown()
-    logger.info("CxCreditGuard shutting down")
+    # One instance per database, claimed before anything else touches it.
+    try:
+        instance_guard.acquire(get_engine())
+    except ConfigError as exc:
+        logger.critical("CxCreditGuard cannot start: %s", exc)
+        raise
+    try:
+        try:
+            _startup(settings)
+        except ConfigError as exc:
+            # Said plainly, on its own line, before the server's traceback.
+            logger.critical("CxCreditGuard cannot start: %s", exc)
+            raise
+        if app.state.run_scheduler:
+            scheduler.start()
+        logger.info("CxCreditGuard %s started in %s mode", __version__, settings.env)
+        yield
+        if app.state.run_scheduler:
+            scheduler.shutdown()
+        logger.info("CxCreditGuard shutting down")
+    finally:
+        instance_guard.release()
 
 
 def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) -> FastAPI:

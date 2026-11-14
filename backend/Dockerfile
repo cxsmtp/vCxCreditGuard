@@ -29,21 +29,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Dependencies first so a source change does not invalidate the install layer.
-# libpq is the only runtime OS package (psycopg's pure-Python mode loads it);
-# the build toolchain goes in a throwaway virtual package so any dependency
-# without a musl wheel can still compile, then is removed to keep the image lean.
-# psycopg is installed directly rather than via the ".[postgres]" extra because
-# that extra pulls psycopg[binary], whose wheels are glibc-only (manylinux).
-COPY backend/pyproject.toml ./
-# Python dependency versions are constrained in pyproject.toml, and pinning apk
-# --no-cache installs to exact versions is fragile across base-image updates.
+# libpq is the only runtime OS package. psycopg is installed with its C
+# implementation ("psycopg[c]"), compiled here against libpq-dev: its pure-Python
+# mode finds libpq through ctypes.util.find_library, which on Alpine (musl) needs
+# gcc or binutils at run time and so fails once the toolchain is removed - the
+# image would build and then be unable to open a PostgreSQL connection. The
+# ".[postgres]" extra is not used because it pulls psycopg[binary], whose wheels
+# are glibc-only (manylinux). The toolchain goes in a throwaway virtual package
+# and is removed to keep the image lean.
+COPY backend/pyproject.toml backend/constraints.txt ./
+# Python dependency versions are pinned by constraints.txt (direct and
+# transitive), so the image is reproducible; pinning apk --no-cache installs to
+# exact versions is fragile across base-image updates.
 # Suppress the KICS unpinned-version findings for this build step.
 # The trailing "|| true" is parenthesised on purpose: unparenthesised it would
 # apply to the whole chain and let a failed dependency install produce an image.
 # kics-scan ignore-block
 RUN apk add --no-cache libpq \
-    && apk add --no-cache --virtual .build gcc musl-dev python3-dev \
-    && pip install --no-cache-dir . psycopg \
+    && apk add --no-cache --virtual .build gcc musl-dev python3-dev libpq-dev \
+    && pip install --no-cache-dir -c constraints.txt . "psycopg[c]" \
     && apk del .build \
     && (pip uninstall -y pip setuptools wheel 2>/dev/null || true)
 

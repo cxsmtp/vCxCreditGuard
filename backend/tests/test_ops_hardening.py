@@ -77,10 +77,15 @@ class TestWatchdog:
         assert watch.state == "disabled"
         assert ops_hardening.scheduler_alive(db) is True
 
-    def test_no_runs_is_down(self, db: Session) -> None:
-        watch = ops_hardening.watchdog_status(db)
+    def test_no_runs_is_down_once_the_first_cycle_is_overdue(self, db: Session) -> None:
+        # Just started: a new installation is not a dead scheduler.
+        assert ops_hardening.watchdog_status(db).state == "ok"
+        assert ops_hardening.scheduler_alive(db) is True
+
+        later = utcnow() + timedelta(days=2)
+        watch = ops_hardening.watchdog_status(db, now=later)
         assert watch.state == "down"
-        assert ops_hardening.scheduler_alive(db) is False
+        assert ops_hardening.scheduler_alive(db, now=later) is False
 
     def test_recent_run_is_ok(self, db: Session) -> None:
         now = utcnow()

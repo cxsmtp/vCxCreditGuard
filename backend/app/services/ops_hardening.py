@@ -139,6 +139,10 @@ class WatchdogStatus:
     detail: str
 
 
+# When this process came up: the reference for "no cycle yet" on a new install.
+_PROCESS_STARTED_AT = utcnow()
+
+
 def watchdog_status(session: Session, *, now: datetime | None = None) -> WatchdogStatus:
     """Judge scheduler liveness from its run history.
 
@@ -169,6 +173,12 @@ def watchdog_status(session: Session, *, now: datetime | None = None) -> Watchdo
             "The scheduler is disabled, so nothing runs automatically.",
         )
     if last is None:
+        # A new installation has no history yet. That is not a dead scheduler
+        # until it has had time to run its first cycle and still has not.
+        if (moment - _PROCESS_STARTED_AT).total_seconds() <= tolerance:
+            return WatchdogStatus(
+                "ok", True, None, None, None, tolerance, "Started; the first cycle is due."
+            )
         return WatchdogStatus(
             "down", True, None, None, None, tolerance, "Enabled, but no cycle has ever run."
         )

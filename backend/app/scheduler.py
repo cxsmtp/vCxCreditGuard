@@ -14,7 +14,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.db.session import session_scope
+from app.db import instance_guard
+from app.db.session import get_engine, session_scope
 from app.services import settings_store
 from app.services.cycle import run_cycle
 
@@ -28,6 +29,12 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def _job() -> None:
+    if not instance_guard.still_held(get_engine()):
+        logger.critical(
+            "Another CxCreditGuard instance has taken over this database. This one is no "
+            "longer running scheduled cycles; stop one of the two."
+        )
+        return
     result = run_cycle(trigger="schedule")
     logger.info(
         "Cycle %s finished with status %s%s",

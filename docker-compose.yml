@@ -1,5 +1,6 @@
 # Shared Volumes Between Containers: each named volume below is mounted by a
-# single service (db-data by db, app-data by app), so this is a false positive.
+# single service (db-data by db, db-backups by backup, app-data by app), so this
+# is a false positive.
 # kics-scan disable=8c978947-0ff6-485c-b0c2-0bfca6026466
 # CxCreditGuard: app, database and TLS terminating reverse proxy.
 #
@@ -9,10 +10,23 @@
 # Only the proxy publishes ports. The app and database are reachable only on the
 # internal compose network.
 
+# Container logs are kept on the host by the default driver without any limit.
+# Cap them so a noisy week cannot fill the disk.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
+    # Ceilings, not reservations: enough for this workload, and a bound on what
+    # a runaway query or leak can take from the host.
+    mem_limit: 1g
+    cpus: 2.0
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-cxcreditguard}
       POSTGRES_USER: ${POSTGRES_USER:-cxcg}
@@ -47,12 +61,54 @@ services:
     networks:
       - internal
 
+  # Scheduled dumps of the database into the db-backups volume. The database
+  # holds the undo snapshots for every restriction applied in Checkmarx One, so
+  # losing it means losing the ability to give that access back automatically.
+  # See "Backup and restore" in the README, and copy the dumps off this host.
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGDATABASE: ${POSTGRES_DB:-cxcreditguard}
+      PGUSER: ${POSTGRES_USER:-cxcg}
+      # A ${POSTGRES_PASSWORD} reference from the operator's .env, not a
+      # hardcoded secret (KICS matches the key name).
+      # kics-scan ignore-line
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+    entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
+    volumes:
+      - ./deploy/backup/backup.sh:/usr/local/bin/backup.sh:ro
+      - db-backups:/backups
+    mem_limit: 256m
+    cpus: 0.5
+    # Runs as the image's default user (root) with every capability dropped:
+    # the named volume's directory is owned by root, and writing to a directory
+    # you own needs no capability.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - internal
+
   app:
     build:
       # Repository root, so the image can build the frontend and the backend.
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    # Exactly one app container: the scheduler and its locks live in this one
+    # process, and a second instance against the same database refuses to start.
+    mem_limit: 1g
+    cpus: 2.0
     depends_on:
       db:
         condition: service_healthy
@@ -104,8 +160,15 @@ services:
     # plain reverse-proxy config never uses.
     image: nginx:1.27-alpine-slim
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
+    cpus: 1.0
+    # Started once the app answers its health check: nginx resolves the upstream
+    # when it starts, and would otherwise crash-loop while the app is still
+    # applying migrations.
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     # A public TLS reverse proxy must publish 80/443 on the host interface; the
     # privileged-ports and host-interface-binding findings below are intended,
     # not misconfigurations.
@@ -142,6 +205,7 @@ services:
 
 volumes:
   db-data:
+  db-backups:
   app-data:
 
 networks:

@@ -912,6 +912,56 @@ class TestResetSecrets:
         master_key.verify_master_key(db)  # and the app can start with the new key
 
 
+class TestRecoverAdmin:
+    def test_the_only_admin_gets_back_in_with_a_temporary_password(
+        self,
+        client: TestClient,
+        db: Session,
+        admin_user: UtilityUser,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from scripts import recover_admin
+
+        auth_service.provision_totp(db, user=admin_user)
+        admin_user.totp_enabled = True
+        db.commit()
+        for _ in range(3):  # leave a lockout counter behind for the account
+            client.post(
+                "/api/auth/login", json={"username": admin_user.username, "password": "wrong"}
+            )
+        assert db.scalar(select(LoginAttempt)) is not None
+
+        assert recover_admin.main([]) == 2  # explains itself, changes nothing
+        assert recover_admin.main(["nobody"]) == 1
+        capsys.readouterr()
+        assert recover_admin.main([admin_user.username]) == 0
+        line = capsys.readouterr().out.splitlines()[0]
+        temporary = line.rsplit(": ", 1)[1]
+
+        db.expire_all()
+        assert admin_user.totp_enabled is False
+        assert admin_user.must_change_password is True
+        assert (
+            db.scalar(select(LoginAttempt).where(LoginAttempt.identifier == admin_user.username))
+            is None
+        )
+        assert db.scalar(select(AuditLogEntry).where(AuditLogEntry.action == "account.recovered"))
+
+        # The old password no longer works, the temporary one does, without a code.
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": admin_user.username, "password": ADMIN_PASSWORD},
+            ).status_code
+            == 401
+        )
+        signed_in = client.post(
+            "/api/auth/login", json={"username": admin_user.username, "password": temporary}
+        )
+        assert signed_in.status_code == 200
+        assert signed_in.json()["must_change_password"] is True
+
+
 @postgres_only
 class TestRecoveryCodeRace:
     def test_two_simultaneous_sign_ins_cannot_both_spend_one_code(
@@ -943,3 +993,120 @@ class TestRecoveryCodeRace:
         for thread in threads:
             thread.join(30)
         assert sorted(results) == [False, True]
+
+
+class TestSingleInstance:
+    """Two copies against one database would each run a scheduler, and neither
+    would see the other's per-target locks."""
+
+    def test_a_second_instance_is_refused(self, db: Session) -> None:
+        import subprocess
+        import sys
+
+        from app.core.config import ConfigError
+        from app.db import instance_guard
+        from app.db.session import get_engine
+
+        url = get_settings().database_url
+        other = subprocess.Popen(  # noqa: S603 - our own interpreter and a fixed script
+            [
+                sys.executable,
+                "-c",
+                "import sys, time\n"
+                "from app.db import instance_guard\n"
+                "from app.db.session import build_engine\n"
+                "instance_guard.acquire(build_engine(sys.argv[1]))\n"
+                "print('claimed', flush=True)\n"
+                "time.sleep(30)\n",
+                url,
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert other.stdout.readline().strip() == "claimed"
+            with pytest.raises(ConfigError, match="already running"):
+                instance_guard.acquire(get_engine())
+        finally:
+            other.kill()
+            other.wait(10)
+
+        # The claim goes with the process that held it: its replacement starts.
+        instance_guard.acquire(get_engine())
+        instance_guard.release()
+
+    def test_starting_the_app_twice_in_one_process_is_allowed(self, db: Session) -> None:
+        from app.db import instance_guard
+        from app.db.session import get_engine
+
+        instance_guard.acquire(get_engine())
+        instance_guard.acquire(get_engine())
+        instance_guard.release()
+        instance_guard.release()
+
+    @postgres_only
+    def test_a_claim_lost_with_its_connection_is_taken_again(self, db: Session) -> None:
+        """The advisory lock dies with its connection (a database restart, a
+        dropped socket). The scheduler re-checks before each cycle."""
+        import subprocess
+        import sys
+        import time
+
+        from sqlalchemy import text
+
+        from app.db import instance_guard
+        from app.db.session import get_engine
+
+        engine = get_engine()
+
+        def drop_the_claim() -> None:
+            pid = instance_guard._held.execute(text("SELECT pg_backend_pid()")).scalar()
+            instance_guard._held.commit()
+            with engine.connect() as other:
+                other.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
+                other.commit()
+                for _ in range(100):
+                    gone = other.execute(
+                        text("SELECT count(*) FROM pg_stat_activity WHERE pid = :pid"),
+                        {"pid": pid},
+                    ).scalar()
+                    other.commit()
+                    if not gone:
+                        return
+                    time.sleep(0.05)
+            raise AssertionError("the claim's connection was not terminated")
+
+        instance_guard.acquire(engine)
+        try:
+            assert instance_guard.still_held(engine) is True
+            drop_the_claim()
+            assert instance_guard.still_held(engine) is True  # taken again
+            assert instance_guard._held is not None
+
+            # Lost again, and this time another instance gets there first.
+            drop_the_claim()
+            rival = subprocess.Popen(  # noqa: S603 - our own interpreter and a fixed script
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys, time\n"
+                    "from app.db import instance_guard\n"
+                    "from app.db.session import build_engine\n"
+                    "instance_guard.acquire(build_engine(sys.argv[1]))\n"
+                    "print('claimed', flush=True)\n"
+                    "time.sleep(30)\n",
+                    get_settings().database_url,
+                ],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert rival.stdout.readline().strip() == "claimed"
+                assert instance_guard.still_held(engine) is False
+                assert instance_guard.still_held(engine) is False  # and keeps saying so
+            finally:
+                rival.kill()
+                rival.wait(10)
+            assert instance_guard.still_held(engine) is True  # the rival is gone
+        finally:
+            instance_guard.release()
