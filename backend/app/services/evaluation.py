@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
@@ -234,6 +234,14 @@ def evaluate_all(
                 dedupe_key=f"badperiod:{limit.id}",
             )
             continue
+        except Exception as exc:  # noqa: BLE001 - one limit must never block the rest
+            # A failure on one limit (a restore that Checkmarx rejected, a deleted
+            # user, a transient outage) is recorded and the loop moves on. Letting
+            # it propagate would leave every later limit unevaluated, cycle after
+            # cycle, for as long as the one failure persisted.
+            logger.exception("Evaluation of limit %s failed", limit.id)
+            result.errors.append(f"limit {limit.id}: {exc}")
+            continue
         result.evaluated += 1
         result.evaluations.append(evaluation)
 
@@ -361,9 +369,14 @@ def _evaluate_one(
             )
             evaluation.enforced = outcome
             if outcome.applied:
-                state.status = LimitStatus.RESTRICTED
-                state.restricted_at = state.restricted_at or moment
                 result.enforced += len(outcome.applied)
+        # RESTRICTED means "a restriction from this limit is in force for this
+        # period", not "a restriction was newly applied this cycle". Deriving it
+        # from the action rows keeps it true on every later cycle of the period,
+        # which is what rollover, hold-until-released and the dashboards rely on.
+        if _has_active_enforcement(session, limit.id, window.key):
+            state.status = LimitStatus.RESTRICTED
+            state.restricted_at = state.restricted_at or moment
     else:
         # Not breaching the limit. If access was previously restricted (e.g. because credit
         # limit was lower or usage was higher), restore the removed access now that
@@ -499,45 +512,77 @@ def _close_stale_periods(
     ``hold_until_released`` opts out, which is how an admin keeps a restriction in
     place across the boundary until they personally lift it.
     """
+    # The restrictions still in force from earlier periods are whatever action
+    # rows say is APPLIED. The period state's own status is only a label and is
+    # never trusted to decide whether someone gets their access back.
+    restricted_periods = set(
+        session.scalars(
+            select(EnforcementAction.period_key).where(
+                EnforcementAction.limit_id == limit.id,
+                EnforcementAction.period_key != current_key,
+                EnforcementAction.status == EnforcementStatus.APPLIED,
+            )
+        )
+    )
+    open_statuses = [LimitStatus.RESTRICTED, LimitStatus.BREACHED, LimitStatus.WARNED]
     stale = list(
         session.scalars(
             select(LimitPeriodState).where(
                 LimitPeriodState.limit_id == limit.id,
                 LimitPeriodState.period_key != current_key,
-                LimitPeriodState.status.in_(
-                    [LimitStatus.RESTRICTED, LimitStatus.BREACHED, LimitStatus.WARNED]
+                or_(
+                    LimitPeriodState.status.in_(open_statuses),
+                    LimitPeriodState.period_key.in_(restricted_periods),
                 ),
             )
         )
     )
-    if not stale:
-        return
+    states_by_period = {state.period_key: state for state in stale}
 
-    for state in stale:
-        if limit.hold_until_released and state.status == LimitStatus.RESTRICTED:
+    # Every period with a live restriction is handled, whether or not it still
+    # has a state row; then any remaining stale state is simply closed.
+    for period_key in sorted(restricted_periods | set(states_by_period)):
+        state = states_by_period.get(period_key)
+        if period_key not in restricted_periods:
+            if state is not None:
+                state.status = LimitStatus.RESTORED if state.restricted_at else LimitStatus.OK
+            continue
+
+        if limit.hold_until_released:
             logger.info(
                 "Limit %s is held until manually released, keeping period %s restricted",
                 limit.id,
-                state.period_key,
+                period_key,
             )
+            if state is not None:
+                state.status = LimitStatus.RESTRICTED
             continue
-        if state.status == LimitStatus.RESTRICTED and client is not None:
-            try:
-                restored = enforcement.restore_for_limit(
-                    session,
-                    client,
-                    limit_id=limit.id,
-                    period_key=state.period_key,
-                    actor=actor,
-                    reason="period_rollover",
-                )
-            except Exception as exc:  # noqa: BLE001 - one failure must not stop the cycle
-                result.errors.append(f"limit {limit.id}: could not restore after rollover: {exc}")
-                logger.exception("Rollover restore failed for limit %s", limit.id)
-                continue
-            result.restored += restored
+        if client is None:
+            # Nothing can be lifted without a connection. Leave the period marked
+            # restricted so the next connected cycle picks it up, rather than
+            # recording a restore that never happened.
+            if state is not None:
+                state.status = LimitStatus.RESTRICTED
+            continue
+        try:
+            restored = enforcement.restore_for_limit(
+                session,
+                client,
+                limit_id=limit.id,
+                period_key=period_key,
+                actor=actor,
+                reason="period_rollover",
+            )
+        except Exception as exc:  # noqa: BLE001 - one failure must not stop the cycle
+            result.errors.append(f"limit {limit.id}: could not restore after rollover: {exc}")
+            logger.exception("Rollover restore failed for limit %s", limit.id)
+            if state is not None:
+                state.status = LimitStatus.RESTRICTED
+            continue
+        result.restored += restored
+        if state is not None:
             state.restored_at = utcnow()
-        state.status = LimitStatus.RESTORED if state.restricted_at else LimitStatus.OK
+            state.status = LimitStatus.RESTORED
     session.flush()
 
 

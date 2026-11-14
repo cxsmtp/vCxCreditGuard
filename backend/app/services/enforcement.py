@@ -743,11 +743,19 @@ def restore_for_limit(
 
     resolver = RoleResolver(client)
     restored = 0
+    first_error: CheckmarxError | None = None
     for action in list(session.scalars(query)):
-        if restore_action(
-            session, client, action=action, actor=actor, reason=reason, resolver=resolver
-        ):
-            restored += 1
+        # Attempt every action before reporting a failure: one target Checkmarx
+        # rejects (a deleted user, say) must not leave the others restricted.
+        try:
+            if restore_action(
+                session, client, action=action, actor=actor, reason=reason, resolver=resolver
+            ):
+                restored += 1
+        except CheckmarxError as exc:
+            first_error = first_error or exc
+    if first_error is not None:
+        raise first_error
     return restored
 
 

@@ -562,6 +562,106 @@ class TestRollover:
         assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
         assert state_of(db, limit, "2026-08").status == LimitStatus.RESTRICTED
 
+    def _restrict_harsh_for_several_cycles(self, db: Session, **limit_kwargs):
+        """Restrict in August, then run more ordinary August cycles, as production does."""
+        tenant, client = prepare(db)
+        limit = add_limit(
+            db,
+            entity_type=EntityType.USER,
+            entity_id="user-harsh",
+            credit_limit=1,
+            enforce=True,
+            **limit_kwargs,
+        )
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        db.commit()
+        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        ingestion.ingest_usage(db, client)
+        db.commit()
+        for _ in range(3):
+            evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+            db.commit()
+        return tenant, client, limit
+
+    def test_a_restriction_stays_marked_restricted_on_later_cycles(self, db: Session) -> None:
+        _tenant, _client, limit = self._restrict_harsh_for_several_cycles(db)
+        assert state_of(db, limit, "2026-08").status == LimitStatus.RESTRICTED
+
+    def test_rollover_restores_a_restriction_that_lasted_several_cycles(self, db: Session) -> None:
+        # A restriction is applied once and then merely re-verified on every later
+        # cycle. The rollover restore must still happen: before this was driven by
+        # the action rows, the period was labelled "restored" while the roles
+        # stayed removed in Checkmarx for good.
+        tenant, client, limit = self._restrict_harsh_for_several_cycles(db)
+        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+
+        result = evaluation.evaluate_all(db, client=client, now=SEPTEMBER, actor=ACTOR)
+        db.commit()
+
+        assert result.restored == 1
+        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert state_of(db, limit, "2026-08").status == LimitStatus.RESTORED
+
+    def test_hold_until_released_survives_rollover_after_several_cycles(self, db: Session) -> None:
+        tenant, client, limit = self._restrict_harsh_for_several_cycles(
+            db, hold_until_released=True
+        )
+        result = evaluation.evaluate_all(db, client=client, now=SEPTEMBER, actor=ACTOR)
+        db.commit()
+        assert result.restored == 0
+        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert state_of(db, limit, "2026-08").status == LimitStatus.RESTRICTED
+
+    def test_rollover_without_a_connection_is_not_recorded_as_restored(self, db: Session) -> None:
+        tenant, client, limit = self._restrict_harsh_for_several_cycles(db)
+
+        # No client this cycle: nothing can be lifted, so nothing may be claimed.
+        evaluation.evaluate_all(db, client=None, now=SEPTEMBER, actor=ACTOR)
+        db.commit()
+        assert state_of(db, limit, "2026-08").status == LimitStatus.RESTRICTED
+
+        # The next connected cycle lifts it.
+        result = evaluation.evaluate_all(db, client=client, now=SEPTEMBER, actor=ACTOR)
+        db.commit()
+        assert result.restored == 1
+        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+
+
+class TestIsolation:
+    def test_one_failing_restore_does_not_block_other_limits(self, db: Session) -> None:
+        tenant, client = prepare(db)
+        harsh = add_limit(
+            db, entity_type=EntityType.USER, entity_id="user-harsh", credit_limit=1, enforce=True
+        )
+        sean = add_limit(
+            db, entity_type=EntityType.USER, entity_id="user-sean", credit_limit=1, enforce=True
+        )
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        db.commit()
+        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Sean Casey", credits=50, actions={"triage": 50})
+        ingestion.ingest_usage(db, client)
+        db.commit()
+        evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        db.commit()
+        for user_id in ("user-harsh", "user-sean"):
+            assert not any(role in tenant.role_mappings[user_id] for role in AI_ROLE_NAMES)
+
+        # Both budgets are raised, so both restrictions should lift. Checkmarx
+        # rejects every call about the first user (as it would for a deleted one).
+        harsh.credit_limit = 1000
+        sean.credit_limit = 1000
+        db.commit()
+        tenant.fail_paths["/users/user-harsh/role-mappings"] = 404
+
+        result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        db.commit()
+
+        assert any(f"limit {harsh.id}" in error for error in result.errors)
+        # The second limit was still evaluated and its user got access back.
+        assert all(role in tenant.role_mappings["user-sean"] for role in AI_ROLE_NAMES)
+        assert state_of(db, sean).status == LimitStatus.RESTORED
+
 
 class TestLimitChanges:
     def test_switching_to_monitor_only_lifts_the_restriction(self, db: Session) -> None:
