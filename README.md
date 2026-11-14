@@ -80,7 +80,7 @@ schedule or on demand via `POST /api/ops/run-cycle`:
 `POST /api/ops/run-cycle` performs a full sync, ingest, evaluate and enforce pass
 and returns per step statistics, and the GUI drives the same endpoints.
 
-647 tests cover the backend, with every Checkmarx endpoint served by an in-memory
+About 1,000 tests cover the backend, with every Checkmarx endpoint served by an in-memory
 fake tenant (`backend/tests/fake_tenant.py`) that holds mutable state, so tests
 assert on what enforcement actually changed rather than on which calls were made.
 The frontend is type checked with `tsc` on every build.
@@ -268,7 +268,8 @@ make podman-run
 
 Each builds `cxcreditguard:podman`, starts the container, and tails the startup
 log — which prints the initial `admin` credentials on a fresh volume. Then open
-**http://localhost:8000**.
+**http://localhost:8000**. The first sign-in asks for a new password, because
+the printed one stays readable in the log.
 
 The equivalent without the helper scripts:
 
@@ -371,7 +372,8 @@ restore it, and check that a second instance refuses to start.
 ### Updating dependencies
 
 `backend/constraints.txt` pins every Python package the image installs, so two
-builds of the same commit produce the same image. `pyproject.toml` still states
+builds of the same commit install the same Python code (base images and
+operating system packages still follow their tags). `pyproject.toml` still states
 the supported ranges. To move to newer versions:
 
 ```sh
@@ -595,7 +597,7 @@ change behaviour most:
 | `CXCG_SESSION_ABSOLUTE_TTL_HOURS` | 12 | Hard cap regardless of activity. |
 | `CXCG_LOGIN_MAX_ATTEMPTS` | 5 | Failures before lockout, which then backs off exponentially. |
 | `CXCG_CX_TOKEN_REFRESH_MARGIN_SECONDS` | 300 | Refresh the access token this long before it expires. |
-| `CXCG_TRUSTED_PROXY_HOPS` | 0 | How many reverse proxies sit in front of the app. Compose sets it to 1 for the bundled nginx. Add one for each further proxy or load balancer in front of that. Too low and every sign-in appears to come from the proxy; too high and a client can forge its address. |
+| `CXCG_TRUSTED_PROXY_HOPS` | 0 | How many reverse proxies sit in front of the app. Compose sets it to 1 for the bundled nginx. Each further proxy or load balancer in front of that adds one, together with the nginx change in [deploy/nginx/README.md](deploy/nginx/README.md). Too low and every sign-in appears to come from the proxy; too high and a client can forge its address. |
 | `CXCG_CX_ALLOWED_HOSTS` | none | Extra Checkmarx One hostnames to accept. Tenant URLs must be `https` and end in `checkmarx.net`; a dedicated or private host has to be listed here or the connection is refused. |
 | `CXCG_SMTP_CA_FILE` | system CAs | CA bundle used to verify the mail server's certificate, for a server with a private CA. |
 | `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP_DAYS` | 24 / 14 | Compose only: how often the database is dumped and how long dumps are kept. |
@@ -630,8 +632,9 @@ change behaviour most:
    so an attacker cannot lock the owner out), and a per-address limit across all
    usernames. Unknown usernames still incur an Argon2 verification, so response
    timing does not enumerate accounts, and the error message is identical for an
-   unknown user and a wrong password. A password set by someone else (bootstrap
-   or an admin reset) must be changed at first sign-in, and changing how an
+   unknown user and a wrong password. A password chosen by someone else (the
+   bootstrap admin, an account an admin creates) must be changed at first
+   sign-in, and changing how an
    account is protected asks for the password again.
 6b. **The SPA runs under a strict CSP with no inline scripts.** Charts are hand
    written SVG rather than a charting library, so no third party script has to be
@@ -731,9 +734,11 @@ copies working the same database would both evaluate limits and both write to
 the tenant. This is enforced: a second instance pointed at the same database
 logs `Another CxCreditGuard instance is already running against this database`
 and exits. Do not scale the `app` service, and do not run uvicorn with more than
-one worker. Availability comes from `restart: unless-stopped` and the health
-check, not from replicas; the lock is released the moment the first process
-dies, so a restart is never blocked by it. On an orchestrator, use a strategy
+one worker. Availability comes from `restart: unless-stopped`, not from
+replicas. The claim goes with the process that holds it, so a restart is not
+blocked by it; the one exception is an external PostgreSQL whose app host
+vanished without closing its connection, where the database takes up to a
+minute to notice. On an orchestrator, use a strategy
 that stops the old container before starting the new one (Kubernetes:
 `strategy: Recreate`, one replica); a rolling update would wait for ever on a
 new copy that refuses to start while the old one is alive.
@@ -755,17 +760,38 @@ podman compose exec backup sh /usr/local/bin/backup.sh once
 # List them, and copy one off the host. A backup that only exists on the machine
 # it protects is not a backup: schedule this copy to somewhere else.
 podman compose exec backup ls -lh /backups
-podman compose cp backup:/backups/cxcreditguard-20261114T020000Z.dump ./
+podman compose exec -T backup cat /backups/cxcreditguard-20261114T020000Z.dump \
+  > ./cxcreditguard-20261114T020000Z.dump
 ```
 
-To restore, stop the app so nothing writes while the data is replaced:
+The first dump is written once the app has started for the first time; a failed
+dump is retried ten minutes later rather than a day later.
+
+To restore, stop the app so nothing writes while the data is replaced, and use
+the restore script (`latest`, or the path of a dump under `/backups`):
 
 ```sh
 podman compose stop app
-podman compose exec backup sh -c '
-  dropdb --if-exists "$PGDATABASE" && createdb "$PGDATABASE" &&
-  pg_restore --no-owner -d "$PGDATABASE" /backups/cxcreditguard-20261114T020000Z.dump'
+podman compose exec backup sh /usr/local/bin/restore.sh latest
 podman compose start app
+```
+
+The script loads the dump into a new database first and swaps it into place
+only when that has worked. A wrong file name, a damaged dump or a connection
+still open to the database stops it with nothing changed. The database it
+replaced is kept under another name (the script prints it) until you remove
+it, so a restore of the wrong dump can be undone. Once the app is back and the
+data is what you expected:
+
+```sh
+podman compose exec backup dropdb cxcreditguard_before_20261114t020500z
+```
+
+To restore a dump that was copied off the host, put it back first:
+
+```sh
+podman compose exec -T backup sh -c 'cat > /backups/cxcreditguard-20261114T020000Z.dump' \
+  < ./cxcreditguard-20261114T020000Z.dump
 ```
 
 The app migrates the restored database forward on start if the dump came from
@@ -804,7 +830,8 @@ message, first make sure the right key is configured (a restored `.env`, the
 right secret file, no stray whitespace). Only if the key is truly gone:
 
 ```sh
-# Compose: put a NEW key in .env first, then
+# Compose: stop the app, put a NEW key in .env, then
+podman compose stop app
 podman compose run --rm --no-deps app python -m scripts.reset_secrets --yes
 podman compose up -d
 ```
@@ -817,13 +844,13 @@ for every account. Restrictions already in force are unaffected, and Restore
 works again as soon as the connection is re-entered.
 
 There is no in-place key rotation. To change the key deliberately, follow the
-same steps: new key, `reset_secrets`, re-enter the secrets. Rotate the
+same steps: stop the app, new key, `reset_secrets`, start, re-enter the secrets. Rotate the
 Checkmarx API key itself on the Setup page whenever you like; that needs no
 restart.
 
 ### Upgrading
 
-Take a backup, pull or build the new image, `podman compose up -d`. Migrations
+Take a backup, pull the new source, `podman compose up -d --build`. Migrations
 run at start. Coming from a version before the production hardening, check
 these, because each one can stop something that used to work:
 
@@ -835,14 +862,19 @@ these, because each one can stop something that used to work:
   mail server with a private CA needs `CXCG_SMTP_CA_FILE`; a server that only
   offers plain SMTP can still be used, but without a username and password.
 - **Client address.** `CXCG_TRUSTED_PROXY_HOPS` must match your topology (see
-  Configuration). Compose sets 1. If you terminate TLS on a load balancer in
-  front of the bundled nginx, set 2 in `docker-compose.yml`.
+  Configuration). Compose sets 1. If a load balancer sits in front of the
+  bundled nginx, two changes go together: set 2 in `docker-compose.yml`, and
+  make nginx pass the incoming header on, as described in
+  [deploy/nginx/README.md](deploy/nginx/README.md). One without the other makes
+  every user appear to come from a single address.
 - **Webhook URL.** It is now stored encrypted and never shown again after
   saving. Audit entries and configuration backups written by earlier versions may
   still contain the old URL in clear text. If the URL embeds a token (Slack and
   Teams URLs do), create a new webhook and retire the old one.
-- **First sign-in.** Accounts whose password was set by bootstrap or by an admin
-  reset are asked to choose their own before anything else.
+- **First sign-in.** An account whose password was chosen by someone else (the
+  bootstrap admin, an account an admin creates with a password, an account
+  recovered from the command line) is asked to choose its own before anything
+  else.
 - **Automatic approvals.** The auto-approve threshold is now a budget per
   30 days, per entity and per requester, not a size per request. Several small
   requests no longer add up past it.

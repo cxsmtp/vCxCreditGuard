@@ -386,6 +386,9 @@ def bootstrap_admin_if_needed(
             password=password,
             role=UtilityRole.ADMIN,
             actor=AuditActor.system("bootstrap"),
+            # The password came from an environment file or a start-up log,
+            # where it stays readable: it is for the first sign-in only.
+            must_change_password=True,
         )
     except ValueError as exc:
         logger.error(

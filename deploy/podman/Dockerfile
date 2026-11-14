@@ -36,14 +36,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Dependencies first so a source change does not invalidate the install layer.
-# libpq is the only runtime OS package (psycopg's pure-Python mode loads it);
-# the build toolchain goes in a throwaway virtual package and is removed after.
+# libpq is the only runtime OS package; the build toolchain goes in a throwaway
+# virtual package and is removed after.
 # psycopg is installed with its C implementation, compiled against libpq-dev:
 # the pure-Python mode cannot find libpq on Alpine once the toolchain is removed
 # (see backend/Dockerfile). ".[postgres]" is not used because it pulls
 # psycopg[binary], whose wheels are glibc-only (manylinux).
 COPY backend/pyproject.toml backend/constraints.txt ./
-# Python dependency versions are constrained in pyproject.toml, and pinning apk
+# Python dependency versions are pinned in constraints.txt, and pinning apk
 # --no-cache installs to exact versions is fragile across base-image updates.
 # Suppress the KICS unpinned-version findings for this build step.
 # kics-scan ignore-block

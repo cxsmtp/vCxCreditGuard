@@ -26,28 +26,27 @@ import secrets
 import string
 import sys
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.core.passwords import hash_password, validate_password
+from app.core.passwords import PasswordPolicyError, hash_password, validate_password
 from app.db.base import utcnow
 from app.db.session import session_scope
-from app.models.auth import UtilityUser
+from app.models.auth import PasswordResetToken, UtilityUser
 from app.services import auth as auth_service
 from app.services.audit import AuditActor, record_audit
 
 
-def temporary_password() -> str:
-    """A random password that satisfies the policy whatever it currently is."""
+def temporary_password(username: str) -> str:
+    """A random password that passes the password policy for this account."""
     alphabet = string.ascii_letters + string.digits
     while True:
         body = "".join(secrets.choice(alphabet) for _ in range(20))
         candidate = f"{body[:10]}-{body[10:]}"
-        if (
-            any(c.islower() for c in candidate)
-            and any(c.isupper() for c in candidate)
-            and any(c.isdigit() for c in candidate)
-        ):
-            return candidate
+        try:
+            validate_password(candidate, username=username)
+        except PasswordPolicyError:
+            continue  # a random draw can contain the username or a run of repeats
+        return candidate
 
 
 def recover(username: str) -> str | None:
@@ -56,8 +55,7 @@ def recover(username: str) -> str | None:
         user = auth_service.get_user_by_username(session, username)
         if user is None:
             return None
-        password = temporary_password()
-        validate_password(password, username=user.username)
+        password = temporary_password(user.username)
         user.password_hash = hash_password(password)
         user.password_changed_at = utcnow()
         user.must_change_password = True
@@ -66,6 +64,15 @@ def recover(username: str) -> str | None:
         user.totp_secret_encrypted = None
         user.totp_recovery_codes = None
         user.totp_last_step = None
+        user.failed_login_count = 0
+        user.locked_until = None
+        # A reset code issued before this (perhaps to whoever caused the
+        # lockout) must not still be redeemable afterwards.
+        session.execute(
+            update(PasswordResetToken)
+            .where(PasswordResetToken.user_id == user.id, PasswordResetToken.used_at.is_(None))
+            .values(used_at=utcnow())
+        )
         auth_service.clear_login_throttle(session, username=user.username)
         ended = auth_service.revoke_all_sessions(session, user_id=user.id)
         record_audit(

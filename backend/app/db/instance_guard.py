@@ -48,11 +48,16 @@ _holders = 0
 _held: Any = None
 # The claim's connection died and has not been re-established yet.
 _lost = False
+# How often a PostgreSQL claim is checked in the background, and the thread
+# doing it. Without this a claim lost to a database restart would only be
+# noticed at the next cycle, leaving that long for a second instance to start.
+WATCH_INTERVAL_SECONDS = 30.0
+_watch_stop: threading.Event | None = None
 
 
 def acquire(engine: Engine) -> None:
     """Claim the database for this process, or raise :class:`ConfigError`."""
-    global _holders, _held
+    global _holders, _held, _watch_stop
     with _lock:
         if _holders:
             # The same process starting the app again (tests do this).
@@ -60,6 +65,13 @@ def acquire(engine: Engine) -> None:
             return
         if engine.dialect.name == "postgresql":
             _held = _acquire_postgres(engine)
+            _watch_stop = threading.Event()
+            threading.Thread(
+                target=_watch,
+                args=(engine, _watch_stop),
+                name="instance-guard",
+                daemon=True,
+            ).start()
         elif engine.dialect.name == "sqlite":
             _held = _acquire_sqlite(engine)
         else:
@@ -67,8 +79,24 @@ def acquire(engine: Engine) -> None:
         _holders = 1
 
 
+def _watch(engine: Engine, stop: threading.Event) -> None:
+    superseded = False
+    while not stop.wait(WATCH_INTERVAL_SECONDS):
+        try:
+            held = still_held(engine)
+        except Exception:  # noqa: BLE001 - the watcher must outlive any one failure
+            logger.exception("Checking the single-instance claim failed")
+            continue
+        if not held and not superseded:
+            logger.critical(
+                "Another CxCreditGuard instance has taken over this database while this "
+                "one was running. Scheduled cycles are suspended here; stop one of the two."
+            )
+        superseded = not held
+
+
 def release() -> None:
-    global _holders, _held, _lost
+    global _holders, _held, _lost, _watch_stop
     with _lock:
         if not _holders:
             return
@@ -77,6 +105,9 @@ def release() -> None:
             return
         held, _held = _held, None
         _lost = False
+        if _watch_stop is not None:
+            _watch_stop.set()
+            _watch_stop = None
     try:
         if held is not None:
             held.close()
@@ -90,9 +121,10 @@ def still_held(engine: Engine) -> bool:
     A PostgreSQL advisory lock lives exactly as long as its connection. If the
     database restarts, or the network drops that one idle connection, the claim
     is gone while this process carries on, and a second instance could then
-    start. So the scheduler asks before each cycle: a lost claim is taken again,
-    and if another instance holds it by now, this one stops doing scheduled work
-    rather than run alongside it.
+    start. So it is checked every few seconds in the background and again by
+    the scheduler before each cycle: a lost claim is taken again, and if another
+    instance holds it by now, this one stops doing scheduled work rather than
+    run alongside it.
     """
     global _held, _lost
     with _lock:
@@ -128,6 +160,15 @@ def still_held(engine: Engine) -> bool:
 def _acquire_postgres(engine: Engine) -> Any:
     connection = engine.connect()
     try:
+        # This connection sits idle for the life of the process. If the host it
+        # is held from dies without closing it, the server must notice within a
+        # minute rather than hold the claim for the two hours TCP allows.
+        for setting, value in (
+            ("tcp_keepalives_idle", 30),
+            ("tcp_keepalives_interval", 10),
+            ("tcp_keepalives_count", 3),
+        ):
+            connection.execute(text(f"SET {setting} = {value}"))
         claimed = connection.execute(
             text("SELECT pg_try_advisory_lock(:cls, :obj)"),
             {"cls": _PG_LOCK_CLASS, "obj": _PG_LOCK_OBJECT},
@@ -160,6 +201,7 @@ def _acquire_sqlite(engine: Engine) -> Any:
     if not database or database == ":memory:":
         return None
     path = Path(f"{database}.instance.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+")
     try:
         import fcntl
@@ -168,9 +210,20 @@ def _acquire_sqlite(engine: Engine) -> Any:
         return None
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
+    except BlockingIOError as exc:
         handle.close()
         raise ConfigError(_ALREADY_RUNNING) from exc
+    except OSError:
+        # A filesystem that cannot lock at all (some network mounts). Refusing
+        # to start for ever would be worse than running without the check.
+        handle.close()
+        logger.warning(
+            "Could not lock %s, so a second instance against this database would not be "
+            "detected. Run exactly one.",
+            path,
+            exc_info=True,
+        )
+        return None
     handle.seek(0)
     handle.truncate()
     handle.write(f"{os.getpid()}\n")

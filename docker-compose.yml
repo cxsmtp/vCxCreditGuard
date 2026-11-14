@@ -23,10 +23,11 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     logging: *default-logging
-    # Ceilings, not reservations: enough for this workload, and a bound on what
-    # a runaway query or leak can take from the host.
+    # A ceiling, not a reservation: enough for this workload, and a bound on
+    # what a runaway query or leak can take from the host. (No CPU ceiling: the
+    # container runtime refuses to start a container whose ceiling is above the
+    # host's core count, which would make a one-core host a broken install.)
     mem_limit: 1g
-    cpus: 2.0
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-cxcreditguard}
       POSTGRES_USER: ${POSTGRES_USER:-cxcg}
@@ -85,6 +86,7 @@ services:
     entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
     volumes:
       - ./deploy/backup/backup.sh:/usr/local/bin/backup.sh:ro
+      - ./deploy/backup/restore.sh:/usr/local/bin/restore.sh:ro
       - db-backups:/backups
     mem_limit: 256m
     cpus: 0.5
@@ -108,7 +110,6 @@ services:
     # Exactly one app container: the scheduler and its locks live in this one
     # process, and a second instance against the same database refuses to start.
     mem_limit: 1g
-    cpus: 2.0
     depends_on:
       db:
         condition: service_healthy

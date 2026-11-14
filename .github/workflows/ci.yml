@@ -11,6 +11,7 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: backend
@@ -41,7 +42,7 @@ jobs:
 
       - name: Dependency audit
         # Fails the build on a known vulnerable dependency, direct or transitive,
-        # in exactly the set that is installed in the image.
+        # in the pinned set the image is built from (plus the test tools).
         run: python -m pip_audit --strict -r constraints.txt
 
   backend-postgres:
@@ -49,6 +50,7 @@ jobs:
     # PostgreSQL disagree on locking, column widths and constraint names, and
     # every defect of that kind was invisible while only SQLite was tested.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: backend
@@ -89,6 +91,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
@@ -114,6 +117,7 @@ jobs:
     # alone proved nothing - the image once built cleanly while being unable to
     # open a database connection.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -139,3 +143,7 @@ jobs:
       - name: Stop the stack
         if: always()
         run: ./deploy/ci/smoke-test.sh down
+
+      - name: Single-container image
+        # The quick-start image has its own Dockerfile and entrypoint.
+        run: ./deploy/ci/smoke-test.sh single

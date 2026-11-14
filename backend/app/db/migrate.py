@@ -25,6 +25,12 @@ def alembic_config(database_url: str | None = None) -> Config:
     config = Config(str(ALEMBIC_INI))
     config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
     config.set_main_option("sqlalchemy.url", database_url or get_settings().database_url)
+    # Leave logging alone. Left to itself, Alembic's env.py replaces the root
+    # logger's handlers with the ones in alembic.ini - which, in a process that
+    # goes on to serve the app, silently removes the handler that redacts
+    # secrets and drops everything below WARNING. (The `alembic` command line
+    # does not come through here and still gets its own logging.)
+    config.attributes["configure_logger"] = False
     return config
 
 

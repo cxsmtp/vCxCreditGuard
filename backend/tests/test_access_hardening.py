@@ -314,6 +314,31 @@ class TestTracebacksAreRedacted:
         assert secret not in out and jwt not in out
 
 
+class TestMigrationsKeepTheLogHandler:
+    def test_logging_is_still_redacted_and_at_info_after_migrating(
+        self, tmp_path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Migrations run inside the server process at start-up. They used to
+        swap the root log handler for Alembic's own: no redaction, and nothing
+        below WARNING, for the rest of the process's life."""
+        import logging
+
+        from app.core.logging import configure_logging, register_secret, unregister_secret
+        from app.db.migrate import upgrade_to_head
+
+        secret = "s3cr3t-api-key-value-for-logging-9876"
+        register_secret(secret)
+        configure_logging("INFO")
+        try:
+            upgrade_to_head(f"sqlite:///{tmp_path / 'migrated.db'}")
+            logging.getLogger("app.after_migration").info("Connected with %s", secret)
+        finally:
+            unregister_secret(secret)
+        captured = capsys.readouterr()
+        assert "Connected with" in captured.out  # INFO still reaches the log
+        assert secret not in captured.out and secret not in captured.err
+
+
 class TestMasterKeyCheck:
     def test_first_start_records_a_check_value(self, db: Session) -> None:
         from app.models.connection import AppSetting
@@ -912,6 +937,25 @@ class TestResetSecrets:
         master_key.verify_master_key(db)  # and the app can start with the new key
 
 
+class TestBootstrapAdmin:
+    def test_the_password_from_the_environment_is_for_the_first_sign_in_only(
+        self, client: TestClient, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It sits in an .env file or a start-up log, readable long afterwards."""
+        monkeypatch.setenv("CXCG_BOOTSTRAP_ADMIN_USERNAME", "firstadmin")
+        monkeypatch.setenv("CXCG_BOOTSTRAP_ADMIN_PASSWORD", ADMIN_PASSWORD)
+        reset_settings_cache()
+        user = auth_service.bootstrap_admin_if_needed(db)
+        db.commit()
+        assert user is not None and user.must_change_password is True
+
+        signed_in = client.post(
+            "/api/auth/login", json={"username": "firstadmin", "password": ADMIN_PASSWORD}
+        )
+        assert signed_in.json()["must_change_password"] is True
+        assert client.get("/api/limits").status_code == 403
+
+
 class TestRecoverAdmin:
     def test_the_only_admin_gets_back_in_with_a_temporary_password(
         self,
@@ -1034,6 +1078,24 @@ class TestSingleInstance:
         # The claim goes with the process that held it: its replacement starts.
         instance_guard.acquire(get_engine())
         instance_guard.release()
+
+    def test_a_filesystem_that_cannot_lock_does_not_stop_the_app(
+        self, db: Session, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only "someone else holds it" means a second instance. A mount that
+        cannot lock at all must not look like one, for ever."""
+        import fcntl
+
+        from sqlalchemy import create_engine
+
+        from app.db import instance_guard
+
+        def unsupported(*_args: object) -> None:
+            raise OSError(95, "Operation not supported")
+
+        monkeypatch.setattr(fcntl, "flock", unsupported)
+        engine = create_engine(f"sqlite:///{tmp_path / 'sub' / 'x.db'}")
+        assert instance_guard._acquire_sqlite(engine) is None
 
     def test_starting_the_app_twice_in_one_process_is_allowed(self, db: Session) -> None:
         from app.db import instance_guard
