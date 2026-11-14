@@ -33,3 +33,8 @@ backend/app/static/
 Thumbs.db
 .idea/
 .vscode/
+
+# TLS material and logs never belong in the repository
+*.pem
+deploy/nginx/certs/
+*.log

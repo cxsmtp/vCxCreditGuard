@@ -9,6 +9,8 @@ replayed into a column read with another purpose (say an SMTP password).
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import os
 from typing import Final
 
@@ -27,7 +29,10 @@ KEY_BYTES: Final = 32
 PURPOSE_CX_API_KEY: Final = "cx-api-key"
 PURPOSE_SMTP_PASSWORD: Final = "smtp-password"
 PURPOSE_WEBHOOK_SECRET: Final = "webhook-secret"
+PURPOSE_WEBHOOK_URL: Final = "webhook-url"
 PURPOSE_TOTP_SECRET: Final = "totp-secret"
+PURPOSE_KEY_CHECK: Final = "master-key-check"
+PURPOSE_RECOVERY_CODE: Final = "totp-recovery-code"
 
 
 class DecryptionError(RuntimeError):
@@ -65,6 +70,14 @@ class SecretBox:
         aesgcm = AESGCM(self._derive(purpose))
         ciphertext = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), purpose.encode("utf-8"))
         return f"{TOKEN_VERSION}.{_b64e(nonce)}.{_b64e(ciphertext)}"
+
+    def digest(self, value: str, *, purpose: str) -> str:
+        """A keyed digest (HMAC-SHA-256) of a short secret, for lookup by equality.
+
+        Unlike a plain hash, it cannot be attacked offline from a copy of the
+        database alone: the master key is needed to test a guess.
+        """
+        return hmac.new(self._derive(purpose), value.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def decrypt(self, token: str, *, purpose: str) -> str:
         try:

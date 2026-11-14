@@ -41,16 +41,40 @@ ADMIN_PASSWORD = "Str0ng!Adm1n#Pass"
 VIEWER_PASSWORD = "Str0ng!V1ewer#Pass"
 
 
+# Set CXCG_TEST_DATABASE_URL to run the whole suite against a real PostgreSQL
+# database instead of a per-test SQLite file, for example
+#   CXCG_TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost/cxcg_test
+# The database must exist and be disposable: its public schema is dropped and
+# recreated before every test. CI runs the suite both ways, because the two
+# engines disagree on exactly the things that matter here (locking, column
+# widths, constraint names).
+TEST_DATABASE_URL = os.environ.get("CXCG_TEST_DATABASE_URL", "").strip()
+USING_SQLITE = not TEST_DATABASE_URL
+
+sqlite_only = pytest.mark.skipif(
+    not USING_SQLITE, reason="observes SQLite's single-writer lock directly"
+)
+postgres_only = pytest.mark.skipif(USING_SQLITE, reason="needs CXCG_TEST_DATABASE_URL")
+
+
 @pytest.fixture(autouse=True)
 def isolated_environment(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    db_file = tmp_path / "test.db"
-    monkeypatch.setenv("CXCG_DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
+    if USING_SQLITE:
+        db_file = tmp_path / "test.db"
+        monkeypatch.setenv("CXCG_DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
+    else:
+        monkeypatch.setenv("CXCG_DATABASE_URL", TEST_DATABASE_URL)
     reset_settings_cache()
     crypto.reset_secret_box()
     db_session.reset_engine()
     connection_service.reset_client_cache()
 
-    Base.metadata.create_all(db_session.get_engine())
+    engine = db_session.get_engine()
+    if not USING_SQLITE:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
+            connection.exec_driver_sql("CREATE SCHEMA public")
+    Base.metadata.create_all(engine)
     yield
     db_session.reset_engine()
     connection_service.reset_client_cache()

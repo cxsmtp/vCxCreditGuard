@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
@@ -52,7 +52,7 @@ from app.models.enums import (
 )
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
 from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
-from app.services import enforcement, ingestion, notifications
+from app.services import enforcement, ingestion, notifications, settings_store
 from app.services.audit import AuditActor, record_audit
 from app.services.periods import PeriodError, PeriodWindow, current_window, describe_window
 
@@ -83,6 +83,11 @@ class EvaluationResult:
     monitor_only: int = 0
     restored: int = 0
     unavailable: int = 0
+    # Breached, enforcing limits whose restriction was not applied because
+    # enforcement is paused (by an admin, or by the safety ceiling).
+    deferred: int = 0
+    # Why new restrictions are not being applied this cycle, or None if they are.
+    enforcement_paused: str | None = None
     errors: list[str] = field(default_factory=list)
     evaluations: list[LimitEvaluation] = field(default_factory=list)
 
@@ -95,6 +100,8 @@ class EvaluationResult:
             "monitor_only": self.monitor_only,
             "restored": self.restored,
             "usage_unavailable": self.unavailable,
+            "deferred": self.deferred,
+            "enforcement_paused": self.enforcement_paused,
             "errors": self.errors,
         }
 
@@ -207,8 +214,37 @@ def evaluate_all(
     index = UsageIndex(session)
     resolver = enforcement.RoleResolver(client) if client is not None else None
 
-    limits = list(session.scalars(select(CreditLimit).where(CreditLimit.is_active.is_(True))))
-    for limit in limits:
+    if client is not None:
+        _lift_unjustified_restrictions(session, client, actor=actor, result=result)
+        # Decided once, before anything is restricted: either the whole cycle
+        # may apply new restrictions or none of it may. Giving access back is
+        # never held up by this.
+        try:
+            result.enforcement_paused = _enforcement_hold(session, moment=moment, actor=actor)
+        except Exception as exc:  # noqa: BLE001 - the safety check failing must fail safe
+            session.rollback()
+            logger.exception("The enforcement safety check failed")
+            result.enforcement_paused = (
+                "The safety check could not be completed this cycle, so no new restriction "
+                "was applied."
+            )
+            result.errors.append(f"enforcement safety check: {exc}")
+
+    limit_ids = list(
+        session.scalars(
+            select(CreditLimit.id).where(CreditLimit.is_active.is_(True)).order_by(CreditLimit.id)
+        )
+    )
+    for limit_id in limit_ids:
+        # Re-read at the start of each limit's own transaction: an admin may have
+        # edited, disabled or deleted it while earlier limits were being worked on.
+        limit = session.get(CreditLimit, limit_id, populate_existing=True)
+        if limit is None or not limit.is_active:
+            continue
+        if client is not None and result.enforcement_paused is None:
+            # An admin can press Pause while a cycle is running. It takes effect
+            # from the next limit, not from the next cycle.
+            result.enforcement_paused = _manual_pause(session)
         try:
             evaluation = _evaluate_one(
                 session,
@@ -219,9 +255,11 @@ def evaluate_all(
                 actor=actor,
                 resolver=resolver,
                 result=result,
+                hold=result.enforcement_paused,
             )
         except PeriodError as exc:
-            result.errors.append(f"limit {limit.id}: {exc}")
+            session.rollback()
+            result.errors.append(f"limit {limit_id}: {exc}")
             notifications.notify(
                 session,
                 category=notifications.CATEGORY_SYNC_ERROR,
@@ -231,14 +269,255 @@ def evaluate_all(
                 entity_type=limit.entity_type,
                 entity_id=limit.entity_id,
                 entity_label=limit.entity_label,
-                dedupe_key=f"badperiod:{limit.id}",
+                dedupe_key=f"badperiod:{limit_id}",
             )
+            session.commit()
             continue
+        except Exception as exc:  # noqa: BLE001 - one limit must never block the rest
+            # A failure on one limit (a restore that Checkmarx rejected, a deleted
+            # user, a transient outage) is recorded and the loop moves on. Letting
+            # it propagate would leave every later limit unevaluated, cycle after
+            # cycle, for as long as the one failure persisted. The rollback clears
+            # whatever that limit left half-written so the next one starts clean.
+            session.rollback()
+            logger.exception("Evaluation of limit %s failed", limit_id)
+            result.errors.append(f"limit {limit_id}: {exc}")
+            continue
+        # One short transaction per limit: its state is durable before the next
+        # limit starts talking to Checkmarx, and no lock outlives its own work.
+        session.commit()
         result.evaluated += 1
         result.evaluations.append(evaluation)
 
-    session.flush()
     return result
+
+
+def _manual_pause(session: Session) -> str | None:
+    """The pause reason if enforcement is paused right now, else None."""
+    guard = settings_store.enforcement_guard(session)
+    if not guard.paused:
+        return None
+    return guard.pause_reason or "Paused by an administrator."
+
+
+def _enforcement_hold(session: Session, *, moment: datetime, actor: AuditActor) -> str | None:
+    """Why no new restriction may be applied this cycle, or None if they may.
+
+    Two things hold enforcement: an admin pausing it, and the safety ceilings.
+    The ceilings are on how much may *start* being restricted in a single cycle,
+    counted both in limits and in the users and projects they would restrict.
+    People run out of budget one at a time; dozens of limits tipping over in the
+    same few minutes, or one limit taking hundreds of projects with it, is what
+    a bad usage read, a mis-imported file or a wrong period looks like. When
+    that happens nothing at all is restricted, and enforcement stays paused
+    until an admin has looked and resumed it. Resuming lets that batch through
+    once; the ceilings apply again from the following cycle.
+    """
+    guard = settings_store.enforcement_guard(session)
+    if guard.paused:
+        return guard.pause_reason or "Paused by an administrator."
+    if guard.ceiling_waived_once:
+        settings_store.set_value(session, settings_store.KEY_CEILING_WAIVED_ONCE, False)
+        session.commit()
+        return None
+    if guard.max_new_per_cycle <= 0 and guard.max_new_targets_per_cycle <= 0:
+        return None
+
+    limits_starting, targets_starting = _about_to_start_restricting(session, moment)
+    over_limits = 0 < guard.max_new_per_cycle < len(limits_starting)
+    over_targets = 0 < guard.max_new_targets_per_cycle < len(targets_starting)
+    if not over_limits and not over_targets:
+        return None
+
+    examples = ", ".join(limits_starting[:5]) + ("..." if len(limits_starting) > 5 else "")
+    what = (
+        f"{len(limits_starting)} limits were about to start restricting in one cycle, more "
+        f"than the safety ceiling of {guard.max_new_per_cycle}"
+        if over_limits
+        else (
+            f"{len(targets_starting)} users and projects were about to be restricted in one "
+            f"cycle, more than the safety ceiling of {guard.max_new_targets_per_cycle}"
+        )
+    )
+    reason = f"Stopped automatically: {what}. Nothing was restricted."
+    settings_store.set_value(session, settings_store.KEY_ENFORCEMENT_PAUSED, True)
+    settings_store.set_value(session, settings_store.KEY_ENFORCEMENT_PAUSE_REASON, reason)
+    notifications.notify(
+        session,
+        category=notifications.CATEGORY_ENFORCEMENT,
+        severity=Severity.CRITICAL,
+        title="Enforcement paused: too much was about to be restricted at once",
+        body=(
+            f"{reason}\n\nLimits affected: {examples}\n\nCheck the Simulation page: if "
+            "the figures are wrong (a bad usage read, a wrong period, a mistaken import), "
+            "fix that first. If they are right, resume enforcement on the Settings page: "
+            "that lets this batch through, and the ceilings apply again afterwards. Access "
+            "that is already restricted stays restricted, and restrictions that are no "
+            "longer justified are still lifted."
+        ),
+        # Each trip is news: it can only happen again after an admin resumed.
+        dedupe_key=f"breaker:{moment.isoformat(timespec='seconds')}",
+    )
+    record_audit(
+        session,
+        action="enforcement.paused",
+        actor=actor,
+        target_type="settings",
+        after={
+            "limits_about_to_restrict": len(limits_starting),
+            "targets_about_to_be_restricted": len(targets_starting),
+            "limit_ceiling": guard.max_new_per_cycle,
+            "target_ceiling": guard.max_new_targets_per_cycle,
+        },
+        detail=reason,
+    )
+    session.commit()
+    logger.error(reason)
+    return reason
+
+
+def _starting_targets(
+    session: Session, limit_id: int, period_key: str, targets: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """The (kind, target id) pairs this limit would newly restrict.
+
+    "Newly" means the cycle would really change something for it: there is no
+    action yet for this limit, period and target, or the last one was lifted
+    automatically and would be re-applied. A target an admin restored this
+    period, one that is already restricted, and one that was tried and not
+    restricted (protected, refused by Checkmarx, deliberately left alone) are
+    not new - counting those would trip the ceiling on every cycle for ever.
+    """
+    if not targets:
+        return []
+    existing = {
+        action.idempotency_key: action
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.limit_id == limit_id,
+                EnforcementAction.period_key == period_key,
+            )
+        )
+    }
+    starting: list[tuple[str, str]] = []
+    for kind, target_id in targets:
+        action = existing.get(
+            enforcement.idempotency_key(
+                limit_id=limit_id, period_key=period_key, kind=kind, target_id=target_id
+            )
+        )
+        if action is None or (
+            action.status == EnforcementStatus.REVERSED
+            and action.reversal_reason != enforcement.ADMIN_REASON
+        ):
+            starting.append((kind, target_id))
+    return starting
+
+
+def _would_start_restricting(session: Session, limit: CreditLimit, period_key: str) -> bool:
+    targets = [
+        (str(target.kind), target.target_id)
+        for target in enforcement.plan_targets(
+            session, entity_type=limit.entity_type, entity_id=limit.entity_id
+        )
+    ]
+    return bool(_starting_targets(session, limit.id, period_key, targets))
+
+
+def _about_to_start_restricting(session: Session, moment: datetime) -> tuple[list[str], set[str]]:
+    """What this cycle would newly restrict: limit labels, and distinct targets."""
+    from app.services import preview_service
+
+    limits_starting: list[str] = []
+    targets_starting: set[str] = set()
+    for row in preview_service.dry_run(session, now=moment).rows:
+        if not row.would_enforce or row.blast is None or row.period_key is None:
+            continue
+        starting = _starting_targets(
+            session,
+            row.limit_id,
+            row.period_key,
+            [(target.kind, target.target_id) for target in row.blast.targets],
+        )
+        if starting:
+            limits_starting.append(row.entity_label or row.entity_id)
+            targets_starting.update(target_id for _kind, target_id in starting)
+    return limits_starting, targets_starting
+
+
+def _lift_unjustified_restrictions(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    actor: AuditActor,
+    result: EvaluationResult,
+) -> None:
+    """Give back access that nothing justifies withholding any more.
+
+    A restriction is lifted the moment its limit is disabled, deleted or switched
+    to monitor only, or its entity is exempted. If Checkmarx was unreachable at
+    that moment the change still stands, and this is what completes it: every
+    cycle looks for restrictions whose reason has gone and lifts them. Without it
+    such a restriction would stay until someone noticed and pressed Restore.
+    """
+    actions = [
+        action
+        for action in session.scalars(
+            select(EnforcementAction)
+            .where(EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES))
+            .order_by(EnforcementAction.id)
+        )
+        if enforcement.may_be_in_force(action)
+    ]
+    if not actions:
+        return
+    resolver = enforcement.RoleResolver(client)
+    harmless_limits: dict[int, CreditLimit] = {}
+    for action in actions:
+        limit = session.get(CreditLimit, action.limit_id) if action.limit_id else None
+        if limit is not None and (not limit.is_active or not limit.enforce):
+            # Handled per limit below, so its period state is updated too.
+            harmless_limits[limit.id] = limit
+            continue
+        if action.reversal_reason == enforcement.ADMIN_REASON:
+            # An admin's Restore that did not finish (Checkmarx was unreachable,
+            # or the process stopped): complete it.
+            reason = enforcement.ADMIN_REASON
+        elif limit is None:
+            reason = "limit_removed"
+        elif enforcement.is_exempt(
+            session, entity_type=action.entity_type, entity_id=action.entity_id
+        ):
+            reason = enforcement.EXEMPTED_REASON
+        else:
+            # The target itself has become exempt or protected (rather than the
+            # limit's own entity): a project exempted while its application's
+            # limit restricts it, a user given an administrator role.
+            released = enforcement.target_released(session, action)
+            if released is None:
+                continue
+            reason = released
+        action_id = action.id
+        try:
+            if enforcement.restore_action(
+                session, client, action=action, actor=actor, reason=reason, resolver=resolver
+            ):
+                result.restored += 1
+        except Exception as exc:  # noqa: BLE001 - one stuck restore must not stop the cycle
+            session.rollback()
+            logger.warning("Could not lift restriction %s: %s", action_id, exc)
+            result.errors.append(f"restore {action_id}: {exc}")
+
+    for limit_id, limit in harmless_limits.items():
+        try:
+            result.restored += restore_on_limit_change(
+                session, client, limit=limit, actor=actor, reason="limit_removed"
+            )
+            session.commit()
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            logger.warning("Could not lift the restrictions of limit %s: %s", limit_id, exc)
+            result.errors.append(f"limit {limit_id}: {exc}")
 
 
 def _evaluate_one(
@@ -251,6 +530,7 @@ def _evaluate_one(
     actor: AuditActor,
     resolver: enforcement.RoleResolver | None,
     result: EvaluationResult,
+    hold: str | None = None,
 ) -> LimitEvaluation:
     window = current_window(limit, moment)
     reported_total, available = index.reported_total(limit)
@@ -342,7 +622,7 @@ def _evaluate_one(
             state.breached_at = moment
             evaluation.newly_breached = True
             result.breached += 1
-            _notify_breach(session, limit, state, window, exempt=exempt)
+            _notify_breach(session, limit, state, window, exempt=exempt, paused=hold is not None)
         if exempt:
             evaluation.note = "Exempt from enforcement."
         elif not limit.enforce:
@@ -350,6 +630,12 @@ def _evaluate_one(
             evaluation.note = "Monitor only, no action taken."
         elif client is None:
             evaluation.note = "No Checkmarx connection available, enforcement deferred."
+        elif hold is not None:
+            # Nothing new is restricted, and existing restrictions are left as
+            # they are (not re-asserted) until enforcement resumes.
+            evaluation.note = f"Enforcement is paused, so no restriction was applied. {hold}"
+            if _would_start_restricting(session, limit, window.key):
+                result.deferred += 1
         else:
             outcome = enforcement.apply_enforcement(
                 session,
@@ -361,9 +647,14 @@ def _evaluate_one(
             )
             evaluation.enforced = outcome
             if outcome.applied:
-                state.status = LimitStatus.RESTRICTED
-                state.restricted_at = state.restricted_at or moment
                 result.enforced += len(outcome.applied)
+        # RESTRICTED means "a restriction from this limit is in force for this
+        # period", not "a restriction was newly applied this cycle". Deriving it
+        # from the action rows keeps it true on every later cycle of the period,
+        # which is what rollover, hold-until-released and the dashboards rely on.
+        if _has_active_enforcement(session, limit.id, window.key):
+            state.status = LimitStatus.RESTRICTED
+            state.restricted_at = state.restricted_at or moment
     else:
         # Not breaching the limit. If access was previously restricted (e.g. because credit
         # limit was lower or usage was higher), restore the removed access now that
@@ -499,45 +790,79 @@ def _close_stale_periods(
     ``hold_until_released`` opts out, which is how an admin keeps a restriction in
     place across the boundary until they personally lift it.
     """
+    # The restrictions still in force from earlier periods are whatever action
+    # rows say is APPLIED. The period state's own status is only a label and is
+    # never trusted to decide whether someone gets their access back.
+    restricted_periods = {
+        action.period_key
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.limit_id == limit.id,
+                EnforcementAction.period_key != current_key,
+                EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES),
+            )
+        )
+        if enforcement.may_be_in_force(action)
+    }
+    open_statuses = [LimitStatus.RESTRICTED, LimitStatus.BREACHED, LimitStatus.WARNED]
     stale = list(
         session.scalars(
             select(LimitPeriodState).where(
                 LimitPeriodState.limit_id == limit.id,
                 LimitPeriodState.period_key != current_key,
-                LimitPeriodState.status.in_(
-                    [LimitStatus.RESTRICTED, LimitStatus.BREACHED, LimitStatus.WARNED]
+                or_(
+                    LimitPeriodState.status.in_(open_statuses),
+                    LimitPeriodState.period_key.in_(restricted_periods),
                 ),
             )
         )
     )
-    if not stale:
-        return
+    states_by_period = {state.period_key: state for state in stale}
 
-    for state in stale:
-        if limit.hold_until_released and state.status == LimitStatus.RESTRICTED:
+    # Every period with a live restriction is handled, whether or not it still
+    # has a state row; then any remaining stale state is simply closed.
+    for period_key in sorted(restricted_periods | set(states_by_period)):
+        state = states_by_period.get(period_key)
+        if period_key not in restricted_periods:
+            if state is not None:
+                state.status = LimitStatus.RESTORED if state.restricted_at else LimitStatus.OK
+            continue
+
+        if limit.hold_until_released:
             logger.info(
                 "Limit %s is held until manually released, keeping period %s restricted",
                 limit.id,
-                state.period_key,
+                period_key,
             )
+            if state is not None:
+                state.status = LimitStatus.RESTRICTED
             continue
-        if state.status == LimitStatus.RESTRICTED and client is not None:
-            try:
-                restored = enforcement.restore_for_limit(
-                    session,
-                    client,
-                    limit_id=limit.id,
-                    period_key=state.period_key,
-                    actor=actor,
-                    reason="period_rollover",
-                )
-            except Exception as exc:  # noqa: BLE001 - one failure must not stop the cycle
-                result.errors.append(f"limit {limit.id}: could not restore after rollover: {exc}")
-                logger.exception("Rollover restore failed for limit %s", limit.id)
-                continue
-            result.restored += restored
+        if client is None:
+            # Nothing can be lifted without a connection. Leave the period marked
+            # restricted so the next connected cycle picks it up, rather than
+            # recording a restore that never happened.
+            if state is not None:
+                state.status = LimitStatus.RESTRICTED
+            continue
+        try:
+            restored = enforcement.restore_for_limit(
+                session,
+                client,
+                limit_id=limit.id,
+                period_key=period_key,
+                actor=actor,
+                reason="period_rollover",
+            )
+        except Exception as exc:  # noqa: BLE001 - one failure must not stop the cycle
+            result.errors.append(f"limit {limit.id}: could not restore after rollover: {exc}")
+            logger.exception("Rollover restore failed for limit %s", limit.id)
+            if state is not None:
+                state.status = LimitStatus.RESTRICTED
+            continue
+        result.restored += restored
+        if state is not None:
             state.restored_at = utcnow()
-        state.status = LimitStatus.RESTORED if state.restricted_at else LimitStatus.OK
+            state.status = LimitStatus.RESTORED
     session.flush()
 
 
@@ -581,12 +906,20 @@ def _notify_breach(
     window: PeriodWindow,
     *,
     exempt: bool,
+    paused: bool = False,
 ) -> None:
     entity = limit.entity_label or limit.entity_id
     if exempt:
         tail = "This entity is on the exemption list, so no action was taken."
         severity = Severity.WARNING
         dedupe = notifications.monitor_only_key(limit.id, window.key)
+    elif limit.enforce and paused:
+        tail = (
+            "This limit enforces, but enforcement is paused, so nothing has been "
+            "restricted. It will be once enforcement is resumed, if still over."
+        )
+        severity = Severity.CRITICAL
+        dedupe = notifications.breach_key(limit.id, window.key)
     elif limit.enforce:
         tail = "Enforcement is on, so access is being restricted now."
         severity = Severity.CRITICAL

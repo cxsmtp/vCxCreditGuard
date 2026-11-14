@@ -11,6 +11,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import OperationalError
 
 from app import __version__, scheduler
 from app.api.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
@@ -23,15 +24,22 @@ from app.api.routes import (
     limits,
     notifications,
     ops,
+    preview,
+    reports,
+    requests,
 )
 from app.api.routes import (
     settings as settings_routes,
 )
 from app.core.config import ConfigError, Settings, get_settings
 from app.core.logging import configure_logging
+from app.db import instance_guard
 from app.db.migrate import upgrade_to_head
-from app.db.session import session_scope
+from app.db.session import get_engine, session_scope
+from app.services import connection as connection_service
+from app.services import settings_store
 from app.services.auth import bootstrap_admin_if_needed
+from app.services.master_key import verify_master_key
 
 logger = logging.getLogger(__name__)
 
@@ -44,20 +52,39 @@ def _startup(settings: Settings) -> None:
     settings.master_key_bytes()
     upgrade_to_head(settings.database_url)
     with session_scope() as db:
+        # ...and with the wrong key it would look just as healthy while every
+        # cycle failed to read the Checkmarx API key.
+        verify_master_key(db)
+        settings_store.encrypt_legacy_secrets(db)
+        connection_service.warn_if_untrusted(db)
         bootstrap_admin_if_needed(db, settings)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
-    _startup(settings)
-    if app.state.run_scheduler:
-        scheduler.start()
-    logger.info("CxCreditGuard %s started in %s mode", __version__, settings.env)
-    yield
-    if app.state.run_scheduler:
-        scheduler.shutdown()
-    logger.info("CxCreditGuard shutting down")
+    # One instance per database, claimed before anything else touches it.
+    try:
+        instance_guard.acquire(get_engine())
+    except ConfigError as exc:
+        logger.critical("CxCreditGuard cannot start: %s", exc)
+        raise
+    try:
+        try:
+            _startup(settings)
+        except ConfigError as exc:
+            # Said plainly, on its own line, before the server's traceback.
+            logger.critical("CxCreditGuard cannot start: %s", exc)
+            raise
+        if app.state.run_scheduler:
+            scheduler.start()
+        logger.info("CxCreditGuard %s started in %s mode", __version__, settings.env)
+        yield
+        if app.state.run_scheduler:
+            scheduler.shutdown()
+        logger.info("CxCreditGuard shutting down")
+    finally:
+        instance_guard.release()
 
 
 def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) -> FastAPI:
@@ -102,6 +129,9 @@ def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) 
     api.include_router(connection.router)
     api.include_router(limits.router)
     api.include_router(limits.exemptions_router)
+    api.include_router(preview.router)
+    api.include_router(reports.router)
+    api.include_router(requests.router)
     api.include_router(notifications.router)
     api.include_router(ops.router)
     api.include_router(settings_routes.router)
@@ -121,6 +151,31 @@ def _register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": {"code": "misconfigured", "message": str(exc)}},
+        )
+
+    @app.exception_handler(OperationalError)
+    async def _database_busy(request: Request, exc: OperationalError) -> JSONResponse:
+        # A lock or statement timeout, or the database being briefly unreachable.
+        # That is "try again in a moment", not a fault in the request, so it gets
+        # a 503 with Retry-After rather than an opaque 500.
+        request_id = getattr(request.state, "request_id", "unknown")
+        logger.warning(
+            "Database busy or unavailable on %s %s (request %s): %s",
+            request.method,
+            request.url.path,
+            request_id,
+            str(exc.orig).splitlines()[0] if exc.orig else exc,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "5"},
+            content={
+                "detail": {
+                    "code": "database_busy",
+                    "message": "The service is busy. Please try again in a few seconds.",
+                    "request_id": request_id,
+                }
+            },
         )
 
     @app.exception_handler(Exception)

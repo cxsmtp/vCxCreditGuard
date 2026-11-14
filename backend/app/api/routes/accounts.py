@@ -8,9 +8,16 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import AdminUser, DbSession
 from app.core.passwords import PasswordPolicyError
+from app.db.base import utcnow
 from app.models.auth import UtilityUser
 from app.models.enums import UtilityRole
-from app.schemas.auth import CreateUserRequest, MessageResponse, UpdateUserRequest, UserSummary
+from app.schemas.auth import (
+    AdminResetResponse,
+    CreateUserRequest,
+    MessageResponse,
+    UpdateUserRequest,
+    UserSummary,
+)
 from app.services import auth as auth_service
 from app.services.audit import record_audit
 
@@ -124,6 +131,72 @@ def update_account(
     return _to_summary(user)
 
 
+@router.post("/{user_id}/reset-password", response_model=AdminResetResponse)
+def admin_reset_password(user_id: int, ctx: AdminUser, db: DbSession) -> AdminResetResponse:
+    """Issue a one-time reset token for a user and return it to the admin.
+
+    For deployments without email, or when a user cannot receive the self-service
+    mail, an admin hands this code to the user out of band; the user redeems it on
+    the sign-in page. The token is shown once and only its digest is stored.
+    """
+    user = db.get(UtilityUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such account.")
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "inactive", "message": "Re-enable the account before resetting it."},
+        )
+    if user.id == ctx.user.id:
+        # A reset code for your own account would let a session alone - someone
+        # at an unlocked screen, a stolen cookie - set a new password without
+        # knowing the old one.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "own_account",
+                "message": "Change your own password on the Account page, with your current one.",
+            },
+        )
+    token = auth_service.admin_issue_reset_token(db, user=user, actor=ctx.actor)
+    expires_at = utcnow() + auth_service.PASSWORD_RESET_TTL
+    db.commit()
+    return AdminResetResponse(reset_token=token, expires_at=expires_at)
+
+
+@router.post("/{user_id}/totp/reset", response_model=MessageResponse)
+def reset_totp(user_id: int, ctx: AdminUser, db: DbSession) -> MessageResponse:
+    """Turn off two factor authentication for someone who has lost their device.
+
+    Their sessions are ended and their recovery codes discarded; they sign in with
+    their password and can enrol a new authenticator.
+    """
+    user = db.get(UtilityUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such account.")
+    if user.id == ctx.user.id:
+        # Turning off your own second factor needs your password (Account page).
+        # Allowing it here would let a session alone remove it.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "own_account",
+                "message": (
+                    "Turn off your own two factor on the Account page. If you have lost "
+                    "your device, use a recovery code or ask another administrator."
+                ),
+            },
+        )
+    if not user.totp_enabled and not user.totp_secret_encrypted:
+        return MessageResponse(
+            message=f"Two factor authentication is not enabled for {user.username}."
+        )
+    auth_service.disable_totp(db, user=user, actor=ctx.actor, action="account.totp_reset")
+    auth_service.revoke_all_sessions(db, user_id=user.id)
+    db.commit()
+    return MessageResponse(message=f"Two factor authentication reset for {user.username}.")
+
+
 @router.post("/{user_id}/unlock", response_model=MessageResponse)
 def unlock_account(user_id: int, ctx: AdminUser, db: DbSession) -> MessageResponse:
     user = db.get(UtilityUser, user_id)
@@ -132,6 +205,9 @@ def unlock_account(user_id: int, ctx: AdminUser, db: DbSession) -> MessageRespon
     before = {"locked_until": user.locked_until, "failed_login_count": user.failed_login_count}
     user.locked_until = None
     user.failed_login_count = 0
+    # Also forget the per-address lockouts, or the account would look unlocked
+    # while its owner still could not sign in from the address that failed.
+    auth_service.clear_login_throttle(db, username=user.username)
     db.flush()
     record_audit(
         db,

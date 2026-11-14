@@ -291,7 +291,7 @@ def upgrade() -> None:
             ondelete="SET NULL",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_credit_limit")),
-        sa.UniqueConstraint("entity_type", "entity_id", name="entity"),
+        sa.UniqueConstraint("entity_type", "entity_id", name="uq_credit_limit_entity"),
     )
     with op.batch_alter_table("credit_limit", schema=None) as batch_op:
         batch_op.create_index(batch_op.f("ix_credit_limit_entity_id"), ["entity_id"], unique=False)
@@ -392,7 +392,7 @@ def upgrade() -> None:
             ondelete="SET NULL",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_exemption")),
-        sa.UniqueConstraint("entity_type", "entity_id", name="entity"),
+        sa.UniqueConstraint("entity_type", "entity_id", name="uq_exemption_entity"),
     )
     with op.batch_alter_table("exemption", schema=None) as batch_op:
         batch_op.create_index(batch_op.f("ix_exemption_entity_id"), ["entity_id"], unique=False)

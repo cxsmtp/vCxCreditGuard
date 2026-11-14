@@ -18,8 +18,9 @@ from sqlalchemy.orm import Session
 from app.checkmarx.apikey import ParsedApiKey, parse_api_key
 from app.checkmarx.client import CheckmarxClient
 from app.checkmarx.errors import CheckmarxError, NotConfiguredError
-from app.checkmarx.regions import derive_api_base_url, normalise_api_base_url
+from app.checkmarx.regions import check_tenant_url, derive_api_base_url, normalise_api_base_url
 from app.checkmarx.token import TokenManager
+from app.core.config import get_settings
 from app.core.crypto import PURPOSE_CX_API_KEY, get_secret_box
 from app.core.logging import register_secret
 from app.db.base import utcnow
@@ -81,6 +82,16 @@ def get_connection(session: Session) -> CxConnection | None:
     return session.get(CxConnection, CONNECTION_ID)
 
 
+def _check_trusted(url: str, *, what: str) -> None:
+    settings = get_settings()
+    check_tenant_url(
+        url,
+        what=what,
+        extra_trusted_hosts=settings.cx_trusted_hosts,
+        allow_plain_http=not settings.is_production,
+    )
+
+
 def _resolve_api_base_url(parsed: ParsedApiKey, override: str | None) -> tuple[str, bool]:
     if override and override.strip():
         return normalise_api_base_url(override), True
@@ -114,6 +125,10 @@ def save_connection(
         )
 
     api_base_url, overridden = _resolve_api_base_url(parsed, api_base_url_override)
+    # Checked before anything is stored or any request is made: the IAM URL is an
+    # unsigned claim inside the pasted key, and the API URL may have been typed in.
+    _check_trusted(parsed.iam_base_url, what="identity (IAM) URL in this API key")
+    _check_trusted(api_base_url, what="platform API URL")
     ciphertext = get_secret_box().encrypt(api_key.strip(), purpose=PURPOSE_CX_API_KEY)
 
     connection = get_connection(session)
@@ -166,6 +181,7 @@ def set_api_base_url(session: Session, *, api_base_url: str, actor: AuditActor) 
     if connection is None:
         raise NotConfiguredError("No Checkmarx connection has been configured yet.")
     before = {"api_base_url": connection.api_base_url}
+    _check_trusted(normalise_api_base_url(api_base_url), what="platform API URL")
     connection.api_base_url = normalise_api_base_url(api_base_url)
     connection.api_base_url_overridden = True
     session.flush()
@@ -186,6 +202,68 @@ def decrypt_api_key(connection: CxConnection) -> str:
     api_key = get_secret_box().decrypt(connection.api_key_encrypted, purpose=PURPOSE_CX_API_KEY)
     register_secret(api_key)
     return api_key
+
+
+def warn_if_untrusted(session: Session) -> bool:
+    """Say so, loudly, if the stored connection points somewhere not allowed.
+
+    Tenant URLs are restricted to checkmarx.net and CXCG_CX_ALLOWED_HOSTS. A
+    deployment that was pointed at a dedicated host before that rule existed
+    stops being governed after upgrading until the host is allowed; without
+    this it would only show up as failed cycles. Returns True if it warned.
+    """
+    from app.checkmarx.regions import UntrustedHostError
+    from app.models.enums import Severity
+    from app.services import notifications
+
+    connection = get_connection(session)
+    if connection is None:
+        return False
+    try:
+        _check_trusted(connection.iam_base_url, what="stored identity (IAM) URL")
+        _check_trusted(connection.api_base_url, what="stored platform API URL")
+    except UntrustedHostError as exc:
+        logger.error("The Checkmarx One connection is blocked: %s", exc)
+        connection.status = ConnectionStatus.FAILED
+        connection.last_error = str(exc)[:2000]
+        connection.last_failure_at = utcnow()
+        notifications.notify(
+            session,
+            category=notifications.CATEGORY_SYNC_ERROR,
+            severity=Severity.CRITICAL,
+            title="The Checkmarx One connection is blocked",
+            body=(
+                f"{exc}\n\nNothing is being synchronised, evaluated or enforced until this "
+                "is resolved."
+            ),
+            dedupe_key=f"untrusted-host:{utcnow().strftime('%Y-%m-%d')}",
+        )
+        session.flush()
+        return True
+    return False
+
+
+_subject_cache: tuple[str, str | None] | None = None
+
+
+def api_key_subject(session: Session) -> str | None:
+    """The tenant user id the stored API key belongs to, if it can be read.
+
+    Cached per stored key: it is asked for on every enforcement plan.
+    """
+    global _subject_cache
+    connection = get_connection(session)
+    if connection is None or not connection.api_key_encrypted:
+        return None
+    cache_key = connection.api_key_encrypted
+    if _subject_cache is not None and _subject_cache[0] == cache_key:
+        return _subject_cache[1]
+    try:
+        subject = parse_api_key(decrypt_api_key(connection)).subject
+    except Exception:  # noqa: BLE001 - an unreadable key protects nobody, and is reported elsewhere
+        subject = None
+    _subject_cache = (cache_key, subject)
+    return subject
 
 
 # --------------------------------------------------------------- client cache
@@ -246,8 +324,13 @@ def get_client(session: Session) -> CheckmarxClient:
         if _cached_token_manager is not None:
             _cached_token_manager.close()
 
+        # Re-checked whenever a client is built, not only when the connection is
+        # saved, so a stored URL the deployment does not trust is never called.
+        _check_trusted(connection.iam_base_url, what="stored identity (IAM) URL")
+        _check_trusted(connection.api_base_url, what="stored platform API URL")
         api_key = decrypt_api_key(connection)
         parsed = parse_api_key(api_key)
+        _check_trusted(parsed.iam_base_url, what="identity (IAM) URL in the stored API key")
         _cached_token_manager = TokenManager(api_key=api_key, token_endpoint=parsed.token_endpoint)
         _cached_client = CheckmarxClient(
             api_base_url=connection.api_base_url,
@@ -257,6 +340,20 @@ def get_client(session: Session) -> CheckmarxClient:
         )
         _cached_key = identity
         return _cached_client
+
+
+def optional_client(session: Session) -> CheckmarxClient | None:
+    """The configured client, or None when the tenant connection is unusable.
+
+    Limit and request administration must keep working while the Checkmarx
+    connection is down, so a missing client degrades to "cannot lift restrictions
+    right now" rather than failing the request.
+    """
+    try:
+        return get_client(session)
+    except CheckmarxError as exc:
+        logger.warning("No usable Checkmarx client for this request: %s", exc)
+        return None
 
 
 # --------------------------------------------------------------------- testing

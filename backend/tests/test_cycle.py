@@ -296,6 +296,41 @@ class TestCreditBalance:
         assert len(rows) == 2
         assert rows[-1].used_credits == Decimal("250")
 
+
+class TestExpiredGrantRollback:
+    def test_the_cycle_rolls_back_a_temporary_grant_that_has_expired(
+        self, db: Session, configured_tenant: FakeTenant
+    ) -> None:
+        from app.models.enums import EntityType
+        from app.models.limits import CreditLimit, CreditRequest
+        from app.services import requests_service
+
+        request = requests_service.create_request(
+            db,
+            data=requests_service.RequestInput(
+                entity_type=EntityType.USER, entity_id="user-harsh", requested_limit=500
+            ),
+            actor=AuditActor.system("test"),
+        )
+        requests_service.approve_request(
+            db,
+            request=request,
+            actor=AuditActor.system("test"),
+            expires_at=utcnow() + timedelta(hours=1),
+        )
+        # Backdate the expiry so this cycle sees it as lapsed (approval itself
+        # refuses a past expiry, so it is set in the future then moved back).
+        request.expires_at = utcnow() - timedelta(minutes=1)
+        db.commit()
+
+        result = cycle.run_cycle(trigger="manual", force_org_sync=True)
+        assert result.steps["grant_expiry"] == {"ok": True, "reverted": 1}
+        with session_scope() as session:
+            limit = session.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh"))
+            assert limit is None
+            reverted = session.get(CreditRequest, request.id)
+            assert reverted is not None and reverted.reverted is True
+
     def test_a_missing_credit_endpoint_is_not_fatal(
         self, db: Session, configured_tenant: FakeTenant
     ) -> None:

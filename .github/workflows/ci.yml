@@ -11,6 +11,7 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: backend
@@ -21,17 +22,18 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: backend/pyproject.toml
+          cache-dependency-path: backend/constraints.txt
 
       - name: Install
-        run: pip install -e ".[dev]"
+        # The pinned versions the image is built with, not whatever is newest.
+        run: pip install -c constraints.txt -e ".[dev]"
 
       - name: Lint
         run: |
           python -m ruff check .
           python -m ruff format --check .
 
-      - name: Tests
+      - name: Tests (SQLite)
         run: python -m pytest -q
         env:
           # A throwaway key: the suite only needs one that is well formed.
@@ -39,16 +41,57 @@ jobs:
           CXCG_COOKIE_SECURE: "false"
 
       - name: Dependency audit
-        # Fails the build on a known vulnerable dependency. Audit the resolved
-        # third-party requirements rather than the live environment: the latter
-        # includes the local editable project (cxcreditguard), which is not on
-        # PyPI and would otherwise trip --strict on every run.
-        run: |
-          python -m pip freeze --exclude-editable > /tmp/requirements.txt
-          python -m pip_audit --strict -r /tmp/requirements.txt
+        # Fails the build on a known vulnerable dependency, direct or transitive,
+        # in the pinned set the image is built from (plus the test tools).
+        run: python -m pip_audit --strict -r constraints.txt
+
+  backend-postgres:
+    # The same suite against the database production actually uses. SQLite and
+    # PostgreSQL disagree on locking, column widths and constraint names, and
+    # every defect of that kind was invisible while only SQLite was tested.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cxcg
+          # Not a secret: a throwaway database that exists for this job only.
+          # kics-scan ignore-line
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: cxcg_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cxcg -d cxcg_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/constraints.txt
+
+      - name: Install
+        run: pip install -c constraints.txt -e ".[dev,postgres]"
+
+      - name: Tests (PostgreSQL)
+        run: python -m pytest -q
+        env:
+          CXCG_ENV: development
+          CXCG_COOKIE_SECURE: "false"
+          CXCG_TEST_DATABASE_URL: postgresql+psycopg://cxcg:ci-only@localhost:5432/cxcg_test
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
@@ -59,21 +102,24 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: frontend/package.json
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install
-        run: npm install --no-audit --no-fund
+        # Exactly what the lock file says, as the image build does.
+        run: npm ci --no-audit --no-fund
 
       - name: Type check and build
         run: npm run build
 
   image:
+    # Builds the image and then runs the documented deployment for real: the
+    # app behind the TLS proxy, on PostgreSQL, with the backup service. Building
+    # alone proved nothing - the image once built cleanly while being unable to
+    # open a database connection.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
-      - name: Build the image
-        run: docker build -f backend/Dockerfile -t cxcreditguard:ci .
 
       - name: Validate the compose file
         run: docker compose config --quiet
@@ -83,3 +129,21 @@ jobs:
           # generic-password false positive (it matches the key name).
           # kics-scan ignore-line
           POSTGRES_PASSWORD: ci-placeholder
+
+      - name: Build and start the stack
+        run: ./deploy/ci/smoke-test.sh up
+
+      - name: Exercise the running stack
+        run: ./deploy/ci/smoke-test.sh check
+
+      - name: Logs
+        if: always()
+        run: ./deploy/ci/smoke-test.sh logs
+
+      - name: Stop the stack
+        if: always()
+        run: ./deploy/ci/smoke-test.sh down
+
+      - name: Single-container image
+        # The quick-start image has its own Dockerfile and entrypoint.
+        run: ./deploy/ci/smoke-test.sh single

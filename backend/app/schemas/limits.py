@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.enums import (
     EntityType,
@@ -32,6 +32,7 @@ class LimitCreateRequest(StrictModel):
     custom_period_start: datetime | None = None
     custom_period_end: datetime | None = None
     notes: str | None = Field(default=None, max_length=1024)
+    business_unit: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def _check_custom_period(self) -> LimitCreateRequest:
@@ -58,6 +59,7 @@ class LimitUpdateRequest(StrictModel):
     custom_period_start: datetime | None = None
     custom_period_end: datetime | None = None
     notes: str | None = Field(default=None, max_length=1024)
+    business_unit: str | None = Field(default=None, max_length=128)
 
 
 class LimitPeriodStateResponse(BaseModel):
@@ -93,6 +95,7 @@ class LimitResponse(BaseModel):
     count_existing_usage: bool
     exempt: bool
     notes: str | None
+    business_unit: str | None = None
     created_at: datetime
     updated_at: datetime
     current_period: LimitPeriodStateResponse | None = None
@@ -103,6 +106,8 @@ class ExemptionCreateRequest(StrictModel):
     entity_type: EntityType
     entity_id: str = Field(min_length=1, max_length=64)
     reason: str | None = Field(default=None, max_length=512)
+    # When set, this is a time-boxed override that auto-expires.
+    expires_at: datetime | None = None
 
 
 class ExemptionResponse(BaseModel):
@@ -111,6 +116,7 @@ class ExemptionResponse(BaseModel):
     entity_id: str
     entity_label: str | None
     reason: str | None
+    expires_at: datetime | None = None
     created_at: datetime
 
 
@@ -177,3 +183,63 @@ class SchedulerStatusResponse(BaseModel):
     entities_restricted: int
     unread_notifications: int
     unresolved_subjects: int
+
+
+class DiagnosticCheckResponse(BaseModel):
+    key: str
+    label: str
+    status: str
+    detail: str
+    remediation: str | None = None
+
+
+class DiagnosticsResponse(BaseModel):
+    generated_at: datetime
+    overall: str
+    checks: list[DiagnosticCheckResponse]
+
+
+class AuditChainResponse(BaseModel):
+    """Result of re-walking the audit hash chain to prove it is intact."""
+
+    ok: bool
+    entries_checked: int
+    tip: str | None
+    broken_at_id: int | None = None
+    reason: str | None = None
+
+
+class UpdateStatusResponse(BaseModel):
+    current: str
+    latest: str | None = None
+    update_available: bool = False
+
+
+class AttestationResponse(BaseModel):
+    version: str
+    migration_head: str | None
+    config_digest: str
+    generated_at: datetime
+    update: UpdateStatusResponse
+
+
+class WatchdogResponse(BaseModel):
+    state: str
+    enabled: bool
+    seconds_since_last_run: int | None
+    last_run_at: datetime | None
+    last_status: str | None
+    tolerance_seconds: int
+    detail: str
+
+
+class RestoreResultResponse(BaseModel):
+    settings: int
+    limits_created: int
+    limits_updated: int
+    exemptions: int
+
+
+class SetLatestVersionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: str = Field(min_length=1, max_length=64)

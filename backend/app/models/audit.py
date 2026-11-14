@@ -44,6 +44,15 @@ class AuditLogEntry(Base):
     ip_address: Mapped[str | None] = mapped_column(String(64))
     user_agent: Mapped[str | None] = mapped_column(String(256))
 
+    # Tamper-evidence. ``entry_hash`` is a SHA-256 over this row's content plus
+    # ``prev_hash``, which is the chain tip at the moment the row was written.
+    # Editing, deleting, reordering, or truncating rows breaks the chain, which
+    # the verifier detects (see app.services.audit_chain for the exact guarantee
+    # and its limits). Both are nullable only so the columns can be added to an
+    # existing table; every row the writer appends sets them.
+    prev_hash: Mapped[str | None] = mapped_column(String(64))
+    entry_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+
     __table_args__ = (Index("ix_audit_log_entry_action_time", "action", "occurred_at"),)
 
 

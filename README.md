@@ -80,7 +80,7 @@ schedule or on demand via `POST /api/ops/run-cycle`:
 `POST /api/ops/run-cycle` performs a full sync, ingest, evaluate and enforce pass
 and returns per step statistics, and the GUI drives the same endpoints.
 
-647 tests cover the backend, with every Checkmarx endpoint served by an in-memory
+About 1,000 tests cover the backend, with every Checkmarx endpoint served by an in-memory
 fake tenant (`backend/tests/fake_tenant.py`) that holds mutable state, so tests
 assert on what enforcement actually changed rather than on which calls were made.
 The frontend is type checked with `tsc` on every build.
@@ -268,7 +268,8 @@ make podman-run
 
 Each builds `cxcreditguard:podman`, starts the container, and tails the startup
 log — which prints the initial `admin` credentials on a fresh volume. Then open
-**http://localhost:8000**.
+**http://localhost:8000**. The first sign-in asks for a new password, because
+the printed one stays readable in the log.
 
 The equivalent without the helper scripts:
 
@@ -320,6 +321,11 @@ podman compose -f docker-compose.yml up -d
 podman compose -f docker-compose.yml logs -f app
 ```
 
+The stack is four containers: the app, PostgreSQL, the nginx proxy (the only one
+that publishes a port) and a `backup` container that dumps the database once a
+day. Read [Operating it](#operating-it) before relying on it: backups stay on
+the same host until you copy them off, and the master key is not in them.
+
 ## Local development
 
 ```sh
@@ -345,10 +351,38 @@ exposed in production), and health at `/healthz`.
 
 ```sh
 cd backend
-python -m pytest -q            # 647 tests
+python -m pytest -q            # about 1,000 tests
 python -m ruff check .
 python -m ruff format --check .
-python -m pip_audit             # dependency vulnerability scan
+python -m pip_audit --strict -r constraints.txt   # dependency vulnerability scan
+```
+
+The suite runs on SQLite by default. To run it on PostgreSQL, which is what the
+Compose deployment uses and what CI also does, point it at an empty database:
+
+```sh
+CXCG_TEST_DATABASE_URL=postgresql+psycopg://user:pass@localhost:5432/cxcg_test \
+  python -m pytest -q
+```
+
+CI (`.github/workflows/ci.yml`) additionally builds the Compose stack and runs
+`deploy/ci/smoke-test.sh` against it: sign in through the proxy, take a backup and
+restore it, and check that a second instance refuses to start.
+
+### Updating dependencies
+
+`backend/constraints.txt` pins every Python package the image installs, so two
+builds of the same commit install the same Python code (base images and
+operating system packages still follow their tags). `pyproject.toml` still states
+the supported ranges. To move to newer versions:
+
+```sh
+python -m venv /tmp/lock && /tmp/lock/bin/pip install "backend[postgres,dev]"
+/tmp/lock/bin/pip freeze | grep -vi '^cxcreditguard' > /tmp/new-pins.txt
+# replace the pins in backend/constraints.txt (keep the header comment), then:
+/tmp/lock/bin/pip install -e backend
+/tmp/lock/bin/python -m pip_audit --strict -r backend/constraints.txt
+cd backend && /tmp/lock/bin/python -m pytest -q
 ```
 
 Every Checkmarx call in the tests is served by `httpx.MockTransport`, and retry
@@ -563,11 +597,16 @@ change behaviour most:
 | `CXCG_SESSION_ABSOLUTE_TTL_HOURS` | 12 | Hard cap regardless of activity. |
 | `CXCG_LOGIN_MAX_ATTEMPTS` | 5 | Failures before lockout, which then backs off exponentially. |
 | `CXCG_CX_TOKEN_REFRESH_MARGIN_SECONDS` | 300 | Refresh the access token this long before it expires. |
+| `CXCG_TRUSTED_PROXY_HOPS` | 0 | How many reverse proxies sit in front of the app. Compose sets it to 1 for the bundled nginx. Each further proxy or load balancer in front of that adds one, together with the nginx change in [deploy/nginx/README.md](deploy/nginx/README.md). Too low and every sign-in appears to come from the proxy; too high and a client can forge its address. |
+| `CXCG_CX_ALLOWED_HOSTS` | none | Extra Checkmarx One hostnames to accept. Tenant URLs must be `https` and end in `checkmarx.net`; a dedicated or private host has to be listed here or the connection is refused. |
+| `CXCG_SMTP_CA_FILE` | system CAs | CA bundle used to verify the mail server's certificate, for a server with a private CA. |
+| `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP_DAYS` | 24 / 14 | Compose only: how often the database is dumped and how long dumps are kept. |
 
 ## Security posture
 
-1. **Secrets at rest.** The Checkmarx API key, TOTP secrets and (once step 9
-   lands) SMTP and webhook secrets are encrypted with AES-256-GCM. Keys are
+1. **Secrets at rest.** The Checkmarx API key, two factor secrets, the SMTP
+   password, and the webhook URL and signing secret are encrypted with
+   AES-256-GCM. Recovery codes are stored only as keyed digests. Keys are
    derived per purpose from the master key with HKDF-SHA256, and the purpose is
    bound in as additional authenticated data, so a ciphertext written for one
    column cannot be replayed into another. The master key comes from the
@@ -578,8 +617,8 @@ change behaviour most:
    decrypted API key, issued access tokens) are additionally scrubbed by exact
    match through a runtime registry.
 3. **Utility authentication.** Local accounts with Argon2id hashing, an enforced
-   password policy, optional TOTP, opaque session tokens stored only as SHA-256
-   digests, `HttpOnly` `Secure` `SameSite=Strict` cookies, an idle timeout and an
+   password policy, optional TOTP with single-use recovery codes, opaque session
+   tokens stored only as SHA-256 digests, `HttpOnly` `Secure` `SameSite=Strict` cookies, an idle timeout and an
    absolute cap.
 4. **CSRF.** Double submit: a script readable CSRF cookie echoed back in
    `X-CSRF-Token` and compared against the digest on the session row. The check
@@ -587,10 +626,16 @@ change behaviour most:
    cannot ship without it.
 5. **RBAC.** Admin has full control. Viewer is read only. The last active Admin
    cannot be demoted, disabled or deleted, and no one can demote themselves.
-6. **Login abuse.** Per username and per IP rate limiting plus account lockout
-   with exponential backoff. Unknown usernames still incur an Argon2
-   verification, so response timing does not enumerate accounts, and the error
-   message is identical for an unknown user and a wrong password.
+6. **Login abuse.** Lockout with exponential backoff per username and source
+   address, a slower account-wide counter that catches guessing spread across
+   many addresses (an address the account has signed in from before is exempt,
+   so an attacker cannot lock the owner out), and a per-address limit across all
+   usernames. Unknown usernames still incur an Argon2 verification, so response
+   timing does not enumerate accounts, and the error message is identical for an
+   unknown user and a wrong password. A password chosen by someone else (the
+   bootstrap admin, an account an admin creates) must be changed at first
+   sign-in, and changing how an
+   account is protected asks for the password again.
 6b. **The SPA runs under a strict CSP with no inline scripts.** Charts are hand
    written SVG rather than a charting library, so no third party script has to be
    allowed, and a test asserts that no inline `<script>` creeps into the shell.
@@ -632,9 +677,11 @@ with regression tests in `backend/tests/test_security_hardening.py`:
    password guessing attempt can still see them.
 
 Two things were considered and deliberately left as they are, both documented at
-the code: the webhook target check is not a general egress control, and
-`X-Forwarded-For` is trusted for rate limiting and logging but never for
-authorisation.
+the code: the webhook target check is not a general egress control, and the
+client address (used for sign-in throttling and the audit log, never for
+authorisation) is read from `X-Forwarded-For` only as far as
+`CXCG_TRUSTED_PROXY_HOPS` proxies vouch for it; with the default of 0 the header
+is ignored.
 
 ### Threat model notes
 
@@ -677,6 +724,210 @@ nothing.
 
 Projects the key cannot see are projects whose usage cannot be counted. The org
 sync reports that as a warning rather than undercounting quietly.
+
+## Operating it
+
+### One instance only
+
+CxCreditGuard runs as **one process**. The scheduler lives inside it, and two
+copies working the same database would both evaluate limits and both write to
+the tenant. This is enforced: a second instance pointed at the same database
+logs `Another CxCreditGuard instance is already running against this database`
+and exits. Do not scale the `app` service, and do not run uvicorn with more than
+one worker. Availability comes from `restart: unless-stopped`, not from
+replicas. The claim goes with the process that holds it, so a restart is not
+blocked by it; the one exception is an external PostgreSQL whose app host
+vanished without closing its connection, where the database takes up to a
+minute to notice. On an orchestrator, use a strategy
+that stops the old container before starting the new one (Kubernetes:
+`strategy: Recreate`, one replica); a rolling update would wait for ever on a
+new copy that refuses to start while the old one is alive.
+
+### Backup and restore
+
+The database is the only place the undo snapshots live. Without it, access the
+utility has restricted in Checkmarx One cannot be given back automatically.
+
+**Compose.** The `backup` container writes a `pg_dump` custom-format file to the
+`db-backups` volume every `BACKUP_INTERVAL_HOURS` (24) and deletes files older
+than `BACKUP_KEEP_DAYS` (14), never the newest. A file with the final name is
+always a complete dump.
+
+```sh
+# Take one now (for example before an upgrade)
+podman compose exec backup sh /usr/local/bin/backup.sh once
+
+# List them, and copy one off the host. A backup that only exists on the machine
+# it protects is not a backup: schedule this copy to somewhere else.
+podman compose exec backup ls -lh /backups
+podman compose exec -T backup cat /backups/cxcreditguard-20261114T020000Z.dump \
+  > ./cxcreditguard-20261114T020000Z.dump
+```
+
+The first dump is written once the app has started for the first time; a failed
+dump is retried ten minutes later rather than a day later.
+
+To restore, stop the app so nothing writes while the data is replaced, and use
+the restore script (`latest`, or the path of a dump under `/backups`):
+
+```sh
+podman compose stop app
+podman compose exec backup sh /usr/local/bin/restore.sh latest
+podman compose start app
+```
+
+The script loads the dump into a new database first and swaps it into place
+only when that has worked. A wrong file name, a damaged dump or a connection
+still open to the database stops it with nothing changed. The database it
+replaced is kept under another name (the script prints it) until you remove
+it, so a restore of the wrong dump can be undone. Once the app is back and the
+data is what you expected:
+
+```sh
+podman compose exec backup dropdb cxcreditguard_before_20261114t020500z
+```
+
+To restore a dump that was copied off the host, put it back first:
+
+```sh
+podman compose exec -T backup sh -c 'cat > /backups/cxcreditguard-20261114T020000Z.dump' \
+  < ./cxcreditguard-20261114T020000Z.dump
+```
+
+The app migrates the restored database forward on start if the dump came from
+an older version. The dump does **not** contain the master key, and is useless
+for the stored secrets without it: keep the key (your `.env` or secret file)
+backed up separately, somewhere else.
+
+After restoring an older dump, restrictions applied since it was taken exist in
+Checkmarx One but not in the database. The next cycle re-applies whatever is
+still over budget and records it; anything that is no longer over budget stays
+restricted in the tenant with no record, and has to be given back by hand in
+Checkmarx One. Restore the most recent dump you have.
+
+**Single container.** Everything is in the `cxcreditguard-data` volume: the
+SQLite database, the generated master key and the first admin password. Stop the
+container and archive the volume:
+
+```sh
+podman stop cxcreditguard
+podman run --rm -v cxcreditguard-data:/data:ro -v "$PWD":/out alpine \
+  tar czf /out/cxcreditguard-data.tgz -C /data .
+podman start cxcreditguard
+```
+
+The in-app backup on the Settings page exports configuration (limits,
+exemptions, settings) for moving between installations. It is not a substitute
+for the above: it has no usage history, no audit log and no undo snapshots.
+
+### Losing the master key
+
+The master key encrypts the Checkmarx API key, the SMTP password, the webhook
+URL and signing secret, and every two factor secret. On each start the app
+checks that the configured key can read what is stored, and **refuses to start**
+if it cannot, rather than run with secrets it cannot use. If you see that
+message, first make sure the right key is configured (a restored `.env`, the
+right secret file, no stray whitespace). Only if the key is truly gone:
+
+```sh
+# Compose: stop the app, put a NEW key in .env, then
+podman compose stop app
+podman compose run --rm --no-deps app python -m scripts.reset_secrets --yes
+podman compose up -d
+```
+
+This deletes the stored secrets and nothing else: limits, exemptions, usage
+history, the audit log, accounts and their passwords are kept. Afterwards an
+admin re-enters the Checkmarx One API key (Setup), the SMTP and webhook secrets
+(Settings), and everyone sets up two factor again, because it is switched off
+for every account. Restrictions already in force are unaffected, and Restore
+works again as soon as the connection is re-entered.
+
+There is no in-place key rotation. To change the key deliberately, follow the
+same steps: stop the app, new key, `reset_secrets`, start, re-enter the secrets. Rotate the
+Checkmarx API key itself on the Setup page whenever you like; that needs no
+restart.
+
+### Upgrading
+
+Take a backup, pull the new source, `podman compose up -d --build`. Migrations
+run at start. Coming from a version before the production hardening, check
+these, because each one can stop something that used to work:
+
+- **Tenant URL.** Only `https` hosts ending in `checkmarx.net` are accepted. A
+  dedicated or private host must be listed in `CXCG_CX_ALLOWED_HOSTS`, or the
+  connection test and every cycle fail with a message saying so.
+- **Mail.** STARTTLS now verifies the server's certificate, port 465 uses
+  implicit TLS, and credentials are never sent over an unencrypted connection. A
+  mail server with a private CA needs `CXCG_SMTP_CA_FILE`; a server that only
+  offers plain SMTP can still be used, but without a username and password.
+- **Client address.** `CXCG_TRUSTED_PROXY_HOPS` must match your topology (see
+  Configuration). Compose sets 1. If a load balancer sits in front of the
+  bundled nginx, two changes go together: set 2 in `docker-compose.yml`, and
+  make nginx pass the incoming header on, as described in
+  [deploy/nginx/README.md](deploy/nginx/README.md). One without the other makes
+  every user appear to come from a single address.
+- **Webhook URL.** It is now stored encrypted and never shown again after
+  saving. Audit entries and configuration backups written by earlier versions may
+  still contain the old URL in clear text. If the URL embeds a token (Slack and
+  Teams URLs do), create a new webhook and retire the old one.
+- **First sign-in.** An account whose password was chosen by someone else (the
+  bootstrap admin, an account an admin creates with a password, an account
+  recovered from the command line) is asked to choose its own before anything
+  else.
+- **Automatic approvals.** The auto-approve threshold is now a budget per
+  30 days, per entity and per requester, not a size per request. Several small
+  requests no longer add up past it.
+
+### Enforcement safety
+
+Settings has an **Enforcement safety** card. These exist because the dangerous
+failure of this tool is restricting many people at once for a wrong reason.
+
+- **Pause.** Stops every new restriction immediately, mid-cycle included.
+  Usage is still read, warnings are still sent, and access is still **given
+  back** when someone drops under budget or a limit is raised. Use it whenever
+  the numbers look wrong.
+- **Ceilings.** If one cycle is about to start restricting more than 25 limits
+  or 100 users and projects that are not restricted now, it restricts nobody,
+  pauses itself, and alerts the admins with the counts. Both numbers are
+  configurable; the defaults suit a tenant of a few hundred engineers. Resuming
+  after such a pause lets the next cycle through once without the ceiling, on
+  the understanding that an admin has looked.
+- **Protected roles.** A user holding one of the listed Checkmarx roles
+  (default `ast-admin`, `iam-admin`) is never restricted, and is released if
+  the role is granted later. They still get the warning. **Check these names
+  against your tenant**: they have not been verified on a live one, and a name
+  that matches nothing protects nobody.
+- **Held readings.** If the tenant suddenly reports less than half the usage it
+  did a moment ago for a dimension, the reading is held rather than believed,
+  until at least three readings in a row over at least two hours tell the same
+  story. Limits keep being judged on the last believed reading meanwhile, and
+  each cycle that holds one reports it as a warning in its result.
+- **Unknown outcomes.** If a restriction or restore fails in a way that leaves
+  it unclear whether the tenant changed (a timeout, a dropped connection), the
+  record says so and the next cycle checks the tenant rather than assuming.
+
+### Accounts
+
+Each person's own page (their name, top right) changes their password and sets
+up two factor authentication. Turning two factor on shows ten recovery codes,
+once; each signs in one time if the device is lost. An admin can reset another
+person's password or two factor from Settings, never their own, so keep at least
+two admin accounts.
+
+A sign-in lockout clears by itself (an hour at most). If the only administrator
+has lost their password, or their authenticator and their recovery codes, there
+is nobody to reset them, and the way back is from a shell in the container:
+
+```sh
+podman compose exec app python -m scripts.recover_admin <username>
+```
+
+It prints a temporary password that must be changed at the next sign-in,
+switches two factor off for that account, and records the reset in the audit
+log. The bootstrap variables do not help here: they only create an account when
+there are none.
 
 ## Runbook: the utility restricted someone it should not have
 

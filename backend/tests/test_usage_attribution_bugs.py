@@ -295,7 +295,23 @@ class TestSilentViewByFallback:
         result = ingestion.ingest_usage(db, client)
         db.commit()
 
+        # Not disabled...
         assert result.dimensions["project"].supported is True
+        state = db.get(DimensionState, "project")
+        assert state is None or state.supported is not False
+        # ...but not read either: without the probe there is no telling a real
+        # project view from the user view served in its place, and filing one as
+        # the other would mark the dimension as trustworthy for good.
+        assert result.dimensions["project"].read_failed is True
+        assert ingestion.latest_snapshot(db, UsageView.PROJECT) is None
+        # The user dimension needs no probe and is unaffected.
+        assert ingestion.latest_snapshot(db, UsageView.USER) is not None
+
+        # Once the probe answers, the dimension is read as normal.
+        tenant.probe_fails = False
+        result = ingestion.ingest_usage(db, client)
+        db.commit()
+        assert result.dimensions["project"].read_failed is False
         assert ingestion.latest_totals(db, UsageView.PROJECT) == {"proj-hybrid": Decimal("13")}
 
     def test_an_idle_real_dimension_is_not_mistaken_for_a_fallback(self, db: Session) -> None:

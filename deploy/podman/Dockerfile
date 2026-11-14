@@ -36,20 +36,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Dependencies first so a source change does not invalidate the install layer.
-# libpq is the only runtime OS package (psycopg's pure-Python mode loads it);
-# the build toolchain goes in a throwaway virtual package and is removed after.
-# psycopg is installed directly rather than via ".[postgres]" because that extra
-# pulls psycopg[binary], whose wheels are glibc-only (manylinux).
-COPY backend/pyproject.toml ./
-# Python dependency versions are constrained in pyproject.toml, and pinning apk
+# libpq is the only runtime OS package; the build toolchain goes in a throwaway
+# virtual package and is removed after.
+# psycopg is installed with its C implementation, compiled against libpq-dev:
+# the pure-Python mode cannot find libpq on Alpine once the toolchain is removed
+# (see backend/Dockerfile). ".[postgres]" is not used because it pulls
+# psycopg[binary], whose wheels are glibc-only (manylinux).
+COPY backend/pyproject.toml backend/constraints.txt ./
+# Python dependency versions are pinned in constraints.txt, and pinning apk
 # --no-cache installs to exact versions is fragile across base-image updates.
 # Suppress the KICS unpinned-version findings for this build step.
 # kics-scan ignore-block
 RUN apk add --no-cache libpq \
-    && apk add --no-cache --virtual .build gcc musl-dev python3-dev \
-    && pip install --no-cache-dir . psycopg \
+    && apk add --no-cache --virtual .build gcc musl-dev python3-dev libpq-dev \
+    && pip install --no-cache-dir -c constraints.txt . "psycopg[c]" \
     && apk del .build \
-    && pip uninstall -y pip setuptools wheel 2>/dev/null || true
+    && (pip uninstall -y pip setuptools wheel 2>/dev/null || true)
 
 COPY backend/alembic.ini ./
 COPY backend/alembic ./alembic
@@ -96,4 +98,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 # The easy entrypoint generates/persists the master key and a first admin, then
 # applies migrations. Pass the real uvicorn command via CMD.
 ENTRYPOINT ["/usr/local/bin/easy-entrypoint.sh"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# No --forwarded-allow-ips: the app does not let the web server rewrite the
+# client address from headers. It reads X-Forwarded-For itself, and only as many
+# hops as CXCG_TRUSTED_PROXY_HOPS says are trustworthy.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]

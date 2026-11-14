@@ -38,19 +38,43 @@ class AuthContext:
         return self.user.role == UtilityRole.ADMIN
 
 
-def client_ip(request: Request) -> str:
-    """Client address, honouring one hop of X-Forwarded-For.
+# What a signed-in account may still reach while it owes a password change:
+# enough to see who it is, set the new password, and sign out.
+_ALLOWED_BEFORE_PASSWORD_CHANGE = frozenset(
+    {"/api/me", "/api/auth/session", "/api/auth/password", "/api/auth/logout"}
+)
 
-    Only the left most entry of the last proxy hop is used, and it is only a log
-    and rate limit input, never an authorisation input, so a spoofed header
-    cannot grant access. Deploy behind the documented reverse proxy for accuracy.
+
+def client_ip(request: Request) -> str:
+    """The client's address, as seen by something we trust.
+
+    ``X-Forwarded-For`` is a list each proxy appends to, so its left-hand end is
+    whatever the client chose to send. Only the entries added by our own proxies
+    can be believed: with ``trusted_proxy_hops`` proxies in front of the app, the
+    client is the entry that many places from the right. With none configured the
+    header is ignored and the connection's own address is used.
+
+    This feeds sign-in throttling and the audit log, so a client must not be able
+    to pick its own value: it could dodge the throttle and forge audit entries.
     """
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first[:64]
-    return (request.client.host if request.client else "unknown")[:64]
+    peer = (request.client.host if request.client else "unknown")[:64]
+    hops = get_settings().trusted_proxy_hops
+    if hops <= 0:
+        return peer
+    # Every X-Forwarded-For line, in order: some proxies add their entry as a
+    # separate header line rather than appending to the existing one, and
+    # reading only the first line would then return the client's own claim.
+    entries = [
+        entry.strip()
+        for line in request.headers.getlist("X-Forwarded-For")
+        for entry in line.split(",")
+        if entry.strip()
+    ]
+    if len(entries) < hops:
+        # The proxy we were told about did not add its entry, so the request did
+        # not come through it. Fall back to what we can see for ourselves.
+        return peer
+    return entries[-hops][:64]
 
 
 def user_agent(request: Request) -> str | None:
@@ -88,6 +112,17 @@ def require_auth(
         )
 
     db.commit()  # persist the slid idle expiry
+
+    # An account flagged for a password change can do nothing else until it has
+    # one: a temporary password handed out by an admin is known to two people.
+    if user.must_change_password and request.url.path not in _ALLOWED_BEFORE_PASSWORD_CHANGE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "password_change_required",
+                "message": "Choose a new password before continuing.",
+            },
+        )
     return AuthContext(
         user=user,
         session_row=session_row,

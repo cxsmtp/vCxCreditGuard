@@ -56,6 +56,16 @@ class Settings(BaseSettings):
     login_lockout_base_seconds: int = Field(default=30, ge=1)
     login_lockout_max_seconds: int = Field(default=3600, ge=1)
     login_rate_limit_per_minute: int = Field(default=10, ge=1)
+    # How many reverse proxies sit in front of the app and append to
+    # X-Forwarded-For. 0 (the default) ignores the header entirely and uses the
+    # connection's own address, which is the only safe choice when clients can
+    # reach the app directly. The bundled nginx is one hop.
+    trusted_proxy_hops: int = Field(default=0, ge=0, le=5)
+
+    # Outbound mail. A CA certificate (PEM) to trust for the SMTP server, in
+    # addition to the system CAs, for a relay with an internally issued
+    # certificate. The server's certificate is always verified.
+    smtp_ca_file: Path | None = None
 
     # First run bootstrap
     bootstrap_admin_username: str | None = None
@@ -68,6 +78,11 @@ class Settings(BaseSettings):
     cx_backoff_max_seconds: float = Field(default=20.0, gt=0)
     cx_token_refresh_margin_seconds: int = Field(default=300, ge=0)
     cx_client_id: str = "ast-app"
+    # Extra hosts (or domain suffixes), comma separated, that tenant credentials
+    # may be sent to. Hosts under checkmarx.net are always allowed; a dedicated
+    # deployment on its own domain must be listed here. Set in the environment,
+    # deliberately not from the GUI.
+    cx_allowed_hosts: str = ""
 
     @model_validator(mode="after")
     def _validate_production_posture(self) -> Settings:
@@ -81,6 +96,10 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.env == "production"
+
+    @property
+    def cx_trusted_hosts(self) -> tuple[str, ...]:
+        return tuple(h.strip().lower() for h in self.cx_allowed_hosts.split(",") if h.strip())
 
     @property
     def cors_origins(self) -> list[str]:

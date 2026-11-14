@@ -47,6 +47,13 @@ _ENTITY_MODELS = {
 }
 
 
+def _pause_reason(db) -> str | None:  # type: ignore[no-untyped-def]
+    guard = settings_store.enforcement_guard(db)
+    if not guard.paused:
+        return None
+    return guard.pause_reason or "Paused by an administrator."
+
+
 @router.get("/me", response_model=MeResponse)
 def me(ctx: CurrentUser, db: DbSession) -> MeResponse:
     """Bootstrap payload for the SPA: who you are and whether setup is done."""
@@ -63,6 +70,9 @@ def me(ctx: CurrentUser, db: DbSession) -> MeResponse:
         # Drives the redirect to Setup on first login.
         setup_required=connection is None,
         ui_accent=settings_store.ui_accent(db),
+        can_request_credits=(ctx.is_admin or settings_store.self_service_requests_enabled(db)),
+        demo_mode=settings_store.demo_mode(db),
+        enforcement_paused=_pause_reason(db),
     )
 
 
@@ -317,6 +327,7 @@ def list_audit(
                 after=row.after,
                 detail=row.detail,
                 ip_address=row.ip_address,
+                entry_hash=row.entry_hash,
             )
             for row in rows
         ],
@@ -394,7 +405,10 @@ def _reattribute_latest_snapshot(db, subject_key: str, user_id: str | None) -> N
     """
     latest = db.scalar(
         select(UsageSnapshot)
-        .where(UsageSnapshot.view_by == str(UsageView.USER))
+        .where(
+            UsageSnapshot.view_by == str(UsageView.USER),
+            UsageSnapshot.held_reason.is_(None),
+        )
         .order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc())
         .limit(1)
     )

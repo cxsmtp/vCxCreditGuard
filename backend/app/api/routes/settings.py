@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -35,21 +36,48 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "smtp_use_tls": settings_store.KEY_SMTP_USE_TLS,
     "smtp_from": settings_store.KEY_SMTP_FROM,
     "smtp_recipients": settings_store.KEY_SMTP_RECIPIENTS,
-    "webhook_url": settings_store.KEY_WEBHOOK_URL,
     "ui_accent": settings_store.KEY_UI_ACCENT,
+    "self_service_requests": settings_store.KEY_SELF_SERVICE_REQUESTS,
+    "report_email_enabled": settings_store.KEY_REPORT_EMAIL_ENABLED,
+    "credit_unit_cost": settings_store.KEY_CREDIT_UNIT_COST,
+    "demo_mode": settings_store.KEY_DEMO_MODE,
+    "automation_enabled": settings_store.KEY_AUTOMATION_ENABLED,
+    "auto_approve_max_increase": settings_store.KEY_AUTO_APPROVE_MAX_INCREASE,
+    "auto_approve_expiry_days": settings_store.KEY_AUTO_APPROVE_EXPIRY_DAYS,
+    "enforcement_paused": settings_store.KEY_ENFORCEMENT_PAUSED,
+    "max_new_enforcements_per_cycle": settings_store.KEY_MAX_NEW_ENFORCEMENTS,
+    "max_new_targets_per_cycle": settings_store.KEY_MAX_NEW_TARGETS,
+    "protected_roles": settings_store.KEY_PROTECTED_ROLES,
 }
 
 _SECRET_FIELDS: dict[str, str] = {
     "smtp_password": settings_store.KEY_SMTP_PASSWORD,
     "webhook_secret": settings_store.KEY_WEBHOOK_SECRET,
+    # Write only, like the others: a webhook URL lets its holder post to the
+    # channel, so it is never sent back to the browser or written to the audit log.
+    "webhook_url": settings_store.KEY_WEBHOOK_URL,
 }
 
 # Fields whose value is never echoed back into the audit log.
 _REDACT_IN_AUDIT = frozenset(_SECRET_FIELDS)
 
 
+def _webhook_host(db) -> str | None:  # type: ignore[no-untyped-def]
+    """Just the host of the configured webhook, so an admin can tell which one it
+    is without the secret part of the URL ever leaving the server."""
+    url = settings_store.get_secret(db, settings_store.KEY_WEBHOOK_URL)
+    if not url:
+        return None
+    try:
+        return urlsplit(url).hostname
+    except ValueError:
+        return None
+
+
 def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
     values = settings_store.all_public_settings(db)
+    policy = settings_store.automation_policy(db)
+    guard = settings_store.enforcement_guard(db)
     return SettingsResponse(
         scheduler_enabled=bool(values.get(settings_store.KEY_SCHEDULER_ENABLED, True)),
         schedule_mode=str(values.get(settings_store.KEY_SCHEDULE_MODE) or "interval"),
@@ -67,7 +95,8 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         smtp_from=values.get(settings_store.KEY_SMTP_FROM),
         smtp_recipients=values.get(settings_store.KEY_SMTP_RECIPIENTS),
         smtp_password_configured=bool(values.get(f"{settings_store.KEY_SMTP_PASSWORD}.configured")),
-        webhook_url=values.get(settings_store.KEY_WEBHOOK_URL),
+        webhook_url_configured=bool(values.get(f"{settings_store.KEY_WEBHOOK_URL}.configured")),
+        webhook_host=_webhook_host(db),
         webhook_secret_configured=bool(
             values.get(f"{settings_store.KEY_WEBHOOK_SECRET}.configured")
         ),
@@ -75,6 +104,18 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         allowed_usage_periods=list(usage_api.SUPPORTED_PERIODS),
         ui_accent=settings_store.ui_accent(db),
         allowed_accents=list(settings_store.ALLOWED_ACCENTS),
+        self_service_requests=settings_store.self_service_requests_enabled(db),
+        report_email_enabled=settings_store.report_email_enabled(db),
+        credit_unit_cost=settings_store.credit_unit_cost(db),
+        demo_mode=settings_store.demo_mode(db),
+        automation_enabled=policy.enabled,
+        auto_approve_max_increase=policy.auto_approve_max_increase,
+        auto_approve_expiry_days=policy.auto_approve_expiry_days,
+        enforcement_paused=guard.paused,
+        enforcement_pause_reason=guard.pause_reason if guard.paused else None,
+        max_new_enforcements_per_cycle=guard.max_new_per_cycle,
+        max_new_targets_per_cycle=guard.max_new_targets_per_cycle,
+        protected_roles=", ".join(sorted(guard.protected_roles)),
         current_schedule_description=scheduler.describe_schedule(),
     )
 
@@ -141,9 +182,10 @@ def update_settings(
 
     for field, value in changes.items():
         if field in _SECRET_FIELDS:
-            # An empty string clears the secret; None means "leave it alone".
-            settings_store.set_secret(db, _SECRET_FIELDS[field], value or None)
-            audited_changes[field] = "set" if value else "cleared"
+            # An empty (or blank) string clears the secret; None means "leave it alone".
+            secret_value = value.strip() if isinstance(value, str) else value
+            settings_store.set_secret(db, _SECRET_FIELDS[field], secret_value or None)
+            audited_changes[field] = "set" if secret_value else "cleared"
             continue
         key = _PUBLIC_FIELDS.get(field)
         if key is None:
@@ -151,6 +193,21 @@ def update_settings(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={"code": "unknown_setting", "message": f"{field} cannot be changed."},
             )
+        if field == "enforcement_paused":
+            was_paused = settings_store.enforcement_guard(db).paused
+            if value and not was_paused:
+                # Pausing by hand records who. An existing pause keeps its own
+                # reason (the safety ceiling's explanation is worth more).
+                settings_store.set_value(
+                    db,
+                    settings_store.KEY_ENFORCEMENT_PAUSE_REASON,
+                    f"Paused by {ctx.actor.actor_name}.",
+                )
+            elif not value and was_paused:
+                # Resuming means an admin has looked at what was held back: that
+                # batch goes through once, without tripping the ceiling again.
+                settings_store.set_value(db, settings_store.KEY_ENFORCEMENT_PAUSE_REASON, None)
+                settings_store.set_value(db, settings_store.KEY_CEILING_WAIVED_ONCE, True)
         settings_store.set_value(db, key, value)
         audited_changes[field] = value
 

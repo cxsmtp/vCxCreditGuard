@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -25,6 +26,7 @@ from sqlalchemy.orm import Session
 from app.checkmarx import usage as usage_api
 from app.checkmarx.client import CheckmarxClient
 from app.checkmarx.errors import (
+    CheckmarxError,
     CheckmarxNotFoundError,
     CheckmarxPermissionError,
     CheckmarxResponseError,
@@ -67,6 +69,29 @@ SYNTHETIC_SUBJECTS: frozenset[str] = frozenset(
 )
 
 
+# A dimension found unavailable is asked for again after this long. Tenants gain
+# features, and one odd answer must not switch a dimension off for good.
+REPROBE_UNSUPPORTED_AFTER = timedelta(hours=24)
+
+# A read whose total is below this share of the previous read is not believed
+# straight away. Reported consumption only falls when old usage ages out of the
+# lookback window, which is gradual; a collapse is far more often an API hiccup
+# (an empty or partial answer with a 200). Believing it would wipe every period
+# baseline, lift every restriction, and then restrict everyone again in one go
+# when the real figures came back.
+HOLD_DROP_RATIO = Decimal("0.5")
+# ...unless the collapse persists: at least this many reads in a row, spanning at
+# least this long, all telling the same story. Then it is taken as real (a
+# genuine reset, such as a new subscription term). Both conditions matter: with a
+# two minute schedule, three reads alone would be only minutes of protection.
+HOLD_CONFIRMATIONS = 3
+HOLD_MIN_DURATION = timedelta(hours=2)
+
+
+class UsageIncompleteError(CheckmarxError):
+    """Pagination stopped before the endpoint's own page count was reached."""
+
+
 def is_synthetic_subject(subject_key: str) -> bool:
     return subject_key.strip().lower() in SYNTHETIC_SUBJECTS
 
@@ -88,12 +113,36 @@ class DimensionResult:
     automated: int = 0
     snapshot_id: int | None = None
     error: str | None = None
+    # True when the read was stored as evidence but not believed (see
+    # HOLD_DROP_RATIO); evaluation keeps using the previous snapshot.
+    held: bool = False
+    # True when the dimension should have been readable and was not (an outage, a
+    # truncated answer, a permission problem), as opposed to the tenant simply
+    # not offering it.
+    read_failed: bool = False
 
 
 @dataclass
 class IngestResult:
     dimensions: dict[str, DimensionResult] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # Dimensions that could not be read this cycle for a reason that is expected
+    # to pass (outage, rate limit, truncated answer). Evaluation then runs on the
+    # previous snapshot, and the cycle is reported as partial.
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def fresh(self) -> bool:
+        """True when every dimension that feeds limits was read and believed.
+
+        The action dimension only feeds the dashboard breakdown, so a problem
+        there does not make the figures limits are judged on stale.
+        """
+        return not any(
+            dimension.held or dimension.read_failed
+            for view, dimension in self.dimensions.items()
+            if view != str(UsageView.ACTION)
+        )
 
     @property
     def total_records(self) -> int:
@@ -110,6 +159,7 @@ class IngestResult:
                 "disputed": dimension.disputed,
                 "automated": dimension.automated,
                 "error": dimension.error,
+                "held": dimension.held,
             }
             for view, dimension in self.dimensions.items()
         }
@@ -254,27 +304,64 @@ def ingest_usage(
 
     for view in views:
         state = session.get(DimensionState, str(view))
-        if state is not None and state.supported is False:
+        if (
+            state is not None
+            and state.supported is False
+            and view != UsageView.USER
+            and not _reprobe_due(state)
+        ):
             result.dimensions[str(view)] = DimensionResult(
                 view_by=str(view), supported=False, error=state.last_error
             )
             continue
 
-        # USER is the dimension the endpoint falls back to, so it can never be a
-        # false positive and needs no probe.
-        if state is None and view != UsageView.USER and not fallback_probed:
+        # Only a dimension that has answered properly before is trusted without a
+        # probe. USER is the dimension the endpoint falls back to, so it can never
+        # be a false positive and needs none.
+        confirmed = state is not None and state.supported is True
+        # Already known to be unavailable: a re-probe that finds it still
+        # unavailable is not news, and must not degrade the run every day.
+        known_unsupported = state is not None and state.supported is False
+        # Nothing is left open in the database while we wait on Checkmarx.
+        session.commit()
+        if not confirmed and view != UsageView.USER and not fallback_probed:
             fallback_fingerprint = usage_api.fetch_fallback_fingerprint(
                 client, period=period_param, page_size=page_size
             )
             fallback_probed = True
 
+        if not confirmed and view != UsageView.USER and fallback_fingerprint is None:
+            # The probe that tells a real dimension from a silent fallback to the
+            # user view did not answer. Reading the dimension without it could
+            # file one entity's usage under another and mark the dimension as
+            # supported for good, so it is left for the next cycle.
+            message = (
+                f"Consumption by {view} could not be verified this cycle (the check for "
+                "a silent fallback to the user view did not answer)."
+            )
+            result.dimensions[str(view)] = DimensionResult(
+                view_by=str(view),
+                supported=not known_unsupported,
+                error=state.last_error if known_unsupported and state else message,
+                read_failed=not known_unsupported,
+            )
+            if not known_unsupported:
+                result.errors.append(message)
+            continue
+
         try:
-            dimension = _ingest_dimension(
-                session,
+            fetched = _fetch_dimension(
                 client,
                 view=view,
                 period_param=period_param,
                 page_size=page_size,
+                fallback_fingerprint=None if confirmed else fallback_fingerprint,
+            )
+            dimension = _store_dimension(
+                session,
+                fetched,
+                view=view,
+                period_param=period_param,
                 user_index=user_index,
                 projects_by_id=projects_by_id,
                 projects_by_name=projects_by_name,
@@ -282,46 +369,83 @@ def ingest_usage(
                 apps_by_name=apps_by_name,
                 groups_by_id=groups_by_id,
                 groups_by_name=groups_by_name,
-                fallback_fingerprint=fallback_fingerprint if state is None else None,
             )
+            if dimension.held:
+                result.warnings.append(dimension.error or f"The {view} read was held back.")
+            _record_dimension(session, view, supported=True, error=None)
         except FallbackDetected as exc:
             # The endpoint answered 200 but gave us the user dimension instead of the
             # one we asked for. Treating that as real data would attribute one
             # entity's consumption to another.
+            session.rollback()
             message = str(exc)
             _record_dimension(session, view, supported=False, error=message)
             dimension = DimensionResult(view_by=str(view), supported=False, error=message)
-            result.warnings.append(
-                f"Checkmarx does not report consumption by {view} on this tenant. It "
-                f"answered successfully but returned the user view instead, so that "
-                f"dimension is ignored. Limits at that level are not evaluated."
-            )
-            logger.warning("Dimension %s is a silent fallback to the user view", view)
+            if not known_unsupported:
+                result.warnings.append(
+                    f"Checkmarx does not report consumption by {view} on this tenant. It "
+                    f"answered successfully but returned the user view instead, so that "
+                    f"dimension is ignored. Limits at that level are not evaluated."
+                )
+                logger.warning("Dimension %s is a silent fallback to the user view", view)
         except (CheckmarxNotFoundError, CheckmarxResponseError) as exc:
-            # A 4xx on one dimension means the tenant does not offer it. Record
-            # that once and stop asking, rather than failing the whole cycle.
+            session.rollback()
             message = str(exc)
-            _record_dimension(session, view, supported=False, error=message)
-            dimension = DimensionResult(view_by=str(view), supported=False, error=message)
-            result.warnings.append(
-                f"Checkmarx does not report consumption by {view}: {message} "
-                f"Limits at that level cannot be evaluated."
-            )
-            logger.warning("Consumption dimension %s is unavailable: %s", view, message)
+            if view == UsageView.USER:
+                # The user dimension is the one everything else depends on, so it
+                # is never written off: an odd answer is a failed read, retried
+                # on the next cycle.
+                _record_dimension(session, view, supported=None, error=message)
+                dimension = DimensionResult(
+                    view_by=str(view), supported=True, error=message, read_failed=True
+                )
+                result.errors.append(f"consumption by {view} could not be read: {message}")
+            else:
+                # A 4xx on one dimension means the tenant does not offer it.
+                # Record that and stop asking for a while, rather than failing
+                # the whole cycle.
+                _record_dimension(session, view, supported=False, error=message)
+                dimension = DimensionResult(view_by=str(view), supported=False, error=message)
+                if not known_unsupported:
+                    result.warnings.append(
+                        f"Checkmarx does not report consumption by {view}: {message} "
+                        f"Limits at that level cannot be evaluated."
+                    )
+            if not known_unsupported:
+                logger.warning("Consumption dimension %s is unavailable: %s", view, message)
         except CheckmarxPermissionError as exc:
+            session.rollback()
             message = str(exc)
             _record_dimension(session, view, supported=None, error=message)
-            dimension = DimensionResult(view_by=str(view), supported=False, error=message)
+            dimension = DimensionResult(
+                view_by=str(view), supported=False, error=message, read_failed=True
+            )
             result.warnings.append(
                 f"The API key is not permitted to read consumption by {view}. {message}"
             )
-        else:
-            _record_dimension(session, view, supported=True, error=None)
+        except CheckmarxError as exc:
+            # An outage, a rate limit or a truncated answer. Nothing was stored, so
+            # the previous snapshot stays the latest one, and the other dimensions
+            # are still read.
+            session.rollback()
+            message = str(exc)
+            dimension = DimensionResult(
+                view_by=str(view), supported=True, error=message, read_failed=True
+            )
+            result.errors.append(f"consumption by {view} could not be read: {message}")
+            logger.warning("Consumption by %s could not be read this cycle: %s", view, message)
 
         result.dimensions[str(view)] = dimension
+        # One short transaction per dimension.
+        session.commit()
 
-    session.flush()
     return result
+
+
+def _reprobe_due(state: DimensionState, *, now: datetime | None = None) -> bool:
+    if state.last_checked_at is None:
+        return True
+    return (now or utcnow()) - state.last_checked_at >= REPROBE_UNSUPPORTED_AFTER
 
 
 def _record_dimension(
@@ -341,40 +465,52 @@ class FallbackDetected(RuntimeError):
     """The endpoint returned the user view for a dimension we asked for by name."""
 
 
-def _ingest_dimension(
-    session: Session,
+@dataclass
+class _Fetched:
+    """Everything one dimension returned, held in memory until it is judged."""
+
+    raw_pages: list[dict]
+    merged: dict[str, usage_api.ParsedUsageItem]
+    total_items: int | None
+    pages: int
+
+    @property
+    def total_credits(self) -> Decimal:
+        return sum((item.credits_used for item in self.merged.values()), Decimal("0"))
+
+
+def _fetch_dimension(
     client: CheckmarxClient,
     *,
     view: UsageView,
     period_param: str,
     page_size: int,
-    user_index: UserIndex,
-    projects_by_id: dict[str, str],
-    projects_by_name: dict[str, str],
-    apps_by_id: dict[str, str],
-    apps_by_name: dict[str, str],
-    groups_by_id: dict[str, str] | None = None,
-    groups_by_name: dict[str, str] | None = None,
     fallback_fingerprint: frozenset[str] | None = None,
-) -> DimensionResult:
-    now = utcnow()
-    snapshot = UsageSnapshot(collected_at=now, view_by=str(view), period_param=period_param, raw=[])
-    session.add(snapshot)
-    session.flush()
+) -> _Fetched:
+    """Read every page for one dimension. Touches no database state.
 
+    The whole answer is collected first so that a read which fails half way, or
+    turns out to be truncated, leaves nothing behind: a partial or empty snapshot
+    would become the "latest" one and be evaluated as though it were the truth.
+    """
     raw_pages: list[dict] = []
     merged: dict[str, usage_api.ParsedUsageItem] = {}
     total_items: int | None = None
+    total_pages: int | None = None
     pages = 0
+    last_page_size = 0
 
     for page in usage_api.fetch_usage(
         client, view_by=view, period=period_param, page_size=page_size
     ):
         pages += 1
+        last_page_size = len(page.items)
         if page.raw is not None:
             raw_pages.append(page.raw)
         if page.total_items is not None:
             total_items = page.total_items
+        if page.total_pages is not None:
+            total_pages = page.total_pages
         for item in page.items:
             existing = merged.get(item.subject_key)
             if existing is None:
@@ -384,22 +520,156 @@ def _ingest_dimension(
                 # overwritten rather than combined.
                 merged[item.subject_key] = _combine(existing, item)
 
+    # The endpoint says how many pages there are. Stopping short of that (an empty
+    # page in the middle, or the safety cap on page count) means consumption is
+    # missing, and under-counted usage must not be stored as the whole picture.
+    if total_pages is not None and pages < total_pages:
+        raise UsageIncompleteError(
+            f"Only {pages} of {total_pages} pages of consumption by {view} could be read."
+        )
+    if total_pages is None and pages >= usage_api.MAX_PAGES and last_page_size >= page_size:
+        raise UsageIncompleteError(
+            f"Consumption by {view} did not end within {usage_api.MAX_PAGES} pages."
+        )
+
     # Compare against the deliberate bad-parameter probe before storing anything. An
     # identical subject set means this dimension does not exist and we were handed the
     # user view, which would otherwise be filed as project or application usage.
     # Both sides must be non empty: two empty responses are identical without
     # telling us anything, and a real but idle dimension legitimately returns none.
     if fallback_fingerprint and merged and frozenset(merged.keys()) == fallback_fingerprint:
-        session.delete(snapshot)
-        session.flush()
         raise FallbackDetected(
             f"viewBy={view} returned the same subjects as an unrecognised viewBy "
             "value, so the endpoint silently fell back to the user dimension."
         )
 
-    snapshot.raw = raw_pages
-    snapshot.total_items = total_items
-    snapshot.pages_fetched = pages
+    return _Fetched(raw_pages=raw_pages, merged=merged, total_items=total_items, pages=pages)
+
+
+def _hold_reason(
+    session: Session, *, view: UsageView, period_param: str, total: Decimal
+) -> str | None:
+    """Why this read should not be believed yet, or None if it should.
+
+    Judged against the last read that *was* believed for the same lookback
+    window. A change of window legitimately changes every total, so a snapshot
+    taken with a different window is no yardstick.
+    """
+    previous = session.scalar(
+        select(UsageSnapshot)
+        .where(
+            UsageSnapshot.view_by == str(view),
+            UsageSnapshot.period_param == period_param,
+            UsageSnapshot.held_reason.is_(None),
+        )
+        .order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc())
+        .limit(1)
+    )
+    if previous is None or previous.total_credits <= 0:
+        return None
+    if total >= previous.total_credits * HOLD_DROP_RATIO:
+        return None
+
+    # The run of held reads immediately before this one (everything since the
+    # last believed read is held, by construction).
+    held_run = list(
+        session.scalars(
+            select(UsageSnapshot)
+            .where(
+                UsageSnapshot.view_by == str(view),
+                UsageSnapshot.period_param == period_param,
+                UsageSnapshot.id > previous.id,
+                UsageSnapshot.held_reason.is_not(None),
+            )
+            .order_by(UsageSnapshot.id)
+        )
+    )
+    now = utcnow()
+    # "The same story": no held read is wildly different from this one. A feed
+    # that returns nothing, then a third, then nothing is still misbehaving.
+    consistent = all(_similar(row.total_credits, total) for row in held_run)
+    long_enough = bool(held_run) and now - held_run[0].collected_at >= HOLD_MIN_DURATION
+    if len(held_run) + 1 >= HOLD_CONFIRMATIONS and long_enough and consistent:
+        logger.warning(
+            "Consumption by %s fell from %s to %s and has stayed there for %d reads over "
+            "%s, so it is accepted",
+            view,
+            previous.total_credits,
+            total,
+            len(held_run) + 1,
+            now - held_run[0].collected_at,
+        )
+        return None
+    return (
+        f"Checkmarx reported {total} credits by {view}, down from {previous.total_credits} "
+        f"on the last accepted read. A collapse like that is usually a faulty answer "
+        f"rather than real usage, so it is being held back and limits are still judged "
+        f"on the previous figures. It is accepted once it has persisted for at least "
+        f"{HOLD_CONFIRMATIONS} reads over {int(HOLD_MIN_DURATION.total_seconds() // 3600)} "
+        f"hours ({len(held_run) + 1} so far)."
+    )
+
+
+def _similar(first: Decimal, second: Decimal) -> bool:
+    """Two held totals tell the same story: both nothing, or within 2x of each other."""
+    low, high = sorted((first, second))
+    if high <= 0:
+        return True
+    return low * 2 >= high
+
+
+def _store_dimension(
+    session: Session,
+    fetched: _Fetched,
+    *,
+    view: UsageView,
+    period_param: str,
+    user_index: UserIndex,
+    projects_by_id: dict[str, str],
+    projects_by_name: dict[str, str],
+    apps_by_id: dict[str, str],
+    apps_by_name: dict[str, str],
+    groups_by_id: dict[str, str] | None = None,
+    groups_by_name: dict[str, str] | None = None,
+) -> DimensionResult:
+    """Write one fully fetched dimension. Makes no network calls."""
+    now = utcnow()
+    merged = fetched.merged
+    held_reason = _hold_reason(
+        session, view=view, period_param=period_param, total=fetched.total_credits
+    )
+    snapshot = UsageSnapshot(
+        collected_at=now,
+        view_by=str(view),
+        period_param=period_param,
+        raw=fetched.raw_pages,
+        total_items=fetched.total_items,
+        pages_fetched=fetched.pages,
+        total_credits=fetched.total_credits,
+        held_reason=held_reason,
+    )
+    session.add(snapshot)
+    session.flush()
+
+    if held_reason is not None:
+        # Kept as evidence of what was returned, but with no records and no
+        # effect on attribution: nothing downstream may treat it as usage.
+        return DimensionResult(
+            view_by=str(view),
+            supported=True,
+            snapshot_id=snapshot.id,
+            total_credits=fetched.total_credits,
+            error=held_reason,
+            held=True,
+        )
+
+    if fetched.total_items is not None and len(merged) < fetched.total_items:
+        logger.warning(
+            "Consumption by %s returned %d distinct subjects but reports %d items",
+            view,
+            len(merged),
+            fetched.total_items,
+        )
 
     result = DimensionResult(view_by=str(view), supported=True, snapshot_id=snapshot.id)
     total = Decimal("0")
@@ -613,11 +883,21 @@ def _apply_user_outcome(
 
 
 def latest_snapshot(session: Session, view: UsageView | str) -> UsageSnapshot | None:
+    from app.services import settings_store
+
+    # A held snapshot is a read that was not believed, so it is never the latest.
+    query = select(UsageSnapshot).where(
+        UsageSnapshot.view_by == str(view), UsageSnapshot.held_reason.is_(None)
+    )
+    # Demo snapshots are only ever visible in demo mode. Outside it they are
+    # hidden from every reader (dashboard and evaluation alike), so seeded demo
+    # data can never be read as - or enforced as - live usage.
+    if not settings_store.demo_mode(session):
+        query = query.where(
+            UsageSnapshot.period_param.is_distinct_from(settings_store.DEMO_PERIOD_PARAM)
+        )
     return session.scalar(
-        select(UsageSnapshot)
-        .where(UsageSnapshot.view_by == str(view))
-        .order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc())
-        .limit(1)
+        query.order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc()).limit(1)
     )
 
 

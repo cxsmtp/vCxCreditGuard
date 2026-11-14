@@ -27,6 +27,7 @@ import ipaddress
 import json
 import logging
 import smtplib
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -35,10 +36,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app import __version__
+from app.core.config import get_settings
 from app.core.logging import register_secret
 from app.models.audit import Notification
 from app.models.connection import CxConnection
@@ -125,9 +127,11 @@ def load_config(session: Session) -> DeliveryConfig:
     )
     password = settings_store.get_secret(session, settings_store.KEY_SMTP_PASSWORD)
     secret = settings_store.get_secret(session, settings_store.KEY_WEBHOOK_SECRET)
-    # Registered so neither can appear in a log line even by accident.
+    webhook_url = settings_store.get_secret(session, settings_store.KEY_WEBHOOK_URL)
+    # Registered so none of them can appear in a log line even by accident.
     register_secret(password)
     register_secret(secret)
+    register_secret(webhook_url)
 
     connection = session.scalar(select(CxConnection).limit(1))
     return DeliveryConfig(
@@ -142,7 +146,7 @@ def load_config(session: Session) -> DeliveryConfig:
         smtp_use_tls=bool(settings_store.get_value(session, settings_store.KEY_SMTP_USE_TLS)),
         smtp_from=_string(settings_store.get_value(session, settings_store.KEY_SMTP_FROM)),
         smtp_recipients=recipients,
-        webhook_url=_string(settings_store.get_value(session, settings_store.KEY_WEBHOOK_URL)),
+        webhook_url=_string(webhook_url),
         webhook_secret=secret,
         tenant_name=connection.tenant_name if connection else None,
     )
@@ -161,14 +165,30 @@ def meets_threshold(severity: str, minimum: str) -> bool:
 def pending_notifications(
     session: Session, *, config: DeliveryConfig, limit: int = DEFAULT_BATCH
 ) -> list[Notification]:
-    """Undelivered notifications at or above the configured severity, oldest first."""
-    rows = session.scalars(
-        select(Notification)
-        .where(Notification.delivery.is_(None))
-        .order_by(Notification.created_at)
-        .limit(limit * 4)
+    """Undelivered notifications at or above the configured severity, oldest first.
+
+    Anything below the threshold is marked as skipped first. Left undelivered it
+    would sit at the front of the queue for ever, and once enough of it had
+    built up, the oldest rows fetched each cycle would all be ones that are
+    never sent - and nothing above the threshold would go out again.
+    """
+    deliverable = [
+        severity for severity in SEVERITY_RANK if meets_threshold(severity, config.min_severity)
+    ]
+    session.execute(
+        update(Notification)
+        .where(Notification.delivery.is_(None), Notification.severity.notin_(deliverable))
+        .values(delivery={"skipped": "below the delivery threshold"})
+        .execution_options(synchronize_session=False)
     )
-    return [row for row in rows if meets_threshold(row.severity, config.min_severity)][:limit]
+    return list(
+        session.scalars(
+            select(Notification)
+            .where(Notification.delivery.is_(None), Notification.severity.in_(deliverable))
+            .order_by(Notification.created_at, Notification.id)
+            .limit(limit)
+        )
+    )
 
 
 def deliver_pending(
@@ -237,7 +257,10 @@ def deliver_pending(
                 _clear_attempts(notification.id)
                 notification.delivery = outcome
 
-        session.flush()
+            # Recorded as soon as it is sent. Leaving it to the end of the batch
+            # would resend everything already delivered if the process stopped
+            # part way through.
+            session.commit()
     finally:
         if owns_client:
             client.close()
@@ -325,21 +348,58 @@ def send_email(
     if not config.email_enabled:
         raise DeliveryError("email is not configured")
 
-    factory = smtp_factory or _default_smtp_factory
     message = build_email(notification, config=config)
+    _transmit(message, config=config, smtp_factory=smtp_factory)
+
+
+def _transmit(
+    message: EmailMessage, *, config: DeliveryConfig, smtp_factory: SmtpFactory | None = None
+) -> None:
+    """Open an SMTP connection, send one already-built message, and close."""
+    factory = smtp_factory or _default_smtp_factory
     try:
         server = factory(config.smtp_host or "", config.smtp_port, SMTP_TIMEOUT_SECONDS)
+    except DeliveryError:
+        raise
+    except ssl.SSLCertVerificationError as exc:
+        raise DeliveryError(
+            "the mail server's TLS certificate could not be verified "
+            f"({getattr(exc, 'verify_message', None) or exc}). If it is signed by a private "
+            "CA, set CXCG_SMTP_CA_FILE to that CA's certificate."
+        ) from exc
     except (OSError, smtplib.SMTPException) as exc:
         raise DeliveryError(
             f"could not connect to {config.smtp_host}: {type(exc).__name__}"
         ) from exc
 
+    # Port 465 is TLS from the first byte (see _default_smtp_factory), so there
+    # is no STARTTLS step and the connection already counts as encrypted.
+    implicit_tls = config.smtp_port == IMPLICIT_TLS_PORT
     try:
-        if config.smtp_use_tls:
-            server.starttls()
+        if config.smtp_use_tls and not implicit_tls:
+            # With a verifying context. Without one the certificate is not
+            # checked at all, and anyone on the path can pose as the mail server
+            # and collect the password and every notification.
+            server.starttls(context=_tls_context())
         if config.smtp_username and config.smtp_password:
+            if not (config.smtp_use_tls or implicit_tls):
+                raise DeliveryError(
+                    "refusing to send the SMTP password without TLS; turn on STARTTLS "
+                    "or remove the credentials"
+                )
             server.login(config.smtp_username, config.smtp_password)
         server.send_message(message)
+    except ssl.SSLCertVerificationError as exc:
+        raise DeliveryError(
+            "the mail server's TLS certificate could not be verified "
+            f"({getattr(exc, 'verify_message', None) or exc}). If it is signed by a private "
+            "CA, set CXCG_SMTP_CA_FILE to that CA's certificate; the name in the certificate "
+            "must match the SMTP host configured here."
+        ) from exc
+    except ssl.SSLError as exc:
+        raise DeliveryError(
+            f"a secure connection to the mail server could not be set up ({exc})"
+        ) from exc
     except smtplib.SMTPAuthenticationError as exc:
         raise DeliveryError("SMTP authentication was rejected") from exc
     except (OSError, smtplib.SMTPException) as exc:
@@ -351,8 +411,75 @@ def send_email(
             logger.debug("SMTP connection did not close cleanly")
 
 
+def send_report_email(
+    *,
+    config: DeliveryConfig,
+    subject: str,
+    text_body: str,
+    smtp_factory: SmtpFactory | None = None,
+) -> None:
+    """Email a report to the configured recipients. Raises DeliveryError on any
+    configuration or transport problem, so callers can record the failure."""
+    if not config.email_enabled:
+        raise DeliveryError("email is not configured")
+    message = EmailMessage()
+    message["Subject"] = _header_safe(f"[CxCreditGuard] {subject}")
+    message["From"] = _header_safe(config.smtp_from or "", limit=320)
+    message["To"] = _header_safe(", ".join(config.smtp_recipients), limit=2048)
+    message["X-CxCreditGuard-Category"] = "report"
+    message.set_content(text_body)
+    _transmit(message, config=config, smtp_factory=smtp_factory)
+
+
+def send_direct_email(
+    *,
+    config: DeliveryConfig,
+    to: str,
+    subject: str,
+    text_body: str,
+    smtp_factory: SmtpFactory | None = None,
+) -> None:
+    """Send one message to a specific recipient over the configured SMTP transport.
+
+    Unlike report and notification mail, this does not go to the configured
+    recipient list; it targets ``to`` (e.g. the account a password reset is for).
+    It only needs the transport to be set up (host and from), not a recipient
+    list, so it raises on a missing transport rather than reusing ``email_enabled``.
+    """
+    if not (config.smtp_host and config.smtp_from):
+        raise DeliveryError("email transport is not configured")
+    message = EmailMessage()
+    message["Subject"] = _header_safe(f"[CxCreditGuard] {subject}")
+    message["From"] = _header_safe(config.smtp_from, limit=320)
+    message["To"] = _header_safe(to, limit=320)
+    message["X-CxCreditGuard-Category"] = "account"
+    message.set_content(text_body)
+    _transmit(message, config=config, smtp_factory=smtp_factory)
+
+
+IMPLICIT_TLS_PORT = 465
+
+
 def _default_smtp_factory(host: str, port: int, timeout: float) -> smtplib.SMTP:
+    if port == IMPLICIT_TLS_PORT:
+        # "SMTPS": the server expects TLS before anything else is said.
+        return smtplib.SMTP_SSL(host=host, port=port, timeout=timeout, context=_tls_context())
     return smtplib.SMTP(host=host, port=port, timeout=timeout)
+
+
+def _tls_context() -> ssl.SSLContext:
+    """Verify the mail server's certificate and hostname.
+
+    Trusts the system CAs, plus a private CA when CXCG_SMTP_CA_FILE points at
+    one (an internal relay with an internally issued certificate).
+    """
+    ca_file = get_settings().smtp_ca_file
+    try:
+        return ssl.create_default_context(cafile=str(ca_file) if ca_file else None)
+    except (OSError, ssl.SSLError) as exc:
+        raise DeliveryError(
+            f"CXCG_SMTP_CA_FILE ({ca_file}) could not be read as a CA certificate: {exc}"
+        ) from exc
 
 
 # -------------------------------------------------------------------- webhook

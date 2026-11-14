@@ -8,7 +8,7 @@ from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, UniqueConstr
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
-from app.db.types import UTCDateTime
+from app.db.types import JSONColumn, UTCDateTime
 from app.models.enums import UtilityRole
 
 
@@ -27,6 +27,12 @@ class UtilityUser(Base, TimestampMixin):
     # TOTP secret is encrypted at rest with purpose "totp-secret".
     totp_secret_encrypted: Mapped[str | None] = mapped_column(String(512))
     totp_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # SHA-256 digests of the unused one-time recovery codes issued when two
+    # factor authentication was enabled. Each is removed as it is used.
+    totp_recovery_codes: Mapped[list | None] = mapped_column(JSONColumn)
+    # The time step of the last authenticator code accepted, so a code cannot be
+    # used twice within its validity window.
+    totp_last_step: Mapped[int | None] = mapped_column(Integer)
 
     failed_login_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
@@ -69,6 +75,27 @@ class UtilitySession(Base):
     __table_args__ = (Index("ix_utility_session_expiry", "idle_expires_at", "absolute_expires_at"),)
 
 
+class PasswordResetToken(Base):
+    """A single-use, time-limited token for self-service password reset.
+
+    Only the token's SHA-256 digest is stored, like session tokens. A token is
+    spent when ``used_at`` is set, and expires at ``expires_at``; requesting a new
+    one marks any earlier unused token for the same user as used.
+    """
+
+    __tablename__ = "password_reset_token"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("utility_user.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    requested_ip: Mapped[str | None] = mapped_column(String(64))
+
+
 class LoginAttempt(Base):
     """Per identifier rate limiting counter, keyed by username and client IP."""
 
@@ -80,5 +107,12 @@ class LoginAttempt(Base):
     window_started_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_attempt_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    # Consecutive failed sign-ins from this address for this username, and the
+    # lockout they earned. Kept per source so that one address guessing passwords
+    # locks itself out, not the account's real owner signing in from elsewhere.
+    failure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     __table_args__ = (UniqueConstraint("identifier", "ip_address", name="identifier_ip"),)

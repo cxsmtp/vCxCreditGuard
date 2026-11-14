@@ -114,6 +114,7 @@ class AuditEntryResponse(BaseModel):
     after: dict | None
     detail: str | None
     ip_address: str | None
+    entry_hash: str | None = None
 
 
 class AuditListResponse(BaseModel):
@@ -177,7 +178,10 @@ class SettingsResponse(BaseModel):
     smtp_from: str | None
     smtp_recipients: str | None
     smtp_password_configured: bool
-    webhook_url: str | None
+    # The URL itself is a credential and is never returned: only whether one is
+    # set, and which host it points at.
+    webhook_url_configured: bool = False
+    webhook_host: str | None = None
     webhook_secret_configured: bool
     allowed_interval_minutes: list[int]
     # The lookback windows the consumption endpoint accepts. Anything else is a 400.
@@ -185,6 +189,26 @@ class SettingsResponse(BaseModel):
     # The organisation accent theme and the set an admin may choose from.
     ui_accent: str = "default"
     allowed_accents: list[str] = Field(default_factory=list)
+    # Whether viewers may submit credit requests for an admin to decide.
+    self_service_requests: bool = False
+    # Whether a weekly summary report is emailed to the notification recipients.
+    report_email_enabled: bool = False
+    # Monetary cost of one credit for chargeback (0 means cost unknown).
+    credit_unit_cost: float = 0.0
+    # Demo mode: synthetic data, enforcement suppressed, UI marked as demo.
+    demo_mode: bool = False
+    # Hands-off automation: auto-approve pending credit requests within a cap.
+    automation_enabled: bool = False
+    auto_approve_max_increase: int = 0
+    auto_approve_expiry_days: int = 0
+    # Enforcement safety: paused (by an admin or by the ceiling), the ceiling on
+    # limits that may start restricting in one cycle (0 = none), and tenant
+    # roles whose holders are never restricted.
+    enforcement_paused: bool = False
+    enforcement_pause_reason: str | None = None
+    max_new_enforcements_per_cycle: int = 25
+    max_new_targets_per_cycle: int = 100
+    protected_roles: str = ""
     current_schedule_description: str
 
 
@@ -209,6 +233,17 @@ class SettingsUpdateRequest(StrictModel):
     webhook_url: str | None = Field(default=None, max_length=1024)
     webhook_secret: str | None = Field(default=None, max_length=512)
     ui_accent: str | None = Field(default=None, max_length=16)
+    self_service_requests: bool | None = None
+    report_email_enabled: bool | None = None
+    credit_unit_cost: float | None = Field(default=None, ge=0, le=1_000_000)
+    demo_mode: bool | None = None
+    automation_enabled: bool | None = None
+    auto_approve_max_increase: int | None = Field(default=None, ge=0, le=10_000_000)
+    auto_approve_expiry_days: int | None = Field(default=None, ge=0, le=3650)
+    enforcement_paused: bool | None = None
+    max_new_enforcements_per_cycle: int | None = Field(default=None, ge=0, le=100_000)
+    max_new_targets_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    protected_roles: str | None = Field(default=None, max_length=1024)
 
     @field_validator("schedule_mode")
     @classmethod
@@ -267,4 +302,12 @@ class MeResponse(BaseModel):
     setup_required: bool
     # The organisation accent theme, so the SPA can apply it on load.
     ui_accent: str = "default"
+    # Whether this user may submit credit requests: always true for an admin,
+    # and for a viewer only when self-service is enabled.
+    can_request_credits: bool = False
+    # Demo mode, so the SPA can show the demo banner.
+    demo_mode: bool = False
+    # Why new restrictions are not being applied, when they are not (paused by
+    # an admin or by the safety ceiling). None when enforcement is running.
+    enforcement_paused: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)

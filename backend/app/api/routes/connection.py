@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.checkmarx.errors import ApiKeyError, CheckmarxError
+from app.checkmarx.regions import UntrustedHostError
 from app.models.enums import ConnectionStatus
 from app.schemas.connection import (
     ApiBaseUrlRequest,
@@ -86,6 +87,12 @@ def save_connection(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_api_key", "message": str(exc)},
         ) from exc
+    except UntrustedHostError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "untrusted_host", "message": str(exc)},
+        ) from exc
     except CheckmarxError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -111,6 +118,12 @@ def override_api_base_url(
 ) -> ConnectionTestResponse:
     try:
         connection_service.set_api_base_url(db, api_base_url=payload.api_base_url, actor=ctx.actor)
+    except UntrustedHostError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "untrusted_host", "message": str(exc)},
+        ) from exc
     except CheckmarxError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

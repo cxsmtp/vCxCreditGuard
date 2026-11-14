@@ -121,3 +121,11 @@ class ConnectionStatus(StrEnum):
     HEALTHY = "healthy"
     DEGRADED = "degraded"
     FAILED = "failed"
+
+
+class RequestStatus(StrEnum):
+    """A credit request's lifecycle. Pending until an admin decides."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"

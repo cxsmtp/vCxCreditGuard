@@ -1,13 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { ApiError, api } from "../api/client";
 import type {
+  AdminResetResult,
   AppSettings,
+  Attestation,
   CycleRun,
   OrgEntity,
+  RestoreResult,
   SchedulerStatus,
   UnresolvedSubject,
   UtilityAccount,
+  WatchdogStatus,
 } from "../api/types";
 import {
   Badge,
@@ -30,10 +34,25 @@ import {
   Toggle,
 } from "../components/ui";
 import { useResource } from "../hooks/useResource";
+import { downloadText, timestampedName } from "../lib/export";
 import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 
-export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
+/** Unsaved edits. The last three are write only: the server never sends the
+ * stored value back, so they exist here only while being typed. */
+type SettingsDraft = Partial<AppSettings> & {
+  smtp_password?: string;
+  webhook_secret?: string;
+  webhook_url?: string;
+};
+
+export function SettingsPage({
+  isAdmin,
+  onSettingsSaved,
+}: {
+  isAdmin: boolean;
+  onSettingsSaved?: () => Promise<unknown>;
+}) {
   const toast = useToast();
   const location = useLocation();
 
@@ -44,7 +63,8 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
     [],
   );
 
-  const [draft, setDraft] = useState<Partial<AppSettings> & { smtp_password?: string; webhook_secret?: string }>({});
+  const [draft, setDraft] = useState<SettingsDraft>({});
+  const [removeWebhook, setRemoveWebhook] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -64,22 +84,31 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
   const value = <K extends keyof AppSettings>(key: K): AppSettings[K] | undefined =>
     (draft[key] as AppSettings[K] | undefined) ?? current?.[key];
 
-  function set(patch: Partial<AppSettings> & { smtp_password?: string; webhook_secret?: string }) {
+  function set(patch: SettingsDraft) {
     setDraft((existing) => ({ ...existing, ...patch }));
   }
 
-  const dirty = Object.keys(draft).length > 0;
+  // Keys cleared back to undefined are not changes.
+  const changes = Object.fromEntries(
+    Object.entries(draft).filter(([, fieldValue]) => fieldValue !== undefined),
+  ) as SettingsDraft;
+  if (removeWebhook && changes.webhook_url === undefined) changes.webhook_url = "";
+  const dirty = Object.keys(changes).length > 0;
 
   async function save() {
     setBusy(true);
     setError(null);
     try {
-      const updated = await api.put<AppSettings>("/api/settings", draft);
+      const updated = await api.put<AppSettings>("/api/settings", changes);
       settings.setData(updated);
       applyAccent(updated.ui_accent);
       setDraft({});
+      setRemoveWebhook(false);
       toast.success(`Settings saved. Schedule is now ${updated.current_schedule_description}.`);
       await status.reload();
+      // Refresh the bootstrap profile so shell-level state (the demo banner,
+      // the accent) reflects the save without a manual reload.
+      await onSettingsSaved?.();
     } catch (caught) {
       setError(caught instanceof ApiError ? caught.message : "Could not save the settings.");
     } finally {
@@ -419,15 +448,41 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
             </Field>
 
             <div className="grid gap-4 border-t border-hairline pt-4 sm:grid-cols-2">
-              <Field label="Webhook URL" hint="A JSON payload is posted for each delivered notification.">
+              <Field
+                label="Webhook URL"
+                hint={
+                  current.webhook_url_configured
+                    ? `A webhook to ${current.webhook_host ?? "a stored URL"} is configured. The URL is not shown again; type a new one to replace it, or clear the box and save to remove it.`
+                    : "A JSON payload is posted for each delivered notification."
+                }
+              >
                 <Input
-                  value={value("webhook_url") ?? ""}
+                  type="text"
+                  name="cxcg-webhook-url"
+                  value={draft.webhook_url ?? ""}
                   disabled={!isAdmin}
-                  onChange={(event) => set({ webhook_url: event.target.value })}
-                  placeholder="https://hooks.example.com/cxcreditguard"
+                  // Emptying the box is "leave it as it is", not "remove it":
+                  // removal is the explicit control below.
+                  onChange={(event) => set({ webhook_url: event.target.value || undefined })}
+                  placeholder={
+                    current.webhook_url_configured
+                      ? `•••••••• (${current.webhook_host ?? "configured"})`
+                      : "https://hooks.example.com/cxcreditguard"
+                  }
                   spellCheck={false}
+                  autoComplete="off"
                 />
               </Field>
+              {isAdmin && current.webhook_url_configured && (
+                <div className="sm:col-span-2">
+                  <Toggle
+                    checked={removeWebhook}
+                    onChange={setRemoveWebhook}
+                    label="Remove the stored webhook when saving"
+                    description="Stops posting notifications to it. Leave off to keep it, or type a new URL above to replace it."
+                  />
+                </div>
+              )}
               <Field
                 label="Webhook signing secret"
                 hint={
@@ -456,12 +511,187 @@ export function SettingsPage({ isAdmin }: { isAdmin: boolean }) {
             options={current.allowed_accents ?? ["default"]}
             onPick={(accent) => set({ ui_accent: accent })}
           />
+          <Card
+            title="Self-service credit requests"
+            description="Let viewers submit requests to raise an entity's budget for you to approve or deny."
+          >
+            <Toggle
+              checked={value("self_service_requests") ?? false}
+              disabled={!isAdmin}
+              onChange={(next) => set({ self_service_requests: next })}
+              label="Allow viewers to request credits"
+              description={
+                (value("self_service_requests") ?? false)
+                  ? "Viewers see a Requests tab where they can ask for more budget. Admins always decide every request."
+                  : "Only admins can file credit requests. Turn this on to open it to viewers."
+              }
+            />
+          </Card>
+          <div id="enforcement-safety">
+            <Card
+              title="Enforcement safety"
+              description="Guard rails around restricting access in Checkmarx One. They apply to every enforcing limit."
+            >
+              {current.enforcement_paused && (
+                <div className="mb-4">
+                  <InfoNote tone="warning">
+                    Enforcement is paused. {current.enforcement_pause_reason} Limits are still
+                    monitored and access that is no longer restricted for a reason is still given
+                    back, but nobody new is restricted until you resume.
+                  </InfoNote>
+                </div>
+              )}
+              <Toggle
+                checked={value("enforcement_paused") ?? false}
+                disabled={!isAdmin}
+                onChange={(next) => set({ enforcement_paused: next })}
+                label="Pause enforcement"
+                description="Stops new restrictions straight away without changing any limit. Existing restrictions stay as they are; restores continue. Turning it off resumes enforcement: whatever was held back is applied on the next cycle, so check the Simulation page first."
+              />
+              <div className="mt-4 grid gap-4 sm:grid-cols-3">
+                <Field
+                  label="Safety ceiling (limits per cycle)"
+                  hint="If more limits than this would start restricting in a single cycle, none are restricted and enforcement pauses itself until an admin resumes it. That many breaches at once usually means bad data, not real spending. 0 removes the ceiling."
+                >
+                  <Input
+                    type="number"
+                    min={0}
+                    step="1"
+                    disabled={!isAdmin}
+                    value={String(value("max_new_enforcements_per_cycle") ?? 25)}
+                    onChange={(event) =>
+                      set({
+                        max_new_enforcements_per_cycle: Math.max(
+                          0,
+                          Math.floor(Number(event.target.value)),
+                        ),
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Safety ceiling (users and projects)"
+                  hint="The same safeguard counted in what would be restricted: one application or group limit can take many projects with it. 0 removes the ceiling."
+                >
+                  <Input
+                    type="number"
+                    min={0}
+                    step="1"
+                    disabled={!isAdmin}
+                    value={String(value("max_new_targets_per_cycle") ?? 100)}
+                    onChange={(event) =>
+                      set({
+                        max_new_targets_per_cycle: Math.max(
+                          0,
+                          Math.floor(Number(event.target.value)),
+                        ),
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Protected roles"
+                  hint="Comma separated Checkmarx One role names. A user holding any of them is never restricted automatically; an admin is told instead. The account your API key belongs to is always protected."
+                >
+                  <Input
+                    disabled={!isAdmin}
+                    value={value("protected_roles") ?? ""}
+                    onChange={(event) => set({ protected_roles: event.target.value })}
+                    placeholder="ast-admin, iam-admin"
+                    spellCheck={false}
+                  />
+                </Field>
+              </div>
+            </Card>
+          </div>
+          <Card
+            title="Hands-off automation"
+            description="Let the governance cycle approve routine credit requests on its own, so small, safe raises do not wait for an admin."
+          >
+            <Toggle
+              checked={value("automation_enabled") ?? false}
+              disabled={!isAdmin}
+              onChange={(next) => set({ automation_enabled: next })}
+              label="Auto-approve credit requests within a cap"
+              description="When on, each cycle approves pending requests whose increase over the current budget is within the cap below. Requests above the cap always wait for an admin."
+            />
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <Field
+                label="Auto-approve cap (credits)"
+                hint="The most that is approved automatically for one entity, and at one requester's asking, in any 30 days - in total, not per request. A request that would go over it waits for an admin. 0 approves nothing, even when the switch is on."
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step="1"
+                  disabled={!isAdmin || !(value("automation_enabled") ?? false)}
+                  value={String(value("auto_approve_max_increase") ?? 0)}
+                  onChange={(event) =>
+                    set({ auto_approve_max_increase: Math.max(0, Math.floor(Number(event.target.value))) })
+                  }
+                />
+              </Field>
+              <Field
+                label="Auto-grant expiry (days)"
+                hint="0 makes auto-approvals permanent. A positive value makes each a temporary grant that self-reverts, so the mode is safe to leave on."
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step="1"
+                  disabled={!isAdmin || !(value("automation_enabled") ?? false)}
+                  value={String(value("auto_approve_expiry_days") ?? 0)}
+                  onChange={(event) =>
+                    set({ auto_approve_expiry_days: Math.max(0, Math.floor(Number(event.target.value))) })
+                  }
+                />
+              </Field>
+            </div>
+          </Card>
+          <Card
+            title="Scheduled report"
+            description="Email a weekly summary report to the notification recipients."
+          >
+            <Toggle
+              checked={value("report_email_enabled") ?? false}
+              disabled={!isAdmin}
+              onChange={(next) => set({ report_email_enabled: next })}
+              label="Email the weekly report"
+              description="Sends the Reports summary to the configured notification recipients once a week. Needs SMTP configured below. Admins can also send it on demand from the Reports page."
+            />
+            <div className="mt-4">
+              <Field
+                label="Credit unit cost (for chargeback)"
+                hint="Monetary cost of one credit. 0 shows chargeback in credits only, with no currency amount."
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step="0.0001"
+                  disabled={!isAdmin}
+                  value={String(value("credit_unit_cost") ?? 0)}
+                  onChange={(event) => set({ credit_unit_cost: Number(event.target.value) })}
+                />
+              </Field>
+            </div>
+          </Card>
+          {isAdmin && (
+            <DemoCard
+              enabled={value("demo_mode") ?? false}
+              onToggle={(next) => set({ demo_mode: next })}
+              onChanged={async () => {
+                await settings.reload();
+                await onSettingsSaved?.();
+              }}
+            />
+          )}
           <AttributionCard
             isAdmin={isAdmin}
             subjects={unresolved.data ?? []}
             loading={unresolved.initialLoading}
             onChanged={() => unresolved.reload()}
           />
+          {isAdmin && <OperationsCard />}
           {isAdmin && <AccountsCard />}
         </div>
       </div>
@@ -868,6 +1098,158 @@ function AttributionCard({
 
 /* ---------------------------------------------------------------- accounts */
 
+const WATCHDOG_TONE: Record<WatchdogStatus["state"], "good" | "neutral" | "warning" | "critical"> = {
+  ok: "good",
+  disabled: "neutral",
+  stale: "warning",
+  down: "critical",
+};
+
+function OperationsCard() {
+  const toast = useToast();
+  const attestation = useResource<Attestation>(
+    (signal) => api.get("/api/ops/attestation", undefined, signal),
+    [],
+  );
+  const watchdog = useResource<WatchdogStatus>(
+    (signal) => api.get("/api/ops/watchdog", undefined, signal),
+    [],
+  );
+  const [busy, setBusy] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  async function downloadBackup() {
+    setBusy(true);
+    try {
+      const data = await api.get<Record<string, unknown>>("/api/ops/backup");
+      downloadText(
+        JSON.stringify(data, null, 2),
+        timestampedName("cxcreditguard-config", "json"),
+        "application/json",
+      );
+      toast.success("Backup downloaded.");
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not export the backup.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function emailBackup() {
+    setBusy(true);
+    try {
+      await api.post("/api/ops/backup/email");
+      toast.success("Backup emailed to the notification recipients.");
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not email the backup.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restore(file: File) {
+    setBusy(true);
+    try {
+      const parsed = JSON.parse(await file.text());
+      const result = await api.post<RestoreResult>("/api/ops/restore", parsed);
+      toast.success(
+        `Restored ${result.limits_created + result.limits_updated} limit(s), ` +
+          `${result.settings} setting(s), ${result.exemptions} override(s).`,
+      );
+      await Promise.all([attestation.reload(), watchdog.reload()]);
+    } catch (caught) {
+      if (caught instanceof SyntaxError) toast.error("That file is not valid JSON.");
+      else toast.error(caught instanceof ApiError ? caught.message : "Restore failed.");
+    } finally {
+      setBusy(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  }
+
+  const att = attestation.data;
+  const watch = watchdog.data;
+
+  return (
+    <Card
+      title="Operations"
+      description="Version and integrity, scheduler liveness, and configuration backup and restore."
+    >
+      <div className="flex flex-col gap-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Version &amp; integrity
+            </p>
+            {att ? (
+              <div className="mt-1 text-sm">
+                <div>
+                  v{att.version}
+                  {att.update.update_available && (
+                    <span className="ml-2">
+                      <Badge tone="warning">Update to {att.update.latest}</Badge>
+                    </span>
+                  )}
+                </div>
+                <code className="text-xs break-all" style={{ color: "var(--text-muted)" }}>
+                  {att.config_digest.slice(0, 16)}…
+                </code>
+              </div>
+            ) : (
+              <Spinner />
+            )}
+          </div>
+          <div>
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Scheduler watchdog
+            </p>
+            {watch ? (
+              <div className="mt-1 flex items-center gap-2">
+                <Badge tone={WATCHDOG_TONE[watch.state]}>{watch.state}</Badge>
+                <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  {watch.detail}
+                </span>
+              </div>
+            ) : (
+              <Spinner />
+            )}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-hairline pt-4">
+          <Button size="sm" onClick={downloadBackup} disabled={busy}>
+            Download backup
+          </Button>
+          <Button size="sm" variant="secondary" onClick={emailBackup} disabled={busy}>
+            Email backup
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => fileInput.current?.click()}
+            disabled={busy}
+          >
+            Restore from file…
+          </Button>
+          <input
+            ref={fileInput}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void restore(file);
+            }}
+          />
+        </div>
+        <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+          Backups hold settings, limits and overrides only. Secrets, passwords and the audit log
+          are never exported. Restoring overwrites matching configuration.
+        </p>
+      </div>
+    </Card>
+  );
+}
+
 function AccountsCard() {
   const toast = useToast();
   const accounts = useResource<UtilityAccount[]>(
@@ -876,6 +1258,10 @@ function AccountsCard() {
   );
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<UtilityAccount | null>(null);
+  const [resettingTotp, setResettingTotp] = useState<UtilityAccount | null>(null);
+  const [resetFor, setResetFor] = useState<
+    (AdminResetResult & { username: string }) | null
+  >(null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<"admin" | "viewer">("viewer");
@@ -948,6 +1334,32 @@ function AccountsCard() {
     }
   }
 
+  async function resetTwoFactor() {
+    if (!resettingTotp) return;
+    setBusy(true);
+    try {
+      await api.post(`/api/accounts/${resettingTotp.id}/totp/reset`);
+      toast.success(`Two factor reset for ${resettingTotp.username}.`);
+      setResettingTotp(null);
+      await accounts.reload();
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not reset two factor.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function issueReset(account: UtilityAccount) {
+    try {
+      const result = await api.post<AdminResetResult>(
+        `/api/accounts/${account.id}/reset-password`,
+      );
+      setResetFor({ username: account.username, ...result });
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not issue a reset code.");
+    }
+  }
+
   return (
     <Card
       title="Utility accounts"
@@ -1017,6 +1429,26 @@ function AccountsCard() {
                         onClick={() => unlock(account)}
                       >
                         Unlock
+                      </button>
+                    )}
+                    {account.is_active && (
+                      <button
+                        type="button"
+                        className="underline"
+                        style={{ color: "var(--text-secondary)" }}
+                        onClick={() => issueReset(account)}
+                      >
+                        Reset password
+                      </button>
+                    )}
+                    {account.totp_enabled && (
+                      <button
+                        type="button"
+                        className="underline"
+                        style={{ color: "var(--text-secondary)" }}
+                        onClick={() => setResettingTotp(account)}
+                      >
+                        Reset two factor
                       </button>
                     )}
                     <button
@@ -1095,6 +1527,129 @@ function AccountsCard() {
         onConfirm={remove}
         onCancel={() => setDeleting(null)}
       />
+
+      <ConfirmDialog
+        open={resettingTotp !== null}
+        title="Reset two factor for this account?"
+        destructive
+        confirmLabel="Reset two factor"
+        busy={busy}
+        message={
+          resettingTotp
+            ? `Use this when ${resettingTotp.username} has lost their authenticator. Two factor is turned off for the account, its recovery codes are discarded and it is signed out everywhere. They sign in with their password and should set two factor up again straight away.`
+            : ""
+        }
+        onConfirm={resetTwoFactor}
+        onCancel={() => setResettingTotp(null)}
+      />
+
+      <Modal
+        open={resetFor !== null}
+        title="One-time reset code"
+        description={
+          resetFor
+            ? `Give this code to ${resetFor.username}. They redeem it on the sign-in page under "I have a reset code". It is shown once.`
+            : ""
+        }
+        onClose={() => setResetFor(null)}
+        footer={
+          <Button variant="primary" onClick={() => setResetFor(null)}>
+            Done
+          </Button>
+        }
+      >
+        {resetFor && (
+          <div className="flex flex-col gap-3">
+            <code
+              className="block rounded-md px-3 py-2 text-sm break-all"
+              style={{ background: "var(--hover)" }}
+            >
+              {resetFor.reset_token}
+            </code>
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Expires {formatDateTime(resetFor.expires_at)}. Issuing a new code invalidates this one.
+            </p>
+          </div>
+        )}
+      </Modal>
+    </Card>
+  );
+}
+
+/* -------------------------------------------------------------------- demo */
+
+function DemoCard({
+  enabled,
+  onToggle,
+  onChanged,
+}: {
+  enabled: boolean;
+  onToggle: (next: boolean) => void;
+  onChanged: () => Promise<unknown>;
+}) {
+  const toast = useToast();
+  const status = useResource<{ demo_mode: boolean; seeded: boolean }>(
+    (signal) => api.get("/api/ops/demo", undefined, signal),
+    [],
+  );
+  const [running, setRunning] = useState<"seed" | "clear" | null>(null);
+
+  async function run(path: "seed" | "clear") {
+    setRunning(path);
+    try {
+      await api.post(`/api/ops/demo/${path}`);
+      toast.success(
+        path === "seed"
+          ? "Demo data seeded and demo mode turned on."
+          : "Demo data cleared and demo mode turned off.",
+      );
+      await status.reload();
+      // Seeding/clearing flips demo mode server-side; refresh the toggle and the
+      // app banner so they match.
+      await onChanged();
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "The demo action failed.");
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  const busy = running !== null;
+
+  return (
+    <Card
+      title="Demo mode"
+      description="Explore CxCreditGuard with synthetic data. In demo mode the scheduler makes no change in Checkmarx, and demo data is never read as live."
+    >
+      <div className="flex flex-col gap-4">
+        <Toggle
+          checked={enabled}
+          onChange={onToggle}
+          label="Demo mode"
+          description={
+            enabled
+              ? "On. The app is marked as demo and automated cycles touch no live tenant. Save to apply."
+              : "Off. Live data and normal enforcement. Save after changing."
+          }
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" onClick={() => run("seed")} loading={running === "seed"} disabled={busy}>
+            Seed demo data
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => run("clear")}
+            loading={running === "clear"}
+            disabled={busy}
+          >
+            Clear demo data
+          </Button>
+          <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+            {status.data?.seeded ? "Demo data is present." : "No demo data seeded."}
+          </span>
+        </div>
+      </div>
     </Card>
   );
 }

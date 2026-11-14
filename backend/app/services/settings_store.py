@@ -17,7 +17,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.usage import DEFAULT_PERIOD
-from app.core.crypto import PURPOSE_SMTP_PASSWORD, PURPOSE_WEBHOOK_SECRET, get_secret_box
+from app.core.crypto import (
+    PURPOSE_SMTP_PASSWORD,
+    PURPOSE_WEBHOOK_SECRET,
+    PURPOSE_WEBHOOK_URL,
+    get_secret_box,
+)
 from app.models.connection import AppSetting
 
 logger = logging.getLogger(__name__)
@@ -53,9 +58,64 @@ KEY_NOTIFY_MIN_SEVERITY = "notify.min_severity"
 KEY_UI_ACCENT = "ui.accent"
 ALLOWED_ACCENTS: tuple[str, ...] = ("default", "teal", "violet", "amber", "rose", "slate")
 
+# Credit requests: when on, a non-admin (viewer) may submit a request to raise an
+# entity's budget for an admin to approve. Off by default, so self-service is a
+# deliberate choice an admin makes rather than something viewers get silently.
+KEY_SELF_SERVICE_REQUESTS = "requests.self_service"
+
+# Scheduled report email: when on, a weekly summary report is emailed to the
+# configured notification recipients. Off by default; needs SMTP configured.
+KEY_REPORT_EMAIL_ENABLED = "reports.weekly_email"
+
+# Chargeback: the monetary cost of one credit, used only to put a figure next to
+# per-business-unit consumption. 0 means "cost unknown"; the report then shows
+# credits without a currency amount.
+KEY_CREDIT_UNIT_COST = "reports.credit_unit_cost"
+
+# Demo mode: when on, the UI is clearly marked as demo and real enforcement is
+# suppressed (no writes to Checkmarx), so the product can be trialled with the
+# seeded synthetic dataset without touching a live tenant.
+KEY_DEMO_MODE = "demo.enabled"
+
+# Hands-off automation: when enabled, the cycle auto-approves pending credit
+# requests whose increase over the current budget is within
+# ``auto_approve_max_increase`` credits. A cap of 0 auto-approves nothing even
+# when enabled (an explicit, safe default: the admin must set a cap). A non-zero
+# ``auto_approve_expiry_days`` makes each auto-grant temporary, so it self-reverts
+# via the existing grant-expiry step and the mode stays safe to leave on.
+KEY_AUTOMATION_ENABLED = "automation.enabled"
+KEY_AUTO_APPROVE_MAX_INCREASE = "automation.auto_approve_max_increase"
+KEY_AUTO_APPROVE_EXPIRY_DAYS = "automation.auto_approve_expiry_days"
+
+# Enforcement safety. ``paused`` stops new restrictions (restores still happen);
+# the cycle sets it itself, with a reason, when more limits than
+# ``max_new_enforcements_per_cycle`` would start restricting in one cycle - a
+# sign of bad data or a mistake far more often than of that many people
+# overspending in the same few minutes. ``protected_roles`` are tenant roles
+# whose holders are never restricted.
+KEY_ENFORCEMENT_PAUSED = "enforcement.paused"
+KEY_ENFORCEMENT_PAUSE_REASON = "enforcement.pause_reason"
+KEY_MAX_NEW_ENFORCEMENTS = "enforcement.max_new_enforcements_per_cycle"
+# The same ceiling counted in users and projects rather than limits: one group
+# or application limit can restrict hundreds of projects on its own.
+KEY_MAX_NEW_TARGETS = "enforcement.max_new_targets_per_cycle"
+# Set when an admin resumes enforcement: the batch they have just looked at is
+# let through once, and the ceilings apply again from the following cycle.
+KEY_CEILING_WAIVED_ONCE = "enforcement.ceiling_waived_once"
+KEY_PROTECTED_ROLES = "enforcement.protected_roles"
+
+# Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
+# so it can never collide with a real Checkmarx lookback window, and so the read
+# path can hide demo snapshots whenever demo mode is off.
+DEMO_PERIOD_PARAM = "__demo__"
+
 SECRET_KEYS: dict[str, str] = {
     KEY_SMTP_PASSWORD: PURPOSE_SMTP_PASSWORD,
     KEY_WEBHOOK_SECRET: PURPOSE_WEBHOOK_SECRET,
+    # A chat or automation webhook URL is a credential in its own right: anyone
+    # who has it can post to the channel. It is stored encrypted, never shown
+    # back, and kept out of audit entries and backups like any other secret.
+    KEY_WEBHOOK_URL: PURPOSE_WEBHOOK_URL,
 }
 
 ALLOWED_INTERVAL_MINUTES: tuple[int, ...] = (2, 5, 15, 60)
@@ -73,6 +133,19 @@ DEFAULTS: dict[str, Any] = {
     KEY_SMTP_USE_TLS: True,
     KEY_NOTIFY_MIN_SEVERITY: "warning",
     KEY_UI_ACCENT: "default",
+    KEY_SELF_SERVICE_REQUESTS: False,
+    KEY_REPORT_EMAIL_ENABLED: False,
+    KEY_CREDIT_UNIT_COST: 0.0,
+    KEY_DEMO_MODE: False,
+    KEY_AUTOMATION_ENABLED: False,
+    KEY_AUTO_APPROVE_MAX_INCREASE: 0,
+    KEY_AUTO_APPROVE_EXPIRY_DAYS: 0,
+    KEY_ENFORCEMENT_PAUSED: False,
+    KEY_ENFORCEMENT_PAUSE_REASON: None,
+    KEY_MAX_NEW_ENFORCEMENTS: 25,
+    KEY_MAX_NEW_TARGETS: 100,
+    KEY_CEILING_WAIVED_ONCE: False,
+    KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
 }
 
 
@@ -90,6 +163,100 @@ def ui_accent(session: Session) -> str:
     somehow invalid (so a stray stored value can never break the UI)."""
     value = get_value(session, KEY_UI_ACCENT, DEFAULTS[KEY_UI_ACCENT])
     return value if value in ALLOWED_ACCENTS else DEFAULTS[KEY_UI_ACCENT]
+
+
+def self_service_requests_enabled(session: Session) -> bool:
+    """Whether a viewer may submit a credit request for an admin to decide."""
+    return bool(get_value(session, KEY_SELF_SERVICE_REQUESTS, DEFAULTS[KEY_SELF_SERVICE_REQUESTS]))
+
+
+def report_email_enabled(session: Session) -> bool:
+    """Whether the weekly summary report is emailed to the notification recipients."""
+    return bool(get_value(session, KEY_REPORT_EMAIL_ENABLED, DEFAULTS[KEY_REPORT_EMAIL_ENABLED]))
+
+
+def demo_mode(session: Session) -> bool:
+    """Whether demo mode is on (synthetic data, enforcement suppressed)."""
+    return bool(get_value(session, KEY_DEMO_MODE, DEFAULTS[KEY_DEMO_MODE]))
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationPolicy:
+    """Hands-off automation settings, normalised to safe values."""
+
+    enabled: bool
+    auto_approve_max_increase: int
+    auto_approve_expiry_days: int
+
+    @property
+    def auto_approves(self) -> bool:
+        """Whether anything is actually auto-approved (enabled and a non-zero cap)."""
+        return self.enabled and self.auto_approve_max_increase > 0
+
+
+def _non_negative_int(value: Any, fallback: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if number >= 0 else fallback
+
+
+def automation_policy(session: Session) -> AutomationPolicy:
+    return AutomationPolicy(
+        enabled=bool(get_value(session, KEY_AUTOMATION_ENABLED, DEFAULTS[KEY_AUTOMATION_ENABLED])),
+        auto_approve_max_increase=_non_negative_int(
+            get_value(session, KEY_AUTO_APPROVE_MAX_INCREASE), 0
+        ),
+        auto_approve_expiry_days=_non_negative_int(
+            get_value(session, KEY_AUTO_APPROVE_EXPIRY_DAYS), 0
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EnforcementGuard:
+    """The safety settings around applying restrictions, normalised."""
+
+    paused: bool
+    pause_reason: str | None
+    # 0 means no ceiling.
+    max_new_per_cycle: int
+    max_new_targets_per_cycle: int
+    # True for the one cycle after an admin resumes enforcement.
+    ceiling_waived_once: bool
+    protected_roles: frozenset[str]
+
+
+def enforcement_guard(session: Session) -> EnforcementGuard:
+    roles = get_value(session, KEY_PROTECTED_ROLES, DEFAULTS[KEY_PROTECTED_ROLES])
+    reason = get_value(session, KEY_ENFORCEMENT_PAUSE_REASON)
+    return EnforcementGuard(
+        paused=bool(get_value(session, KEY_ENFORCEMENT_PAUSED, False)),
+        pause_reason=reason if isinstance(reason, str) and reason else None,
+        max_new_per_cycle=_non_negative_int(
+            get_value(session, KEY_MAX_NEW_ENFORCEMENTS), DEFAULTS[KEY_MAX_NEW_ENFORCEMENTS]
+        ),
+        max_new_targets_per_cycle=_non_negative_int(
+            get_value(session, KEY_MAX_NEW_TARGETS), DEFAULTS[KEY_MAX_NEW_TARGETS]
+        ),
+        ceiling_waived_once=bool(get_value(session, KEY_CEILING_WAIVED_ONCE, False)),
+        protected_roles=frozenset(
+            name.strip().lower()
+            for name in str(roles or "").replace(";", ",").split(",")
+            if name.strip()
+        ),
+    )
+
+
+def credit_unit_cost(session: Session) -> float:
+    """Monetary cost of one credit for chargeback, or 0.0 when unset/invalid."""
+    value = get_value(session, KEY_CREDIT_UNIT_COST, DEFAULTS[KEY_CREDIT_UNIT_COST])
+    try:
+        cost = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return cost if cost >= 0 else 0.0
 
 
 def get_raw(session: Session, key: str) -> AppSetting | None:
@@ -118,7 +285,33 @@ def get_secret(session: Session, key: str) -> str | None:
     row = get_raw(session, key)
     if row is None or not row.value:
         return None
+    if not row.is_secret:
+        # Written before this setting was treated as a secret: still plain JSON.
+        # encrypt_legacy_secrets() converts these at start-up.
+        return _legacy_plaintext(row.value)
     return get_secret_box().decrypt(row.value, purpose=purpose)
+
+
+def _legacy_plaintext(value: str) -> str | None:
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, str) and decoded else None
+
+
+def encrypt_legacy_secrets(session: Session) -> int:
+    """Encrypt any secret setting that an older version stored in the clear."""
+    converted = 0
+    for key in SECRET_KEYS:
+        row = get_raw(session, key)
+        if row is None or row.is_secret:
+            continue
+        set_secret(session, key, _legacy_plaintext(row.value) if row.value else None)
+        converted += 1
+    if converted:
+        logger.info("Encrypted %d setting(s) that were previously stored in the clear", converted)
+    return converted
 
 
 def set_value(session: Session, key: str, value: Any, *, description: str | None = None) -> None:
@@ -147,6 +340,7 @@ def set_secret(session: Session, key: str, value: str | None) -> None:
         session.add(AppSetting(key=key, value=ciphertext, is_secret=True))
     else:
         row.value = ciphertext
+        row.is_secret = True
     session.flush()
 
 

@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.checkmarx.errors import CheckmarxError
 from app.models.audit import Notification
-from app.models.enums import EnforcementStatus, Severity
+from app.models.enums import Severity
 from app.models.limits import EnforcementAction
 from app.schemas.limits import (
     EnforcementActionResponse,
@@ -71,18 +71,20 @@ def list_notifications(
         db.scalars(query.order_by(Notification.created_at.desc()).limit(limit).offset(offset))
     )
 
-    # Only actions still in the applied state can be restored.
+    # Only actions that are, or may still be, in force can be restored.
     action_ids = [row.enforcement_action_id for row in rows if row.enforcement_action_id]
     restorable: set[int] = set()
     if action_ids:
-        restorable = set(
-            db.scalars(
-                select(EnforcementAction.id).where(
+        restorable = {
+            action.id
+            for action in db.scalars(
+                select(EnforcementAction).where(
                     EnforcementAction.id.in_(action_ids),
-                    EnforcementAction.status == EnforcementStatus.APPLIED,
+                    EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES),
                 )
             )
-        )
+            if enforcement.may_be_in_force(action)
+        }
 
     return NotificationListResponse(
         items=[
@@ -110,8 +112,14 @@ def list_enforcements(
 ) -> list[EnforcementActionResponse]:
     query = select(EnforcementAction)
     if only_active:
-        query = query.where(EnforcementAction.status == EnforcementStatus.APPLIED)
-    rows = db.scalars(query.order_by(EnforcementAction.created_at.desc()).limit(limit))
+        query = query.where(EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES))
+    rows = [
+        row
+        for row in db.scalars(query.order_by(EnforcementAction.created_at.desc()).limit(limit))
+        # "Active" includes a restriction whose outcome was never confirmed: it
+        # may be in place in Checkmarx, and this is where an admin can undo it.
+        if not only_active or enforcement.may_be_in_force(row)
+    ]
     return [
         EnforcementActionResponse(
             id=row.id,
@@ -147,7 +155,7 @@ def restore_access(action_id: int, ctx: AdminUser, db: DbSession) -> dict[str, o
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="No such enforcement action."
         )
-    if action.status != EnforcementStatus.APPLIED:
+    if not enforcement.may_be_in_force(action):
         return {
             "restored": False,
             "message": f"This action is already {action.status}, so there is nothing to undo.",
@@ -166,7 +174,7 @@ def restore_access(action_id: int, ctx: AdminUser, db: DbSession) -> dict[str, o
 
     try:
         restored = enforcement.restore_action(
-            db, client, action=action, actor=ctx.actor, reason="admin"
+            db, client, action=action, actor=ctx.actor, reason=enforcement.ADMIN_REASON
         )
     except CheckmarxError as exc:
         db.commit()  # keep the failure notification and audit entry

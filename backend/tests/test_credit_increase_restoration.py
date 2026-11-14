@@ -299,3 +299,47 @@ def test_update_limit_service_restores_immediately_on_credit_increase(db: Sessio
         )
     )
     assert state.status == LimitStatus.RESTORED
+
+
+def test_approving_a_credit_request_restores_access_immediately(db: Session) -> None:
+    """Approving a request to raise a restricted user's budget lifts the live
+    Checkmarx restriction now, not just at the next cycle."""
+    from app.services import requests_service
+
+    tenant, client = prepare(db)
+    limit = add_limit(
+        db,
+        entity_type=EntityType.USER,
+        entity_id="user-harsh",
+        credit_limit=5,
+        enforce=True,
+        label="Harsh Gokani",
+    )
+    evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+    db.commit()
+
+    tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=20)
+    ingestion.ingest_usage(db, client)
+    db.commit()
+    evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+    db.commit()
+    assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+
+    request = requests_service.create_request(
+        db,
+        data=requests_service.RequestInput(
+            entity_type=EntityType.USER, entity_id="user-harsh", requested_limit=500
+        ),
+        actor=ACTOR,
+    )
+    requests_service.approve_request(db, request=request, actor=ACTOR, client=client)
+    db.commit()
+
+    # Roles are back immediately, without waiting for the next scheduled cycle.
+    assert any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+    state = db.scalar(
+        select(LimitPeriodState).where(
+            LimitPeriodState.limit_id == limit.id, LimitPeriodState.period_key == "2026-08"
+        )
+    )
+    assert state.status == LimitStatus.RESTORED

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
 from app.checkmarx.token import TokenManager
-from app.core.config import get_settings
+from app.core.config import get_settings, reset_settings_cache
 from app.models import AuditLogEntry, CxConnection
 from app.models.enums import ConnectionStatus
 from app.services import connection as connection_service
@@ -102,7 +102,9 @@ class TestSaveConnection:
         assert connection.api_base_url == API_BASE
         assert connection.api_base_url_overridden is False
 
-    def test_override_is_respected(self, db: Session) -> None:
+    def test_override_is_respected(self, db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CXCG_CX_ALLOWED_HOSTS", "dedicated.example.com")
+        reset_settings_cache()
         connection = connection_service.save_connection(
             db,
             api_key=make_api_key(),
@@ -263,6 +265,8 @@ class TestApiBaseUrlOverride:
                 ok=True, token_acquired=True, api_reachable=True, message="stubbed"
             ),
         )
+        monkeypatch.setenv("CXCG_CX_ALLOWED_HOSTS", "custom.example")
+        reset_settings_cache()
         response = admin_client.patch(
             "/api/connection/api-base-url", json={"api_base_url": "https://custom.example/api"}
         )

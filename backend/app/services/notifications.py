@@ -8,10 +8,10 @@ and warned again next period if it happens again.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
@@ -47,32 +47,69 @@ def notify(
     checked here, because two scheduler processes racing on the same condition
     must not produce two rows.
     """
+    dedupe_key = _bounded_key(dedupe_key)
     if dedupe_key is not None:
         existing = session.scalar(select(Notification).where(Notification.dedupe_key == dedupe_key))
         if existing is not None:
             return None
 
-    notification = Notification(
-        created_at=utcnow(),
-        severity=severity,
-        category=category,
-        entity_type=entity_type,
-        entity_id=entity_id,
-        entity_label=entity_label,
-        title=title[:256],
-        body=body,
-        dedupe_key=dedupe_key,
-        enforcement_action_id=enforcement_action_id,
-    )
-    session.add(notification)
-    try:
+    values = {
+        "created_at": utcnow(),
+        "severity": severity,
+        "category": category,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "entity_label": entity_label[:512] if entity_label else entity_label,
+        "title": title[:256],
+        "body": body,
+        "dedupe_key": dedupe_key,
+        "enforcement_action_id": enforcement_action_id,
+    }
+    if dedupe_key is None:
+        notification = Notification(**values)
+        session.add(notification)
         session.flush()
-    except IntegrityError:
-        # Lost a race on the dedupe key. That is the correct outcome, not an error.
-        session.rollback()
+        return notification
+
+    # Another writer can insert the same key between the check above and this
+    # insert. The insert therefore ignores a conflict instead of raising: an
+    # error here would have to be rolled back, and rolling back would discard
+    # everything the caller had done in its transaction so far - an enforcement
+    # record, an approval - because a notification happened to be a duplicate.
+    new_id = session.execute(
+        _insert_ignoring_conflict(session).values(**values).returning(Notification.__table__.c.id)
+    ).scalar()
+    if new_id is None:
+        # Nothing was inserted: the key was taken in the meantime.
         logger.debug("Notification %s was already recorded by another writer", dedupe_key)
         return None
-    return notification
+    return session.get(Notification, new_id)
+
+
+DEDUPE_KEY_LENGTH = 160
+
+
+def _bounded_key(key: str | None) -> str | None:
+    """A dedupe key that fits its column, without two long keys colliding.
+
+    Keys are built from identifiers that can be long (an e-mail address used as
+    a subject, say). Cutting one off would make different conditions share a
+    key, and all but the first would be silently dropped; so the tail of an
+    over-long key is replaced by a digest of the whole of it.
+    """
+    if key is None or len(key) <= DEDUPE_KEY_LENGTH:
+        return key
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    return f"{key[: DEDUPE_KEY_LENGTH - 33]}~{digest}"
+
+
+def _insert_ignoring_conflict(session: Session):  # type: ignore[no-untyped-def]
+    """INSERT ... ON CONFLICT DO NOTHING, in the dialect's own spelling."""
+    if session.get_bind().dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    return dialect_insert(Notification.__table__).on_conflict_do_nothing()
 
 
 def unread_count(session: Session) -> int:
@@ -128,6 +165,26 @@ def reconcile_key(action_id: int, period_key: str) -> str:
 
 def restoration_key(action_id: int) -> str:
     return f"restored:{action_id}"
+
+
+def enforcement_failed_key(action_id: int, day: str) -> str:
+    """One "could not restrict" alert per action per day, however often it is retried."""
+    return f"enforcefail:{action_id}:{day}"
+
+
+def protected_key(limit_id: int, period_key: str) -> str:
+    """One "over budget but protected" notice per limit and period."""
+    return f"protected:{limit_id}:{period_key}"
+
+
+def not_restricted_key(action_id: int) -> str:
+    """One "deliberately left unchanged" notice per limit, target and period."""
+    return f"notrestricted:{action_id}"
+
+
+def restore_failed_key(action_id: int, day: str) -> str:
+    """One "could not restore" alert per action per day, however often it is retried."""
+    return f"restorefail:{action_id}:{day}"
 
 
 def sync_error_key(step: str, day: str) -> str:

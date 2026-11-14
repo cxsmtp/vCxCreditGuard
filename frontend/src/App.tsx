@@ -6,11 +6,15 @@ import { AppShell } from "./components/AppShell";
 import { Spinner } from "./components/ui";
 import { applyAccent } from "./lib/ui-context";
 import { useInterval } from "./hooks/useResource";
+import { AccountPage, PasswordChangeRequired } from "./pages/AccountPage";
 import { AuditPage } from "./pages/AuditPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { LimitsPage } from "./pages/LimitsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { NotificationsPage } from "./pages/NotificationsPage";
+import { PreviewPage } from "./pages/PreviewPage";
+import { ReportsPage } from "./pages/ReportsPage";
+import { RequestsPage } from "./pages/RequestsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { SetupPage } from "./pages/SetupPage";
 
@@ -104,6 +108,27 @@ export function App() {
     );
   }
 
+  // Changing the password ends every session for the account, this one
+  // included, so the only honest next screen is the sign-in page.
+  function passwordChanged() {
+    setAuthState("signedOut");
+    setMe(null);
+    applyAccent("default");
+    navigate("/");
+  }
+
+  // An account still on a temporary password can do nothing else: the server
+  // refuses every other request, so the app shows only the way out of that.
+  if (me.must_change_password) {
+    return (
+      <PasswordChangeRequired
+        username={me.username}
+        onChanged={passwordChanged}
+        onSignOut={signOut}
+      />
+    );
+  }
+
   const isAdmin = me.role === "admin";
 
   return (
@@ -115,12 +140,24 @@ export function App() {
         <Route path="/" element={<DashboardPage isAdmin={isAdmin} />} />
         <Route path="/setup" element={<SetupPage isAdmin={isAdmin} onConnected={loadMe} />} />
         <Route path="/limits" element={<LimitsPage isAdmin={isAdmin} />} />
+        <Route path="/preview" element={<PreviewPage />} />
+        <Route path="/reports" element={<ReportsPage isAdmin={isAdmin} />} />
+        {me.can_request_credits && (
+          <Route path="/requests" element={<RequestsPage isAdmin={isAdmin} />} />
+        )}
         <Route
           path="/notifications"
           element={<NotificationsPage isAdmin={isAdmin} onUnreadChange={setUnread} />}
         />
-        <Route path="/audit" element={<AuditPage />} />
-        <Route path="/settings" element={<SettingsPage isAdmin={isAdmin} />} />
+        <Route path="/audit" element={<AuditPage isAdmin={isAdmin} />} />
+        <Route
+          path="/settings"
+          element={<SettingsPage isAdmin={isAdmin} onSettingsSaved={loadMe} />}
+        />
+        <Route
+          path="/account"
+          element={<AccountPage me={me} onChanged={loadMe} onPasswordChanged={passwordChanged} />}
+        />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </AppShell>
