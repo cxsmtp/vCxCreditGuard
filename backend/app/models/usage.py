@@ -224,6 +224,14 @@ class AutoTriageProjectState(Base):
     branches from before observation started (``observing_since``), as
     ``[[initiator, "YYYY-MM-DD", count], ...]``. It is what credits the project
     already reported when observation began are estimated against.
+
+    ``history_ceiling`` is the most Auto Triage transactions from before
+    observation began that can still be inside the lookback window: the
+    reading observation (re)started at, less every fall the cursor followed
+    since (older transactions age out first, so a fall comes out of the history
+    before anything observed). The estimate never exceeds it at the project's
+    current credits per transaction. Null (a row from before the column existed)
+    means "the current reading".
     """
 
     __tablename__ = "auto_triage_project_state"
@@ -242,6 +250,7 @@ class AutoTriageProjectState(Base):
     history_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     history: Mapped[list | None] = mapped_column(JSONColumn)
     history_collected_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    history_ceiling: Mapped[int | None] = mapped_column(Integer)
     # The auto-triage branches last read from the project's configuration; null
     # when the configuration could not be read or names none (all branches).
     branches: Mapped[list | None] = mapped_column(JSONColumn)

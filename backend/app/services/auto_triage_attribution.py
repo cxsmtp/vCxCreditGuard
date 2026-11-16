@@ -18,6 +18,9 @@ did, and otherwise its Auto Triage transactions priced at the tenant wide
 credits-per-transaction the action dimension reports for Auto Triage, capped at
 the project's transaction-mix share so that credits of other actions (human
 triage, already counted against the person who did it) never become ``A_p``.
+Without that tenant price, a project row that also did other actions has no
+``A_p`` at all: the mix share alone could hand a person's own credits to a
+scan initiator.
 
 Who triggered it
 ----------------
@@ -27,21 +30,28 @@ Who triggered it
   completes). The new transactions, priced at the project's current credits
   per Auto Triage transaction, are split equally across the completed scans on
   the project's auto-triage branches, so per initiator by scan count; scans
-  without an initiator keep their share on the project. With no such scan in
-  the interval, the latest one before it (since observation began, inside the
-  window, and not before the previous charged interval) is used; with none at
-  all the increase is recorded as ``unattributed`` and stays on the project.
-  The cursor is the transaction count, never a credit figure: a price change
-  is not new auto triage. A project missing from a reading, or a row without
-  the per action breakdown, is no reading at all and leaves the cursor alone.
+  without an initiator keep their share on the project. A scan an earlier
+  charge already named is not counted again. With no such scan in the
+  interval, the latest one before it (since observation began, inside the
+  window, after the previous charged interval ended, and not already charged)
+  is used; with none at all the increase is recorded as ``unattributed`` and
+  stays on the project. The cursor is the transaction count, never a credit
+  figure: a price change is not new auto triage. A project missing from a
+  reading, or a row that cannot say how much Auto Triage it did (no per action
+  breakdown, an unreadable count, a breakdown without Auto Triage that does not
+  add up), is no reading at all and leaves the cursor alone.
 * **Observation (re)starts** at the current reading whenever the setting is
   turned on (``attribution.auto_triage_observation_epoch``), the lookback
-  window changes, or a project is first seen with consumption it already had:
-  whatever arrived before is history and estimated, never observed.
-* **Estimated.** Whatever part of ``A_p`` no recorded charge explains (credits
-  from before observation began, or an interval that could not be observed) is
-  split by the number of completed scans each person ran on the auto-triage
-  branches inside the consumption window, before observation began.
+  window changes, or a project is first seen with consumption it already had
+  (also under a row that matched no project yet): whatever arrived before is
+  history and estimated, never observed.
+* **Estimated.** Credits from before observation began are split by the
+  number of completed scans each person ran on the auto-triage branches inside
+  the consumption window, before observation began. Never more than what is
+  left of that history (``history_ceiling``: the reading observation began at,
+  less every fall since, at the current credits per transaction); whatever
+  else no recorded charge explains (an interval that could not be read, new
+  transactions netted against older ones ageing out) stays on the project.
 * An initiator that does not resolve to a synced user (a webhook bot, an
   unknown address) is raised as an unresolved subject of kind
   ``scan_initiator`` for an admin to map; until then its share stays on the
@@ -61,9 +71,10 @@ Crash safety
 ------------
 No write transaction is open while Checkmarx is called: state is committed
 before every call. A project's cursor only advances once its increase has been
-recorded, so a failed or deferred listing is caught up by the next cycle and is
-estimated meanwhile. Any failure in one project (the tenant, a payload, the
-database) is rolled back and recorded on that project; the others carry on.
+recorded, so a failed or deferred listing is caught up by the next cycle and
+stays on the project meanwhile. Any failure in one project (the tenant, a
+payload, the database) is rolled back and recorded on that project; the others
+carry on.
 Listing is bounded per project and per cycle.
 """
 
@@ -75,7 +86,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
 from app.checkmarx import platform
@@ -89,6 +100,7 @@ from app.checkmarx.errors import (
 )
 from app.db.base import utcnow
 from app.models.enums import ActionType, ActorType, Severity, UsageView
+from app.models.org import CxProject
 from app.models.usage import (
     AutoTriageCharge,
     AutoTriageProjectState,
@@ -120,12 +132,14 @@ OBSERVATION_LAG = timedelta(minutes=30)
 # interval is about the cycle interval plus the lag, so the listing covers about
 # 4h45m of scans, and only a project with more than ~100 scans an hour on its
 # auto-triage branches reaches the per-project cap. A scan that runs longer
-# than this and finishes inside an interval is not seen; its share goes to the
-# scans that are (or the increase is estimated).
+# than this and finishes inside an interval is seen only if the listing happened
+# to read it on its last page; otherwise its share goes to the scans that are
+# (or the increase stays on the project).
 SCAN_RUNTIME_ALLOWANCE = timedelta(hours=4)
 
 # Bounds, so one busy project or a huge tenant never makes a cycle unbounded.
-# Whatever does not fit is caught up on the next cycle and estimated meanwhile.
+# Whatever does not fit is caught up on the next cycle and stays on the project
+# meanwhile.
 MAX_PROJECTS_PER_CYCLE = 50
 MAX_REQUESTS_PER_CYCLE = 300
 MAX_PAGES_PER_LISTING = 5
@@ -188,17 +202,73 @@ def auto_triage_price(session: Session) -> Decimal | None:
     return None
 
 
+def _valid_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _raw_auto_triage_counts(record: UsageRecord) -> list[object]:
+    """Every ``transactionCount`` the raw row gives for Auto Triage, as sent.
+
+    The parser turns a value that is not an integer into 0, so whether the feed
+    sent a real 0 or something unreadable is only visible in the raw row.
+    """
+    raw = record.raw if isinstance(record.raw, dict) else {}
+    performed = raw.get("actionsPerformed")
+    entries = performed.get("actions") if isinstance(performed, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [
+        entry.get("transactionCount")
+        for entry in entries
+        if isinstance(entry, dict)
+        and usage_api.normalise_action_type(entry.get("actionType")) == ActionType.AUTO_TRIAGE
+    ]
+
+
 def auto_triage_transactions(record: UsageRecord) -> int | None:
     """The row's Auto Triage transaction count, or None when it cannot say.
 
-    A row without the per action breakdown says nothing about Auto Triage
-    unless it reports no credits at all.
+    None ("no reading") for:
+
+    * a row without the per action breakdown, whatever its credits: a row that
+      briefly comes back with no breakdown (or 0 credits and no breakdown) is
+      a dip in the feed, not the project's auto triage falling to nothing;
+    * an Auto Triage count that is not a non-negative integer;
+    * a breakdown without Auto Triage that is not otherwise complete. Without
+      the entry the row is a real 0 only when other actions account for it:
+      at least one other action with transactions, every count readable, and
+      the counts adding up to the reported total when there is one. Anything
+      less (an empty or zero breakdown, a total the counts do not reach) could
+      be a partial breakdown that left Auto Triage out.
     """
     actions = record.actions or {}
     if not actions:
-        return 0 if Decimal(record.credits_used or 0) <= 0 else None
+        return None
+    raw_counts = _raw_auto_triage_counts(record)
+    if any(not _valid_count(value) for value in raw_counts):
+        return None
     count = actions.get(ActionType.AUTO_TRIAGE.value)
-    return count if isinstance(count, int) and count > 0 else 0
+    if count is not None or raw_counts:
+        return count if _valid_count(count) else None
+    others = list(actions.values())
+    if not all(_valid_count(value) for value in others) or sum(others) <= 0:
+        return None
+    if record.transactions is not None and record.transactions != sum(others):
+        return None
+    return 0
+
+
+def _may_be_zero(record: UsageRecord) -> bool:
+    """A row that says nothing about Auto Triage but reports no credits either.
+
+    Read as 0 only while the project's cursor already stands at 0 (so a dip of
+    a project with auto triage never resets its cursor); otherwise no reading.
+    """
+    if Decimal(record.credits_used or 0) > 0:
+        return False
+    if any(not _valid_count(value) for value in _raw_auto_triage_counts(record)):
+        return False
+    return ActionType.AUTO_TRIAGE.value not in (record.actions or {})
 
 
 def auto_triage_share(record: UsageRecord, price: Decimal | None) -> Decimal:
@@ -210,6 +280,11 @@ def auto_triage_share(record: UsageRecord, price: Decimal | None) -> Decimal:
     is dearer than this project's own credits allow, the difference would be
     other actions' credits (a person's own triage, already counted against
     them), and those must never be charged to a scan initiator as well.
+
+    Without a tenant price, a row that also did other actions has no Auto
+    Triage part anyone can be charged for: the mix share alone can hand a
+    person's own (dearer) remediation credits to a scan initiator. Only a row
+    whose breakdown is Auto Triage alone then takes its credits.
     """
     actions = record.actions or {}
     count = actions.get(ActionType.AUTO_TRIAGE.value)
@@ -219,10 +294,9 @@ def auto_triage_share(record: UsageRecord, price: Decimal | None) -> Decimal:
     total = sum(value for value in actions.values() if isinstance(value, int) and value > 0)
     if total <= count:
         return _q(credits)
-    mix = credits * count / total
-    if price is not None and price > 0:
-        return _q(min(mix, price * count))
-    return _q(mix)
+    if price is None or price <= 0:
+        return ZERO
+    return _q(min(credits * count / total, price * count))
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +305,9 @@ class ProjectReading:
 
     transactions: int
     credits: Decimal
+    # False when a row of it said nothing about Auto Triage and reported no
+    # credits: read as 0 only while the cursor is already 0.
+    certain: bool = True
 
     @property
     def unit(self) -> Decimal:
@@ -245,9 +322,12 @@ def project_readings(
 ) -> dict[str, ProjectReading | None]:
     """Every synced project's reading in a project snapshot.
 
-    None for a project whose row cannot say how much Auto Triage it did (no
-    per action breakdown); a project absent from the snapshot is absent here.
-    Both mean "no reading": the collector leaves that project's cursor alone.
+    None for a project whose row cannot say how much Auto Triage it did (see
+    ``auto_triage_transactions``); a project absent from the snapshot is absent
+    here. Both mean "no reading": the collector leaves that project's cursor
+    alone. A row with no credits that says nothing about Auto Triage gives an
+    uncertain 0 (``certain`` false), which the collector only takes while the
+    cursor already stands at 0.
     """
     readings: dict[str, ProjectReading | None] = {}
     for record in session.scalars(
@@ -257,25 +337,29 @@ def project_readings(
     ):
         if not record.entity_id:
             continue
+        if record.entity_id in readings and readings[record.entity_id] is None:
+            continue
         count = auto_triage_transactions(record)
-        known = readings.get(record.entity_id, ProjectReading(0, ZERO))
-        if record.entity_id in readings and known is None:
-            continue
+        certain = True
         if count is None:
-            readings[record.entity_id] = None
-            continue
+            if not _may_be_zero(record):
+                readings[record.entity_id] = None
+                continue
+            count, certain = 0, False
+        known = readings.get(record.entity_id) or ProjectReading(0, ZERO)
         readings[record.entity_id] = ProjectReading(
             transactions=known.transactions + count,
             credits=known.credits + auto_triage_share(record, price),
+            certain=known.certain and certain,
         )
     return readings
 
 
 def project_auto_triage_credits(
     session: Session, snapshot: UsageSnapshot, *, price: Decimal | None = None
-) -> dict[str, Decimal]:
-    """``A_p`` for every synced project in a project snapshot that has any."""
-    result: dict[str, Decimal] = {}
+) -> dict[str, tuple[Decimal, int]]:
+    """``A_p`` and its Auto Triage transactions, per synced project that has any."""
+    result: dict[str, tuple[Decimal, int]] = {}
     for record in session.scalars(
         select(UsageRecord).where(
             UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.is_not(None)
@@ -285,7 +369,12 @@ def project_auto_triage_credits(
             continue
         share = auto_triage_share(record, price)
         if share > 0:
-            result[record.entity_id] = result.get(record.entity_id, ZERO) + share
+            count = (record.actions or {}).get(ActionType.AUTO_TRIAGE.value)
+            credits, transactions = result.get(record.entity_id, (ZERO, 0))
+            result[record.entity_id] = (
+                credits + share,
+                transactions + (count if _valid_count(count) else 0),
+            )
     return result
 
 
@@ -383,6 +472,33 @@ def _history_counts(
     return counts
 
 
+def _estimate_cap(
+    state: AutoTriageProjectState | None,
+    snapshot: UsageSnapshot,
+    available: Decimal,
+    transactions_now: int,
+) -> Decimal:
+    """The most of ``A_p`` the history from before observation can explain.
+
+    The history ceiling (in transactions) at the project's current credits per
+    Auto Triage transaction. Without a ceiling (no state yet, a state from
+    another lookback window, or one from before the ceiling existed) the
+    current reading is the ceiling, which bounds nothing beyond ``A_p``.
+    """
+    if transactions_now <= 0 or available <= 0:
+        return ZERO
+    ceiling = transactions_now
+    if (
+        state is not None
+        and state.history_ceiling is not None
+        and state.period_param == snapshot.period_param
+    ):
+        ceiling = max(0, min(int(state.history_ceiling), transactions_now))
+    if ceiling >= transactions_now:
+        return available
+    return _q(available * ceiling / transactions_now)
+
+
 def build_model(
     session: Session, *, user_index: ingestion.UserIndex | None = None
 ) -> AttributionModel:
@@ -463,7 +579,7 @@ def build_model(
         )
 
     for project_id in sorted(set(totals) | set(charges)):
-        available = totals.get(project_id, ZERO)
+        available, transactions_now = totals.get(project_id, (ZERO, 0))
         state = states.get(project_id)
         project = ProjectAttribution(
             project_id=project_id,
@@ -486,6 +602,14 @@ def build_model(
                 project.unattributed += share
 
         remainder = available - covered if available > covered else ZERO
+        cap = _estimate_cap(state, snapshot, available, transactions_now)
+        if remainder > cap:
+            # More than what is left of the history: newer auto triage that no
+            # recorded charge explains (an interval that could not be read, or
+            # new transactions netted against older ones ageing out). It is not
+            # the history's, so it stays on the project.
+            project.unattributed += remainder - cap
+            remainder = cap
         if remainder <= 0:
             continue
         counts = _history_counts(state, window_start=window_start)
@@ -599,7 +723,7 @@ class CollectResult:
     requests: int = 0
     # Increases left for the next cycle because the per-cycle cap was reached.
     deferred: int = 0
-    # Listings that hit the per-project cap: that increase is estimated instead.
+    # Listings that hit the per-project cap: that increase stays on the project.
     capped: int = 0
     # Projects whose observation (re)started at this reading: setting turned on,
     # lookback window changed, or first seen with consumption it already had.
@@ -642,6 +766,8 @@ class _Increase:
     snapshot_id: int
     # How far back the "latest scan before the interval" fallback may look.
     widen_floor: datetime
+    # The start of the lookback window: charges before it no longer count.
+    lookback_start: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -703,7 +829,7 @@ def collect(
             message = (
                 f"Auto-triage attribution reached its per-cycle cap ({MAX_PROJECTS_PER_CYCLE} "
                 f"projects, {MAX_REQUESTS_PER_CYCLE} requests); {len(left)} project(s) are "
-                "estimated for now and caught up on the next cycle."
+                "left on the project for now and caught up on the next cycle."
             )
             result.warnings.append(message)
             logger.warning(message)
@@ -718,7 +844,7 @@ def collect(
             # Whatever went wrong (the tenant, an unexpected payload, the
             # database refusing a value), this project's cursor did not move:
             # the next cycle tries the interval again, and until then the
-            # increase is estimated like older credits. The other projects go on.
+            # increase stays on the project. The other projects go on.
             session.rollback()
             if isinstance(exc, CheckmarxError):
                 message = f"Scans of project {task.project_id} could not be read: {exc}"
@@ -734,7 +860,7 @@ def collect(
             if isinstance(exc, OUTAGE_ERRORS):
                 # The tenant is down or throttling us: every further project
                 # would only wait through the same retries. Leave the rest for
-                # the next cycle (estimated meanwhile).
+                # the next cycle (on the project meanwhile).
                 left = pending[position + 1 :]
                 result.deferred += sum(1 for item in left if isinstance(item, _Increase))
                 if left:
@@ -755,7 +881,7 @@ def collect(
             title="Auto-triage credits could not all be traced to a scan this cycle",
             body=(
                 "; ".join(result.warnings[:10])
-                + "\n\nThe credits concerned stay estimated from earlier scans until a later "
+                + "\n\nThe credits concerned count against the project only until a later "
                 "cycle reads them. Nothing else in the cycle was affected."
             ),
             dedupe_key=notifications.sync_error_key(
@@ -788,30 +914,108 @@ def _is_current(state: AutoTriageProjectState, snapshot: UsageSnapshot, epoch: s
     )
 
 
+def _earlier_rows(snapshot: UsageSnapshot, *, since: datetime) -> Select:
+    """Project rows with consumption in earlier readings inside the window."""
+    return (
+        select(UsageRecord.id)
+        .join(UsageSnapshot, UsageRecord.snapshot_id == UsageSnapshot.id)
+        .where(
+            UsageRecord.view_by == str(UsageView.PROJECT),
+            (UsageRecord.credits_used > 0) | (UsageRecord.transactions > 0),
+            UsageSnapshot.period_param == snapshot.period_param,
+            UsageSnapshot.collected_at < snapshot.collected_at,
+            UsageSnapshot.collected_at > since,
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _UnmatchedRow:
+    """An earlier project row that matched no project in the local catalogue."""
+
+    reported_id: str | None
+    name: str
+
+
+def _unmatched_rows(
+    session: Session, snapshot: UsageSnapshot, *, since: datetime
+) -> list[_UnmatchedRow]:
+    """Each distinct unmatched project row with consumption, earlier in the window.
+
+    Ingestion stores a project row it cannot match to the catalogue (a project
+    created since the last organisation sync, a failed sync, a name or id
+    mismatch) with no entity. One query for the distinct subjects, then the
+    newest row of each for the id the feed reported.
+    """
+    newest = session.execute(
+        _earlier_rows(snapshot, since=since)
+        .with_only_columns(UsageRecord.subject_key, func.max(UsageRecord.id))
+        .where(UsageRecord.entity_id.is_(None))
+        .group_by(UsageRecord.subject_key)
+    ).all()
+    rows: list[_UnmatchedRow] = []
+    for subject_key, record_id in newest:
+        record = session.get(UsageRecord, record_id)
+        if record is None:
+            continue
+        parsed = usage_api.parse_usage_item(record.raw) if isinstance(record.raw, dict) else None
+        name = (record.subject_name or subject_key or "").strip().lower()
+        rows.append(_UnmatchedRow(reported_id=parsed.reported_id if parsed else None, name=name))
+    return rows
+
+
+def _identities(
+    session: Session, project_id: str, snapshot: UsageSnapshot
+) -> tuple[set[str], set[str]]:
+    """The ids and lowercased names a project is known by, here and in the feed."""
+    ids = {project_id}
+    names: set[str] = set()
+    project = session.get(CxProject, project_id)
+    if project is not None and project.name:
+        names.add(project.name.strip().lower())
+    for record in session.scalars(
+        select(UsageRecord).where(
+            UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id == project_id
+        )
+    ):
+        if record.subject_name:
+            names.add(record.subject_name.strip().lower())
+        if record.subject_key:
+            names.add(record.subject_key.strip().lower())
+        parsed = usage_api.parse_usage_item(record.raw) if isinstance(record.raw, dict) else None
+        if parsed is not None and parsed.reported_id:
+            ids.add(parsed.reported_id)
+    return ids, names
+
+
 def _reported_before(
-    session: Session, project_id: str, snapshot: UsageSnapshot, *, since: datetime
+    session: Session,
+    project_id: str,
+    snapshot: UsageSnapshot,
+    *,
+    since: datetime,
+    unmatched: list[_UnmatchedRow],
 ) -> bool:
     """Whether an earlier project reading (inside the window) showed consumption.
 
     Tells a project that is genuinely new (its first consumption arrived since
     the last reading) from one that was missing from a reading or two and comes
-    back with consumption it already had.
+    back with consumption it already had. Earlier rows that matched no project
+    count too when they are this project's: the same reported id, or the same
+    name. An unmatched row with no reported id cannot be told apart from this
+    project, so it counts as well: restarting estimates the history, observing
+    could charge all of it to whoever scanned last.
     """
-    return (
-        session.scalar(
-            select(UsageRecord.id)
-            .join(UsageSnapshot, UsageRecord.snapshot_id == UsageSnapshot.id)
-            .where(
-                UsageRecord.entity_id == project_id,
-                UsageRecord.view_by == str(UsageView.PROJECT),
-                UsageRecord.credits_used > 0,
-                UsageSnapshot.period_param == snapshot.period_param,
-                UsageSnapshot.collected_at < snapshot.collected_at,
-                UsageSnapshot.collected_at > since,
-            )
-            .limit(1)
-        )
-        is not None
+    matched = session.scalar(
+        _earlier_rows(snapshot, since=since).where(UsageRecord.entity_id == project_id).limit(1)
+    )
+    if matched is not None:
+        return True
+    if not unmatched:
+        return False
+    ids, names = _identities(session, project_id, snapshot)
+    return any(
+        row.reported_id is None or row.reported_id in ids or row.name in names for row in unmatched
     )
 
 
@@ -834,18 +1038,36 @@ def _plan(
     )
     lookback = timedelta(days=lookback_days(snapshot.period_param))
     window_start = snapshot.collected_at - lookback
+    # Where the previous charged interval ended: a scan that completed before
+    # that was dealt with then (charged, or part of an interval without a rise).
     latest_charge = dict(
         session.execute(
-            select(AutoTriageCharge.project_id, func.max(AutoTriageCharge.window_start)).group_by(
+            select(AutoTriageCharge.project_id, func.max(AutoTriageCharge.window_end)).group_by(
                 AutoTriageCharge.project_id
             )
         ).all()
     )
+    unmatched: list[_UnmatchedRow] | None = None
     increases: list[_Increase] = []
     histories: list[_History] = []
     for project_id in sorted(set(readings) | set(states)):
         reading = readings.get(project_id)
         state = states.get(project_id)
+        if (
+            reading is not None
+            and not reading.certain
+            and not (
+                state is not None
+                and _is_current(state, snapshot, epoch)
+                and int(state.last_transactions or 0) == 0
+                and reading.transactions == 0
+            )
+        ):
+            # A row with no credits that says nothing about Auto Triage: a 0
+            # only for a project whose cursor already stands at 0. Otherwise it
+            # is a dip in the feed, and taking it would re-charge the whole
+            # count as new when the row comes back.
+            reading = None
         if reading is None:
             # Missing from this reading, or a row without the breakdown: no
             # reading at all. The cursor stays, so the next real reading is
@@ -861,27 +1083,29 @@ def _plan(
                         )
                     )
             continue
-        if (
-            state is None
-            and previous is not None
-            and previous < snapshot.collected_at
-            and not _reported_before(session, project_id, snapshot, since=window_start)
-        ):
-            # A project with no consumption at all in the readings before: all
-            # of it arrived since the last reading dealt with, so it is observed.
-            state = AutoTriageProjectState(
-                project_id=project_id,
-                period_param=snapshot.period_param,
-                observation_epoch=epoch,
-                observing_since=previous,
-                history_status="none",
-                last_snapshot_id=None,
-                last_collected_at=previous,
-                last_transactions=0,
-                last_credits=ZERO,
-                updated_at=utcnow(),
-            )
-            session.add(state)
+        if state is None and previous is not None and previous < snapshot.collected_at:
+            if unmatched is None:
+                unmatched = _unmatched_rows(session, snapshot, since=window_start)
+            if not _reported_before(
+                session, project_id, snapshot, since=window_start, unmatched=unmatched
+            ):
+                # A project with no consumption at all in the readings before:
+                # all of it arrived since the last reading dealt with, so it is
+                # observed. It has no history.
+                state = AutoTriageProjectState(
+                    project_id=project_id,
+                    period_param=snapshot.period_param,
+                    observation_epoch=epoch,
+                    observing_since=previous,
+                    history_status="none",
+                    history_ceiling=0,
+                    last_snapshot_id=None,
+                    last_collected_at=previous,
+                    last_transactions=0,
+                    last_credits=ZERO,
+                    updated_at=utcnow(),
+                )
+                session.add(state)
         if state is None or not _is_current(state, snapshot, epoch):
             # Observation (re)starts now: the setting was turned on, the
             # lookback window changed, or the project was first seen with
@@ -896,6 +1120,7 @@ def _plan(
             state.history_status = "pending" if reading.transactions > 0 else "none"
             state.history = None
             state.history_collected_at = None
+            state.history_ceiling = reading.transactions
             state.last_error = None
             _advance(state, snapshot, reading)
             result.restarted += 1
@@ -923,11 +1148,21 @@ def _plan(
                         window_end=snapshot.collected_at,
                         snapshot_id=snapshot.id,
                         widen_floor=max(floors),
+                        lookback_start=window_start,
                     )
                 )
             else:
                 # No new transactions, or fewer (older ones aged out of the
                 # lookback window): the cursor follows, nothing is charged.
+                # What ages out is the oldest first, so a fall comes out of the
+                # history before anything observed: its ceiling drops with it.
+                if delta_transactions < 0:
+                    base = state.history_ceiling
+                    if base is None:
+                        base = int(state.last_transactions or 0)
+                    state.history_ceiling = max(
+                        0, min(base + delta_transactions, reading.transactions)
+                    )
                 _advance(state, snapshot, reading)
         if state.history_status == "pending":
             histories.append(
@@ -938,6 +1173,28 @@ def _plan(
     increases.sort(key=lambda item: (item.window_start, item.project_id))
     histories.sort(key=lambda item: (item.until, item.project_id))
     return increases, histories
+
+
+def _charged_scans(session: Session, task: _Increase) -> set[str]:
+    """The scans this project's charges inside the lookback window already name.
+
+    The interval opens a lag before the previous reading, so without this a
+    scan that completed just before that reading would take a full share of
+    the next rise too. A scan in an interval that showed no rise is in no
+    charge, so auto triage that genuinely landed late is still placed. Read
+    only for a project being observed, through the (project, window_end) index.
+    """
+    charged: set[str] = set()
+    for scan_ids in session.scalars(
+        select(AutoTriageCharge.scan_ids).where(
+            AutoTriageCharge.project_id == task.project_id,
+            AutoTriageCharge.window_end > task.lookback_start,
+            AutoTriageCharge.scan_count > 0,
+        )
+    ):
+        if isinstance(scan_ids, list):
+            charged.update(str(scan_id) for scan_id in scan_ids)
+    return charged
 
 
 def _advance(
@@ -1009,7 +1266,9 @@ def _list(
     """Completed scans on the given branches, newest first, and whether capped.
 
     Scans without an initiator are kept: they are part of the split, and their
-    share stays on the project.
+    share stays on the project. Scans created before ``since`` that were on the
+    last page read are kept too (no extra request): a long scan can complete
+    well after it was created. Callers filter by completion time.
     """
     if (
         branches
@@ -1033,7 +1292,7 @@ def _list(
         )
         budget.requests += listing.requests
         truncated = truncated or listing.truncated
-        for scan in listing.scans:
+        for scan in (*listing.scans, *listing.older):
             if (
                 scan.completed
                 and scan.completed_at is not None
@@ -1051,11 +1310,12 @@ def _observe(
     budget: _Budget,
     result: CollectResult,
 ) -> None:
+    charged = _charged_scans(session, task)
     branches = _read_branches(session, client, task.project_id, budget)
     # Listed back to the window start less the runtime allowance: a scan
-    # created before that finished before the window by assumption. The listing
-    # is newest first by creation, so "truncated" means exactly that the unread
-    # tail still holds scans created after that point, which could have
+    # created before that is only seen if it was on the last page read. The
+    # listing is newest first by creation, so "truncated" means exactly that the
+    # unread tail still holds scans created after that point, which could have
     # completed inside the interval.
     listed = _list(
         session,
@@ -1067,21 +1327,25 @@ def _observe(
         page_size=SCAN_PAGE_SIZE,
         budget=budget,
     )
+    # A scan an earlier charge already took a share for is not counted again:
+    # the interval opens a lag before the previous reading, and a scan that
+    # completed in that lag was part of the previous rise.
     qualifying = [
         scan
         for scan in listed.scans
         if scan.completed_at is not None
         and task.window_start < scan.completed_at <= task.window_end
+        and scan.id not in charged
     ]
     detail: str | None = None
     if listed.truncated:
         # Too many scans to see them all: a split over the ones we happened to
-        # read would be biased, so this increase is left to the estimate.
+        # read would be biased, so this increase stays on the project.
         result.capped += 1
         message = (
             f"Project {task.project_id} had more scans in one interval than the "
             f"{MAX_PAGES_PER_LISTING * SCAN_PAGE_SIZE} read per project; that increase is "
-            "estimated from earlier scans instead."
+            "left on the project instead."
         )
         result.warnings.append(message)
         logger.warning("Auto-triage attribution: %s", message)
@@ -1091,8 +1355,9 @@ def _observe(
         # Widen once: the latest qualifying scan that completed before the
         # window opened (an auto triage that ran late, or a long lag). Never
         # further back than the lookback window, the start of observation, or
-        # the previous charged interval: a scan before that was either already
-        # charged for its own auto triage or belongs to the estimate.
+        # the end of the previous charged interval, and never a scan a charge
+        # already names: a scan before that was either already charged for its
+        # own auto triage or belongs to the estimate.
         earlier = _list(
             session,
             client,
@@ -1108,6 +1373,7 @@ def _observe(
             for scan in earlier.scans
             if scan.completed_at is not None
             and task.widen_floor < scan.completed_at <= task.window_end
+            and scan.id not in charged
         ]
         if before:
             qualifying = [before[0]]
@@ -1156,7 +1422,7 @@ def _observe(
                         basis=BASIS_UNATTRIBUTED,
                         initiator=None,
                         initiator_key=None,
-                        scan_ids=[scan.id for scan in group][:50],
+                        scan_ids=[scan.id for scan in group],
                         scan_count=len(group),
                         credits=credits,
                         window_start=task.window_start,
@@ -1174,7 +1440,7 @@ def _observe(
                     basis=BASIS_OBSERVED,
                     initiator=names[key],
                     initiator_key=key,
-                    scan_ids=[scan.id for scan in group][:50],
+                    scan_ids=[scan.id for scan in group],
                     scan_count=len(group),
                     credits=credits,
                     window_start=task.window_start,

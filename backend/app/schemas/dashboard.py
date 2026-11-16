@@ -383,6 +383,7 @@ class AutoTriageChargeResponse(BaseModel):
     project_id: str
     basis: str
     initiator: str | None
+    # At most the first 50 (scan_count has them all).
     scan_ids: list[str] = Field(default_factory=list)
     scan_count: int
     credits: Decimal

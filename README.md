@@ -221,9 +221,12 @@ project reading. The feed reports per action *transactions*, not credits, so `A_
 is the project's credits when Auto Triage is all it did, otherwise its Auto Triage
 transactions priced at the tenant-wide credits per Auto Triage transaction from the
 `action` dimension, but never more than the project's transaction-mix share (its
-credits less what the mix attributes to its other actions), and by that mix share
-alone if the tenant price is not available. The cap matters when the tenant
-average says Auto Triage costs more than this project's credits allow: the
+credits less what the mix attributes to its other actions). Without the tenant
+price, a project row that also did other actions has no `A_p` at all (only a row
+whose breakdown is Auto Triage alone keeps its credits): the mix share alone can
+hand a person's own, dearer remediation credits to a scan initiator. The cap
+matters when the tenant average says Auto Triage costs more than this project's
+credits allow: the
 difference would be other actions' credits, such as a person's own triage that
 already counts against them, and it must not be charged to anyone a second time.
 The cap is conservative: it can under-charge a project whose Auto Triage really is
@@ -237,17 +240,23 @@ explained:
 
 | Basis | How |
 | ----- | --- |
-| **Observed** | Each cycle, a project whose Auto Triage *transaction count* rose since the last reading has its scans listed (`GET /api/scans/`) for that interval, less a 30 minute lag because auto triage runs after a scan completes. Only completed (or partial) scans on the project's auto-triage branches count; failed, canceled and running ones never do (branches are read from its AI configuration, *also when Auto Triage is switched off now*, so history from when it ran is still placed; no branches configured, an unreadable configuration, or one whose branches are not a list, means all branches). The new transactions, priced at the project's current credits per Auto Triage transaction, are split equally across those scans, so per person by number of scans. With none in the interval, the latest such scan before it is used, but never one from before observation began, before the lookback window, or before the previous charged interval. |
-| **Estimated** | Whatever `A_p` the recorded charges do not explain: credits from before the switch was turned on, or an interval that could not be read. Split by how many completed scans each person ran on the auto-triage branches inside the lookback window before observation began (sampled once per project, newest 500 scans). |
-| **Unattributed** | A rise with no qualifying scan at all, a remainder with no earlier scan to estimate against, and the share of scans that have no initiator (a scheduler): those scans count in the split, so the people who did start scans are only charged their own share. Stays on the project. |
+| **Observed** | Each cycle, a project whose Auto Triage *transaction count* rose since the last reading has its scans listed (`GET /api/scans/`) for that interval, less a 30 minute lag because auto triage runs after a scan completes. Only completed (or partial) scans on the project's auto-triage branches count; failed, canceled and running ones never do (branches are read from its AI configuration, *also when Auto Triage is switched off now*, so history from when it ran is still placed; no branches configured, an unreadable configuration, or one whose branches are not a list, means all branches). The new transactions, priced at the project's current credits per Auto Triage transaction, are split equally across those scans, so per person by number of scans. A scan an earlier charge of the project already names is not counted again: the lag reaches back into the previous interval, and a scan that completed in it took its share of that rise (a scan whose interval showed no rise is in no charge, so auto triage that really landed late is still placed). With none in the interval, the latest such scan before it is used, but never one from before observation began, before the lookback window, before the previous charged interval ended, or one already charged. |
+| **Estimated** | Credits from before the switch was turned on (the history). Split by how many completed scans each person ran on the auto-triage branches inside the lookback window before observation began (sampled once per project, newest 500 scans). Never more than what is left of that history: its *ceiling* is the transaction count observation began at, less every fall followed since (what ages out of the window is the oldest first, so a fall comes out of the history), priced at the project's current credits per transaction. |
+| **Unattributed** | A rise with no qualifying scan at all, a remainder with no earlier scan to estimate against, whatever the charges and the history together do not explain (an interval that could not be read or was too busy to read, new transactions that arrived while as many older ones aged out), and the share of scans that have no initiator (a scheduler): those scans count in the split, so the people who did start scans are only charged their own share. Stays on the project. |
 
 **What is followed.** The per project cursor is the Auto Triage *transaction count*
 the feed reports, never a credit figure: the tenant-wide credits per transaction
 moves from reading to reading, and a credit cursor would turn every wobble into a
-"new" rise. A project missing from a reading, or a row without the per action
-breakdown, is no reading at all and leaves the cursor where it was, so a dip is
-never charged again when it comes back. A real fall (older transactions ageing out
-of the lookback window) moves the cursor down without charging anything.
+"new" rise. No reading at all, leaving the cursor where it was so a dip is never
+charged again when it comes back, is: a project missing from a reading; a row
+without the per action breakdown, whatever its credits (a row with no credits and
+no breakdown counts as 0 only while the cursor already stands at 0); an Auto
+Triage `transactionCount` that is not a whole number of at least 0; and a breakdown
+without an Auto Triage entry unless the other actions account for the row (at
+least one with transactions, all readable, adding up to the reported total when
+there is one), since a partial breakdown could have left Auto Triage out. A real
+fall (older transactions ageing out of the lookback window) moves the cursor down
+without charging anything, and lowers the history ceiling by as much.
 
 **When observation (re)starts.** Turning the switch on stamps an observation start
 (`attribution.auto_triage_observation_epoch`, written whichever way the switch was
@@ -256,9 +265,13 @@ Every project whose cursor is from an earlier start, from another lookback windo
 or from before the upgrade that introduced the transaction cursor starts again at
 the current reading: what arrived while the switch was off is history, estimated
 and never one big observed rise. A project first seen with consumption that earlier
-readings already showed (it was missing from a reading or two) also starts there;
-only a project with no consumption in any earlier reading has its first auto triage
-observed.
+readings already showed (it was missing from a reading or two) also starts there.
+That includes readings where its row matched no project in the local catalogue
+(created since the last organisation sync, a failed sync, a name or id mismatch),
+which are stored without a project: an earlier unmatched row with the same reported
+id or the same name counts, and so does any unmatched row the feed gave no id for,
+since it cannot be told apart. Only a project with no consumption in any earlier
+reading has its first auto triage observed.
 
 A scan's `initiator` is matched to a synced user exactly like a consumption
 subject (admin mapping, then email, username, full name, then the conservative
@@ -283,14 +296,18 @@ counted and the per project parts all from the same rebuild); the period's
 example after an initiator is mapped (`evaluated_counted` shows what it included).
 
 **Bounded and crash safe.** Listing is paged and capped (50 projects and 300
-requests per cycle, 500 scans per project interval). A scan is listed by when it was
-created, so an interval is listed back to four hours before it opened, enough for a
-long SAST scan of a large repository to finish inside it; a scan running longer than
-that is not seen (its share goes to the scans that are). Only a project with more
+requests per cycle, 500 scans per project interval). Scans are listed newest
+first by when they were created, so an interval is listed back to four hours before
+it opened, enough for a long SAST scan of a large repository to finish inside it. The
+listing does not ask the server to filter by date (the pages read are the same), so
+the last page also carries a few scans created earlier; one of them that completed
+inside the interval is counted too. A scan running longer than that and not on that
+page is not seen (its share goes to the scans that are). Only a project with more
 than about a hundred scans an hour on its auto-triage branches reaches the cap. A
-project that does not fit is caught up on the next cycle and estimated meanwhile; an
-interval whose unread scans could still include one that finished inside it is left
-to the estimate rather than split over a biased sample. Any failure in one project,
+project that does not fit is caught up on the next cycle and stays on the project
+meanwhile; an interval whose unread scans could still include one that finished
+inside it stays on the project rather than being split over a biased sample. Any
+failure in one project,
 a tenant error or anything unexpected, leaves that project's cursor where it was,
 records the error on it, raises a warning, and the other projects carry on (an
 outage stops the step for the cycle instead of waiting on every project). Nothing
@@ -1008,7 +1025,9 @@ these, because each one can stop something that used to work:
   second migration (`b7d4e2a9c1f3`) adds `last_transactions` and
   `observation_epoch` to `auto_triage_project_state`; a row from before it (both
   null) restarts observation at the next reading, so nothing that happened before
-  the upgrade is charged as observed.
+  the upgrade is charged as observed. A third (`c8e1f5a3d6b2`) adds
+  `history_ceiling`; a row from before it (null) bounds the estimate by the current
+  reading until the next fall sets it, and a restart sets it at once.
 
 ### Enforcement safety
 

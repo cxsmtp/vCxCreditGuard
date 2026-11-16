@@ -23,13 +23,19 @@ scheduler) reports its own name there. Scans are returned newest first.
 Listing is deliberately bounded: a project can have thousands of scans, and one
 busy project must never make a governance cycle unbounded. A listing that hits
 its page cap says so (``truncated``) instead of pretending it saw everything.
+
+The listing is paged newest first by creation and stops at the first page that
+reaches a scan created before ``since``. That page usually carries a few such
+older scans too; they are returned separately (``older``) rather than thrown
+away, because a long scan created before ``since`` can still have completed
+after it. No request is made for them.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -69,10 +75,15 @@ class ScanPage:
 
 @dataclass
 class ScanListing:
+    # Scans created at or after ``since``: every one of them, unless truncated.
     scans: list[ScanSummary]
     # True when the page cap was reached before the listing reached ``since``.
     truncated: bool
     requests: int
+    # Scans created before ``since`` that happened to be on the pages read
+    # (the last one). Not a complete list of anything: only a scan that was
+    # created early and completed late is of interest among them.
+    older: list[ScanSummary] = field(default_factory=list)
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -177,13 +188,17 @@ def list_project_scans(
 ) -> ScanListing:
     """The project's scans, newest first, back to ``since`` (by creation time).
 
-    ``since`` is sent as ``from-date`` and also enforced here, because paging
-    stops as soon as a page reaches scans created before it: the listing is
-    newest first, so nothing after that point can be newer. At most
-    ``max_pages`` requests are made; reaching that cap with more to read sets
-    ``truncated``.
+    Paging stops as soon as a page reaches a scan created before ``since``: the
+    listing is newest first, so nothing after that point can be newer. ``since``
+    is deliberately not sent as ``from-date``: the server would then leave out
+    the older scans on that last page, and a long scan created before ``since``
+    that completed after it is worth keeping (``older``). The pages read are the
+    same either way. At most ``max_pages`` requests are made; reaching that cap
+    before reaching ``since`` (or the end) sets ``truncated``, whatever older
+    scans were seen: it means scans created after ``since`` may be unread.
     """
     scans: list[ScanSummary] = []
+    older: list[ScanSummary] = []
     seen: set[str] = set()
     requests = 0
     offset = 0
@@ -191,8 +206,6 @@ def list_project_scans(
         params: dict[str, Any] = {"project-id": project_id, "limit": page_size, "offset": offset}
         if branch:
             params["branch"] = branch
-        if since is not None:
-            params["from-date"] = format_time(since)
         payload = client.get_json(SCANS_PATH, params=params)
         requests += 1
         page = parse_scan_page(payload)
@@ -203,6 +216,7 @@ def list_project_scans(
             seen.add(scan.id)
             if since is not None and scan.created_at is not None and scan.created_at < since:
                 reached_since = True
+                older.append(scan)
                 continue
             scans.append(scan)
         offset += len(page.scans)
@@ -211,6 +225,6 @@ def list_project_scans(
             or len(page.scans) < page_size
             or (page.total is not None and offset >= page.total)
         ):
-            return ScanListing(scans=scans, truncated=False, requests=requests)
+            return ScanListing(scans=scans, truncated=False, requests=requests, older=older)
     logger.info("Scan listing for project %s stopped at the %d page cap", project_id, max_pages)
-    return ScanListing(scans=scans, truncated=True, requests=requests)
+    return ScanListing(scans=scans, truncated=True, requests=requests, older=older)

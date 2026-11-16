@@ -654,7 +654,7 @@ def auto_triage_attribution_overview(
                 project_id=row.project_id,
                 basis=row.basis,
                 initiator=row.initiator,
-                scan_ids=[str(scan) for scan in (row.scan_ids or [])],
+                scan_ids=[str(scan) for scan in (row.scan_ids or [])[:50]],
                 scan_count=row.scan_count,
                 credits=row.credits,
                 window_start=row.window_start,
