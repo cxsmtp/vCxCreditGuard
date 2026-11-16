@@ -880,8 +880,10 @@ function AutoTriageCard({
           completed scans on the project's auto-triage branches in between: the rise is split
           equally between those scans, so per person by number of scans (<b>observed</b>). Credits
           from before it was watching are split by how many such scans each person ran in the
-          lookback window (<b>estimated</b>); a monthly or quarterly budget never counts estimated
-          credits. A scan started by an integration (a webhook bot) has no person behind it: map it
+          lookback window (<b>estimated</b>). A monthly or quarterly budget counts only credits
+          observed after it opened, unless it is set to count consumption that predates the period:
+          then, like a lifetime or custom budget, it counts everything attributed in the window,
+          estimated credits included. A scan started by an integration (a webhook bot) has no person behind it: map it
           below, under Unmatched, to the person it acts for. Until then its share stays on the
           project only. Project and tenant totals never change: people are only ever charged a
           split of what the project reports.

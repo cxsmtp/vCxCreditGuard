@@ -75,13 +75,15 @@ def _auto_triage_response(
             )
         return labels[key]
 
-    counted = (
-        state.attributed_credits if state.attributed_credits is not None else attributed.counted
-    )
+    # Every figure here is from one live rebuild, so counted, not_counted and
+    # the parts always agree with each other. ``evaluated_counted`` is what the
+    # period's credits_used included at its last evaluation; the two differ
+    # only between cycles (an initiator mapped since, a reading since).
     return AutoTriageAttributionResponse(
-        counted=counted,
+        counted=attributed.counted,
+        evaluated_counted=state.attributed_credits,
         window_total=attributed.window_total,
-        not_counted=max(Decimal("0"), attributed.window_total - counted),
+        not_counted=max(Decimal("0"), attributed.not_counted),
         counts_existing_usage=attributed.counts_existing,
         counted_since=attributed.since,
         parts=[

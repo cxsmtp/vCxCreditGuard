@@ -208,7 +208,12 @@ function UsageBar({ limit }: { limit: Limit }) {
                 (part) =>
                   `${part.user_label ?? part.user_id} · ${part.project_label ?? part.project_id}: ${formatCredits(part.counted)} (${part.basis})`,
               )
-              .join("\n")
+              .join("\n") +
+            (state.auto_triage_attributed.evaluated_counted !== null &&
+            Number(state.auto_triage_attributed.evaluated_counted) !==
+              Number(state.auto_triage_attributed.counted)
+              ? `\n\nAs it would count now. The period figure above was evaluated with ${formatCredits(state.auto_triage_attributed.evaluated_counted)} and catches up at the next cycle.`
+              : "")
           }
         >
           incl. {formatCredits(state.auto_triage_attributed.counted)} auto triage from their scans

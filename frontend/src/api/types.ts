@@ -194,7 +194,10 @@ export interface AutoTriagePart {
 }
 
 export interface AutoTriageAttributed {
+  /** As it would be counted now; parts, window_total and not_counted agree with it. */
   counted: string;
+  /** What credits_used included at the last evaluation (catches up next cycle). */
+  evaluated_counted: string | null;
   window_total: string;
   not_counted: string;
   counts_existing_usage: boolean;

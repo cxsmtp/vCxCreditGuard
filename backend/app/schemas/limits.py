@@ -87,9 +87,14 @@ class AutoTriageAttributionResponse(BaseModel):
     include member usage.
     """
 
-    # The amount included in credits_used (as of the last evaluation when the
-    # period has been evaluated, otherwise as it would be now).
+    # Every figure below is as it would be counted now, from the same live
+    # rebuild, so counted + not_counted == window_total and the parts add up.
+    # The amount that counts towards this period.
     counted: Decimal
+    # What the period's credits_used included at its last evaluation (null
+    # before the first). Differs from ``counted`` only between cycles, for
+    # example right after an initiator was mapped; the next cycle catches up.
+    evaluated_counted: Decimal | None = None
     # Everything attributed to the person (or the group's members) inside the
     # consumption window, counted or not.
     window_total: Decimal

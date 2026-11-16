@@ -205,9 +205,20 @@ class AutoTriageCharge(Base):
 class AutoTriageProjectState(Base):
     """Per project bookkeeping for auto-triage attribution.
 
-    ``last_credits`` and ``last_snapshot_id`` are the cursor: the next increase
-    is measured from them, and they only move once that increase has been dealt
-    with, so a cycle that could not reach Checkmarx is caught up by the next one.
+    ``last_transactions`` (with ``last_snapshot_id`` and ``last_collected_at``)
+    is the cursor: the project's Auto Triage *transaction count* in the last
+    reading dealt with. The next increase is measured from it, and it only moves
+    once that increase has been dealt with, so a cycle that could not reach
+    Checkmarx is caught up by the next one. It is a transaction count, not a
+    credit figure, because only the count is what the feed reports per project:
+    a credit figure moves with the tenant-wide price and would turn a price
+    wobble into a phantom rise. ``last_credits`` is the matching credit figure,
+    kept for display only.
+
+    ``observation_epoch`` is the stamp of the enablement the cursor belongs to
+    (``attribution.auto_triage_observation_epoch``). A state from an earlier
+    enablement (or with no transaction cursor, from before this column existed)
+    restarts at the current reading: what arrived meanwhile is history.
 
     ``history`` is a compact sample of the completed scans on the auto-triage
     branches from before observation started (``observing_since``), as
@@ -224,6 +235,8 @@ class AutoTriageProjectState(Base):
     last_credits: Mapped[Decimal] = mapped_column(
         Numeric(18, 4), nullable=False, default=Decimal("0")
     )
+    last_transactions: Mapped[int | None] = mapped_column(Integer)
+    observation_epoch: Mapped[str | None] = mapped_column(String(64))
     observing_since: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     # "pending" | "done" | "truncated" | "none"
     history_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
