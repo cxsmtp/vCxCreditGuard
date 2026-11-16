@@ -30,16 +30,21 @@ Who triggered it
   completes). The new transactions, priced at the project's current credits
   per Auto Triage transaction, are split equally across the completed scans on
   the project's auto-triage branches, so per initiator by scan count; scans
-  without an initiator keep their share on the project. A scan an earlier
-  charge already named is not counted again. With no such scan in the
-  interval, the latest one before it (since observation began, inside the
-  window, after the previous charged interval ended, and not already charged)
-  is used; with none at all the increase is recorded as ``unattributed`` and
-  stays on the project. The cursor is the transaction count, never a credit
-  figure: a price change is not new auto triage. A project missing from a
-  reading, or a row that cannot say how much Auto Triage it did (no per action
-  breakdown, an unreadable count, a breakdown without Auto Triage that does not
-  add up), is no reading at all and leaves the cursor alone.
+  without an initiator keep their share on the project, and so do scans an
+  earlier charge already named (they are not charged twice, and their share
+  does not move onto the other scans). A scan whose ``updatedAt`` (all the
+  listing gives for completion) is more than ``MAX_SCAN_RUNTIME`` after its
+  creation was edited later and is not taken. With no scan in the interval,
+  the latest one before it (since observation began, inside the window, after
+  the previous charged interval ended, and not already charged) is used; with
+  none at all, or with more scans than a listing reads, the increase is
+  recorded as ``unattributed`` and stays on the project. The cursor is the
+  transaction count, never a credit figure: a price change is not new auto
+  triage. A project missing from a reading, or a row that cannot say how much
+  Auto Triage it did (no per action breakdown, an unreadable count, a
+  breakdown without Auto Triage that no total confirms complete), is no
+  reading at all and leaves the cursor alone (a row that may be a 0 is taken
+  only while the cursor already stands at 0).
 * **Observation (re)starts** at the current reading whenever the setting is
   turned on (``attribution.auto_triage_observation_epoch``), the lookback
   window changes, or a project is first seen with consumption it already had
@@ -48,10 +53,13 @@ Who triggered it
 * **Estimated.** Credits from before observation began are split by the
   number of completed scans each person ran on the auto-triage branches inside
   the consumption window, before observation began. Never more than what is
-  left of that history (``history_ceiling``: the reading observation began at,
-  less every fall since, at the current credits per transaction); whatever
-  else no recorded charge explains (an interval that could not be read, new
-  transactions netted against older ones ageing out) stays on the project.
+  left of that history: ``history_ceiling`` (the reading observation began
+  at, less every fall since, at the current credits per transaction), scaled
+  by the share of the sampled history scans still inside the window. A fall
+  only shows when more ages out than arrives; the scans' dates show the
+  history ageing out either way. Whatever else no recorded charge explains
+  (an interval that could not be read, new transactions netted against older
+  ones ageing out) stays on the project.
 * An initiator that does not resolve to a synced user (a webhook bot, an
   unknown address) is raised as an unresolved subject of kind
   ``scan_initiator`` for an admin to map; until then its share stays on the
@@ -136,6 +144,15 @@ OBSERVATION_LAG = timedelta(minutes=30)
 # to read it on its last page; otherwise its share goes to the scans that are
 # (or the increase stays on the project).
 SCAN_RUNTIME_ALLOWANCE = timedelta(hours=4)
+# The longest a listed scan may have run (creation to ``updatedAt``) and still
+# be taken. ``completed_at`` is the scan's ``updatedAt``, which also moves when
+# the scan is edited later (a tag, say): without a bound, a scan created weeks
+# ago that was on the last page read (or inside a widen listing, which can
+# reach back to when observation began) and was touched in the interval would
+# be taken for one that just finished. A day is far beyond any real scan (the
+# allowance above already covers a long one); a scan that genuinely ran longer
+# is not charged, and its share stays on the project.
+MAX_SCAN_RUNTIME = timedelta(hours=24)
 
 # Bounds, so one busy project or a huge tenant never makes a cycle unbounded.
 # Whatever does not fit is caught up on the next cycle and stays on the project
@@ -234,12 +251,13 @@ def auto_triage_transactions(record: UsageRecord) -> int | None:
       briefly comes back with no breakdown (or 0 credits and no breakdown) is
       a dip in the feed, not the project's auto triage falling to nothing;
     * an Auto Triage count that is not a non-negative integer;
-    * a breakdown without Auto Triage that is not otherwise complete. Without
+    * a breakdown without Auto Triage that is not confirmed complete. Without
       the entry the row is a real 0 only when other actions account for it:
       at least one other action with transactions, every count readable, and
-      the counts adding up to the reported total when there is one. Anything
-      less (an empty or zero breakdown, a total the counts do not reach) could
-      be a partial breakdown that left Auto Triage out.
+      the counts adding up to the reported total. Anything less (an empty or
+      zero breakdown, a total the counts do not reach, no total at all) could
+      be a partial breakdown that left Auto Triage out. Without a total it is
+      only a possible 0 (``_may_be_zero``).
     """
     actions = record.actions or {}
     if not actions:
@@ -253,22 +271,34 @@ def auto_triage_transactions(record: UsageRecord) -> int | None:
     others = list(actions.values())
     if not all(_valid_count(value) for value in others) or sum(others) <= 0:
         return None
-    if record.transactions is not None and record.transactions != sum(others):
+    if record.transactions is None or record.transactions != sum(others):
         return None
     return 0
 
 
 def _may_be_zero(record: UsageRecord) -> bool:
-    """A row that says nothing about Auto Triage but reports no credits either.
+    """A row that says nothing about Auto Triage, yet may be a real 0.
 
-    Read as 0 only while the project's cursor already stands at 0 (so a dip of
-    a project with auto triage never resets its cursor); otherwise no reading.
+    Either it reports no credits, or its other actions look complete but no
+    total confirms that the breakdown left nothing out. Read as 0 only while
+    the project's cursor already stands at 0 (so a dip of a project with auto
+    triage never resets its cursor, and is not re-charged in full when the
+    entry comes back); otherwise no reading.
     """
-    if Decimal(record.credits_used or 0) > 0:
-        return False
     if any(not _valid_count(value) for value in _raw_auto_triage_counts(record)):
         return False
-    return ActionType.AUTO_TRIAGE.value not in (record.actions or {})
+    actions = record.actions or {}
+    if ActionType.AUTO_TRIAGE.value in actions:
+        return False
+    if Decimal(record.credits_used or 0) <= 0:
+        return True
+    others = list(actions.values())
+    return (
+        record.transactions is None
+        and bool(others)
+        and all(_valid_count(value) for value in others)
+        and sum(others) > 0
+    )
 
 
 def auto_triage_share(record: UsageRecord, price: Decimal | None) -> Decimal:
@@ -305,8 +335,9 @@ class ProjectReading:
 
     transactions: int
     credits: Decimal
-    # False when a row of it said nothing about Auto Triage and reported no
-    # credits: read as 0 only while the cursor is already 0.
+    # False when a row of it said nothing about Auto Triage and nothing confirms
+    # that is a 0 (no credits, or a breakdown without a total): read as 0 only
+    # while the cursor is already 0.
     certain: bool = True
 
     @property
@@ -325,9 +356,9 @@ def project_readings(
     None for a project whose row cannot say how much Auto Triage it did (see
     ``auto_triage_transactions``); a project absent from the snapshot is absent
     here. Both mean "no reading": the collector leaves that project's cursor
-    alone. A row with no credits that says nothing about Auto Triage gives an
-    uncertain 0 (``certain`` false), which the collector only takes while the
-    cursor already stands at 0.
+    alone. A row that says nothing about Auto Triage and may still be a 0 (see
+    ``_may_be_zero``) gives an uncertain 0 (``certain`` false), which the
+    collector only takes while the cursor already stands at 0.
     """
     readings: dict[str, ProjectReading | None] = {}
     for record in session.scalars(
@@ -445,16 +476,18 @@ class AttributionModel:
 
 def _history_counts(
     state: AutoTriageProjectState | None, *, window_start: datetime
-) -> dict[str | None, tuple[str | None, int]]:
-    """Completed scans per initiator key in the sample, inside the window.
+) -> tuple[dict[str | None, tuple[str | None, int]], int]:
+    """Completed scans per initiator key in the sample inside the window, and
+    how many scans the sample held in all (inside the window or not).
 
     Scans with no initiator are counted under the key None: they are part of
     the split (their share stays on the project), so the people who did start
     scans are not charged for them.
     """
     counts: dict[str | None, tuple[str | None, int]] = {}
+    sampled = 0
     if state is None or not isinstance(state.history, list):
-        return counts
+        return counts, sampled
     floor = window_start.date().isoformat()
     for entry in state.history:
         if not isinstance(entry, list | tuple) or len(entry) != 3:
@@ -462,14 +495,15 @@ def _history_counts(
         initiator, day, count = entry
         if initiator is not None and not isinstance(initiator, str):
             continue
-        if not isinstance(day, str) or not isinstance(count, int):
+        if not isinstance(day, str) or not isinstance(count, int) or count <= 0:
             continue
-        if day < floor or count <= 0:
+        sampled += count
+        if day < floor:
             continue
         key = initiator_key(initiator) if initiator and initiator.strip() else None
         name, total = counts.get(key, (initiator if key is not None else None, 0))
         counts[key] = (name, total + count)
-    return counts
+    return counts, sampled
 
 
 def _estimate_cap(
@@ -602,18 +636,26 @@ def build_model(
                 project.unattributed += share
 
         remainder = available - covered if available > covered else ZERO
+        counts, sampled = _history_counts(state, window_start=window_start)
+        scans = sum(count for _name, count in counts.values())
         cap = _estimate_cap(state, snapshot, available, transactions_now)
+        if sampled and scans < sampled:
+            # Part of the sampled history has aged out of the window by date.
+            # The transaction ceiling only drops on a net fall, so history
+            # ageing out while as many new transactions arrive never lowers
+            # it; the scans' own dates do. Only the share of the sample still
+            # inside the window can be left of the history.
+            cap = _q(cap * scans / sampled)
         if remainder > cap:
             # More than what is left of the history: newer auto triage that no
-            # recorded charge explains (an interval that could not be read, or
-            # new transactions netted against older ones ageing out). It is not
-            # the history's, so it stays on the project.
+            # recorded charge explains (an interval that could not be read or
+            # was too busy to read, or new transactions netted against older
+            # ones ageing out). It is not the history's, so it stays on the
+            # project.
             project.unattributed += remainder - cap
             remainder = cap
         if remainder <= 0:
             continue
-        counts = _history_counts(state, window_start=window_start)
-        scans = sum(count for _name, count in counts.values())
         if not scans:
             project.unattributed += remainder
             continue
@@ -728,6 +770,9 @@ class CollectResult:
     # Projects whose observation (re)started at this reading: setting turned on,
     # lookback window changed, or first seen with consumption it already had.
     restarted: int = 0
+    # Of those, projects restarted only because an earlier project row without
+    # an id, that matched nothing, could have been theirs (logged as a warning).
+    restarted_unidentified: int = 0
     # Projects with no usable reading this cycle (missing from the snapshot, or
     # a row without the per action breakdown): their cursor stayed where it was.
     no_reading: int = 0
@@ -746,6 +791,7 @@ class CollectResult:
             "deferred": self.deferred,
             "capped": self.capped,
             "restarted": self.restarted,
+            "restarted_unidentified": self.restarted_unidentified,
             "no_reading": self.no_reading,
             "unresolved_initiators": self.unresolved_initiators,
             "warnings": self.warnings,
@@ -988,6 +1034,10 @@ def _identities(
     return ids, names
 
 
+REPORTED_AS_ITSELF = "itself"
+REPORTED_UNIDENTIFIED = "unidentified"
+
+
 def _reported_before(
     session: Session,
     project_id: str,
@@ -995,8 +1045,12 @@ def _reported_before(
     *,
     since: datetime,
     unmatched: list[_UnmatchedRow],
-) -> bool:
+) -> str | None:
     """Whether an earlier project reading (inside the window) showed consumption.
+
+    ``REPORTED_AS_ITSELF`` when a row of this project (by entity, reported id or
+    name) did; ``REPORTED_UNIDENTIFIED`` when only an unmatched row without an
+    id could have been it; None when nothing earlier was.
 
     Tells a project that is genuinely new (its first consumption arrived since
     the last reading) from one that was missing from a reading or two and comes
@@ -1010,13 +1064,15 @@ def _reported_before(
         _earlier_rows(snapshot, since=since).where(UsageRecord.entity_id == project_id).limit(1)
     )
     if matched is not None:
-        return True
+        return REPORTED_AS_ITSELF
     if not unmatched:
-        return False
+        return None
     ids, names = _identities(session, project_id, snapshot)
-    return any(
-        row.reported_id is None or row.reported_id in ids or row.name in names for row in unmatched
-    )
+    if any(row.reported_id in ids or row.name in names for row in unmatched):
+        return REPORTED_AS_ITSELF
+    if any(row.reported_id is None for row in unmatched):
+        return REPORTED_UNIDENTIFIED
+    return None
 
 
 def _plan(
@@ -1086,9 +1142,20 @@ def _plan(
         if state is None and previous is not None and previous < snapshot.collected_at:
             if unmatched is None:
                 unmatched = _unmatched_rows(session, snapshot, since=window_start)
-            if not _reported_before(
+            reported = _reported_before(
                 session, project_id, snapshot, since=window_start, unmatched=unmatched
-            ):
+            )
+            if reported == REPORTED_UNIDENTIFIED:
+                # Only once per project: the state made below is current from
+                # now on, so this project is never asked again.
+                result.restarted_unidentified += 1
+                logger.warning(
+                    "Auto-triage attribution: project %s is new, but an earlier project row "
+                    "without an id matched nothing in the catalogue and could have been it; "
+                    "its consumption so far is estimated from its scans, not observed.",
+                    project_id,
+                )
+            if reported is None:
                 # A project with no consumption at all in the readings before:
                 # all of it arrived since the last reading dealt with, so it is
                 # observed. It has no history.
@@ -1176,19 +1243,30 @@ def _plan(
 
 
 def _charged_scans(session: Session, task: _Increase) -> set[str]:
-    """The scans this project's charges inside the lookback window already name.
+    """The scans this project's recent charges already name.
 
     The interval opens a lag before the previous reading, so without this a
     scan that completed just before that reading would take a full share of
     the next rise too. A scan in an interval that showed no rise is in no
     charge, so auto triage that genuinely landed late is still placed. Read
     only for a project being observed, through the (project, window_end) index.
+
+    Only charges that could name a scan this interval (or its widen fallback)
+    can take are read, not every charge in the lookback window: ``_list`` keeps
+    a scan only if it completed at most ``MAX_SCAN_RUNTIME`` after its
+    creation, and a scan only qualifies if it completed after the interval's
+    start (or the widen floor), so every scan that can qualify was created
+    after the floor below. A charge ends no
+    earlier than the completion it saw for each scan it names, which is no
+    earlier than that scan's creation; a charge that ended before the floor
+    cannot name a scan seen now, however far its ``updatedAt`` has moved.
     """
+    floor = min(task.window_start, task.widen_floor) - MAX_SCAN_RUNTIME
     charged: set[str] = set()
     for scan_ids in session.scalars(
         select(AutoTriageCharge.scan_ids).where(
             AutoTriageCharge.project_id == task.project_id,
-            AutoTriageCharge.window_end > task.lookback_start,
+            AutoTriageCharge.window_end > floor,
             AutoTriageCharge.scan_count > 0,
         )
     ):
@@ -1268,7 +1346,9 @@ def _list(
     Scans without an initiator are kept: they are part of the split, and their
     share stays on the project. Scans created before ``since`` that were on the
     last page read are kept too (no extra request): a long scan can complete
-    well after it was created. Callers filter by completion time.
+    well after it was created. Any scan whose ``updatedAt`` is more than
+    ``MAX_SCAN_RUNTIME`` after its creation is dropped: that is a later edit of
+    an old scan, not its completion. Callers filter by completion time.
     """
     if (
         branches
@@ -1280,6 +1360,18 @@ def _list(
         targets = [None]
     found: dict[str, scans_api.ScanSummary] = {}
     truncated = False
+
+    def plausible(scan: scans_api.ScanSummary) -> bool:
+        # ``completed_at`` is the scan's ``updatedAt``. A scan without a
+        # creation time, or "completed" before it was created, cannot be
+        # placed; one "completed" more than ``MAX_SCAN_RUNTIME`` after it was
+        # created was edited later, and its ``updatedAt`` is not a completion.
+        # That matters most for the scans created before ``since`` on the last
+        # page, and for the widen listing, which can reach weeks back.
+        if scan.created_at is None or scan.completed_at is None:
+            return False
+        return timedelta(0) <= scan.completed_at - scan.created_at <= MAX_SCAN_RUNTIME
+
     for branch in targets:
         session.commit()
         listing = scans_api.list_project_scans(
@@ -1295,7 +1387,7 @@ def _list(
         for scan in (*listing.scans, *listing.older):
             if (
                 scan.completed
-                and scan.completed_at is not None
+                and plausible(scan)
                 and scans_api.branch_matches(scan.branch, branches)
             ):
                 found.setdefault(scan.id, scan)
@@ -1327,20 +1419,24 @@ def _observe(
         page_size=SCAN_PAGE_SIZE,
         budget=budget,
     )
-    # A scan an earlier charge already took a share for is not counted again:
-    # the interval opens a lag before the previous reading, and a scan that
-    # completed in that lag was part of the previous rise.
-    qualifying = [
+    in_window = [
         scan
         for scan in listed.scans
         if scan.completed_at is not None
         and task.window_start < scan.completed_at <= task.window_end
-        and scan.id not in charged
     ]
+    # A scan an earlier charge already took a share for is not charged again:
+    # the interval opens a lag before the previous reading, and a scan that
+    # completed in that lag was part of the previous rise. It still counts in
+    # the split, its share stays on the project: auto triage of it that landed
+    # late is not moved onto the other scans of the interval.
+    qualifying = [scan for scan in in_window if scan.id not in charged]
+    already = [scan for scan in in_window if scan.id in charged]
     detail: str | None = None
     if listed.truncated:
         # Too many scans to see them all: a split over the ones we happened to
-        # read would be biased, so this increase stays on the project.
+        # read would be biased, so this increase stays on the project,
+        # recorded as such so that it is never estimated to the history.
         result.capped += 1
         message = (
             f"Project {task.project_id} had more scans in one interval than the "
@@ -1349,9 +1445,16 @@ def _observe(
         )
         result.warnings.append(message)
         logger.warning("Auto-triage attribution: %s", message)
-        _finish(session, task, branches, charges=[], note=message)
+        result.unattributed_charges += 1
+        _finish(
+            session,
+            task,
+            branches,
+            charges=[_unattributed(task, utcnow(), detail=message)],
+            note=message,
+        )
         return
-    if not qualifying:
+    if not in_window:
         # Widen once: the latest qualifying scan that completed before the
         # window opened (an auto triage that ran late, or a long lag). Never
         # further back than the lookback window, the start of observation, or
@@ -1381,28 +1484,32 @@ def _observe(
 
     now = utcnow()
     charges: list[AutoTriageCharge] = []
-    if not qualifying:
+    if not qualifying and not already:
         charges.append(
-            AutoTriageCharge(
-                project_id=task.project_id,
-                basis=BASIS_UNATTRIBUTED,
-                initiator=None,
-                initiator_key=None,
-                scan_ids=[],
-                scan_count=0,
-                credits=task.delta,
-                window_start=task.window_start,
-                window_end=task.window_end,
-                snapshot_id=task.snapshot_id,
-                created_at=now,
+            _unattributed(
+                task,
+                now,
                 detail="No completed scan on the auto-triage branches explains this increase.",
             )
         )
         result.unattributed_charges += 1
     else:
-        # Scans without an initiator stay in the denominator: their share is
-        # recorded as unattributed, so the people who did start scans are only
-        # charged for theirs.
+        # Scans without an initiator, and scans already charged, stay in the
+        # denominator: their share is recorded as unattributed, so the people
+        # who did start the other scans are only charged for theirs.
+        total = len(qualifying) + len(already)
+        if already:
+            charges.append(
+                _unattributed(
+                    task,
+                    now,
+                    credits=_q(task.delta * len(already) / total),
+                    scans=already,
+                    detail="Scans an earlier charge already named: their share stays on the "
+                    "project.",
+                )
+            )
+            result.unattributed_charges += 1
         by_initiator: dict[str | None, list[scans_api.ScanSummary]] = defaultdict(list)
         names: dict[str, str] = {}
         for scan in qualifying:
@@ -1412,23 +1519,15 @@ def _observe(
             else:
                 key = None
             by_initiator[key].append(scan)
-        total = len(qualifying)
         for key, group in sorted(by_initiator.items(), key=lambda item: item[0] or ""):
             credits = _q(task.delta * len(group) / total)
             if key is None:
                 charges.append(
-                    AutoTriageCharge(
-                        project_id=task.project_id,
-                        basis=BASIS_UNATTRIBUTED,
-                        initiator=None,
-                        initiator_key=None,
-                        scan_ids=[scan.id for scan in group],
-                        scan_count=len(group),
+                    _unattributed(
+                        task,
+                        now,
                         credits=credits,
-                        window_start=task.window_start,
-                        window_end=task.window_end,
-                        snapshot_id=task.snapshot_id,
-                        created_at=now,
+                        scans=group,
                         detail="Scans with no initiator: their share stays on the project.",
                     )
                 )
@@ -1452,6 +1551,31 @@ def _observe(
             )
             result.observed_charges += 1
     _finish(session, task, branches, charges=charges, note=None)
+
+
+def _unattributed(
+    task: _Increase,
+    now: datetime,
+    *,
+    detail: str,
+    credits: Decimal | None = None,
+    scans: list[scans_api.ScanSummary] | None = None,
+) -> AutoTriageCharge:
+    """A charge that keeps (part of) an increase on the project, on record."""
+    return AutoTriageCharge(
+        project_id=task.project_id,
+        basis=BASIS_UNATTRIBUTED,
+        initiator=None,
+        initiator_key=None,
+        scan_ids=[scan.id for scan in scans or []],
+        scan_count=len(scans or []),
+        credits=task.delta if credits is None else credits,
+        window_start=task.window_start,
+        window_end=task.window_end,
+        snapshot_id=task.snapshot_id,
+        created_at=now,
+        detail=detail,
+    )
 
 
 def _finish(

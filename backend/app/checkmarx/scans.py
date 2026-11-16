@@ -193,17 +193,24 @@ def list_project_scans(
     is deliberately not sent as ``from-date``: the server would then leave out
     the older scans on that last page, and a long scan created before ``since``
     that completed after it is worth keeping (``older``). The pages read are the
-    same either way. At most ``max_pages`` requests are made; reaching that cap
+    same either way. At most ``max_pages`` pages are read; reaching that cap
     before reaching ``since`` (or the end) sets ``truncated``, whatever older
     scans were seen: it means scans created after ``since`` may be unread.
+    When the cap is reached on a full last page that did not reach ``since``,
+    one more request of a single scan tells whether anything after ``since`` is
+    left (``page.total`` cannot: without ``from-date`` it counts every scan
+    ever made), so exactly ``max_pages`` pages of scans after ``since`` are not
+    reported as truncated.
     """
     scans: list[ScanSummary] = []
     older: list[ScanSummary] = []
     seen: set[str] = set()
     requests = 0
     offset = 0
-    while requests < max_pages:
-        params: dict[str, Any] = {"project-id": project_id, "limit": page_size, "offset": offset}
+
+    def read(limit: int) -> tuple[ScanPage, bool]:
+        nonlocal requests
+        params: dict[str, Any] = {"project-id": project_id, "limit": limit, "offset": offset}
         if branch:
             params["branch"] = branch
         payload = client.get_json(SCANS_PATH, params=params)
@@ -219,6 +226,10 @@ def list_project_scans(
                 older.append(scan)
                 continue
             scans.append(scan)
+        return page, reached_since
+
+    while requests < max_pages:
+        page, reached_since = read(page_size)
         offset += len(page.scans)
         if (
             reached_since
@@ -226,5 +237,14 @@ def list_project_scans(
             or (page.total is not None and offset >= page.total)
         ):
             return ScanListing(scans=scans, truncated=False, requests=requests, older=older)
+    if since is not None:
+        # The cap was reached on a full page with nothing older on it yet: the
+        # next scan says whether the listing had in fact reached ``since``.
+        kept = len(scans)
+        page, reached_since = read(1)
+        if reached_since or not page.scans:
+            del scans[kept:]
+            return ScanListing(scans=scans, truncated=False, requests=requests, older=older)
+        del scans[kept:]
     logger.info("Scan listing for project %s stopped at the %d page cap", project_id, max_pages)
     return ScanListing(scans=scans, truncated=True, requests=requests, older=older)

@@ -240,9 +240,9 @@ explained:
 
 | Basis | How |
 | ----- | --- |
-| **Observed** | Each cycle, a project whose Auto Triage *transaction count* rose since the last reading has its scans listed (`GET /api/scans/`) for that interval, less a 30 minute lag because auto triage runs after a scan completes. Only completed (or partial) scans on the project's auto-triage branches count; failed, canceled and running ones never do (branches are read from its AI configuration, *also when Auto Triage is switched off now*, so history from when it ran is still placed; no branches configured, an unreadable configuration, or one whose branches are not a list, means all branches). The new transactions, priced at the project's current credits per Auto Triage transaction, are split equally across those scans, so per person by number of scans. A scan an earlier charge of the project already names is not counted again: the lag reaches back into the previous interval, and a scan that completed in it took its share of that rise (a scan whose interval showed no rise is in no charge, so auto triage that really landed late is still placed). With none in the interval, the latest such scan before it is used, but never one from before observation began, before the lookback window, before the previous charged interval ended, or one already charged. |
-| **Estimated** | Credits from before the switch was turned on (the history). Split by how many completed scans each person ran on the auto-triage branches inside the lookback window before observation began (sampled once per project, newest 500 scans). Never more than what is left of that history: its *ceiling* is the transaction count observation began at, less every fall followed since (what ages out of the window is the oldest first, so a fall comes out of the history), priced at the project's current credits per transaction. |
-| **Unattributed** | A rise with no qualifying scan at all, a remainder with no earlier scan to estimate against, whatever the charges and the history together do not explain (an interval that could not be read or was too busy to read, new transactions that arrived while as many older ones aged out), and the share of scans that have no initiator (a scheduler): those scans count in the split, so the people who did start scans are only charged their own share. Stays on the project. |
+| **Observed** | Each cycle, a project whose Auto Triage *transaction count* rose since the last reading has its scans listed (`GET /api/scans/`) for that interval, less a 30 minute lag because auto triage runs after a scan completes. Only completed (or partial) scans on the project's auto-triage branches count; failed, canceled and running ones never do (branches are read from its AI configuration, *also when Auto Triage is switched off now*, so history from when it ran is still placed; no branches configured, an unreadable configuration, or one whose branches are not a list, means all branches). The new transactions, priced at the project's current credits per Auto Triage transaction, are split equally across those scans, so per person by number of scans. A scan an earlier charge of the project already names is not charged again: the lag reaches back into the previous interval, and a scan that completed in it took its share of that rise. It still counts in the split, and its share stays on the project, so late auto triage of it never lands on the other scans of the interval (a scan whose interval showed no rise is in no charge, so auto triage that really landed late is still placed). The listing gives no completion time, only `updatedAt`, which also moves when a scan is edited later (a tag, say): a scan whose `updatedAt` is more than 24 hours after its creation is taken for an old scan edited since, not one that just finished, and is not charged. With no scan in the interval, the latest such scan before it is used, but never one from before observation began, before the lookback window, before the previous charged interval ended, or one already charged. |
+| **Estimated** | Credits from before the switch was turned on (the history). Split by how many completed scans each person ran on the auto-triage branches inside the lookback window before observation began (sampled once per project, newest 500 scans). Never more than what is left of that history: its *ceiling* is the transaction count observation began at, less every fall followed since (what ages out of the window is the oldest first, so a fall comes out of the history), priced at the project's current credits per transaction, and scaled by the share of the sampled history scans still inside the window. A fall only shows when more ages out than arrives in an interval; the dates of the history's scans show it ageing out either way, so the estimate shrinks as they leave the window even while new transactions keep the count up. |
+| **Unattributed** | A rise with no qualifying scan at all, a remainder with no earlier scan to estimate against, whatever the charges and the history together do not explain (an interval that could not be read; an interval too busy to read, recorded as an unattributed charge so it is never estimated to the history; new transactions that arrived while older ones aged out, as far as the history estimate has shrunk with its scans leaving the window), the share of scans that have no initiator (a scheduler), and the share of scans an earlier charge already named: those scans count in the split, so the people who did start the other scans are only charged their own share. Stays on the project. New transactions netted against as many older ones ageing out are never seen as a rise, so nobody is charged for them: under-charging is the safe side. |
 
 **What is followed.** The per project cursor is the Auto Triage *transaction count*
 the feed reports, never a credit figure: the tenant-wide credits per transaction
@@ -253,8 +253,10 @@ without the per action breakdown, whatever its credits (a row with no credits an
 no breakdown counts as 0 only while the cursor already stands at 0); an Auto
 Triage `transactionCount` that is not a whole number of at least 0; and a breakdown
 without an Auto Triage entry unless the other actions account for the row (at
-least one with transactions, all readable, adding up to the reported total when
-there is one), since a partial breakdown could have left Auto Triage out. A real
+least one with transactions, all readable, adding up to the reported total),
+since a partial breakdown could have left Auto Triage out. Without a total to
+confirm it, such a row counts as 0 only while the cursor already stands at 0;
+otherwise the whole count would be charged again when the entry comes back. A real
 fall (older transactions ageing out of the lookback window) moves the cursor down
 without charging anything, and lowers the history ceiling by as much.
 
@@ -270,7 +272,8 @@ That includes readings where its row matched no project in the local catalogue
 (created since the last organisation sync, a failed sync, a name or id mismatch),
 which are stored without a project: an earlier unmatched row with the same reported
 id or the same name counts, and so does any unmatched row the feed gave no id for,
-since it cannot be told apart. Only a project with no consumption in any earlier
+since it cannot be told apart (that case is logged as a warning and counted in the
+cycle's `restarted_unidentified` step figure, once per project). Only a project with no consumption in any earlier
 reading has its first auto triage observed.
 
 A scan's `initiator` is matched to a synced user exactly like a consumption
@@ -301,9 +304,12 @@ first by when they were created, so an interval is listed back to four hours bef
 it opened, enough for a long SAST scan of a large repository to finish inside it. The
 listing does not ask the server to filter by date (the pages read are the same), so
 the last page also carries a few scans created earlier; one of them that completed
-inside the interval is counted too. A scan running longer than that and not on that
-page is not seen (its share goes to the scans that are). Only a project with more
-than about a hundred scans an hour on its auto-triage branches reaches the cap. A
+inside the interval (and within 24 hours of its creation) is counted too. A scan
+running longer than that and not on that page is not seen (its share goes to the
+scans that are). Only a project with more than about a hundred scans an hour on its
+auto-triage branches reaches the cap. When the cap is reached on a full page that
+did not yet reach the interval's start, one more request for a single scan tells
+whether anything was left unread, so exactly 500 scans is not reported as capped. A
 project that does not fit is caught up on the next cycle and stays on the project
 meanwhile; an interval whose unread scans could still include one that finished
 inside it stays on the project rather than being split over a biased sample. Any

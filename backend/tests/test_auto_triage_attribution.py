@@ -556,7 +556,10 @@ class TestFailuresAndCaps:
         result = run()
 
         assert result.steps["auto_triage_attribution"]["capped"] == 1
-        assert charges(db) == []
+        # On record as left on the project, so it is never estimated instead.
+        [charge] = charges(db)
+        assert charge.basis == "unattributed" and charge.credits == Decimal("3")
+        assert charge.scan_ids == [] and charge.scan_count == 0
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.last_credits == Decimal("13")
         # Sean's history is the 10 there were when observation began; the 3
@@ -1027,6 +1030,11 @@ class TestObservationRestarts:
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.period_param == "last_90_days"
         assert state.last_transactions == 20
+        # scan-h1 completed long before the next interval (it would otherwise
+        # sit in its lag, already charged, and keep its share on the project).
+        stale = (utcnow() - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        tenant.scans["proj-api"][0]["updatedAt"] = stale
+        tenant.scans["proj-api"][0]["createdAt"] = stale
         set_project(tenant, "proj-api", "payments/api", 23)
         scan(tenant, "scan-h2", HARSH)
         run()
@@ -1212,8 +1220,11 @@ class TestWhichScansCount:
             ],
             history_status="done",
         )
-        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("10")}
+        # Harsh's scans are out of the window, and so is the part of the
+        # history they stand for: only Sean's one in six sampled scans is left.
+        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("1.6666")}
         assert parts(db, "user-harsh") == {}
+        assert model(db).projects["proj-api"].unattributed == Decimal("8.3334")
 
 
 class TestWidenFallbackBounds:
@@ -1531,9 +1542,15 @@ class TestAlreadyChargedScans:
         scan(tenant, "scan-a1", AKASH)
         set_project(tenant, "proj-api", "payments/api", 18)
         run()
+        # scan-h1 is not charged again, but it stays in the split: its share
+        # of this rise (late auto triage of it, perhaps) stays on the project.
         assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("4")}
-        assert charges(db)[-1].scan_ids == ["scan-a1"]
+        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("2")}
+        latest = [(c.basis, c.scan_ids, c.credits) for c in charges(db)[1:]]
+        assert latest == [
+            ("unattributed", ["scan-h1"], Decimal("2")),
+            ("observed", ["scan-a1"], Decimal("2")),
+        ]
 
     def test_the_widen_fallback_does_not_reach_the_previous_charged_scan(
         self, db: Session, tenant: FakeTenant
@@ -1765,8 +1782,12 @@ class TestRowsThatSayNothing:
         assert count(record_from(breakdown(5, [("auto_triage", True)]))) is None
         # No Auto Triage entry: a 0 only when the other actions account for it.
         assert count(record_from(breakdown(5, [("triage", 2)], total=2))) == 0
-        assert count(record_from(breakdown(5, [("triage", 2)]))) == 0
-        assert count(record_from(breakdown(5, [("triage", 2)], total=6))) is None
+        # Without a total nothing confirms the breakdown is complete: only a
+        # possible 0, taken while the cursor already stands at 0.
+        no_total = record_from(breakdown(5, [("triage", 2)]))
+        assert count(no_total) is None and may_be_zero(no_total)
+        short = record_from(breakdown(5, [("triage", 2)], total=6))
+        assert count(short) is None and not may_be_zero(short)
         assert count(record_from(breakdown(5, [("triage", 0)]))) is None
         assert count(record_from(breakdown(5, [("triage", "2")]))) is None
         assert count(record_from(breakdown(5, []))) is None
@@ -1860,3 +1881,293 @@ class TestObservationEpochStamp:
         result = run()
         assert result.steps["auto_triage_attribution"]["restarted"] == 0
         assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+
+
+# -------------------------------------------------- third review regressions
+
+
+def age_history_of(db: Session, initiator: str, days: int) -> None:
+    """Move an initiator's sampled history scans ``days`` back (out of the window)."""
+    state = db.get(AutoTriageProjectState, "proj-api")
+    assert state is not None
+    history = [list(entry) for entry in state.history]
+    for entry in history:
+        if entry[0] == initiator:
+            entry[1] = (utcnow() - timedelta(days=days)).date().isoformat()
+    set_state(db, "proj-api", history=history)
+
+
+class TestHistoryAgeingOutNetted:
+    def test_history_ageing_out_by_date_lowers_the_estimate_when_netted(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=300))
+        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=2))
+        turn_on(db)
+        run(force=True)
+        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("5")}
+        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("5")}
+        # Four old transactions age out while Akash's scan adds four: the count
+        # stays at 10, so nothing is seen as new and the ceiling stays.
+        scan(tenant, "scan-a1", AKASH)
+        run()
+        assert parts(db, "user-akash") == {}
+        # Harsh's history scan leaves the window: half the sampled history is
+        # gone, whatever the count says. Sean keeps at most his own half.
+        age_history_of(db, HARSH, 400)
+        m = model(db)
+        assert parts(db, "user-harsh") == {}
+        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("5")}
+        assert m.projects["proj-api"].unattributed == Decimal("5")
+        assert total_charged(m, "proj-api") <= Decimal("5")
+
+    def test_more_arriving_than_ageing_out_charges_only_the_net_rise(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=300))
+        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=2))
+        turn_on(db)
+        run(force=True)
+        # Five age out, eight arrive: a rise of three is all that is seen.
+        scan(tenant, "scan-a1", AKASH)
+        set_project(tenant, "proj-api", "payments/api", 13)
+        run()
+        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("3")}
+        age_history_of(db, HARSH, 400)
+        m = model(db)
+        # What is left of the history (five) is never exceeded.
+        assert parts(db, "user-harsh") == {}
+        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("5")}
+        assert m.projects["proj-api"].unattributed == Decimal("5")
+
+
+class TestLateLandingShare:
+    def test_an_already_charged_scan_keeps_its_share_on_the_project(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        turn_on(db)
+        run(force=True)
+        scan(tenant, "scan-h1", HARSH, ago=timedelta(minutes=2))
+        set_project(tenant, "proj-api", "payments/api", 14)
+        run()
+        state = db.get(AutoTriageProjectState, "proj-api")
+        assert state is not None
+        set_state(db, "proj-api", last_collected_at=state.last_collected_at - timedelta(minutes=1))
+        scan(tenant, "scan-a1", AKASH)
+        set_project(tenant, "proj-api", "payments/api", 22)
+        run()
+        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("4")}
+        latest = [(c.basis, c.scan_ids, c.credits) for c in charges(db)[1:]]
+        assert latest == [
+            ("unattributed", ["scan-h1"], Decimal("4")),
+            ("observed", ["scan-a1"], Decimal("4")),
+        ]
+
+
+class TestOldScansTouchedLater:
+    def test_an_old_scan_touched_in_the_interval_is_not_charged(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        turn_on(db)
+        run(force=True)
+        observing_for(db, "proj-api", timedelta(days=30))
+        # Created twenty days ago and never charged; a tag edit moved its
+        # updatedAt into this interval. It is on the last page read.
+        scan(
+            tenant,
+            "scan-h-old",
+            HARSH,
+            ago=timedelta(minutes=5),
+            created_at=utcnow() - timedelta(days=20),
+        )
+        scan(tenant, "scan-a1", AKASH)
+        set_project(tenant, "proj-api", "payments/api", 18)
+        run()
+        assert parts(db, "user-harsh") == {}
+        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("8")}
+        assert [c.scan_ids for c in charges(db)] == [["scan-a1"]]
+
+    def test_the_widen_fallback_does_not_take_an_old_touched_scan_either(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        turn_on(db)
+        run(force=True)
+        observing_for(db, "proj-api", timedelta(days=30))
+        scan(
+            tenant,
+            "scan-h-old",
+            HARSH,
+            ago=timedelta(minutes=5),
+            created_at=utcnow() - timedelta(days=20),
+        )
+        set_project(tenant, "proj-api", "payments/api", 18)
+        run()
+        assert parts(db, "user-harsh") == {}
+        [charge] = charges(db)
+        assert charge.basis == "unattributed" and charge.credits == Decimal("8")
+
+    def test_a_scan_charged_long_ago_and_touched_now_is_not_charged_again(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        # Its charge is far outside what _charged_scans reads now; the runtime
+        # bound is what keeps it out.
+        turn_on(db)
+        run(force=True)
+        observing_for(db, "proj-api", timedelta(days=30))
+        scan(tenant, "scan-h1", HARSH)
+        set_project(tenant, "proj-api", "payments/api", 14)
+        run()
+        [charge] = charges(db)
+        charge.window_start = utcnow() - timedelta(days=10, minutes=30)
+        charge.window_end = utcnow() - timedelta(days=10)
+        db.commit()
+        tenant.scans["proj-api"][0]["createdAt"] = (
+            utcnow() - timedelta(days=10, minutes=20)
+        ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        tenant.scans["proj-api"][0]["updatedAt"] = (utcnow() - timedelta(minutes=5)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ"
+        )
+        set_project(tenant, "proj-api", "payments/api", 18)
+        run()
+        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert charges(db)[-1].basis == "unattributed"
+
+    def test_only_charges_near_the_interval_are_read(self, db: Session) -> None:
+        now = utcnow()
+
+        def charge(scan_id: str, ended: timedelta) -> AutoTriageCharge:
+            return AutoTriageCharge(
+                project_id="proj-api",
+                basis="observed",
+                initiator=HARSH,
+                initiator_key=HARSH,
+                scan_ids=[scan_id],
+                scan_count=1,
+                credits=Decimal("1"),
+                window_start=now - ended - timedelta(minutes=30),
+                window_end=now - ended,
+                snapshot_id=None,
+                created_at=now,
+            )
+
+        db.add_all(
+            [charge("scan-recent", timedelta(hours=20)), charge("scan-old", timedelta(days=5))]
+        )
+        db.commit()
+        task = auto_triage_attribution._Increase(
+            project_id="proj-api",
+            delta_transactions=1,
+            delta=Decimal("1"),
+            transactions_after=1,
+            credits_after=Decimal("1"),
+            window_start=now - timedelta(minutes=30),
+            window_end=now,
+            snapshot_id=0,
+            widen_floor=now - timedelta(hours=1),
+            lookback_start=now - timedelta(days=365),
+        )
+        assert auto_triage_attribution._charged_scans(db, task) == {"scan-recent"}
+
+
+class TestBreakdownWithoutTotal:
+    def test_a_breakdown_missing_auto_triage_without_a_total_is_not_a_reset(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        set_price(tenant, 100)
+
+        def put(item: dict) -> None:
+            drop_project_row(tenant, "proj-api")
+            tenant.consumption["project"].append(item)
+
+        put(breakdown(12, [("auto_triage", 10), ("triage", 2)], total=12))
+        turn_on(db)
+        run(force=True)
+        # A glitch: the Auto Triage entry is missing and there is no total.
+        put(breakdown(12, [("triage", 2)]))
+        result = run()
+        assert result.steps["auto_triage_attribution"]["no_reading"] >= 1
+        db.expire_all()
+        state = db.get(AutoTriageProjectState, "proj-api")
+        assert state is not None
+        assert state.last_transactions == 10 and state.history_ceiling == 10
+        scan(tenant, "scan-a1", AKASH)
+        put(breakdown(12, [("auto_triage", 10), ("triage", 2)], total=12))
+        run()
+        assert parts(db, "user-akash") == {}
+        assert charges(db) == []
+
+
+class TestCappedIntervalOnRecord:
+    def test_a_capped_rise_is_not_estimated_to_history_without_a_ceiling(
+        self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=3))
+        turn_on(db)
+        run(force=True)
+        # A row from before the ceiling existed.
+        set_state(db, "proj-api", history_ceiling=None)
+        set_project(tenant, "proj-api", "payments/api", 13)
+        for number in range(3):
+            scan(tenant, f"scan-h{number}", HARSH)
+        monkeypatch.setattr(auto_triage_attribution, "MAX_PAGES_PER_LISTING", 1)
+        monkeypatch.setattr(auto_triage_attribution, "SCAN_PAGE_SIZE", 2)
+        result = run()
+        assert result.steps["auto_triage_attribution"]["capped"] == 1
+        assert result.steps["auto_triage_attribution"]["unattributed_charges"] == 1
+        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-harsh") == {}
+        assert model(db).projects["proj-api"].unattributed == Decimal("3")
+
+
+class TestUnidentifiedRowSurfaced:
+    def test_the_unidentified_row_fallback_is_counted_and_logged(
+        self, db: Session, tenant: FakeTenant, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        turn_on(db)
+        run(force=True)
+        tenant.set_entity_credits(
+            view="project", name="team/old-name", credits=40, actions={"auto_triage": 40}
+        )
+        run()
+        drop_row_named(tenant, "team/old-name")
+        tenant.add_project(project_id="proj-new", name="team/new")
+        set_project(tenant, "proj-new", "team/new", 40)
+        with caplog.at_level("WARNING", logger="app.services.auto_triage_attribution"):
+            result = run(force=True)
+        assert result.steps["auto_triage_attribution"]["restarted_unidentified"] == 1
+        assert any("proj-new" in record.getMessage() for record in caplog.records)
+        # Once only: the project now has a current state.
+        set_project(tenant, "proj-new", "team/new", 44)
+        result = run()
+        assert result.steps["auto_triage_attribution"]["restarted_unidentified"] == 0
+
+
+class TestListingReachedSinceAtTheCap:
+    def test_exactly_the_cap_of_scans_after_since_is_not_truncated(
+        self, tenant: FakeTenant
+    ) -> None:
+        since = utcnow() - timedelta(hours=1)
+        for number in range(4):
+            scan(tenant, f"scan-n{number}", HARSH, ago=timedelta(minutes=number))
+        scan(
+            tenant,
+            "scan-before",
+            AKASH,
+            created_at=since - timedelta(hours=2),
+            ago=timedelta(hours=2),
+        )
+        client = tenant.client()
+        listing = scans_api.list_project_scans(
+            client, project_id="proj-api", since=since, page_size=2, max_pages=2
+        )
+        assert not listing.truncated
+        assert [s.id for s in listing.scans] == ["scan-n0", "scan-n1", "scan-n2", "scan-n3"]
+        assert [s.id for s in listing.older] == ["scan-before"]
+        assert listing.requests == 3
+        # One more scan after since than the pages hold: truncated.
+        scan(tenant, "scan-n4", HARSH, ago=timedelta(minutes=4))
+        listing = scans_api.list_project_scans(
+            client, project_id="proj-api", since=since, page_size=2, max_pages=2
+        )
+        assert listing.truncated and len(listing.scans) == 4
