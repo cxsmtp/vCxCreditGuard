@@ -15,8 +15,10 @@ import { BlastSummary } from "./PreviewPage";
 import { EntityPicker } from "../components/EntityPicker";
 import { ExportMenu } from "../components/ExportMenu";
 import type { ExportColumn } from "../lib/export";
+import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import {
   Badge,
+  type BadgeTone,
   Button,
   Card,
   ConfirmDialog,
@@ -98,24 +100,38 @@ const EMPTY_FORM: LimitForm = {
   business_unit: "",
 };
 
-function statusBadge(limit: Limit) {
+function statusOf(limit: Limit): [BadgeTone, string] {
   const state = limit.current_period;
-  if (limit.exempt) return <Badge tone="neutral">Exempt</Badge>;
-  if (!limit.is_active) return <Badge tone="neutral">Disabled</Badge>;
-  if (state && !state.usage_available) return <Badge tone="neutral">Usage not reported</Badge>;
+  if (limit.exempt) return ["neutral", "Exempt"];
+  if (!limit.is_active) return ["neutral", "Disabled"];
+  if (state && !state.usage_available) return ["neutral", "Usage not reported"];
   switch (state?.status) {
     case "restricted":
-      return <Badge tone="critical">Restricted</Badge>;
+      return ["critical", "Restricted"];
     case "breached":
-      return <Badge tone="critical">Over limit</Badge>;
+      return ["critical", "Over limit"];
     case "warned":
-      return <Badge tone="warning">Near limit</Badge>;
+      return ["warning", "Near limit"];
     case "restored":
-      return <Badge tone="good">Restored</Badge>;
+      return ["good", "Restored"];
     default:
-      return <Badge tone="good">Within budget</Badge>;
+      return ["good", "Within budget"];
   }
 }
+
+function statusBadge(limit: Limit) {
+  const [tone, label] = statusOf(limit);
+  return <Badge tone={tone}>{label}</Badge>;
+}
+
+const LIMIT_VIEW: ViewColumn<Limit>[] = [
+  { key: "entity", value: (l) => l.entity_label ?? l.entity_id, filter: false },
+  { key: "level", value: (l) => entityLabel(l.entity_type) },
+  { key: "period", value: (l) => periodLabel(l.period_type) },
+  { key: "usage", value: (l) => l.current_period?.percent_used ?? null, filter: false },
+  { key: "status", value: (l) => statusOf(l)[1] },
+  { key: "mode", value: (l) => (l.enforce ? "Enforcing" : "Monitor only") },
+];
 
 function UsageBar({ limit }: { limit: Limit }) {
   const state = limit.current_period;
@@ -221,6 +237,8 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
     });
   }, [limits.data, tab, search]);
 
+  const view = useTableView(visible, LIMIT_VIEW);
+
   const counts = useMemo(() => {
     const rows = limits.data ?? [];
     return {
@@ -309,12 +327,12 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
   return (
     <>
       <PageHeader
-        title="Limits"
-        description="Budgets for users, groups, projects and applications. A new limit is monitor only until you turn enforcement on."
+        title="Budgets"
+        description="Budgets for users, groups, projects and applications. A new budget only monitors until you set it to enforce."
         actions={
           <>
             <ExportMenu
-              rows={visible}
+              rows={view.rows}
               columns={LIMIT_EXPORT_COLUMNS}
               filenameBase="cxcreditguard-limits"
               title="CxCreditGuard limits"
@@ -414,21 +432,28 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
             }
           />
         ) : (
+          <>
+          <FilterNote
+            shown={view.rows.length}
+            total={view.total}
+            filtered={view.filtered}
+            onClear={view.clearFilters}
+          />
           <Table>
             <thead>
               <tr>
                 {isAdmin && <Th className="w-8" />}
-                <Th>Entity</Th>
-                <Th>Level</Th>
-                <Th>Period</Th>
-                <Th>Usage this period</Th>
-                <Th>Status</Th>
-                <Th>Mode</Th>
+                {view.th("entity", "Entity")}
+                {view.th("level", "Level")}
+                {view.th("period", "Period")}
+                {view.th("usage", "Usage this period")}
+                {view.th("status", "Status")}
+                {view.th("mode", "Mode")}
                 <Th align="right">Actions</Th>
               </tr>
             </thead>
             <tbody>
-              {visible.map((limit) => (
+              {view.rows.map((limit) => (
                 <tr
                   key={limit.id}
                   style={
@@ -533,6 +558,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
               ))}
             </tbody>
           </Table>
+          </>
         )}
       </Card>
 

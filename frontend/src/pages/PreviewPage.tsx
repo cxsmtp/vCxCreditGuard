@@ -16,6 +16,7 @@ import {
   Th,
   type BadgeTone,
 } from "../components/ui";
+import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import { entityLabel, formatCredits, formatDateTime, formatPercent } from "../lib/format";
 
@@ -27,6 +28,14 @@ const STATUS_TONE: Record<string, BadgeTone> = {
   restored: "good",
 };
 
+const DRY_RUN_VIEW: ViewColumn<DryRunRow>[] = [
+  { key: "entity", value: (r) => r.entity_label ?? r.entity_id, filter: false },
+  { key: "used", value: (r) => (r.usage_available ? Number(r.credits_used) : null), filter: false },
+  { key: "pct", value: (r) => r.percent_used, filter: false },
+  { key: "projected", value: (r) => r.projected_status },
+  { key: "enforce", value: (r) => (r.would_enforce ? "Yes" : "No") },
+];
+
 export function PreviewPage() {
   const dryRun = useResource<DryRunResult>(
     (signal) => api.get("/api/preview/dry-run", undefined, signal),
@@ -35,6 +44,7 @@ export function PreviewPage() {
 
   const reload = useCallback(() => void dryRun.reload(), [dryRun]);
   const data = dryRun.data;
+  const view = useTableView(data?.rows ?? [], DRY_RUN_VIEW);
   const rows = data?.rows ?? [];
 
   const exportColumns: ExportColumn<DryRunRow>[] = [
@@ -70,7 +80,7 @@ export function PreviewPage() {
             <button
               type="button"
               onClick={reload}
-              className="rounded-md border border-hairline px-3 py-1.5 text-sm"
+              className="cg-btn sm"
             >
               Refresh
             </button>
@@ -106,19 +116,19 @@ export function PreviewPage() {
                 description="There are no active limits to simulate yet."
               />
             ) : (
-              <Table>
+              <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
                 <thead>
                   <tr>
-                    <Th>Entity</Th>
-                    <Th align="right">Used / limit</Th>
-                    <Th align="right">%</Th>
-                    <Th>Projected</Th>
-                    <Th>Would enforce</Th>
+                    {view.th("entity", "Entity")}
+                    {view.th("used", "Used / limit", "right")}
+                    {view.th("pct", "%", "right")}
+                    {view.th("projected", "Projected")}
+                    {view.th("enforce", "Would enforce")}
                     <Th>Blast radius</Th>
                   </tr>
                 </thead>
                 <tbody>
-                  {data.rows.map((row) => (
+                  {view.rows.map((row) => (
                     <tr key={row.limit_id}>
                       <Td>
                         <span className="font-medium">{row.entity_label ?? row.entity_id}</span>

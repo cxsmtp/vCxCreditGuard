@@ -15,6 +15,7 @@ import {
   Td,
   Th,
 } from "../components/ui";
+import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import type { ExportColumn } from "../lib/export";
 import { entityLabel, formatCredits, formatDate, formatDateTime } from "../lib/format";
@@ -58,6 +59,7 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
 
   const data = report.data;
   const projections = data?.projections ?? [];
+  const view = useTableView(projections, PROJECTION_VIEW);
 
   return (
     <div>
@@ -121,7 +123,7 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
             <Card>
               <p className="text-sm">
                 {data.impact.monitor_only_breaches} monitor-only limit(s) are over budget but not
-                restricting anything. Turn on enforcement from the Limits page if you want them to
+                restricting anything. Turn on enforcement from the Budgets page if you want them to
                 act.
               </p>
             </Card>
@@ -138,19 +140,19 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
                 description="Projections appear once limits have usage within an open budget period."
               />
             ) : (
-              <Table>
+              <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
                 <thead>
                   <tr>
-                    <Th>Entity</Th>
-                    <Th align="right">Used / limit</Th>
-                    <Th align="right">Burn / day</Th>
-                    <Th align="right">Projected end</Th>
-                    <Th>Exhausts</Th>
-                    <Th>Outlook</Th>
+                    {view.th("entity", "Entity")}
+                    {view.th("used", "Used / limit", "right")}
+                    {view.th("burn", "Burn / day", "right")}
+                    {view.th("projected", "Projected end", "right")}
+                    {view.th("exhausts", "Exhausts")}
+                    {view.th("outlook", "Outlook")}
                   </tr>
                 </thead>
                 <tbody>
-                  {projections.map((p) => (
+                  {view.rows.map((p) => (
                     <tr key={p.limit_id}>
                       <Td>
                         <span className="font-medium">{p.entity_label ?? p.entity_id}</span>
@@ -196,6 +198,15 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
   );
 }
 
+const PROJECTION_VIEW: ViewColumn<Projection>[] = [
+  { key: "entity", value: (p) => p.entity_label ?? p.entity_id, filter: false },
+  { key: "used", value: (p) => Number(p.credits_used), filter: false },
+  { key: "burn", value: (p) => Number(p.burn_per_day), filter: false },
+  { key: "projected", value: (p) => Number(p.projected_period_end), filter: false },
+  { key: "exhausts", value: (p) => p.exhaustion_at, filter: false },
+  { key: "outlook", value: (p) => (p.will_breach ? "Will breach" : "Within budget") },
+];
+
 const CHARGEBACK_COLUMNS: ExportColumn<ChargebackRow>[] = [
   { key: "bu", header: "Business unit", value: (r) => r.business_unit },
   { key: "limits", header: "Limits", value: (r) => r.limits },
@@ -239,7 +250,7 @@ function ChargebackCard({
       ) : !data || data.rows.length === 0 ? (
         <EmptyState
           title="No business units assigned"
-          description="Set a business unit on a limit (on the Limits page) to attribute its consumption here."
+          description="Set a business unit on a limit (on the Budgets page) to attribute its consumption here."
         />
       ) : (
         <>
@@ -271,7 +282,7 @@ function ChargebackCard({
             <span>
               {data.currency_known
                 ? `Estimated at ${data.unit_cost} per credit.`
-                : "Set a credit unit cost on the Settings page to show an estimated cost."}
+                : "Set a credit unit cost under Settings → Notifications & reports to show an estimated cost."}
             </span>
             {data.unassigned_limits > 0 && (
               <span>

@@ -2,6 +2,7 @@ import {
   useEffect,
   useId,
   useRef,
+  useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
@@ -18,6 +19,7 @@ export function Card({
   children,
   className = "",
   padded = true,
+  help,
 }: {
   title?: ReactNode;
   description?: ReactNode;
@@ -25,27 +27,56 @@ export function Card({
   children?: ReactNode;
   className?: string;
   padded?: boolean;
+  /** A longer explanation, folded behind a "?" beside the title. */
+  help?: ReactNode;
 }) {
+  const [open, setOpen] = useState(false);
   return (
-    <section
-      className={`rounded-lg border border-hairline bg-surface ${className}`}
-      style={{ background: "var(--surface)" }}
-    >
+    <section className={`cg-panel ${className}`}>
       {(title || actions) && (
-        <header className="flex flex-wrap items-start justify-between gap-3 border-b border-hairline px-5 py-4">
+        <header className="cg-panel-head">
           <div className="min-w-0">
-            {title && <h2 className="text-sm font-semibold tracking-tight">{title}</h2>}
-            {description && (
-              <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
-                {description}
-              </p>
+            {title && (
+              <h2 className="cg-panel-title flex items-center gap-2">
+                {title}
+                {help && <HelpToggle open={open} onToggle={() => setOpen((v) => !v)} />}
+              </h2>
             )}
+            {description && <p className="cg-panel-desc">{description}</p>}
+            {help && open && <div className="cg-help-text">{help}</div>}
           </div>
           {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
         </header>
       )}
-      <div className={padded ? "p-5" : ""}>{children}</div>
+      <div className={padded ? "cg-panel-body" : title || actions ? "pt-3" : ""}>{children}</div>
     </section>
+  );
+}
+
+/** The "?" that unfolds an explanation. */
+export function HelpToggle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      className="cg-help"
+      aria-expanded={open}
+      aria-label={open ? "Hide the explanation" : "Explain this"}
+      title={open ? "Hide the explanation" : "Explain this"}
+      onClick={onToggle}
+    >
+      ?
+    </button>
+  );
+}
+
+/** Text that stays folded behind a "?" until asked for. */
+export function Help({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <span className="inline-flex flex-col align-middle">
+      <HelpToggle open={open} onToggle={() => setOpen((v) => !v)} />
+      {open && <span className="cg-help-text block">{children}</span>}
+    </span>
   );
 }
 
@@ -59,14 +90,10 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
-        {description && (
-          <p className="mt-1 max-w-3xl text-sm" style={{ color: "var(--text-secondary)" }}>
-            {description}
-          </p>
-        )}
+    <div className="cg-head">
+      <div className="min-w-0">
+        <h1 className="cg-title">{title}</h1>
+        {description && <p className="cg-subtitle">{description}</p>}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
     </div>
@@ -77,41 +104,35 @@ export function PageHeader({
 
 type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 
-const BUTTON_STYLES: Record<ButtonVariant, string> = {
-  primary: "text-white",
-  secondary: "border border-hairline-strong",
-  ghost: "border border-transparent",
-  danger: "text-white",
-};
-
+/**
+ * A button. Each page has at most one primary button: its main next step.
+ */
 export function Button({
   variant = "secondary",
   size = "md",
   loading = false,
   children,
   className = "",
-  style,
   ...rest
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: ButtonVariant;
   size?: "sm" | "md";
   loading?: boolean;
 }) {
-  const background =
+  const variantClass =
     variant === "primary"
-      ? "var(--accent)"
+      ? "primary"
       : variant === "danger"
-        ? "var(--status-critical)"
-        : "transparent";
-  const foreground = variant === "primary" ? "var(--accent-contrast)" : undefined;
+        ? "danger solid"
+        : variant === "ghost"
+          ? "ghost"
+          : "";
   return (
     <button
+      type="button"
       {...rest}
       disabled={rest.disabled || loading}
-      className={`inline-flex items-center justify-center gap-2 rounded-md font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-        size === "sm" ? "px-2.5 py-1.5 text-xs" : "px-3.5 py-2 text-sm"
-      } ${BUTTON_STYLES[variant]} ${className}`}
-      style={{ background, ...(foreground ? { color: foreground } : {}), ...style }}
+      className={`cg-btn ${variantClass} ${size === "sm" ? "sm" : ""} ${className}`}
     >
       {loading && <Spinner size={14} />}
       {children}
@@ -125,55 +146,54 @@ export function Field({
   error,
   children,
   required,
+  help,
 }: {
   label: string;
   hint?: ReactNode;
   error?: string | null;
   children: ReactNode;
   required?: boolean;
+  /** A longer explanation, folded behind a "?" beside the label. */
+  help?: ReactNode;
 }) {
+  const [open, setOpen] = useState(false);
+  // A long hint is an explanation: folded behind the "?" so the form stays light.
+  if (!help && typeof hint === "string" && hint.length > 110) {
+    help = hint;
+    hint = undefined;
+  }
   return (
-    <label className="block">
-      <span className="mb-1.5 flex items-center gap-1 text-xs font-medium">
-        {label}
-        {required && <span style={{ color: "var(--status-critical)" }}>*</span>}
-      </span>
-      {children}
-      {hint && !error && (
-        <span className="mt-1.5 block text-xs" style={{ color: "var(--text-muted)" }}>
-          {hint}
+    <div className="block">
+      <label className="block">
+        <span className="cg-field-label">
+          {label}
+          {required && <span style={{ color: "var(--status-critical)" }}>*</span>}
+          {help && (
+            <HelpToggle
+              open={open}
+              onToggle={() => setOpen((v) => !v)}
+            />
+          )}
         </span>
-      )}
+        {help && open && <span className="cg-help-text mb-2 block">{help}</span>}
+        {children}
+      </label>
+      {hint && !error && <span className="cg-hint">{hint}</span>}
       {error && (
-        <span className="mt-1.5 block text-xs" style={{ color: "var(--status-critical)" }}>
+        <span className="cg-hint" style={{ color: "var(--status-critical)" }}>
           {error}
         </span>
       )}
-    </label>
+    </div>
   );
 }
 
-const CONTROL_CLASS =
-  "w-full rounded-md border border-hairline-strong px-3 py-2 text-sm outline-none disabled:opacity-60";
-
 export function Input({ className = "", ...rest }: InputHTMLAttributes<HTMLInputElement>) {
-  return (
-    <input
-      {...rest}
-      className={`${CONTROL_CLASS} ${className}`}
-      style={{ background: "var(--surface-raised)", color: "var(--text-primary)" }}
-    />
-  );
+  return <input {...rest} className={`cg-input ${className}`} />;
 }
 
 export function Textarea({ className = "", ...rest }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
-  return (
-    <textarea
-      {...rest}
-      className={`${CONTROL_CLASS} ${className}`}
-      style={{ background: "var(--surface-raised)", color: "var(--text-primary)" }}
-    />
-  );
+  return <textarea {...rest} className={`cg-input ${className}`} />;
 }
 
 export function Select({
@@ -182,11 +202,7 @@ export function Select({
   ...rest
 }: SelectHTMLAttributes<HTMLSelectElement>) {
   return (
-    <select
-      {...rest}
-      className={`${CONTROL_CLASS} ${className}`}
-      style={{ background: "var(--surface-raised)", color: "var(--text-primary)" }}
-    >
+    <select {...rest} className={`cg-input ${className}`}>
       {children}
     </select>
   );
@@ -206,6 +222,9 @@ export function Toggle({
   disabled?: boolean;
 }) {
   const id = useId();
+  const [open, setOpen] = useState(false);
+  // A long description is an explanation: folded behind the "?".
+  const folded = typeof description === "string" && description.length > 140;
   return (
     <div className="flex items-start gap-3">
       <button
@@ -224,11 +243,14 @@ export function Toggle({
         />
       </button>
       <div className="min-w-0">
-        <label htmlFor={id} className="block text-sm font-medium">
-          {label}
-        </label>
-        {description && (
-          <p className="mt-0.5 text-xs" style={{ color: "var(--text-secondary)" }}>
+        <span className="flex items-center gap-2">
+          <label htmlFor={id} className="block text-sm font-medium">
+            {label}
+          </label>
+          {folded && <HelpToggle open={open} onToggle={() => setOpen((v) => !v)} />}
+        </span>
+        {description && (!folded || open) && (
+          <p className={folded ? "cg-help-text" : "mt-0.5 text-[13px]"} style={folded ? undefined : { color: "var(--text-secondary)" }}>
             {description}
           </p>
         )}
@@ -265,10 +287,7 @@ export function Badge({
 }) {
   const colors = BADGE_COLORS[tone];
   return (
-    <span
-      className="inline-flex items-center gap-1.5 rounded-full border border-hairline px-2 py-0.5 text-xs font-medium whitespace-nowrap"
-      style={{ color: colors.fg }}
-    >
+    <span className="cg-chip" style={{ color: colors.fg }}>
       {icon ?? (
         <span
           aria-hidden="true"
@@ -328,8 +347,13 @@ export function EmptyState({
 export function ErrorNote({ children }: { children: ReactNode }) {
   return (
     <div
-      className="flex items-start gap-2 rounded-md border px-3 py-2 text-sm"
-      style={{ borderColor: "var(--status-critical)", color: "var(--text-primary)" }}
+      className="flex items-start gap-2 border px-3 py-2 text-sm"
+      style={{
+        borderColor: "var(--status-critical)",
+        borderRadius: "var(--radius-sm)",
+        background: "color-mix(in srgb, var(--status-critical) 8%, var(--surface))",
+        color: "var(--text-primary)",
+      }}
       role="alert"
     >
       <span aria-hidden="true" style={{ color: "var(--status-critical)" }}>
@@ -344,8 +368,13 @@ export function InfoNote({ children, tone = "info" }: { children: ReactNode; ton
   const colors = BADGE_COLORS[tone];
   return (
     <div
-      className="rounded-md border-l-2 px-3 py-2 text-xs"
-      style={{ borderColor: colors.dot, background: "var(--hover)", color: "var(--text-secondary)" }}
+      className="border-l-2 px-3 py-2 text-[13px]"
+      style={{
+        borderColor: colors.dot,
+        borderRadius: "0 var(--radius-sm) var(--radius-sm) 0",
+        background: "var(--surface-2)",
+        color: "var(--text-secondary)",
+      }}
     >
       {children}
     </div>
@@ -354,10 +383,20 @@ export function InfoNote({ children, tone = "info" }: { children: ReactNode; ton
 
 /* --------------------------------------------------------------------- table */
 
-export function Table({ children, className = "" }: { children: ReactNode; className?: string }) {
+export function Table({
+  children,
+  className = "",
+  before,
+}: {
+  children: ReactNode;
+  className?: string;
+  /** Shown above the table, such as how many rows a filter left. */
+  before?: ReactNode;
+}) {
   return (
     <div className="overflow-x-auto">
-      <table className={`w-full border-collapse text-sm ${className}`}>{children}</table>
+      {before}
+      <table className={`cg-table ${className}`}>{children}</table>
     </div>
   );
 }
@@ -374,8 +413,8 @@ export function Th({
   return (
     <th
       scope="col"
-      className={`border-b border-hairline px-3 py-2 text-xs font-medium whitespace-nowrap ${className}`}
-      style={{ color: "var(--text-secondary)", textAlign: align }}
+      className={className}
+      style={{ textAlign: align }}
     >
       {children}
     </th>
@@ -396,7 +435,7 @@ export function Td({
   return (
     <td
       colSpan={colSpan}
-      className={`border-b border-hairline px-3 py-2 align-top ${className}`}
+      className={className}
       style={{ textAlign: align }}
     >
       {children}
@@ -453,8 +492,7 @@ export function Modal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4 sm:items-center"
-      style={{ background: "rgba(0,0,0,0.55)" }}
+      className="cg-overlay"
       onClick={onClose}
       role="presentation"
     >
@@ -464,12 +502,11 @@ export function Modal({
         aria-modal="true"
         aria-label={title}
         tabIndex={-1}
-        className={`w-full ${width} rounded-lg border border-hairline shadow-xl outline-none`}
-        style={{ background: "var(--surface)" }}
+        className={`cg-dialog ${width}`}
         onClick={(event) => event.stopPropagation()}
       >
         <header className="border-b border-hairline px-5 py-4">
-          <h2 className="text-sm font-semibold">{title}</h2>
+          <h2 className="cg-panel-title">{title}</h2>
           {description && (
             <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
               {description}

@@ -10,79 +10,155 @@ import {
 
 /* ----------------------------------------------------------------- theme */
 
+/*
+  Three independent choices, each remembered on this device:
+
+  * mode: light, dark, or follow the system;
+  * look: Standard (calm, one accent) or Command Center (the operations room);
+  * phosphor: Command Center's colour.
+
+  The organisation's accent (an admin's choice, from /api/me) colours Standard
+  and is applied separately by applyAccent.
+*/
+
 export type Theme = "light" | "dark";
+export type ThemeMode = Theme | "system";
+export type Look = "standard" | "command";
+export type Phosphor = "green" | "cyan" | "blue" | "amber" | "red" | "violet";
+
+export const LOOKS: { id: Look; name: string; blurb: string }[] = [
+  { id: "standard", name: "Standard", blurb: "Calm and plain: one accent colour, plain surfaces." },
+  {
+    id: "command",
+    name: "Command Center",
+    blurb: "The operations room: phosphor on a dark grid, radar and a status strip.",
+  },
+];
+
+export const PHOSPHORS: { id: Phosphor; colour: string }[] = [
+  { id: "green", colour: "#39ff88" },
+  { id: "cyan", colour: "#00e5ff" },
+  { id: "blue", colour: "#4d9fff" },
+  { id: "amber", colour: "#ffb000" },
+  { id: "red", colour: "#ff4d4d" },
+  { id: "violet", colour: "#be82ff" },
+];
 
 const THEME_KEY = "cxcg-theme";
+const LOOK_KEY = "cxcg-look";
+const OPS_KEY = "cxcg-ops";
 
-interface ThemeContextValue {
-  theme: Theme;
-  setTheme: (theme: Theme) => void;
-  toggle: () => void;
-}
-
-const ThemeContext = createContext<ThemeContextValue | null>(null);
-
-export function readInitialTheme(): Theme {
+function stored(key: string): string | null {
   try {
-    const stored = localStorage.getItem(THEME_KEY);
-    if (stored === "light" || stored === "dark") return stored;
+    return localStorage.getItem(key);
   } catch {
     // Private browsing can throw on localStorage access.
+    return null;
   }
-  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-/** Applied before React renders so a dark-mode reload does not flash light. */
-export function applyTheme(theme: Theme): void {
-  document.documentElement.dataset.theme = theme;
+function remember(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Not fatal: the choice simply will not survive a reload.
+  }
+}
+
+const media = typeof window !== "undefined" ? window.matchMedia?.("(prefers-color-scheme: dark)") : undefined;
+
+function resolve(mode: ThemeMode): Theme {
+  if (mode === "system") return media?.matches ? "dark" : "light";
+  return mode;
+}
+
+export function readInitialMode(): ThemeMode {
+  const value = stored(THEME_KEY);
+  return value === "light" || value === "dark" || value === "system" ? value : "system";
+}
+
+export function readInitialLook(): Look {
+  return stored(LOOK_KEY) === "command" ? "command" : "standard";
+}
+
+export function readInitialPhosphor(): Phosphor {
+  const value = stored(OPS_KEY);
+  return PHOSPHORS.some((option) => option.id === value) ? (value as Phosphor) : "green";
+}
+
+/** Applied before React renders so a reload does not flash the wrong look. */
+export function applyTheme(mode: ThemeMode, look: Look, phosphor: Phosphor): void {
+  const root = document.documentElement;
+  root.dataset.theme = resolve(mode);
+  root.dataset.look = look;
+  root.dataset.ops = phosphor;
 }
 
 /**
- * The organisation accent theme (admin-set). Orthogonal to light/dark: it only
- * remaps the --accent tokens via [data-accent]. An unknown value falls back to
- * the base palette by simply not matching any preset selector. The last applied
- * accent is cached so a reload can pre-apply it (via readInitialAccent) before
- * /api/me resolves, avoiding a flash of the default accent.
+ * The organisation accent theme (admin-set). It only colours the Standard look.
+ * The last applied accent is cached so a reload can pre-apply it before /api/me
+ * resolves.
  */
 const ACCENT_KEY = "cxcg-accent";
 
 export function readInitialAccent(): string {
-  try {
-    return localStorage.getItem(ACCENT_KEY) || "default";
-  } catch {
-    return "default";
-  }
+  return stored(ACCENT_KEY) || "default";
 }
 
 export function applyAccent(accent: string | null | undefined): void {
   const value = accent || "default";
   document.documentElement.dataset.accent = value;
-  try {
-    localStorage.setItem(ACCENT_KEY, value);
-  } catch {
-    // Not fatal: the accent simply will not survive a reload before /api/me.
-  }
+  remember(ACCENT_KEY, value);
 }
 
+interface ThemeContextValue {
+  /** What is on screen now: light or dark. */
+  theme: Theme;
+  mode: ThemeMode;
+  look: Look;
+  phosphor: Phosphor;
+  setMode: (mode: ThemeMode) => void;
+  setLook: (look: Look) => void;
+  setPhosphor: (phosphor: Phosphor) => void;
+  toggle: () => void;
+}
+
+const ThemeContext = createContext<ThemeContextValue | null>(null);
+
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [theme, setThemeState] = useState<Theme>(readInitialTheme);
+  const [mode, setModeState] = useState<ThemeMode>(readInitialMode);
+  const [look, setLookState] = useState<Look>(readInitialLook);
+  const [phosphor, setPhosphorState] = useState<Phosphor>(readInitialPhosphor);
+  const [systemDark, setSystemDark] = useState<boolean>(Boolean(media?.matches));
 
   useEffect(() => {
-    applyTheme(theme);
-    try {
-      localStorage.setItem(THEME_KEY, theme);
-    } catch {
-      // Not fatal: the theme simply will not persist.
-    }
-  }, [theme]);
+    if (!media) return;
+    const onChange = () => setSystemDark(media.matches);
+    media.addEventListener?.("change", onChange);
+    return () => media.removeEventListener?.("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    applyTheme(mode, look, phosphor);
+    remember(THEME_KEY, mode);
+    remember(LOOK_KEY, look);
+    remember(OPS_KEY, phosphor);
+  }, [mode, look, phosphor, systemDark]);
+
+  const theme: Theme = mode === "system" ? (systemDark ? "dark" : "light") : mode;
 
   const value = useMemo<ThemeContextValue>(
     () => ({
       theme,
-      setTheme: setThemeState,
-      toggle: () => setThemeState((current) => (current === "dark" ? "light" : "dark")),
+      mode,
+      look,
+      phosphor,
+      setMode: setModeState,
+      setLook: setLookState,
+      setPhosphor: setPhosphorState,
+      toggle: () => setModeState(theme === "dark" ? "light" : "dark"),
     }),
-    [theme],
+    [theme, mode, look, phosphor],
   );
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;

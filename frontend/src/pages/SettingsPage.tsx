@@ -33,10 +33,12 @@ import {
   Th,
   Toggle,
 } from "../components/ui";
+import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import { downloadText, timestampedName } from "../lib/export";
 import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
+import { LookPicker } from "../components/AppShell";
 
 /** Unsaved edits. The last three are write only: the server never sends the
  * stored value back, so they exist here only while being typed. */
@@ -46,12 +48,60 @@ type SettingsDraft = Partial<AppSettings> & {
   webhook_url?: string;
 };
 
+export type SettingsSection =
+  | "general"
+  | "enforcement"
+  | "requests"
+  | "notifications"
+  | "attribution"
+  | "accounts"
+  | "appearance"
+  | "operations";
+
+const SECTION_HEAD: Record<SettingsSection, { title: string; description: string }> = {
+  general: {
+    title: "Schedule & data",
+    description: "When cycles run, how usage is read from Checkmarx One, and how long history is kept.",
+  },
+  enforcement: {
+    title: "Enforcement",
+    description:
+      "Guard rails around restricting access in Checkmarx One. They apply to every budget set to enforce.",
+  },
+  requests: {
+    title: "Credit requests",
+    description: "Who may ask for more budget, and what may be approved without an admin.",
+  },
+  notifications: {
+    title: "Notifications & reports",
+    description: "Where alerts and the weekly report are delivered. The Notification Center always keeps everything.",
+  },
+  attribution: {
+    title: "Attribution",
+    description: "Who the credits Checkmarx One reports are counted against.",
+  },
+  accounts: {
+    title: "Accounts",
+    description: "The people who can sign in to CxCreditGuard, and their roles.",
+  },
+  appearance: {
+    title: "Appearance",
+    description: "Your look on this device, and the organisation's accent colour.",
+  },
+  operations: {
+    title: "Backups & health",
+    description: "Configuration backup and restore, the scheduler watchdog and the release attestation.",
+  },
+};
+
 export function SettingsPage({
   isAdmin,
   onSettingsSaved,
+  section,
 }: {
   isAdmin: boolean;
   onSettingsSaved?: () => Promise<unknown>;
+  section: SettingsSection;
 }) {
   const toast = useToast();
   const location = useLocation();
@@ -75,7 +125,7 @@ export function SettingsPage({
   } | null>(null);
 
   useEffect(() => {
-    if (location.hash === "#attribution") {
+    if (location.hash === "#unmatched") {
       document.getElementById("attribution")?.scrollIntoView({ behavior: "smooth" });
     }
   }, [location.hash, unresolved.data]);
@@ -166,19 +216,17 @@ export function SettingsPage({
   return (
     <>
       <PageHeader
-        title="Settings"
-        description="Scheduling, ingestion, notification delivery, attribution fixes and utility accounts."
+        title={SECTION_HEAD[section].title}
+        description={SECTION_HEAD[section].description}
         actions={
-          isAdmin && (
+          isAdmin &&
+          (section === "general" || section === "operations") && (
             <>
               <Button size="sm" onClick={() => runCycle(false)} loading={running}>
                 Run a cycle now
               </Button>
               <Button size="sm" onClick={() => runCycle(true)} loading={running}>
                 Sync organisation model
-              </Button>
-              <Button variant="primary" size="sm" onClick={save} disabled={!dirty} loading={busy}>
-                Save changes
               </Button>
             </>
           )
@@ -191,7 +239,8 @@ export function SettingsPage({
         </div>
       )}
 
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="flex max-w-[1000px] flex-col gap-6">
+        {section === "general" && (
         <Card title="Scheduler" description={`Currently ${current.current_schedule_description}.`}>
           <div className="flex flex-col gap-5">
             <Toggle
@@ -292,7 +341,9 @@ export function SettingsPage({
             </div>
           </div>
         </Card>
+        )}
 
+        {section === "general" && (
         <Card
           title="Usage ingestion"
           description="How the consumption endpoint is queried. Budget periods are derived from a baseline, so this window only has to be at least as wide as your widest budget period."
@@ -341,7 +392,9 @@ export function SettingsPage({
             </Field>
           </div>
         </Card>
+        )}
 
+        {section === "notifications" && (
         <Card
           title="Notification delivery"
           description="The Notification Center always records everything. These channels push copies out."
@@ -503,14 +556,26 @@ export function SettingsPage({
             </div>
           </div>
         </Card>
+        )}
 
-        <div className="flex flex-col gap-6">
-          <AppearanceCard
-            isAdmin={isAdmin}
-            value={value("ui_accent") ?? "default"}
-            options={current.allowed_accents ?? ["default"]}
-            onPick={(accent) => set({ ui_accent: accent })}
-          />
+        <>
+          {section === "appearance" && (
+            <>
+              <Card
+                title="Your look"
+                description="Standard or Command Center, light or dark. Remembered on this device."
+              >
+                <LookPicker />
+              </Card>
+              <AppearanceCard
+                isAdmin={isAdmin}
+                value={value("ui_accent") ?? "default"}
+                options={current.allowed_accents ?? ["default"]}
+                onPick={(accent) => set({ ui_accent: accent })}
+              />
+            </>
+          )}
+          {section === "requests" && (
           <Card
             title="Self-service credit requests"
             description="Let viewers submit requests to raise an entity's budget for you to approve or deny."
@@ -527,6 +592,8 @@ export function SettingsPage({
               }
             />
           </Card>
+          )}
+          {section === "enforcement" && (
           <div id="enforcement-safety">
             <Card
               title="Enforcement safety"
@@ -604,6 +671,8 @@ export function SettingsPage({
               </div>
             </Card>
           </div>
+          )}
+          {section === "requests" && (
           <Card
             title="Hands-off automation"
             description="Let the governance cycle approve routine credit requests on its own, so small, safe raises do not wait for an admin."
@@ -648,6 +717,8 @@ export function SettingsPage({
               </Field>
             </div>
           </Card>
+          )}
+          {section === "notifications" && (
           <Card
             title="Scheduled report"
             description="Email a weekly summary report to the notification recipients."
@@ -675,7 +746,8 @@ export function SettingsPage({
               </Field>
             </div>
           </Card>
-          {isAdmin && (
+          )}
+          {isAdmin && section === "general" && (
             <DemoCard
               enabled={value("demo_mode") ?? false}
               onToggle={(next) => set({ demo_mode: next })}
@@ -685,22 +757,24 @@ export function SettingsPage({
               }}
             />
           )}
-          <AttributionCard
-            isAdmin={isAdmin}
-            subjects={unresolved.data ?? []}
-            loading={unresolved.initialLoading}
-            onChanged={() => unresolved.reload()}
-          />
-          {isAdmin && <OperationsCard />}
-          {isAdmin && <AccountsCard />}
-        </div>
+          {section === "attribution" && (
+            <AttributionCard
+              isAdmin={isAdmin}
+              subjects={unresolved.data ?? []}
+              loading={unresolved.initialLoading}
+              onChanged={() => unresolved.reload()}
+            />
+          )}
+          {isAdmin && section === "operations" && <OperationsCard />}
+          {isAdmin && section === "accounts" && <AccountsCard />}
+        </>
       </div>
 
       {dirty && isAdmin && (
         <div className="sticky bottom-4 mt-6 flex justify-end">
           <div
-            className="flex items-center gap-3 rounded-lg border border-hairline px-4 py-3 shadow-lg"
-            style={{ background: "var(--surface-raised)" }}
+            className="cg-panel flex items-center gap-3 px-4 py-3"
+            style={{ background: "var(--surface-raised)", boxShadow: "var(--shadow-pop)" }}
           >
             <span className="text-sm">You have unsaved changes.</span>
             <Button variant="secondary" size="sm" onClick={() => setDraft({})} disabled={busy}>
@@ -735,6 +809,18 @@ const TAB_BLURB: Record<AttributionTab, string> = {
     "No user resembled the reported handle closely enough to suggest. Map these by hand. Automation accounts (bots) are listed here too and are never counted.",
 };
 
+const SUBJECT_VIEW: ViewColumn<UnresolvedSubject>[] = [
+  { key: "reported", value: (s) => s.subject_email ?? s.subject_name ?? s.subject_key, filter: false },
+  { key: "credits", value: (s) => Number(s.credits_used), filter: false },
+];
+
+const ACCOUNT_VIEW: ViewColumn<UtilityAccount>[] = [
+  { key: "username", value: (a) => a.username, filter: false },
+  { key: "role", value: (a) => (a.role === "admin" ? "Admin" : "Viewer") },
+  { key: "totp", value: (a) => (a.totp_enabled ? "On" : "Off") },
+  { key: "last", value: (a) => a.last_login_at, filter: false },
+];
+
 function confidence(score: number | null | undefined): string {
   return score == null ? "" : `${Math.round(score * 100)}%`;
 }
@@ -752,7 +838,7 @@ function isCounted(s: UnresolvedSubject): boolean {
 // Representative swatch colour per accent (the light-mode value). Purely for the
 // picker preview; the real tokens live in index.css under [data-accent].
 const ACCENT_SWATCH: Record<string, string> = {
-  default: "#2a78d6",
+  default: "#0b6b86",
   teal: "#0f766e",
   violet: "#6d46c8",
   amber: "#b45309",
@@ -773,8 +859,8 @@ function AppearanceCard({
 }) {
   return (
     <Card
-      title="Appearance"
-      description="The accent colour for everyone in this organisation. Light and dark mode stay a personal choice; this only sets the accent."
+      title="Organisation accent"
+      description="The one accent colour of the Standard look, for everyone in this organisation. Command Center uses each person's phosphor colour instead."
     >
       <div className="flex flex-wrap gap-2.5">
         {options.map((accent) => {
@@ -803,7 +889,7 @@ function AppearanceCard({
                   outlineOffset: "1px",
                 }}
               />
-              {accent}
+              {accent === "default" ? "standard" : accent}
             </button>
           );
         })}
@@ -844,6 +930,7 @@ function AttributionCard({
     unmatched: subjects.filter((s) => !isCounted(s) && s.status !== "disputed"),
   };
   const rows = groups[tab];
+  const view = useTableView(rows, SUBJECT_VIEW);
 
   useEffect(() => {
     if (!mapping) return;
@@ -964,17 +1051,17 @@ function AttributionCard({
           }
         />
       ) : (
-        <Table>
+        <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
           <thead>
             <tr>
-              <Th>Reported as</Th>
-              <Th align="right">Credits</Th>
+              {view.th("reported", "Reported as")}
+              {view.th("credits", "Credits", "right")}
               <Th>{tab === "matched" ? "Counts towards" : "Suggestion"}</Th>
               <Th align="right" />
             </tr>
           </thead>
           <tbody>
-            {rows.map((subject) => (
+            {view.rows.map((subject) => (
               <tr key={subject.id}>
                 <Td>
                   <span className="text-sm">{subject.subject_name ?? subject.subject_key}</span>
@@ -1256,6 +1343,7 @@ function AccountsCard() {
     (signal) => api.get("/api/accounts", undefined, signal),
     [],
   );
+  const view = useTableView(accounts.data ?? [], ACCOUNT_VIEW);
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<UtilityAccount | null>(null);
   const [resettingTotp, setResettingTotp] = useState<UtilityAccount | null>(null);
@@ -1373,18 +1461,18 @@ function AccountsCard() {
       {accounts.initialLoading ? (
         <Spinner />
       ) : (
-        <Table>
+        <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
           <thead>
             <tr>
-              <Th>Username</Th>
-              <Th>Role</Th>
-              <Th>Two factor</Th>
-              <Th>Last sign in</Th>
+              {view.th("username", "Username")}
+              {view.th("role", "Role")}
+              {view.th("totp", "Two factor")}
+              {view.th("last", "Last sign in")}
               <Th align="right" />
             </tr>
           </thead>
           <tbody>
-            {(accounts.data ?? []).map((account) => (
+            {view.rows.map((account) => (
               <tr key={account.id}>
                 <Td>
                   <span className="text-sm font-medium">{account.username}</span>

@@ -118,7 +118,7 @@ export function EntityPicker({
           )}
           {!loading && !error && results.length === 0 && (
             <p className="px-3 py-3 text-xs" style={{ color: "var(--text-secondary)" }}>
-              Nothing matched. Run an organisation sync from the Settings page if this entity is new.
+              Nothing matched. Run an organisation sync from Settings → Schedule & data if this entity is new.
             </p>
           )}
           <ul>

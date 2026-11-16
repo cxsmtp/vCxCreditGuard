@@ -2,22 +2,13 @@ import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 /**
- * A stat tile. The number is the chart, so there is no plot and no hover layer.
- *
- * The value uses proportional figures on purpose: tabular figures make a large
- * standalone number look loose. Any tone is paired with a word, never colour alone.
+ * A key figure. The number is the chart, so there is no plot and no hover layer.
+ * Any tone is paired with a word in the label or detail, never colour alone.
  */
 
 export type TileTone = "neutral" | "good" | "warning" | "critical";
 
-const TONE_COLORS: Record<TileTone, string> = {
-  neutral: "var(--text-primary)",
-  good: "var(--status-good-text)",
-  warning: "var(--text-primary)",
-  critical: "var(--status-critical)",
-};
-
-const TONE_ACCENTS: Record<TileTone, string> = {
+const TONE_DOT: Record<TileTone, string> = {
   neutral: "var(--axis)",
   good: "var(--status-good)",
   warning: "var(--status-warning)",
@@ -41,48 +32,33 @@ export function StatTile({
 }) {
   const content = (
     <>
-      <div className="flex items-center gap-2">
+      <div className="cg-kpi-label">
         <span
           aria-hidden="true"
-          className="inline-block h-3 w-0.5 rounded-full"
-          style={{ background: TONE_ACCENTS[tone] }}
+          className="inline-block size-1.5 rounded-full"
+          style={{ background: TONE_DOT[tone] }}
         />
-        <span className="text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
-          {label}
-        </span>
+        {label}
       </div>
-      <div className="mt-2 flex items-baseline gap-1.5">
-        <span className="text-2xl leading-none font-semibold" style={{ color: TONE_COLORS[tone] }}>
-          {value}
-        </span>
+      <div className="flex items-baseline gap-1.5">
+        <span className="cg-kpi-value">{value}</span>
         {unit && (
           <span className="text-xs" style={{ color: "var(--text-muted)" }}>
             {unit}
           </span>
         )}
       </div>
-      {detail && (
-        <p className="mt-1.5 text-xs" style={{ color: "var(--text-muted)" }}>
-          {detail}
-        </p>
-      )}
+      {detail && <p className="cg-kpi-detail">{detail}</p>}
     </>
   );
 
-  const className =
-    "block rounded-lg border border-hairline px-4 py-3.5 transition-colors" +
-    (to ? " hover:border-hairline-strong" : "");
-
+  const className = `cg-kpi tone-${tone}`;
   if (to) {
     return (
-      <Link to={to} className={className} style={{ background: "var(--surface)" }}>
+      <Link to={to} className={className}>
         {content}
       </Link>
     );
   }
-  return (
-    <div className={className} style={{ background: "var(--surface)" }}>
-      {content}
-    </div>
-  );
+  return <div className={className}>{content}</div>;
 }

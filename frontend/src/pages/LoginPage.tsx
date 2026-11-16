@@ -2,6 +2,7 @@ import { useState } from "react";
 import { ApiError, api } from "../api/client";
 import type { MessageResponse, SessionInfo } from "../api/types";
 import { Button, ErrorNote, Field, Input, InfoNote } from "../components/ui";
+import { BrandMark } from "../components/Icon";
 
 type Mode = "login" | "forgot" | "reset";
 
@@ -107,22 +108,23 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4 py-10">
-      <div className="w-full max-w-sm">
-        <div className="mb-6 flex items-center gap-2">
-          <span
-            aria-hidden="true"
-            className="inline-block size-3 rounded-sm"
-            style={{ background: "var(--series-1)" }}
-          />
-          <h1 className="text-lg font-semibold tracking-tight">CxCreditGuard</h1>
+    <div className="cg-auth">
+      <div className="cg-bg" aria-hidden="true">
+        <div className="cg-grid" />
+      </div>
+      <div className="cg-auth-card">
+        <div className="cg-brand mb-4" style={{ paddingLeft: 0 }}>
+          <BrandMark />
+          <span>
+            <b>CxCreditGuard</b>
+            <small>Credit governance</small>
+          </span>
         </div>
 
         {mode === "login" && (
           <form
             onSubmit={submitLogin}
-            className="flex flex-col gap-4 rounded-lg border border-hairline p-5"
-            style={{ background: "var(--surface)" }}
+            className="cg-panel flex flex-col gap-4 p-5"
           >
             <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
               Sign in to manage Checkmarx One AI credit budgets.
@@ -209,8 +211,7 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
         {mode === "forgot" && (
           <form
             onSubmit={submitForgot}
-            className="flex flex-col gap-4 rounded-lg border border-hairline p-5"
-            style={{ background: "var(--surface)" }}
+            className="cg-panel flex flex-col gap-4 p-5"
           >
             <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
               Enter your username or email. If the account exists and has an email on file, a
@@ -246,8 +247,7 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
         {mode === "reset" && (
           <form
             onSubmit={submitReset}
-            className="flex flex-col gap-4 rounded-lg border border-hairline p-5"
-            style={{ background: "var(--surface)" }}
+            className="cg-panel flex flex-col gap-4 p-5"
           >
             <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
               Enter the one-time code and choose a new password (at least 12 characters).

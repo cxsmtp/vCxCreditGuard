@@ -153,8 +153,7 @@ export function SetupPage({ isAdmin, onConnected }: { isAdmin: boolean; onConnec
                   rows={4}
                   spellCheck={false}
                   autoComplete="off"
-                  className="w-full rounded-md border border-hairline-strong px-3 py-2 font-mono text-xs outline-none"
-                  style={{ background: "var(--surface-raised)", color: "var(--text-primary)" }}
+                  className="cg-input font-mono text-xs"
                   placeholder="eyJhbGciOi..."
                 />
               </Field>

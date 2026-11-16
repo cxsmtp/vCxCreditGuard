@@ -86,12 +86,11 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
   return (
     <div className={dashboard.loading ? "opacity-70 transition-opacity" : "transition-opacity"}>
       <PageHeader
-        title="Dashboard"
+        title="Overview"
         description={
           <>
-            Credit consumption for the {data.lookback_window.replace(/_/g, " ")} window as Checkmarx
-            reports it. Budget periods are measured from a baseline taken when each period opened,
-            which is what the Limits page shows.
+            AI credits used in the {data.lookback_window.replace(/_/g, " ")} window, as Checkmarx One
+            reports them. Each budget counts from when its period opened: see Budgets.
           </>
         }
         actions={
@@ -127,8 +126,8 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
               unmatched.reduce((sum, row) => sum + Number(row.credits_used), 0),
             )}{" "}
             credits are not counted towards any user limit.{" "}
-            <Link to="/settings#attribution" className="underline">
-              Map them on the Settings page
+            <Link to="/settings/attribution#unmatched" className="underline">
+              Map them under Settings → Attribution
             </Link>
             .
           </InfoNote>

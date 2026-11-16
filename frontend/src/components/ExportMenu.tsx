@@ -66,7 +66,7 @@ export function ExportMenu<T>({
         type="button"
         disabled={disabled || rows.length === 0}
         onClick={() => setOpen((v) => !v)}
-        className="rounded-md border border-hairline px-3 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+        className="cg-btn sm"
         aria-haspopup="menu"
         aria-expanded={open}
       >
@@ -75,8 +75,7 @@ export function ExportMenu<T>({
       {open && (
         <div
           role="menu"
-          className="absolute right-0 z-20 mt-1 w-64 rounded-md border border-hairline p-3 shadow-lg"
-          style={{ background: "var(--surface-raised)" }}
+          className="cg-menu w-64 p-3"
         >
           <p className="mb-2 text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
             Columns
@@ -98,8 +97,7 @@ export function ExportMenu<T>({
               type="button"
               disabled={!canExport}
               onClick={() => doExport("csv")}
-              className="flex-1 rounded-md px-2.5 py-1.5 text-xs font-medium text-white disabled:opacity-50"
-              style={{ background: "var(--accent)", color: "var(--accent-contrast)" }}
+              className="cg-btn sm primary flex-1"
             >
               CSV
             </button>
@@ -107,7 +105,7 @@ export function ExportMenu<T>({
               type="button"
               disabled={!canExport}
               onClick={() => doExport("html")}
-              className="flex-1 rounded-md border border-hairline px-2.5 py-1.5 text-xs font-medium disabled:opacity-50"
+              className="cg-btn sm flex-1"
             >
               HTML
             </button>
