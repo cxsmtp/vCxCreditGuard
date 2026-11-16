@@ -66,7 +66,7 @@ _REMEDIATION: dict[tuple[str, str], str] = {
         "towards that user's limit."
     ),
     ("auto_triage_attribution", WARN): (
-        "Map each scan initiator listed as unresolved on the Settings page to the person it "
+        "Map each scan initiator listed as unmatched under Settings → Attribution to the person it "
         "acts for, so their share of auto-triage credits counts. If scans could not be read, "
         "check the connection; those credits stay estimated until a later cycle reads them."
     ),
@@ -255,7 +255,7 @@ def _attribution_check(session: Session) -> Check:
         "Usage attribution",
         WARN,
         f"{count} consumer(s) could not be matched to a user, so that usage counts "
-        "towards no user limit. Resolve them on the Settings page.",
+        "towards no user limit. Resolve them under Settings → Attribution.",
     )
 
 

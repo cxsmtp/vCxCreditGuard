@@ -5,6 +5,7 @@ import type {
   AdminResetResult,
   AppSettings,
   Attestation,
+  AutoTriageOverview,
   CycleRun,
   OrgEntity,
   RestoreResult,
@@ -39,6 +40,7 @@ import { downloadText, timestampedName } from "../lib/export";
 import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 import { LookPicker } from "../components/AppShell";
+import { StatTile } from "../components/StatTile";
 import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
 /** Unsaved edits. The last three are write only: the server never sends the
@@ -763,6 +765,15 @@ export function SettingsPage({
             />
           )}
           {section === "attribution" && (
+            <AutoTriageCard
+              isAdmin={isAdmin}
+              checked={value("charge_auto_triage_to_scan_initiator") ?? false}
+              saved={current.charge_auto_triage_to_scan_initiator ?? false}
+              demo={current.demo_mode ?? false}
+              onChange={(next) => set({ charge_auto_triage_to_scan_initiator: next })}
+            />
+          )}
+          {section === "attribution" && (
             <AttributionCard
               isAdmin={isAdmin}
               subjects={unresolved.data ?? []}
@@ -795,6 +806,257 @@ export function SettingsPage({
         </div>
       )}
     </>
+  );
+}
+
+/* ------------------------------------------------------ auto-triage charging */
+
+const BASIS_LABEL: Record<string, string> = {
+  observed: "Observed",
+  estimated: "Estimated",
+  unattributed: "Unattributed",
+};
+
+type OverviewUser = AutoTriageOverview["users"][number];
+type OverviewProject = AutoTriageOverview["projects"][number];
+type OverviewCharge = AutoTriageOverview["recent_charges"][number];
+
+const AT_USER_VIEW: ViewColumn<OverviewUser>[] = [
+  { key: "person", value: (u) => u.user_label ?? u.user_id, filter: false },
+  { key: "total", value: (u) => Number(u.total), filter: false },
+  { key: "observed", value: (u) => Number(u.observed), filter: false },
+  { key: "estimated", value: (u) => Number(u.estimated), filter: false },
+];
+
+const AT_PROJECT_VIEW: ViewColumn<OverviewProject>[] = [
+  { key: "project", value: (p) => p.project_label ?? p.project_id, filter: false },
+  { key: "credits", value: (p) => Number(p.auto_triage_credits), filter: false },
+  { key: "people", value: (p) => Number(p.charged_to_people), filter: false },
+  { key: "waiting", value: (p) => Number(p.unresolved), filter: false },
+  { key: "unattributed", value: (p) => Number(p.unattributed), filter: false },
+];
+
+const AT_CHARGE_VIEW: ViewColumn<OverviewCharge>[] = [
+  { key: "when", value: (c) => c.window_end, filter: false },
+  { key: "project", value: (c) => c.project_id },
+  { key: "initiator", value: (c) => c.initiator ?? "" },
+  { key: "basis", value: (c) => BASIS_LABEL[c.basis] ?? c.basis },
+  { key: "credits", value: (c) => Number(c.credits), filter: false },
+];
+
+function AutoTriageCard({
+  isAdmin,
+  checked,
+  saved,
+  demo,
+  onChange,
+}: {
+  isAdmin: boolean;
+  checked: boolean;
+  saved: boolean;
+  demo: boolean;
+  onChange: (next: boolean) => void;
+}) {
+  const overview = useResource<AutoTriageOverview>(
+    (signal) => api.get("/api/usage/auto-triage-attribution", { charges: 25 }, signal),
+    [saved],
+  );
+  const data = overview.data;
+  const users = useTableView(data?.users ?? [], AT_USER_VIEW);
+  const projects = useTableView(data?.projects ?? [], AT_PROJECT_VIEW);
+  const charges = useTableView(data?.recent_charges ?? [], AT_CHARGE_VIEW);
+  const projectName = new Map((data?.projects ?? []).map((p) => [p.project_id, p.project_label ?? p.project_id]));
+  const sum = (key: "auto_triage_credits" | "charged_to_people" | "unresolved" | "unattributed") =>
+    (data?.projects ?? []).reduce((total, p) => total + Number(p[key]), 0);
+  const waitingInitiators = (data?.initiators ?? []).filter((i) => !i.counts_towards_user_id);
+
+  return (
+    <Card
+      title="Auto triage: charge the person who started the scan"
+      description="Checkmarx One reports Auto Triage credits against the project. This also counts them against the person whose scan the auto triage ran after."
+      help={
+        <>
+          For each project, CxCreditGuard watches its Auto Triage credits rise and lists the
+          completed scans on the project's auto-triage branches in between: the rise is split
+          equally between those scans, so per person by number of scans (<b>observed</b>). Credits
+          from before it was watching are split by how many such scans each person ran in the
+          lookback window (<b>estimated</b>); a monthly or quarterly budget never counts estimated
+          credits. A scan started by an integration (a webhook bot) has no person behind it: map it
+          below, under Unmatched, to the person it acts for. Until then its share stays on the
+          project only. Project and tenant totals never change: people are only ever charged a
+          split of what the project reports.
+        </>
+      }
+    >
+      <Toggle
+        checked={checked}
+        disabled={!isAdmin || demo}
+        onChange={onChange}
+        label="Charge auto-triage credits to the person who started the scan"
+        description={
+          checked
+            ? "On: auto triage counts against the scan starter's own budget, and a group budget that includes its members' usage. With many people near their budget, turning this on can restrict several at once: the enforcement safety ceiling still applies, and the Simulation shows the effect first."
+            : "Off: auto triage counts against the project, its application and the tenant only, as Checkmarx One reports it."
+        }
+      />
+      {demo && (
+        <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
+          Not available in demo mode.
+        </p>
+      )}
+      {checked !== saved && (
+        <div className="mt-3">
+          <InfoNote tone="warning">
+            Saved with the other settings. Check the Simulation page after saving to see who would
+            be restricted.
+          </InfoNote>
+        </div>
+      )}
+
+      {saved && overview.error && (
+        <div className="mt-4">
+          <ErrorNote>{overview.error}</ErrorNote>
+        </div>
+      )}
+      {saved && data && !data.available && (
+        <div className="mt-4">
+          <InfoNote>
+            Nothing to show yet: the first cycle after a project consumption reading fills this in.
+          </InfoNote>
+        </div>
+      )}
+      {saved && data?.available && (
+        <div className="mt-5 flex flex-col gap-5">
+          <div className="grid gap-3 sm:grid-cols-4">
+            <StatTile label="Auto-triage credits" value={formatCredits(sum("auto_triage_credits"))} detail="In the lookback window" />
+            <StatTile label="Charged to people" value={formatCredits(sum("charged_to_people"))} tone="good" detail="Observed and estimated" />
+            <StatTile
+              label="Waiting for mapping"
+              value={formatCredits(sum("unresolved"))}
+              tone={sum("unresolved") > 0 ? "warning" : "neutral"}
+              detail={`${waitingInitiators.length} scan initiator${waitingInitiators.length === 1 ? "" : "s"} not matched to a person`}
+            />
+            <StatTile label="Stays on the project" value={formatCredits(sum("unattributed"))} detail="No scan to charge it to" />
+          </div>
+
+          <div>
+            <h3 className="cg-panel-title mb-2">People charged</h3>
+            {users.total === 0 ? (
+              <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
+                No one has been charged yet.
+              </p>
+            ) : (
+              <Table before={<FilterNote shown={users.rows.length} total={users.total} filtered={users.filtered} onClear={users.clearFilters} />}>
+                <thead>
+                  <tr>
+                    {users.th("person", "Person")}
+                    {users.th("total", "Charged", "right")}
+                    {users.th("observed", "Observed", "right")}
+                    {users.th("estimated", "Estimated", "right")}
+                    <Th>From projects</Th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {users.rows.map((u) => (
+                    <tr key={u.user_id}>
+                      <Td>{u.user_label ?? u.user_id}</Td>
+                      <Td align="right" className="tabular">{formatCredits(u.total)}</Td>
+                      <Td align="right" className="tabular">{formatCredits(u.observed)}</Td>
+                      <Td align="right" className="tabular">{formatCredits(u.estimated)}</Td>
+                      <Td>
+                        <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                          {u.parts
+                            .map((part) => `${part.project_label ?? part.project_id} ${formatCredits(part.credits)} (${(BASIS_LABEL[part.basis] ?? part.basis).toLowerCase()})`)
+                            .join(" · ")}
+                        </span>
+                      </Td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            )}
+          </div>
+
+          {projects.total > 0 && (
+            <div>
+              <h3 className="cg-panel-title mb-2">By project</h3>
+              <Table before={<FilterNote shown={projects.rows.length} total={projects.total} filtered={projects.filtered} onClear={projects.clearFilters} />}>
+                <thead>
+                  <tr>
+                    {projects.th("project", "Project")}
+                    {projects.th("credits", "Auto-triage credits", "right")}
+                    {projects.th("people", "Charged to people", "right")}
+                    {projects.th("waiting", "Waiting for mapping", "right")}
+                    {projects.th("unattributed", "Stays on project", "right")}
+                  </tr>
+                </thead>
+                <tbody>
+                  {projects.rows.map((p) => (
+                    <tr key={p.project_id}>
+                      <Td>
+                        {p.project_label ?? p.project_id}
+                        {p.observing_since && (
+                          <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
+                            Observed since {formatDateTime(p.observing_since)}
+                          </span>
+                        )}
+                      </Td>
+                      <Td align="right" className="tabular">{formatCredits(p.auto_triage_credits)}</Td>
+                      <Td align="right" className="tabular">{formatCredits(p.charged_to_people)}</Td>
+                      <Td align="right" className="tabular">{formatCredits(p.unresolved)}</Td>
+                      <Td align="right" className="tabular">{formatCredits(p.unattributed)}</Td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
+          )}
+
+          {charges.total > 0 && (
+            <div>
+              <h3 className="cg-panel-title mb-2">Latest charges</h3>
+              <Table before={<FilterNote shown={charges.rows.length} total={charges.total} filtered={charges.filtered} onClear={charges.clearFilters} />}>
+                <thead>
+                  <tr>
+                    {charges.th("when", "Seen")}
+                    {charges.th("project", "Project")}
+                    {charges.th("initiator", "Scan started by")}
+                    {charges.th("basis", "Basis")}
+                    {charges.th("credits", "Credits", "right")}
+                  </tr>
+                </thead>
+                <tbody>
+                  {charges.rows.map((c) => (
+                    <tr key={c.id}>
+                      <Td>
+                        <span className="text-xs tabular" title={c.detail ?? undefined}>
+                          {formatDateTime(c.window_end)}
+                        </span>
+                      </Td>
+                      <Td>{projectName.get(c.project_id) ?? c.project_id}</Td>
+                      <Td>
+                        {c.initiator ?? "—"}
+                        {c.scan_count > 0 && (
+                          <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
+                            {c.scan_count} scan{c.scan_count === 1 ? "" : "s"}
+                          </span>
+                        )}
+                      </Td>
+                      <Td>
+                        <Badge tone={c.basis === "observed" ? "good" : c.basis === "estimated" ? "info" : "neutral"}>
+                          {BASIS_LABEL[c.basis] ?? c.basis}
+                        </Badge>
+                      </Td>
+                      <Td align="right" className="tabular">{formatCredits(c.credits)}</Td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -1079,6 +1341,11 @@ function AttributionCard({
                   {subject.is_bot && (
                     <span className="ml-1.5">
                       <Badge tone="neutral">Bot</Badge>
+                    </span>
+                  )}
+                  {subject.source === "scan_initiator" && (
+                    <span className="ml-1.5" title="Started scans that auto triage ran after. Map it to the person it acts for to charge them.">
+                      <Badge tone="info">Scan initiator</Badge>
                     </span>
                   )}
                   {subject.subject_email && subject.subject_email !== subject.subject_name && (

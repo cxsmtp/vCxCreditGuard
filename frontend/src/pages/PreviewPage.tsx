@@ -139,6 +139,11 @@ export function PreviewPage() {
                             {row.note}
                           </p>
                         )}
+                        {row.auto_triage_attributed && Number(row.auto_triage_attributed) > 0 && (
+                          <p className="mt-0.5 text-xs" style={{ color: "var(--text-muted)" }}>
+                            incl. {formatCredits(row.auto_triage_attributed)} auto triage from their scans
+                          </p>
+                        )}
                       </Td>
                       <Td align="right" className="tabular">
                         {row.usage_available

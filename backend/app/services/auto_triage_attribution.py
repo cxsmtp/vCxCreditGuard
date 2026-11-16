@@ -1053,7 +1053,7 @@ def _sync_initiator_subjects(session: Session, model: AttributionModel, now: dat
                         f"{_q(info.credits)} credits, but {info.initiator} does not match any "
                         "synced Checkmarx user, so those credits count against the project only. "
                         "If they belong to a person (a bot or integration acting for someone), "
-                        "map it to that user on the Settings page."
+                        "map it to that user under Settings → Attribution."
                     ),
                     dedupe_key=notifications.attribution_key(key),
                 )
@@ -1069,7 +1069,7 @@ def _sync_initiator_subjects(session: Session, model: AttributionModel, now: dat
                 detail=(
                     f"Scans started by {info.initiator} were automatically matched to "
                     f"{top.label} at {round(top.score * 100)}% confidence for auto-triage "
-                    "attribution. Override it on the Settings page if this is wrong."
+                    "attribution. Override it under Settings → Attribution if this is wrong."
                 ),
             )
     session.flush()

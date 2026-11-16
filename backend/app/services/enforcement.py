@@ -367,7 +367,7 @@ def apply_enforcement(
                 body=(
                     f"{label} has gone over their credit limit, but their AI access is "
                     f"not removed automatically because {why}. Raise it with them, or "
-                    "change the protected roles on the Settings page."
+                    "change the protected roles under Settings → Enforcement."
                 ),
                 entity_type=limit.entity_type,
                 entity_id=limit.entity_id,
@@ -781,8 +781,8 @@ def _capture(
         if why is not None:
             raise ProtectedTarget(
                 f"{target.target_label}'s AI access is not removed automatically because "
-                f"{why}. Raise it with them, or change the protected roles on the "
-                "Settings page.",
+                f"{why}. Raise it with them, or change the protected roles under "
+                "Settings → Enforcement.",
                 label=target.target_label,
             )
         to_remove = [role for role in current if role.name in iam.AI_ROLE_NAMES]

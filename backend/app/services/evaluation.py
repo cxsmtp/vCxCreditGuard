@@ -442,7 +442,7 @@ def _enforcement_hold(session: Session, *, moment: datetime, actor: AuditActor) 
         body=(
             f"{reason}\n\nLimits affected: {examples}\n\nCheck the Simulation page: if "
             "the figures are wrong (a bad usage read, a wrong period, a mistaken import), "
-            "fix that first. If they are right, resume enforcement on the Settings page: "
+            "fix that first. If they are right, resume enforcement under Settings → Enforcement: "
             "that lets this batch through, and the ceilings apply again afterwards. Access "
             "that is already restricted stays restricted, and restrictions that are no "
             "longer justified are still lifted."

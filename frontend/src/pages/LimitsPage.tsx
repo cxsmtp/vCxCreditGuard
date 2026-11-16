@@ -196,6 +196,24 @@ function UsageBar({ limit }: { limit: Limit }) {
           {formatCredits(state.baseline_credits)} before this period
         </p>
       )}
+      {state.auto_triage_attributed && Number(state.auto_triage_attributed.counted) > 0 && (
+        <p
+          className="mt-1 text-xs tabular"
+          style={{ color: "var(--text-muted)" }}
+          title={
+            "Auto triage that ran after scans this person started, charged to them (Settings → Attribution):\n" +
+            state.auto_triage_attributed.parts
+              .filter((part) => Number(part.counted) > 0)
+              .map(
+                (part) =>
+                  `${part.user_label ?? part.user_id} · ${part.project_label ?? part.project_id}: ${formatCredits(part.counted)} (${part.basis})`,
+              )
+              .join("\n")
+          }
+        >
+          incl. {formatCredits(state.auto_triage_attributed.counted)} auto triage from their scans
+        </p>
+      )}
     </div>
   );
 }

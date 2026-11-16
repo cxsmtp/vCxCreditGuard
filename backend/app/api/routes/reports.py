@@ -110,7 +110,7 @@ def email_report(ctx: AdminUser, db: DbSession) -> ReportEmailResult:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "code": "email_not_configured",
-                "message": "Configure SMTP and recipients on the Settings page first.",
+                "message": "Configure SMTP and recipients under Settings → Notifications & reports first.",
             },
         )
     report = reporting_service.build_report(db)

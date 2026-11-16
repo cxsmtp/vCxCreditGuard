@@ -879,8 +879,8 @@ def _apply_user_outcome(
             after={"suggested_user_id": top.user_id, "score": round(top.score, 4)},
             detail=(
                 f"Credit usage reported as {item.subject_key} was automatically matched to "
-                f"{top.label} at {round(top.score * 100)}% confidence. Override it on the "
-                "Settings page if this is wrong."
+                f"{top.label} at {round(top.score * 100)}% confidence. Override it under "
+                "Settings → Attribution if this is wrong."
             ),
         )
 

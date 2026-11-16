@@ -73,7 +73,7 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
   const tiles = data.tiles;
   // Not counted towards anyone: no manual mapping, no auto-match, and not a bot.
   const unmatched = (unresolved.data ?? []).filter(
-    (row) => !row.counts_towards_user_id && !row.is_bot,
+    (row) => !row.counts_towards_user_id && !row.is_bot && row.source !== "scan_initiator",
   );
 
   const consumers = {
@@ -117,6 +117,19 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
         </div>
       )}
 
+      {(tiles.unresolved_scan_initiators ?? 0) > 0 && (
+        <div className="mb-5">
+          <InfoNote tone="warning">
+            {formatNumber(tiles.unresolved_scan_initiators ?? 0)} scan{" "}
+            {tiles.unresolved_scan_initiators === 1 ? "initiator is" : "initiators are"} not matched to
+            a person, so their share of auto-triage credits stays on the project.{" "}
+            <Link to="/settings/attribution#unmatched" className="underline">
+              Map them under Settings → Attribution
+            </Link>
+            .
+          </InfoNote>
+        </div>
+      )}
       {unmatched.length > 0 && (
         <div className="mb-5">
           <InfoNote tone="warning">
