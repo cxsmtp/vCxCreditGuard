@@ -24,6 +24,15 @@ Usage by entity level:
   flag defaults to off because a group whose projects and members overlap would
   otherwise count the same credits twice.
 
+Auto-triage credits charged to the person who started the scan (the setting
+``attribution.auto_triage_to_scan_initiator``, see
+``app/services/auto_triage_attribution.py``) are a second, dated component of a
+user's figure, added on top of ``reported_total - baseline_credits``. They follow
+the same period rule as the person's own credits: a limit that counts existing
+usage counts all of them inside the consumption window; one that discounts it
+counts only charges observed after its baseline was taken (``baseline_at``).
+With the setting off nothing here changes.
+
 Precedence: the brief's "most restrictive limit wins" is implemented as "every
 breached limit enforces its own action". A user in two groups working on a project
 inside an application is restricted the moment any one of those budgets is
@@ -52,7 +61,13 @@ from app.models.enums import (
 )
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
 from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
-from app.services import enforcement, ingestion, notifications, settings_store
+from app.services import (
+    auto_triage_attribution,
+    enforcement,
+    ingestion,
+    notifications,
+    settings_store,
+)
 from app.services.audit import AuditActor, record_audit
 from app.services.periods import PeriodError, PeriodWindow, current_window, describe_window
 
@@ -119,6 +134,76 @@ class UsageIndex:
         self.group_dimension = ingestion.dimension_supported(session, UsageView.GROUP)
         self.application_dimension = ingestion.dimension_supported(session, UsageView.APPLICATION)
         self.user_dimension = ingestion.dimension_supported(session, UsageView.USER)
+        self._attribution: auto_triage_attribution.AttributionModel | None = None
+
+    @property
+    def attribution(self) -> auto_triage_attribution.AttributionModel:
+        """Auto-triage credits charged to scan initiators, built once per run."""
+        if self._attribution is None:
+            self._attribution = auto_triage_attribution.build_model(self._session)
+        return self._attribution
+
+    def attributed_usage(
+        self,
+        limit: CreditLimit,
+        *,
+        window: PeriodWindow,
+        state: LimitPeriodState | None,
+        moment: datetime,
+    ) -> auto_triage_attribution.AttributedUsage | None:
+        """The auto-triage credits charged from scans that count towards this limit.
+
+        None when the setting is off or the limit is not one a person's usage
+        feeds (a user limit, or a group limit that includes member usage).
+        Project, application and plain group figures already contain the
+        project's auto-triage credits and are never touched.
+        """
+        if limit.entity_type != EntityType.USER and not (
+            limit.entity_type == EntityType.GROUP and limit.include_member_usage
+        ):
+            return None
+        if not self.user_dimension or not self.attribution.enabled:
+            return None
+        if limit.entity_type == EntityType.USER:
+            user_ids = [limit.entity_id]
+            exclude: set[str] = set()
+        else:
+            user_ids = list(
+                self._session.scalars(
+                    select(CxGroupMembership.user_id).where(
+                        CxGroupMembership.group_id == limit.entity_id
+                    )
+                )
+            )
+            # The group's own projects are already counted in full by the
+            # project rollup; charging their auto triage to members as well
+            # would count it twice.
+            exclude = (
+                set(
+                    self._session.scalars(
+                        select(CxProjectGroup.project_id).where(
+                            CxProjectGroup.group_id == limit.entity_id
+                        )
+                    )
+                )
+                if self.project_dimension
+                else set()
+            )
+        counts_all = counts_existing_usage(limit, window=window)
+        if counts_all:
+            since = None
+        elif state is not None:
+            since = state.baseline_at or state.period_start
+        else:
+            # No period yet: the first evaluation takes its baseline now.
+            since = moment
+        return auto_triage_attribution.attributed_usage(
+            self.attribution,
+            user_ids=user_ids,
+            exclude_projects=exclude,
+            counts_existing=counts_all,
+            since=since,
+        )
 
     def project_total(self, project_id: str) -> tuple[Decimal, bool]:
         if not self.project_dimension:
@@ -552,7 +637,12 @@ def _evaluate_one(
     )
 
     state = _get_or_create_state(
-        session, limit=limit, window=window, reported_total=reported_total, available=available
+        session,
+        limit=limit,
+        window=window,
+        reported_total=reported_total,
+        available=available,
+        moment=moment,
     )
 
     # A sliding lookback window can drop old consumption, which would otherwise
@@ -570,6 +660,16 @@ def _evaluate_one(
     state.credits_used = (
         max(Decimal("0"), reported_total - state.baseline_credits) if available else Decimal("0")
     )
+    attributed = (
+        index.attributed_usage(limit, window=window, state=state, moment=moment)
+        if available
+        else None
+    )
+    if attributed is not None:
+        state.credits_used += attributed.counted
+        state.attributed_credits = attributed.counted
+    elif state.attributed_credits is not None:
+        state.attributed_credits = None
     state.last_evaluated_at = moment
 
     if not available:
@@ -742,11 +842,55 @@ def baseline_for(
         # A baseline taken from an unreadable dimension would make the first real
         # reading look like a full period of consumption.
         return Decimal("0")
-    if window.period_type in {PeriodType.LIFETIME, PeriodType.CUSTOM}:
-        return Decimal("0")
-    if limit.count_existing_usage:
+    if counts_existing_usage(limit, window=window):
         return Decimal("0")
     return reported_total
+
+
+def counts_existing_usage(limit: CreditLimit, *, window: PeriodWindow) -> bool:
+    """True when the period counts usage already reported when it opened.
+
+    The rule behind ``baseline_for``, shared with the auto-triage credits
+    charged to a person from their scans so both follow the same period logic.
+    """
+    if window.period_type in {PeriodType.LIFETIME, PeriodType.CUSTOM}:
+        return True
+    return bool(limit.count_existing_usage)
+
+
+def period_usage(
+    session: Session,
+    *,
+    limit: CreditLimit,
+    window: PeriodWindow,
+    index: UsageIndex,
+    moment: datetime,
+) -> tuple[Decimal, bool, auto_triage_attribution.AttributedUsage | None]:
+    """What the next evaluation would count for this limit, without writing.
+
+    ``(credits_used, usage_available, attributed)``, using the stored period
+    state when there is one and the baseline the first evaluation would take
+    when there is not. Shared by the simulation and the reports so they cannot
+    drift from the evaluation arithmetic.
+    """
+    reported_total, available = index.reported_total(limit)
+    state = session.scalar(
+        select(LimitPeriodState).where(
+            LimitPeriodState.limit_id == limit.id, LimitPeriodState.period_key == window.key
+        )
+    )
+    baseline = (
+        state.baseline_credits
+        if state is not None
+        else baseline_for(limit, window=window, reported_total=reported_total, available=available)
+    )
+    if not available:
+        return Decimal("0"), False, None
+    used = max(Decimal("0"), reported_total - baseline)
+    attributed = index.attributed_usage(limit, window=window, state=state, moment=moment)
+    if attributed is not None:
+        used += attributed.counted
+    return used, True, attributed
 
 
 def _get_or_create_state(
@@ -756,6 +900,7 @@ def _get_or_create_state(
     window: PeriodWindow,
     reported_total: Decimal,
     available: bool,
+    moment: datetime | None = None,
 ) -> LimitPeriodState:
     state = session.scalar(
         select(LimitPeriodState).where(
@@ -773,6 +918,7 @@ def _get_or_create_state(
         baseline_credits=baseline_for(
             limit, window=window, reported_total=reported_total, available=available
         ),
+        baseline_at=moment or utcnow(),
         reported_total=reported_total,
         credits_used=Decimal("0"),
         usage_available=available,

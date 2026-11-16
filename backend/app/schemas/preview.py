@@ -46,6 +46,9 @@ class DryRunRowResponse(BaseModel):
     would_enforce: bool
     blast: BlastRadiusResponse | None
     note: str | None
+    # How much of credits_used is auto-triage charged to the person from their
+    # scans. Null when that setting is off or the limit is not fed by a person.
+    auto_triage_attributed: Decimal | None = None
 
 
 class DryRunResponse(BaseModel):

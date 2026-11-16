@@ -20,7 +20,7 @@ from app.models.enums import EntityType, LimitStatus, UsageView
 from app.models.limits import CreditLimit, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxProjectGroup, CxUser
 from app.models.usage import CreditBalanceSnapshot, UsageRecord, UsageSnapshot
-from app.services import ingestion
+from app.services import auto_triage_attribution, ingestion, settings_store
 from app.services.periods import PeriodError, current_window, describe_window
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,8 @@ class Consumer:
     credits_used_in_period: Decimal | None = None
     status: str | None = None
     percent_of_total: float | None = None
+    # Users only, while auto-triage credits are charged to scan initiators.
+    auto_triage_attributed: Decimal | None = None
 
 
 @dataclass
@@ -214,6 +216,11 @@ def top_users(session: Session, *, limit: int = DEFAULT_TOP_N) -> list[Consumer]
                 percent_of_total=_percent(record.credits_used, total),
             )
         )
+    if settings_store.auto_triage_to_initiator(session):
+        model = auto_triage_attribution.build_model(session)
+        for consumer in consumers:
+            if consumer.entity_id:
+                consumer.auto_triage_attributed = model.window_total(consumer.entity_id)
     return _attach_limits(session, consumers)
 
 

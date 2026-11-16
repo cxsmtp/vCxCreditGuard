@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -60,6 +61,10 @@ class FakeTenant:
     auto_triage: dict[str, dict[str, Any]] = field(default_factory=dict)
     # repo id -> remediation severities
     repo_severities: dict[str, list[str]] = field(default_factory=dict)
+    # project id -> scans, in the shape GET /api/scans/ returns them.
+    scans: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Every GET /api/scans/ query, as parsed parameters, for assertions.
+    scan_queries: list[dict[str, list[str]]] = field(default_factory=list)
 
     # Test controls
     unsupported_views: set[str] = field(default_factory=set)
@@ -191,17 +196,82 @@ class FakeTenant:
         rows.append(item)
 
     def set_entity_credits(
-        self, *, view: str, name: str, credits: int | float, entity_id: str | None = None
+        self,
+        *,
+        view: str,
+        name: str,
+        credits: int | float,
+        entity_id: str | None = None,
+        actions: dict[str, int] | None = None,
     ) -> None:
+        """Add or replace a row of a non-user dimension.
+
+        ``actions`` adds the per action transaction breakdown the real project
+        rows carry, for example ``{"auto_triage": 4, "triage": 1}``.
+        """
         item: dict[str, Any] = {"name": name, "creditsUsed": credits, "percentOfTotal": 1.0}
         if entity_id:
             item["id"] = entity_id
+        if actions:
+            item["actionsPerformed"] = {
+                "actions": [
+                    {"actionType": action, "transactionCount": count}
+                    for action, count in actions.items()
+                ],
+                "total": sum(actions.values()),
+            }
         rows = self.consumption.setdefault(view, [])
         for index, existing in enumerate(rows):
             if existing.get("name") == name or (entity_id and existing.get("id") == entity_id):
                 rows[index] = item
                 return
         rows.append(item)
+
+    def set_auto_triage_config(
+        self, project_id: str, *, enabled: bool, branches: list[str] | None
+    ) -> None:
+        """The project's auto triage configuration, as the coordinator reports it."""
+        config: dict[str, Any] = {
+            "scannerTypes": ["SAST", "SCA"],
+            "riskStatuses": ["NEW", "RECURRENT"],
+            "severityLevels": ["CRITICAL", "HIGH"],
+        }
+        if branches is not None:
+            config["branches"] = branches
+        self.auto_triage[project_id] = {"enabled": enabled, "config": config}
+
+    def add_scan(
+        self,
+        *,
+        project_id: str,
+        scan_id: str,
+        initiator: str | None,
+        completed_at: datetime,
+        branch: str = "main",
+        status: str = "Completed",
+        created_at: datetime | None = None,
+        source_origin: str = "webapp",
+    ) -> None:
+        """A scan in the shape of GET /api/scans/ (synthetic data only)."""
+        created = created_at or completed_at - timedelta(minutes=10)
+        self.scans.setdefault(project_id, []).append(
+            {
+                "id": scan_id,
+                "status": status,
+                "statusDetails": [{"name": "general", "status": status, "details": ""}],
+                "branch": branch,
+                "createdAt": _iso(created),
+                "updatedAt": _iso(completed_at),
+                "projectId": project_id,
+                "projectName": project_id,
+                "userAgent": "test-agent",
+                "initiator": initiator,
+                "tags": {},
+                "engines": ["sast", "sca"],
+                "sourceType": "github",
+                "sourceOrigin": source_origin,
+            }
+        )
 
     # ----------------------------------------------------------------- routing
 
@@ -270,6 +340,9 @@ class FakeTenant:
         if "/repos-manager/repo/" in path:
             return self._repo_response(request, path, params)
 
+        if path.rstrip("/").endswith("/api/scans") and request.method == "GET":
+            return self._scans_response(params)
+
         return httpx.Response(404, json={"message": f"no fake route for {path}"})
 
     # ---------------------------------------------------------------- handlers
@@ -332,6 +405,31 @@ class FakeTenant:
                 "totalItems": len(rows),
                 "totalPages": total_pages,
                 "currentPage": page,
+            },
+        )
+
+    def _scans_response(self, params: dict[str, list[str]]) -> httpx.Response:
+        """GET /api/scans/: newest first, filtered by project, branch and from-date."""
+        self.scan_queries.append(params)
+        project_id = params.get("project-id", [""])[0]
+        rows = list(self.scans.get(project_id, []))
+        total = len(rows)
+        branch = params.get("branch", [None])[0]
+        if branch:
+            rows = [row for row in rows if row["branch"] == branch]
+        since = params.get("from-date", [None])[0]
+        if since:
+            floor = _parse(since)
+            rows = [row for row in rows if _parse(row["createdAt"]) >= floor]
+        rows.sort(key=lambda row: row["createdAt"], reverse=True)
+        limit = int(params.get("limit", ["20"])[0])
+        offset = int(params.get("offset", ["0"])[0])
+        return httpx.Response(
+            200,
+            json={
+                "totalCount": total,
+                "filteredTotalCount": len(rows),
+                "scans": rows[offset : offset + limit],
             },
         )
 
@@ -426,6 +524,14 @@ class FakeTenant:
             settings=get_settings(),
             sleep=lambda _s: None,
         )
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def populated_tenant() -> FakeTenant:

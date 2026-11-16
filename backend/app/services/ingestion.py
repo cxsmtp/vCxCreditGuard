@@ -54,8 +54,11 @@ DEFAULT_VIEWS: tuple[UsageView, ...] = (
 # Consumption the tenant attributes to automation rather than to a person. Auto
 # Triage is reported in the *user* dimension under a synthetic name like
 # "Auto-triage", which is not a user and must not be offered to an admin as an
-# unmatched person to map. Per the brief it belongs to the project only, so it is
-# counted tenant wide and at project level, and deliberately not at user level.
+# unmatched person to map. It is counted tenant wide and at project level, and
+# never at user level from this row. (With the setting
+# attribution.auto_triage_to_scan_initiator on, the project's auto-triage credits
+# are additionally charged to whoever started the scan, from the scan listing:
+# see app/services/auto_triage_attribution.py. This row still counts for nobody.)
 SYNTHETIC_SUBJECTS: frozenset[str] = frozenset(
     {
         "auto-triage",
@@ -851,6 +854,9 @@ def _apply_user_outcome(
             )
         )
     else:
+        # The consumption feed owns a row it shares a key with: a row first
+        # raised as a scan initiator becomes a consumption subject.
+        row.view_by = UsageView.USER
         row.last_seen_at = now
         row.times_seen += 1
         row.credits_used = item.credits_used

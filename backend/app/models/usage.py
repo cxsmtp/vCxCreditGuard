@@ -157,6 +157,85 @@ class UnresolvedSubject(Base):
     suggestions: Mapped[list | None] = mapped_column(JSONColumn)
 
 
+class AutoTriageCharge(Base):
+    """Auto Triage credits observed on a project and charged to whoever scanned.
+
+    Written only while the admin setting "charge auto-triage credits to the
+    person who started the scan" is on. Each row is one share of one increase in
+    a project's reported Auto Triage credits between two project snapshots:
+
+    * ``observed`` - the increase was split equally across the completed scans,
+      on the project's auto-triage branches, found in the observed window, and
+      this row is the share of the scans one initiator started.
+    * ``unattributed`` - no qualifying scan was found, so the increase stays on
+      the project only (``initiator`` is null).
+
+    The raw initiator string is stored rather than a user id, so an admin
+    mapping an unresolved initiator later takes effect for every past charge.
+    Credits are never charged twice: the read side caps the sum for a project at
+    what the project currently reports for Auto Triage.
+    """
+
+    __tablename__ = "auto_triage_charge"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    basis: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Exactly as Checkmarx reported it on the scan: an email, a username or the
+    # name of an integration such as a PR webhook bot.
+    initiator: Mapped[str | None] = mapped_column(String(320))
+    # Lowercased initiator: the key it is matched (and mapped) under.
+    initiator_key: Mapped[str | None] = mapped_column(String(320), index=True)
+    scan_ids: Mapped[list | None] = mapped_column(JSONColumn)
+    scan_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    credits: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False, default=Decimal("0"))
+    # The interval the increase was observed over: from the previous project
+    # snapshot (less a small lag) to the snapshot that showed the increase.
+    window_start: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    window_end: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, index=True)
+    # The project snapshot that showed the increase. Not a foreign key: snapshots
+    # are pruned on their own schedule and the charge must survive that.
+    snapshot_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    detail: Mapped[str | None] = mapped_column(String(512))
+
+    __table_args__ = (Index("ix_auto_triage_charge_project_window", "project_id", "window_end"),)
+
+
+class AutoTriageProjectState(Base):
+    """Per project bookkeeping for auto-triage attribution.
+
+    ``last_credits`` and ``last_snapshot_id`` are the cursor: the next increase
+    is measured from them, and they only move once that increase has been dealt
+    with, so a cycle that could not reach Checkmarx is caught up by the next one.
+
+    ``history`` is a compact sample of the completed scans on the auto-triage
+    branches from before observation started (``observing_since``), as
+    ``[[initiator, "YYYY-MM-DD", count], ...]``. It is what credits the project
+    already reported when observation began are estimated against.
+    """
+
+    __tablename__ = "auto_triage_project_state"
+
+    project_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    period_param: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_snapshot_id: Mapped[int | None] = mapped_column(Integer)
+    last_collected_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    last_credits: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4), nullable=False, default=Decimal("0")
+    )
+    observing_since: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    # "pending" | "done" | "truncated" | "none"
+    history_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    history: Mapped[list | None] = mapped_column(JSONColumn)
+    history_collected_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # The auto-triage branches last read from the project's configuration; null
+    # when the configuration could not be read or names none (all branches).
+    branches: Mapped[list | None] = mapped_column(JSONColumn)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+
+
 class CreditBalanceSnapshot(Base):
     """The tenant's AI credit pool as Checkmarx reported it at one moment.
 

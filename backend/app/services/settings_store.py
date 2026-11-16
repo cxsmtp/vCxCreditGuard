@@ -104,6 +104,14 @@ KEY_MAX_NEW_TARGETS = "enforcement.max_new_targets_per_cycle"
 KEY_CEILING_WAIVED_ONCE = "enforcement.ceiling_waived_once"
 KEY_PROTECTED_ROLES = "enforcement.protected_roles"
 
+# Attribution: when on, the Auto Triage credits a project reports are also
+# charged to the person (a synced Checkmarx user) whose scan triggered the auto
+# triage, so their user limit - and group limits that include member usage -
+# reflect it. Off by default: it changes who is counted for what, and turning it
+# on can push many people over budget at once (the enforcement safety ceilings
+# still apply). Project, application and tenant totals are unaffected either way.
+KEY_AUTO_TRIAGE_TO_INITIATOR = "attribution.auto_triage_to_scan_initiator"
+
 # Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
 # so it can never collide with a real Checkmarx lookback window, and so the read
 # path can hide demo snapshots whenever demo mode is off.
@@ -146,6 +154,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_MAX_NEW_TARGETS: 100,
     KEY_CEILING_WAIVED_ONCE: False,
     KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
+    KEY_AUTO_TRIAGE_TO_INITIATOR: False,
 }
 
 
@@ -173,6 +182,20 @@ def self_service_requests_enabled(session: Session) -> bool:
 def report_email_enabled(session: Session) -> bool:
     """Whether the weekly summary report is emailed to the notification recipients."""
     return bool(get_value(session, KEY_REPORT_EMAIL_ENABLED, DEFAULTS[KEY_REPORT_EMAIL_ENABLED]))
+
+
+def auto_triage_to_initiator(session: Session) -> bool:
+    """Whether auto-triage credits are also charged to the scan's initiator.
+
+    Never in demo mode: the charges are collected from the live tenant and must
+    not be laid over the seeded demo figures.
+    """
+    if demo_mode(session):
+        return False
+    return (
+        get_value(session, KEY_AUTO_TRIAGE_TO_INITIATOR, DEFAULTS[KEY_AUTO_TRIAGE_TO_INITIATOR])
+        is True
+    )
 
 
 def demo_mode(session: Session) -> bool:

@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
 from app.models.enums import EnforcementKind, LimitStatus
-from app.models.limits import CreditLimit, LimitPeriodState
+from app.models.limits import CreditLimit
 from app.services import enforcement, evaluation
 from app.services.periods import PeriodError, current_window
 
@@ -120,6 +120,9 @@ class DryRunRow:
     note: str | None = None
     # The budget period the projection is for (None when the period is misconfigured).
     period_key: str | None = None
+    # How much of credits_used is auto-triage charged from scans; None when that
+    # setting is off or the limit is not fed by a person's usage.
+    auto_triage_attributed: Decimal | None = None
 
 
 @dataclass(slots=True)
@@ -206,27 +209,19 @@ def _project_one(
             note=f"Misconfigured period: {exc}",
         )
 
-    reported_total, available = index.reported_total(limit)
     # Read the stored baseline without creating or mutating any state. When no
     # state exists yet, use the exact baseline the first real cycle would pick
     # (evaluation.baseline_for) rather than assuming the current reading: for a
     # lifetime, custom or count_existing_usage limit that baseline is 0, so the
     # first cycle counts the whole reported total and can breach immediately. A
     # naive "baseline = reported_total" would make the simulation claim such a
-    # limit is within budget right up until it restricts someone.
-    state = session.scalar(
-        select(LimitPeriodState).where(
-            LimitPeriodState.limit_id == limit.id, LimitPeriodState.period_key == window.key
-        )
+    # limit is within budget right up until it restricts someone. Auto-triage
+    # credits charged to a person from their scans are included exactly as the
+    # evaluation includes them.
+    credits_used, available, attributed = evaluation.period_usage(
+        session, limit=limit, window=window, index=index, moment=moment
     )
-    baseline = (
-        state.baseline_credits
-        if state is not None
-        else evaluation.baseline_for(
-            limit, window=window, reported_total=reported_total, available=available
-        )
-    )
-    credits_used = max(Decimal("0"), reported_total - baseline) if available else Decimal("0")
+    auto_triage = attributed.counted if attributed is not None else None
 
     if not available or not window.is_active:
         return DryRunRow(
@@ -304,4 +299,5 @@ def _project_one(
         blast=blast,
         note=note,
         period_key=window.key,
+        auto_triage_attributed=auto_triage,
     )

@@ -41,6 +41,10 @@ class TopConsumerItem(BaseModel):
     credits_used_in_period: Decimal | None = None
     status: LimitStatus | None = None
     resolved: bool = True
+    # Users only, and only while auto-triage credits are charged to scan
+    # initiators: what this person is charged for auto triage inside the
+    # lookback window, on top of ``credits``.
+    auto_triage_attributed: Decimal | None = None
 
 
 class StatusTiles(BaseModel):
@@ -55,6 +59,9 @@ class StatusTiles(BaseModel):
     last_success_at: datetime | None = None
     last_run_status: str | None = None
     schedule: str
+    # Scan initiators whose share of auto-triage credits counts towards nobody
+    # (only ever non-zero while that attribution setting is on).
+    unresolved_scan_initiators: int = 0
 
 
 class CreditPoolInfo(BaseModel):
@@ -154,6 +161,10 @@ class UnresolvedSubjectResponse(BaseModel):
     # or the auto-match), with a label for display. Null when nothing counts.
     counts_towards_user_id: str | None = None
     counts_towards_label: str | None = None
+    # "consumption": a subject of the credit consumption feed. "scan_initiator":
+    # who started scans whose auto triage is charged to people (only raised
+    # while that setting is on). Both are mapped the same way.
+    source: str = "consumption"
 
 
 class MapSubjectRequest(StrictModel):
@@ -209,6 +220,9 @@ class SettingsResponse(BaseModel):
     max_new_enforcements_per_cycle: int = 25
     max_new_targets_per_cycle: int = 100
     protected_roles: str = ""
+    # Charge each project's auto-triage credits also to the person whose scan
+    # triggered it. Off by default.
+    charge_auto_triage_to_scan_initiator: bool = False
     current_schedule_description: str
 
 
@@ -244,6 +258,7 @@ class SettingsUpdateRequest(StrictModel):
     max_new_enforcements_per_cycle: int | None = Field(default=None, ge=0, le=100_000)
     max_new_targets_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
     protected_roles: str | None = Field(default=None, max_length=1024)
+    charge_auto_triage_to_scan_initiator: bool | None = None
 
     @field_validator("schedule_mode")
     @classmethod
@@ -311,3 +326,80 @@ class MeResponse(BaseModel):
     # an admin or by the safety ceiling). None when enforcement is running.
     enforcement_paused: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class AutoTriageUserPart(BaseModel):
+    project_id: str
+    project_label: str | None = None
+    basis: str
+    credits: Decimal
+
+
+class AutoTriageUserAttribution(BaseModel):
+    user_id: str
+    user_label: str | None = None
+    # Everything charged to this person inside the lookback window.
+    total: Decimal
+    observed: Decimal
+    estimated: Decimal
+    parts: list[AutoTriageUserPart] = Field(default_factory=list)
+
+
+class AutoTriageProjectAttribution(BaseModel):
+    project_id: str
+    project_label: str | None = None
+    # The project's auto-triage credits in the newest project reading. Always
+    # counted against the project; the split below never changes that.
+    auto_triage_credits: Decimal
+    observed: Decimal
+    estimated: Decimal
+    # Recorded as untraceable, or with no earlier scan to estimate against.
+    unattributed: Decimal
+    # Held by initiators that are not a synced user yet.
+    unresolved: Decimal
+    # The part also charged to people (observed + estimated).
+    charged_to_people: Decimal
+    # Below 1 when charges recorded earlier add up to more than the project now
+    # reports, and were scaled down to fit.
+    scale: float = 1.0
+    # "pending" | "done" | "truncated" | "none": the sample of scans from before
+    # observation began that estimates are made against.
+    history_status: str | None = None
+    observing_since: datetime | None = None
+
+
+class AutoTriageInitiator(BaseModel):
+    initiator: str
+    credits: Decimal
+    status: str
+    counts_towards_user_id: str | None = None
+    counts_towards_label: str | None = None
+    # The unresolved_subject row to map, when there is one.
+    subject_id: int | None = None
+
+
+class AutoTriageChargeResponse(BaseModel):
+    id: int
+    project_id: str
+    basis: str
+    initiator: str | None
+    scan_ids: list[str] = Field(default_factory=list)
+    scan_count: int
+    credits: Decimal
+    window_start: datetime
+    window_end: datetime
+    detail: str | None = None
+
+
+class AutoTriageAttributionOverview(BaseModel):
+    enabled: bool
+    # False until a project consumption reading exists (or the tenant does not
+    # report consumption by project).
+    available: bool
+    reference_at: datetime | None = None
+    window_start: datetime | None = None
+    projects: list[AutoTriageProjectAttribution] = Field(default_factory=list)
+    users: list[AutoTriageUserAttribution] = Field(default_factory=list)
+    initiators: list[AutoTriageInitiator] = Field(default_factory=list)
+    # The newest recorded charges (filtered like the rest), newest first.
+    recent_charges: list[AutoTriageChargeResponse] = Field(default_factory=list)

@@ -175,7 +175,7 @@ Usage per entity level:
 
 | Level | Source |
 | ----- | ------ |
-| User | `viewBy=user`, attributed to a synced IAM user |
+| User | `viewBy=user`, attributed to a synced IAM user; plus, only with auto-triage charging on, their share of the auto triage their scans triggered (see below) |
 | Application | `viewBy=application`, falling back to the sum of its projects |
 | Project | `viewBy=project` |
 | Group | `viewBy=group` when the group appears in the response, otherwise the sum of the group's projects, plus member users when `include_member_usage` is on |
@@ -202,8 +202,73 @@ Verified against a live tenant: `user`, `action`, `application`, `project` and
 
 The user dimension includes a synthetic subject named `Auto-triage` carrying the
 credits that automation spent. It is not a person, so it is never offered as an
-unmatched user to map, and never counted against a user limit. Per the brief, that
-consumption belongs to the project, and it is counted there and tenant wide.
+unmatched user to map, and that row is never counted against a user limit. By
+default that consumption belongs to the project only: it is counted there (and in
+the project's application and groups) and tenant wide.
+
+### Charging auto triage to the person who started the scan
+
+Settings has an off-by-default switch, **Charge auto-triage credits to the person
+who started the scan** (API field `charge_auto_triage_to_scan_initiator`, stored as
+`attribution.auto_triage_to_scan_initiator`). With it on, each project's Auto
+Triage credits are *additionally* counted against the synced Checkmarx user whose
+scan triggered the auto triage, so their user limit (and a group limit that
+includes member usage) reflects it. Project, application and tenant figures do not
+change: they already contain those credits.
+
+**The amount.** `A_p` is the project's Auto Triage credits in the newest believed
+project reading. The feed reports per action *transactions*, not credits, so `A_p`
+is the project's credits when Auto Triage is all it did, otherwise its Auto Triage
+transactions priced at the tenant-wide credits per Auto Triage transaction from the
+`action` dimension (or by the project's transaction mix if that is not available).
+Only `A_p` is ever split between people. What is charged to people for a project
+never adds up to more than `A_p`; whatever cannot be placed stays on the project
+only, exactly as with the switch off.
+
+**Who is charged.** Each part of `A_p` gets a basis, shown wherever the figure is
+explained:
+
+| Basis | How |
+| ----- | --- |
+| **Observed** | Each cycle, a project whose `A_p` rose since the last reading has its scans listed (`GET /api/scans/`) for that interval, less a 30 minute lag because auto triage runs after a scan completes. Only completed scans on the project's auto-triage branches count (read from its AI configuration, *also when Auto Triage is switched off now*, so history from when it ran is still placed; no branches configured, or an unreadable configuration, means all branches). The rise is split equally across those scans, so per person by number of scans. With none in the interval, the latest such scan before it is used. |
+| **Estimated** | Whatever `A_p` the recorded charges do not explain: credits from before the switch was turned on, or an interval that could not be read. Split by how many completed scans each person ran on the auto-triage branches inside the lookback window before observation began (sampled once per project, newest 500 scans). |
+| **Unattributed** | A rise with no qualifying scan at all, or a remainder with no earlier scan to estimate against. Stays on the project. |
+
+A scan's `initiator` is matched to a synced user exactly like a consumption
+subject (admin mapping, then email, username, full name, then the conservative
+fuzzy match). An initiator that matches nobody, typically an integration such as a
+PR webhook that scans under its own name, is listed with the unmatched consumers on
+Settings, marked as a **scan initiator** (`source: "scan_initiator"`), and its share
+stays on the project until an admin maps it to the person it acts for. Mapping takes
+effect for every past charge at once.
+
+**Windows and periods.** Observed charges are dated (the reading that showed the
+rise); estimated shares are not. Charges older than the lookback window drop out,
+exactly as the reported figures do, and if older usage ages out so that the project
+reports less than was charged inside the window, the charges are scaled down to fit.
+Within a budget period the attributed part follows the same rule as the person's own
+credits: a lifetime, custom or `count_existing_usage` limit counts everything
+attributed inside the window, and a monthly or quarterly limit counts only charges
+observed after its baseline was taken. So turning the switch on, or a new month
+opening, does not suddenly bill months of old auto triage against a monthly budget.
+
+**Bounded and crash safe.** Listing is paged and capped (50 projects and 300
+requests per cycle, 500 scans per project interval). A project that does not fit is
+caught up on the next cycle and estimated meanwhile; an interval with more scans than
+the cap is left to the estimate rather than split over a biased sample; a tenant
+failure leaves the project's cursor where it was, raises a warning, and touches
+nothing else in the cycle. No database lock is held while Checkmarx is called.
+
+**Enforcement implications.** Turning the switch on can push many people over budget
+at once, especially on lifetime limits. The enforcement safety ceilings still apply:
+if that cycle would start restricting more than the ceiling allows, it restricts
+nobody and pauses enforcement for an admin to look. Look at the Simulation page
+(every row shows its `auto_triage_attributed` part) before turning it on. The change
+is audited with its before and after value. It is not part of the configuration
+backup, for the same reason the enforcement safety settings are not: a restore must
+never quietly change who is billed for what. The diagnostics page (and
+`scripts/diagnose_usage.py`, section 6) explains a person's or a project's split.
+The listing needs read access to scans (`GET /api/scans/`) for the API key.
 
 ### Attribution
 
@@ -570,7 +635,7 @@ ranges are allowed. Only an Admin can set the URL.
 
 `retention_days` (default 365) controls how long snapshots, notifications,
 scheduler runs and audit entries are kept. Pruning runs at most once a day inside
-the normal cycle. Four safeguards are worth knowing:
+the normal cycle. Five safeguards are worth knowing:
 
 1. **A seven day floor.** A shorter setting is raised to it and the run says so. A
    governance tool with a week of history cannot answer the question it exists to
@@ -579,7 +644,10 @@ the normal cycle. Four safeguards are worth knowing:
    only record of how to give access back, so it outlives any retention window.
 3. **A notification attached to a live restriction is kept**, however old, because
    it carries the Restore access button.
-4. **The prune of audit rows is itself audited.** `app/services/retention.py` is
+4. **Auto-triage charges inside the lookback window are kept**, however short the
+   retention setting, because they are part of someone's current figure. Older
+   ones are pruned with everything else.
+5. **The prune of audit rows is itself audited.** `app/services/retention.py` is
    the only code anywhere that deletes audit rows, and it writes an entry stating
    the counts, so the log always explains its own gaps.
 
@@ -713,6 +781,7 @@ The key needs to reach these endpoints:
 | Users, roles, groups | `GET /auth/realms/<tenant>/users/v2`, `GET /auth/realms/<tenant>/groups` | Read users and groups in IAM |
 | Projects, applications | `GET /api/projects`, `GET /api/applications` | Read projects and applications, tenant wide |
 | Credit usage | `GET /api/credits/consumption` | Read credit consumption |
+| Scans (only with auto-triage charging on) | `GET /api/scans/`, `GET /api/ai-agents-coordinator/projects/{id}/configuration` | Read scans and project configuration |
 | Role mapping (enforce mode only) | `GET`/`POST`/`DELETE` `/auth/admin/realms/<tenant>/users/{id}/role-mappings/clients/{clientUuid}`, plus `GET .../clients` and `GET .../clients/{uuid}/roles` | IAM admin, sufficient to manage role mappings |
 | Project AI toggles (enforce mode only) | `GET`/`PUT` `/api/ai-agents-coordinator/projects/{id}/configuration`, `PATCH /api/repos-manager/repo/{repoId}?projectId={id}` | Manage project configuration |
 
@@ -883,6 +952,15 @@ these, because each one can stop something that used to work:
 - **Automatic approvals.** The auto-approve threshold is now a budget per
   30 days, per entity and per requester, not a size per request. Several small
   requests no longer add up past it.
+- **Auto-triage charging (new, off).** The migration adds two tables
+  (`auto_triage_charge`, `auto_triage_project_state`) and two nullable columns on
+  `limit_period_state` (`baseline_at`, `attributed_credits`). Nothing changes until
+  an admin turns on *Charge auto-triage credits to the person who started the scan*
+  (see [Charging auto triage to the person who started the
+  scan](#charging-auto-triage-to-the-person-who-started-the-scan)). Before turning
+  it on, check the Simulation page, and make sure the API key can read scans. The
+  first cycle afterwards starts with estimates and becomes event based from then on;
+  periods opened before the upgrade count charges observed after their start.
 
 ### Enforcement safety
 

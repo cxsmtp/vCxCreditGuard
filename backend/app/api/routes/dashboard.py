@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, or_, select
@@ -15,11 +16,23 @@ from app.models.connection import CxConnection
 from app.models.enums import ConnectionStatus, EnforcementStatus, EntityType, UsageView
 from app.models.limits import CreditLimit, EnforcementAction, Exemption
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
-from app.models.usage import SchedulerRun, UnresolvedSubject, UsageRecord, UsageSnapshot
+from app.models.usage import (
+    AutoTriageCharge,
+    SchedulerRun,
+    UnresolvedSubject,
+    UsageRecord,
+    UsageSnapshot,
+)
 from app.schemas.dashboard import (
     ActionBreakdownItem,
     AuditEntryResponse,
     AuditListResponse,
+    AutoTriageAttributionOverview,
+    AutoTriageChargeResponse,
+    AutoTriageInitiator,
+    AutoTriageProjectAttribution,
+    AutoTriageUserAttribution,
+    AutoTriageUserPart,
     CreditPoolInfo,
     DashboardResponse,
     MapSubjectRequest,
@@ -31,9 +44,9 @@ from app.schemas.dashboard import (
     TrendPoint,
     UnresolvedSubjectResponse,
 )
+from app.services import auto_triage_attribution, settings_store
 from app.services import dashboard as dashboard_service
 from app.services import notifications as notification_service
-from app.services import settings_store
 from app.services.audit import record_audit
 
 logger = logging.getLogger(__name__)
@@ -88,6 +101,7 @@ def _to_consumer(consumer) -> TopConsumerItem:  # type: ignore[no-untyped-def]
         credits_used_in_period=consumer.credits_used_in_period,
         status=consumer.status,
         resolved=consumer.resolved,
+        auto_triage_attributed=consumer.auto_triage_attributed,
     )
 
 
@@ -147,9 +161,27 @@ def get_dashboard(
                 UnresolvedSubject.mapped_user_id.is_(None),
                 UnresolvedSubject.status != "auto_matched",
                 UnresolvedSubject.is_bot.is_(False),
+                UnresolvedSubject.view_by != auto_triage_attribution.SOURCE_SCAN_INITIATOR,
             )
         )
         or 0
+    )
+    unresolved_initiators = (
+        int(
+            db.scalar(
+                select(func.count())
+                .select_from(UnresolvedSubject)
+                .where(
+                    UnresolvedSubject.mapped_user_id.is_(None),
+                    UnresolvedSubject.status != "auto_matched",
+                    UnresolvedSubject.is_bot.is_(False),
+                    UnresolvedSubject.view_by == auto_triage_attribution.SOURCE_SCAN_INITIATOR,
+                )
+            )
+            or 0
+        )
+        if settings_store.auto_triage_to_initiator(db)
+        else 0
     )
 
     return DashboardResponse(
@@ -189,6 +221,7 @@ def get_dashboard(
             last_success_at=last_success,
             last_run_status=last_run.status if last_run else None,
             schedule=scheduler.describe_schedule(),
+            unresolved_scan_initiators=unresolved_initiators,
         ),
         unavailable_dimensions=dashboard_service.unavailable_dimensions(db),
         credit_pool=_pool_info(dashboard_service.credit_pool(db)),
@@ -384,6 +417,11 @@ def _subject_response(db, row: UnresolvedSubject) -> UnresolvedSubjectResponse: 
         suggestions=suggestions,
         counts_towards_user_id=counts_id,
         counts_towards_label=counts_label,
+        source=(
+            auto_triage_attribution.SOURCE_SCAN_INITIATOR
+            if row.view_by == auto_triage_attribution.SOURCE_SCAN_INITIATOR
+            else "consumption"
+        ),
     )
 
 
@@ -490,3 +528,149 @@ def usage_dimensions(ctx: CurrentUser, db: DbSession) -> dict[str, object]:
         }
         for view in (UsageView.USER, UsageView.ACTION, UsageView.APPLICATION, UsageView.PROJECT)
     }
+
+
+@router.get("/usage/auto-triage-attribution", response_model=AutoTriageAttributionOverview)
+def auto_triage_attribution_overview(
+    ctx: CurrentUser,
+    db: DbSession,
+    user_id: str | None = Query(default=None, max_length=64),
+    project_id: str | None = Query(default=None, max_length=64),
+    charges: int = Query(default=50, ge=0, le=500),
+) -> AutoTriageAttributionOverview:
+    """How each project's auto-triage credits are charged to the people who scanned.
+
+    Read only, from stored data. Filter by ``user_id`` or ``project_id`` to
+    explain one figure. Empty (``enabled`` false) while the setting is off.
+    """
+    model = auto_triage_attribution.build_model(db)
+    if not model.enabled:
+        return AutoTriageAttributionOverview(enabled=False, available=False)
+
+    names: dict[tuple[str, str], str | None] = {}
+
+    def label(kind, entity_id: str) -> str | None:  # type: ignore[no-untyped-def]
+        key = (kind.__tablename__, entity_id)
+        if key not in names:
+            row = db.get(kind, entity_id)
+            names[key] = (
+                (row.display_name if isinstance(row, CxUser) else row.name) if row else None
+            )
+        return names[key]
+
+    projects = [
+        AutoTriageProjectAttribution(
+            project_id=item.project_id,
+            project_label=label(CxProject, item.project_id),
+            auto_triage_credits=item.auto_triage_credits,
+            observed=item.observed,
+            estimated=item.estimated,
+            unattributed=item.unattributed,
+            unresolved=item.unresolved,
+            charged_to_people=item.charged_to_people,
+            scale=float(item.scale),
+            history_status=item.history_status,
+            observing_since=item.observing_since,
+        )
+        for item in sorted(model.projects.values(), key=lambda p: -p.auto_triage_credits)
+        if (project_id is None or item.project_id == project_id) and item.auto_triage_credits > 0
+    ]
+
+    users: list[AutoTriageUserAttribution] = []
+    for uid, parts in model.parts_by_user.items():
+        if user_id is not None and uid != user_id:
+            continue
+        selected = [part for part in parts if project_id is None or part.project_id == project_id]
+        if not selected:
+            continue
+        grouped: dict[tuple[str, str], Decimal] = {}
+        for part in selected:
+            key = (part.project_id, part.basis)
+            grouped[key] = grouped.get(key, Decimal("0")) + part.credits
+        users.append(
+            AutoTriageUserAttribution(
+                user_id=uid,
+                user_label=label(CxUser, uid),
+                total=sum((part.credits for part in selected), Decimal("0")),
+                observed=sum(
+                    (part.credits for part in selected if part.basis == "observed"),
+                    Decimal("0"),
+                ),
+                estimated=sum(
+                    (part.credits for part in selected if part.basis == "estimated"),
+                    Decimal("0"),
+                ),
+                parts=[
+                    AutoTriageUserPart(
+                        project_id=pid,
+                        project_label=label(CxProject, pid),
+                        basis=basis,
+                        credits=credits,
+                    )
+                    for (pid, basis), credits in sorted(grouped.items())
+                ],
+            )
+        )
+    users.sort(key=lambda item: -item.total)
+
+    initiators: list[AutoTriageInitiator] = []
+    if user_id is None and model.initiators:
+        subject_ids = {
+            row.subject_key: row.id
+            for row in db.scalars(
+                select(UnresolvedSubject).where(
+                    UnresolvedSubject.subject_key.in_(list(model.initiators))
+                )
+            )
+        }
+        for key, info in sorted(model.initiators.items(), key=lambda kv: -kv[1].credits):
+            counted = info.outcome.counted_user_id
+            initiators.append(
+                AutoTriageInitiator(
+                    initiator=info.initiator,
+                    credits=info.credits,
+                    status=info.outcome.method,
+                    counts_towards_user_id=counted,
+                    counts_towards_label=label(CxUser, counted) if counted else None,
+                    subject_id=subject_ids.get(key),
+                )
+            )
+
+    recent: list[AutoTriageChargeResponse] = []
+    if charges:
+        query = select(AutoTriageCharge).order_by(AutoTriageCharge.id.desc()).limit(charges)
+        if project_id is not None:
+            query = query.where(AutoTriageCharge.project_id == project_id)
+        if user_id is not None:
+            keys = [
+                key
+                for key, info in model.initiators.items()
+                if info.outcome.counted_user_id == user_id
+            ]
+            query = query.where(AutoTriageCharge.initiator_key.in_(keys or [""]))
+        recent = [
+            AutoTriageChargeResponse(
+                id=row.id,
+                project_id=row.project_id,
+                basis=row.basis,
+                initiator=row.initiator,
+                scan_ids=[str(scan) for scan in (row.scan_ids or [])],
+                scan_count=row.scan_count,
+                credits=row.credits,
+                window_start=row.window_start,
+                window_end=row.window_end,
+                detail=row.detail,
+            )
+            for row in db.scalars(query)
+        ]
+
+    return AutoTriageAttributionOverview(
+        enabled=True,
+        available=model.available,
+        reference_at=model.reference_at,
+        window_start=model.window_start,
+        projects=projects,
+        users=users,
+        initiators=initiators,
+        recent_charges=recent,
+    )
