@@ -5,6 +5,7 @@ import type { Me, NotificationList } from "./api/types";
 import { AppShell } from "./components/AppShell";
 import { Spinner } from "./components/ui";
 import { applyAccent } from "./lib/ui-context";
+import { settingsDraft } from "./lib/settingsDraft";
 import { useInterval } from "./hooks/useResource";
 import { AccountPage, PasswordChangeRequired } from "./pages/AccountPage";
 import { AuditPage } from "./pages/AuditPage";
@@ -53,6 +54,10 @@ function SettingsRoute({
 }) {
   const { section } = useParams();
   if (!SECTIONS.includes(section as SettingsSection)) return <Navigate to="/settings/general" replace />;
+  // Accounts, and backups and health, are an admin's only.
+  if (!isAdmin && (section === "accounts" || section === "operations")) {
+    return <Navigate to="/settings/general" replace />;
+  }
   return (
     <SettingsPage
       key={section}
@@ -126,6 +131,7 @@ export function App() {
     }
     setAuthState("signedOut");
     setMe(null);
+    settingsDraft.clear();
     // Drop the cached org accent so a shared browser does not pre-apply one
     // organisation's accent for the next person who signs in.
     applyAccent("default");

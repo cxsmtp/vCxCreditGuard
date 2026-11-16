@@ -1,4 +1,6 @@
 import {
+  cloneElement,
+  isValidElement,
   useEffect,
   useId,
   useRef,
@@ -9,6 +11,7 @@ import {
   type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
 } from "react";
+import { createPortal } from "react-dom";
 
 /* ------------------------------------------------------------------- layout */
 
@@ -66,17 +69,6 @@ export function HelpToggle({ open, onToggle }: { open: boolean; onToggle: () => 
     >
       ?
     </button>
-  );
-}
-
-/** Text that stays folded behind a "?" until asked for. */
-export function Help({ children }: { children: ReactNode }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <span className="inline-flex flex-col align-middle">
-      <HelpToggle open={open} onToggle={() => setOpen((v) => !v)} />
-      {open && <span className="cg-help-text block">{children}</span>}
-    </span>
   );
 }
 
@@ -147,6 +139,7 @@ export function Field({
   children,
   required,
   help,
+  fold = true,
 }: {
   label: string;
   hint?: ReactNode;
@@ -155,29 +148,35 @@ export function Field({
   required?: boolean;
   /** A longer explanation, folded behind a "?" beside the label. */
   help?: ReactNode;
+  /**
+   * A long hint is an explanation and folds behind the "?" so the form stays
+   * light. Pass false for a hint that must always be read (a safety caveat).
+   */
+  fold?: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  // A long hint is an explanation: folded behind the "?" so the form stays light.
-  if (!help && typeof hint === "string" && hint.length > 110) {
+  const generatedId = useId();
+  if (fold && !help && typeof hint === "string" && hint.length > 110) {
     help = hint;
     hint = undefined;
   }
+  // The label names its control by id, so the "?" can sit beside it without
+  // being inside the <label> (where it would become the labelled control).
+  let control = children;
+  let controlId: string | undefined;
+  if (isValidElement<{ id?: string }>(children)) {
+    controlId = children.props.id ?? generatedId;
+    if (!children.props.id) control = cloneElement(children, { id: controlId });
+  }
   return (
     <div className="block">
-      <label className="block">
-        <span className="cg-field-label">
-          {label}
-          {required && <span style={{ color: "var(--status-critical)" }}>*</span>}
-          {help && (
-            <HelpToggle
-              open={open}
-              onToggle={() => setOpen((v) => !v)}
-            />
-          )}
-        </span>
-        {help && open && <span className="cg-help-text mb-2 block">{help}</span>}
-        {children}
-      </label>
+      <span className="cg-field-label">
+        <label htmlFor={controlId}>{label}</label>
+        {required && <span style={{ color: "var(--status-critical)" }}>*</span>}
+        {help && <HelpToggle open={open} onToggle={() => setOpen((v) => !v)} />}
+      </span>
+      {help && open && <span className="cg-help-text mb-2 block">{help}</span>}
+      {control}
       {hint && !error && <span className="cg-hint">{hint}</span>}
       {error && (
         <span className="cg-hint" style={{ color: "var(--status-critical)" }}>
@@ -222,9 +221,6 @@ export function Toggle({
   disabled?: boolean;
 }) {
   const id = useId();
-  const [open, setOpen] = useState(false);
-  // A long description is an explanation: folded behind the "?".
-  const folded = typeof description === "string" && description.length > 140;
   return (
     <div className="flex items-start gap-3">
       <button
@@ -243,14 +239,11 @@ export function Toggle({
         />
       </button>
       <div className="min-w-0">
-        <span className="flex items-center gap-2">
-          <label htmlFor={id} className="block text-sm font-medium">
-            {label}
-          </label>
-          {folded && <HelpToggle open={open} onToggle={() => setOpen((v) => !v)} />}
-        </span>
-        {description && (!folded || open) && (
-          <p className={folded ? "cg-help-text" : "mt-0.5 text-[13px]"} style={folded ? undefined : { color: "var(--text-secondary)" }}>
+        <label htmlFor={id} className="block text-sm font-medium">
+          {label}
+        </label>
+        {description && (
+          <p className="mt-0.5 text-[13px]" style={{ color: "var(--text-secondary)" }}>
             {description}
           </p>
         )}
@@ -482,7 +475,11 @@ export function Modal({
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key !== "Escape") return;
+      // Only the dialog on top closes: one Escape, one dialog.
+      const dialogs = document.querySelectorAll('[aria-modal="true"]');
+      if (dialogs[dialogs.length - 1] !== dialogRef.current) return;
+      onClose();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
@@ -490,7 +487,9 @@ export function Modal({
 
   if (!open) return null;
 
-  return (
+  // Rendered at page level: a dialog opened from inside a card must not be
+  // positioned or clipped by that card.
+  return createPortal(
     <div
       className="cg-overlay"
       onClick={onClose}
@@ -520,7 +519,8 @@ export function Modal({
           </footer>
         )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

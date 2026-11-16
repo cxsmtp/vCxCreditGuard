@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import type { Me } from "../api/types";
 import { LOOKS, PHOSPHORS, useTheme, useToast } from "../lib/ui-context";
+import { settingsDraft, useSettingsDraft } from "../lib/settingsDraft";
 import { BrandMark, Icon, type IconName } from "./Icon";
 import { Modal } from "./ui";
 
@@ -138,6 +139,17 @@ function OpsStrip({ me }: { me: Me }) {
 /** The small status lights in the top bar: only what needs attention. */
 function Lights({ me }: { me: Me }) {
   const lights: { key: string; tone: string; label: string; to: string; title: string }[] = [];
+  const location = useLocation();
+  useSettingsDraft();
+  if (settingsDraft.dirty() && !location.pathname.startsWith("/settings/")) {
+    lights.push({
+      key: "unsaved",
+      tone: "warn",
+      label: "Unsaved settings",
+      to: "/settings/general",
+      title: "Settings were changed and not saved yet",
+    });
+  }
   if (!me.connection_configured) {
     lights.push({
       key: "conn",
@@ -306,11 +318,12 @@ function JumpPalette({ me, open, onClose }: { me: Me; open: boolean; onClose: ()
   }, [query, targets]);
 
   useEffect(() => {
-    if (open) {
-      setQuery("");
-      setIndex(0);
-      window.setTimeout(() => inputRef.current?.focus(), 0);
-    }
+    if (!open) return;
+    const before = document.activeElement as HTMLElement | null;
+    setQuery("");
+    setIndex(0);
+    window.setTimeout(() => inputRef.current?.focus(), 0);
+    return () => before?.focus?.();
   }, [open]);
 
   useEffect(() => setIndex(0), [query]);
@@ -351,6 +364,7 @@ function JumpPalette({ me, open, onClose }: { me: Me; open: boolean; onClose: ()
                 event.preventDefault();
                 go(matches[index]);
               } else if (event.key === "Escape") {
+                event.stopPropagation();
                 onClose();
               }
             }}
@@ -411,10 +425,17 @@ export function AppShell({
   const nav = mainNav(me);
   const settings = inSettings(location.pathname);
 
-  // Ctrl K (or Cmd K) opens Jump to from anywhere.
+  // Ctrl K (or Cmd K) opens Jump to, except over a dialog that is already open.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !event.repeat &&
+        event.key.toLowerCase() === "k" &&
+        !document.querySelector('[aria-modal="true"]')
+      ) {
         event.preventDefault();
         setJumpOpen(true);
       }
@@ -429,8 +450,20 @@ export function AppShell({
     const onDown = (event: MouseEvent) => {
       if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false);
     };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setMenuOpen(false);
+        menuRef.current?.querySelector<HTMLElement>(".cg-who")?.focus();
+      }
+    };
     document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    // Focus the first item, so the menu can be used from the keyboard.
+    window.setTimeout(() => menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus(), 0);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
   }, [menuOpen]);
   useEffect(() => {
     setSideOpen(false);
@@ -540,7 +573,14 @@ export function AppShell({
               </button>
               {menuOpen && (
                 <div className="cg-menu" role="menu">
-                  <button type="button" role="menuitem" onClick={() => navigate("/account")}>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      navigate("/account");
+                    }}
+                  >
                     <Icon name="user" size={16} />
                     Your account
                   </button>
@@ -555,7 +595,14 @@ export function AppShell({
                     <Icon name="theme" size={16} />
                     Look…
                   </button>
-                  <button type="button" role="menuitem" onClick={() => navigate("/settings/about")}>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      navigate("/settings/about");
+                    }}
+                  >
                     <Icon name="info" size={16} />
                     About
                   </button>

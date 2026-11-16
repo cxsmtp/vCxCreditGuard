@@ -42,7 +42,7 @@ const STATUS_LABEL: Record<RequestStatus, string> = {
 const REQUEST_VIEW: ViewColumn<CreditRequest>[] = [
   { key: "entity", value: (r) => r.entity_label ?? r.entity_id, filter: false },
   { key: "requested", value: (r) => r.requested_limit, filter: false },
-  { key: "status", value: (r) => r.status },
+  { key: "status", value: (r) => r.status, label: (v) => String(v).charAt(0).toUpperCase() + String(v).slice(1) },
   { key: "by", value: (r) => r.requested_by_name },
   { key: "when", value: (r) => r.requested_at, filter: false },
 ];

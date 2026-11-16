@@ -69,7 +69,7 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
         actions={
           <>
             <ExportMenu
-              rows={projections}
+              rows={view.rows}
               columns={PROJECTION_COLUMNS}
               filenameBase="cxcreditguard-projection"
               title="CxCreditGuard projection"

@@ -239,6 +239,16 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
 
   const view = useTableView(visible, LIMIT_VIEW);
 
+  // A bulk action applies to what is selected, so nothing hidden by a tab, the
+  // search or a column filter may stay selected.
+  useEffect(() => {
+    const shown = new Set(view.rows.map((limit) => limit.id));
+    setSelected((current) => {
+      const kept = [...current].filter((id) => shown.has(id));
+      return kept.length === current.size ? current : new Set(kept);
+    });
+  }, [view.rows]);
+
   const counts = useMemo(() => {
     const rows = limits.data ?? [];
     return {
@@ -358,7 +368,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
                   Add override
                 </Button>
                 <Button size="sm" variant="primary" onClick={() => setCreating(true)}>
-                  New limit
+                  New budget
                 </Button>
               </>
             )}
@@ -417,16 +427,16 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
           </div>
         ) : visible.length === 0 ? (
           <EmptyState
-            title="No limits here yet"
+            title="No budgets here yet"
             description={
               isAdmin
                 ? "Create one to start monitoring credit consumption. Monitoring has no side effects."
-                : "An Admin has not configured any limits at this level."
+                : "An admin has not set any budgets at this level."
             }
             action={
               isAdmin && (
                 <Button variant="primary" onClick={() => setCreating(true)}>
-                  New limit
+                  New budget
                 </Button>
               )
             }
@@ -656,7 +666,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
 
       <ConfirmDialog
         open={deleting !== null}
-        title="Delete this limit?"
+        title="Delete this budget?"
         destructive
         confirmLabel="Delete limit"
         busy={busy}
@@ -834,7 +844,7 @@ function LimitDialog({
   return (
     <Modal
       open
-      title={editing ? "Edit limit" : "New limit"}
+      title={editing ? "Edit budget" : "New budget"}
       description={
         editing
           ? `${limit?.entity_label ?? limit?.entity_id}`

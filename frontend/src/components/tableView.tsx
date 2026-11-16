@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 /**
  * Sorting and per-column filters for any table.
@@ -96,6 +97,7 @@ export function useTableView<T>(rows: readonly T[], columns: ViewColumn<T>[]) {
           </button>
           {filterable && (
             <ColumnFilter
+              name={typeof label === "string" ? label : key}
               values={rows.map((row) => text(column.value(row)))}
               label={column.label ? (v) => (v === "(blank)" ? v : column.label!(v)) : undefined}
               chosen={filters[key] ?? new Set()}
@@ -118,11 +120,13 @@ export function useTableView<T>(rows: readonly T[], columns: ViewColumn<T>[]) {
 }
 
 function ColumnFilter({
+  name,
   values,
   chosen,
   onChange,
   label,
 }: {
+  name: string;
   values: string[];
   chosen: Set<string>;
   onChange: (next: Set<string>) => void;
@@ -132,32 +136,49 @@ function ColumnFilter({
   const [query, setQuery] = useState("");
   const [at, setAt] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
   const ref = useRef<HTMLSpanElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const options = useMemo(() => {
     const counts = new Map<string, number>();
     for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+    // A chosen value the current rows no longer hold stays listed (at 0), so it
+    // can be seen and unticked rather than filtering everything out unseen.
+    for (const value of chosen) if (!counts.has(value)) counts.set(value, 0);
     return [...counts.entries()].sort((a, b) =>
       a[0].localeCompare(b[0], undefined, { numeric: true, sensitivity: "base" }),
     );
-  }, [values]);
+  }, [values, chosen]);
 
   useEffect(() => {
     if (!open) return;
+    const inside = (target: EventTarget | null) =>
+      ref.current?.contains(target as Node) || popRef.current?.contains(target as Node);
     const onDown = (event: MouseEvent) => {
-      if (!ref.current?.contains(event.target as Node)) setOpen(false);
+      if (!inside(event.target)) setOpen(false);
     };
-    const onKey = (event: KeyboardEvent) => event.key === "Escape" && setOpen(false);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.stopPropagation();
+      setOpen(false);
+      buttonRef.current?.focus();
+    };
     // Fixed to the viewport so a scrolling table cannot clip it; it closes
-    // rather than drift when the page moves under it.
-    const close = () => setOpen(false);
+    // rather than drift when the page moves under it, but not when its own
+    // list of values is scrolled.
+    const close = (event: Event) => {
+      if (!inside(event.target)) setOpen(false);
+    };
+    const onResize = () => setOpen(false);
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
-    window.addEventListener("resize", close);
+    window.addEventListener("resize", onResize);
     window.addEventListener("scroll", close, true);
+    // Focus moves into the filter, so a keyboard user lands on its first value.
+    window.setTimeout(() => popRef.current?.querySelector<HTMLElement>("input")?.focus(), 0);
     return () => {
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
-      window.removeEventListener("resize", close);
+      window.removeEventListener("resize", onResize);
       window.removeEventListener("scroll", close, true);
     };
   }, [open]);
@@ -183,6 +204,7 @@ function ColumnFilter({
         aria-haspopup="dialog"
         aria-expanded={open}
         title={chosen.size ? `Filtered: ${chosen.size} chosen` : "Filter this column"}
+        aria-label={chosen.size ? `Filter ${name} (${chosen.size} chosen)` : `Filter ${name}`}
         onClick={() => {
           const rect = buttonRef.current?.getBoundingClientRect();
           if (rect) {
@@ -196,8 +218,10 @@ function ColumnFilter({
       >
         ▾
       </button>
-      {open && (
+      {open &&
+        createPortal(
         <div
+          ref={popRef}
           className="cg-filter-pop"
           role="dialog"
           aria-label="Filter this column"
@@ -210,7 +234,6 @@ function ColumnFilter({
                 placeholder="Find a value"
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                autoFocus
               />
             </div>
           )}
@@ -229,12 +252,20 @@ function ColumnFilter({
             <button type="button" className="cg-btn sm ghost" onClick={() => onChange(new Set())}>
               Show all
             </button>
-            <button type="button" className="cg-btn sm" onClick={() => setOpen(false)}>
+            <button
+              type="button"
+              className="cg-btn sm"
+              onClick={() => {
+                setOpen(false);
+                buttonRef.current?.focus();
+              }}
+            >
               Done
             </button>
           </div>
-        </div>
-      )}
+        </div>,
+          document.body,
+        )}
     </span>
   );
 }

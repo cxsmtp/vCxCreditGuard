@@ -59,7 +59,7 @@
   --topbar: #f4f6f7;
   --text-primary: #17212a;
   --text-secondary: #566573;
-  --text-muted: #8794a0;
+  --text-muted: #6b7c88;
   --grid: #e0e5e9;
   --axis: #ccd4da;
   --border: #e0e5e9;
@@ -189,7 +189,7 @@
 /* Command Center, light: the operations room by day. */
 :root[data-look="command"][data-theme="light"] {
   color-scheme: light;
-  --ops-rgb: 0, 140, 72;
+  --ops-rgb: 0, 122, 62;
   --heading-font: var(--font-mono);
   --page: #eef5f0;
   --surface: rgba(255, 255, 255, 0.88);
@@ -199,7 +199,7 @@
   --topbar: rgba(255, 255, 255, 0.88);
   --text-primary: #08281a;
   --text-secondary: #3f6a54;
-  --text-muted: #7d9e8b;
+  --text-muted: #5b7d69;
   --grid: rgba(var(--ops-rgb), 0.14);
   --axis: rgba(var(--ops-rgb), 0.3);
   --border: rgba(var(--ops-rgb), 0.18);
@@ -880,7 +880,6 @@ code,
 }
 :root[data-look="command"] .cg-panel {
   border-color: var(--border-strong);
-  backdrop-filter: blur(6px);
 }
 :root[data-look="command"] .cg-panel-title {
   font-size: 14px;
@@ -958,7 +957,6 @@ a.cg-kpi:hover {
 }
 :root[data-look="command"] .cg-kpi {
   border-color: var(--border-strong);
-  backdrop-filter: blur(6px);
 }
 :root[data-look="command"] .cg-kpi-label {
   font-family: var(--font-mono);

@@ -45,7 +45,6 @@ export function PreviewPage() {
   const reload = useCallback(() => void dryRun.reload(), [dryRun]);
   const data = dryRun.data;
   const view = useTableView(data?.rows ?? [], DRY_RUN_VIEW);
-  const rows = data?.rows ?? [];
 
   const exportColumns: ExportColumn<DryRunRow>[] = [
     { key: "entity", header: "Entity", value: (r) => r.entity_label ?? r.entity_id },
@@ -72,7 +71,7 @@ export function PreviewPage() {
         actions={
           <>
             <ExportMenu
-              rows={rows}
+              rows={view.rows}
               columns={exportColumns}
               filenameBase="cxcreditguard-simulation"
               title="CxCreditGuard simulation"

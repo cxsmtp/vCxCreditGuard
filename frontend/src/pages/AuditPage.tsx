@@ -16,7 +16,6 @@ import {
   Td,
   Th,
 } from "../components/ui";
-import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import { formatDateTime, humanise } from "../lib/format";
 
@@ -109,13 +108,6 @@ function IntegrityCheck() {
   );
 }
 
-const AUDIT_VIEW: ViewColumn<AuditEntry>[] = [
-  { key: "when", value: (e) => e.occurred_at, filter: false },
-  { key: "actor", value: (e) => e.actor_name ?? (e.actor_type === "system" ? "System" : "unknown") },
-  { key: "action", value: (e) => e.action },
-  { key: "target", value: (e) => e.target_label ?? e.target_id ?? "" },
-];
-
 export function AuditPage({ isAdmin }: { isAdmin: boolean }) {
   const [action, setAction] = useState("");
   const [query, setQuery] = useState("");
@@ -131,7 +123,6 @@ export function AuditPage({ isAdmin }: { isAdmin: boolean }) {
       ),
     [action, query, page],
   );
-  const view = useTableView(audit.data?.items ?? [], AUDIT_VIEW);
 
   const total = audit.data?.total ?? 0;
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -187,19 +178,19 @@ export function AuditPage({ isAdmin }: { isAdmin: boolean }) {
           <EmptyState title="No matching entries" />
         ) : (
           <>
-            <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
+            <Table>
               <thead>
                 <tr>
-                  {view.th("when", "When")}
-                  {view.th("actor", "Actor")}
-                  {view.th("action", "Action")}
-                  {view.th("target", "Target")}
+                  <Th>When</Th>
+                  <Th>Actor</Th>
+                  <Th>Action</Th>
+                  <Th>Target</Th>
                   <Th>Detail</Th>
                   <Th align="right" />
                 </tr>
               </thead>
               <tbody>
-                {view.rows.map((entry) => (
+                {(audit.data?.items ?? []).map((entry) => (
                   <tr key={entry.id}>
                     <Td>
                       <span className="text-xs whitespace-nowrap tabular">

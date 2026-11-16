@@ -39,6 +39,7 @@ import { downloadText, timestampedName } from "../lib/export";
 import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 import { LookPicker } from "../components/AppShell";
+import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
 /** Unsaved edits. The last three are write only: the server never sends the
  * stored value back, so they exist here only while being typed. */
@@ -113,8 +114,8 @@ export function SettingsPage({
     [],
   );
 
-  const [draft, setDraft] = useState<SettingsDraft>({});
-  const [removeWebhook, setRemoveWebhook] = useState(false);
+  const { draft, removeWebhook } = useSettingsDraft<SettingsDraft>();
+  const setRemoveWebhook = settingsDraft.setRemoveWebhook;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -135,7 +136,7 @@ export function SettingsPage({
     (draft[key] as AppSettings[K] | undefined) ?? current?.[key];
 
   function set(patch: SettingsDraft) {
-    setDraft((existing) => ({ ...existing, ...patch }));
+    settingsDraft.patch(patch);
   }
 
   // Keys cleared back to undefined are not changes.
@@ -144,6 +145,7 @@ export function SettingsPage({
   ) as SettingsDraft;
   if (removeWebhook && changes.webhook_url === undefined) changes.webhook_url = "";
   const dirty = Object.keys(changes).length > 0;
+  useWarnBeforeUnload(dirty);
 
   async function save() {
     setBusy(true);
@@ -152,8 +154,7 @@ export function SettingsPage({
       const updated = await api.put<AppSettings>("/api/settings", changes);
       settings.setData(updated);
       applyAccent(updated.ui_accent);
-      setDraft({});
-      setRemoveWebhook(false);
+      settingsDraft.clear();
       toast.success(`Settings saved. Schedule is now ${updated.current_schedule_description}.`);
       await status.reload();
       // Refresh the bootstrap profile so shell-level state (the demo banner,
@@ -503,6 +504,7 @@ export function SettingsPage({
             <div className="grid gap-4 border-t border-hairline pt-4 sm:grid-cols-2">
               <Field
                 label="Webhook URL"
+                fold={false}
                 hint={
                   current.webhook_url_configured
                     ? `A webhook to ${current.webhook_host ?? "a stored URL"} is configured. The URL is not shown again; type a new one to replace it, or clear the box and save to remove it.`
@@ -587,7 +589,7 @@ export function SettingsPage({
               label="Allow viewers to request credits"
               description={
                 (value("self_service_requests") ?? false)
-                  ? "Viewers see a Requests tab where they can ask for more budget. Admins always decide every request."
+                  ? "Viewers see a Requests page where they can ask for more budget. Admins always decide every request."
                   : "Only admins can file credit requests. Turn this on to open it to viewers."
               }
             />
@@ -597,7 +599,7 @@ export function SettingsPage({
           <div id="enforcement-safety">
             <Card
               title="Enforcement safety"
-              description="Guard rails around restricting access in Checkmarx One. They apply to every enforcing limit."
+              description="Guard rails around restricting access in Checkmarx One. They apply to every budget set to enforce."
             >
               {current.enforcement_paused && (
                 <div className="mb-4">
@@ -618,6 +620,7 @@ export function SettingsPage({
               <div className="mt-4 grid gap-4 sm:grid-cols-3">
                 <Field
                   label="Safety ceiling (limits per cycle)"
+                  fold={false}
                   hint="If more limits than this would start restricting in a single cycle, none are restricted and enforcement pauses itself until an admin resumes it. That many breaches at once usually means bad data, not real spending. 0 removes the ceiling."
                 >
                   <Input
@@ -638,6 +641,7 @@ export function SettingsPage({
                 </Field>
                 <Field
                   label="Safety ceiling (users and projects)"
+                  fold={false}
                   hint="The same safeguard counted in what would be restricted: one application or group limit can take many projects with it. 0 removes the ceiling."
                 >
                   <Input
@@ -687,6 +691,7 @@ export function SettingsPage({
             <div className="mt-4 grid gap-4 sm:grid-cols-2">
               <Field
                 label="Auto-approve cap (credits)"
+                fold={false}
                 hint="The most that is approved automatically for one entity, and at one requester's asking, in any 30 days - in total, not per request. A request that would go over it waits for an admin. 0 approves nothing, even when the switch is on."
               >
                 <Input
@@ -728,7 +733,7 @@ export function SettingsPage({
               disabled={!isAdmin}
               onChange={(next) => set({ report_email_enabled: next })}
               label="Email the weekly report"
-              description="Sends the Reports summary to the configured notification recipients once a week. Needs SMTP configured below. Admins can also send it on demand from the Reports page."
+              description="Sends the Reports summary to the configured notification recipients once a week. Needs the mail server set up above. Admins can also send it on demand from the Reports page."
             />
             <div className="mt-4">
               <Field
@@ -776,8 +781,11 @@ export function SettingsPage({
             className="cg-panel flex items-center gap-3 px-4 py-3"
             style={{ background: "var(--surface-raised)", boxShadow: "var(--shadow-pop)" }}
           >
-            <span className="text-sm">You have unsaved changes.</span>
-            <Button variant="secondary" size="sm" onClick={() => setDraft({})} disabled={busy}>
+            <span className="text-sm">
+              You have unsaved settings. They are kept while you move between settings pages and
+              saved together.
+            </span>
+            <Button variant="secondary" size="sm" onClick={() => settingsDraft.clear()} disabled={busy}>
               Discard
             </Button>
             <Button variant="primary" size="sm" onClick={save} loading={busy}>
@@ -915,7 +923,10 @@ function AttributionCard({
   onChanged: () => Promise<void>;
 }) {
   const toast = useToast();
-  const [tab, setTab] = useState<AttributionTab>("disputed");
+  // Opened from "map them" on the Overview: start on the unmatched usage.
+  const [tab, setTab] = useState<AttributionTab>(() =>
+    window.location.hash === "#unmatched" ? "unmatched" : "disputed",
+  );
   const [mapping, setMapping] = useState<UnresolvedSubject | null>(null);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<OrgEntity[]>([]);
