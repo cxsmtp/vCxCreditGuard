@@ -15,6 +15,8 @@ EXPECTED_TABLES = {
     "alembic_version",
     "app_setting",
     "audit_log_entry",
+    "auto_triage_charge",
+    "auto_triage_project_state",
     "credit_balance_snapshot",
     "credit_limit",
     "credit_request",

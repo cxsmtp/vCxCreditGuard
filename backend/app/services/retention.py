@@ -19,13 +19,20 @@ from datetime import timedelta
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from app.checkmarx import usage as usage_api
 from app.db.base import utcnow
 from app.models.audit import AuditLogEntry, Notification
 from app.models.auth import LoginAttempt
 from app.models.enums import EnforcementStatus
 from app.models.limits import EnforcementAction, LimitPeriodState
-from app.models.usage import CreditBalanceSnapshot, SchedulerRun, UsageRecord, UsageSnapshot
-from app.services import audit_chain
+from app.models.usage import (
+    AutoTriageCharge,
+    CreditBalanceSnapshot,
+    SchedulerRun,
+    UsageRecord,
+    UsageSnapshot,
+)
+from app.services import audit_chain, settings_store
 from app.services import auth as auth_service
 from app.services.audit import AuditActor, record_audit
 
@@ -50,6 +57,7 @@ class RetentionResult:
     sessions: int = 0
     login_attempts: int = 0
     enforcement_actions: int = 0
+    auto_triage_charges: int = 0
     skipped: list[str] = field(default_factory=list)
 
     @property
@@ -63,6 +71,7 @@ class RetentionResult:
             + self.sessions
             + self.login_attempts
             + self.enforcement_actions
+            + self.auto_triage_charges
         )
 
     def as_stats(self) -> dict[str, object]:
@@ -76,6 +85,7 @@ class RetentionResult:
             "sessions": self.sessions,
             "login_attempts": self.login_attempts,
             "enforcement_actions": self.enforcement_actions,
+            "auto_triage_charges": self.auto_triage_charges,
             "skipped": self.skipped,
         }
 
@@ -104,6 +114,7 @@ def prune(
     # input, which is worth closing.
     result.login_attempts = _prune_login_attempts(session)
     _prune_period_states(session, cutoff)
+    result.auto_triage_charges = _prune_auto_triage_charges(session, cutoff)
 
     # Audited last, and only if something was removed, so the entry can state the
     # counts. This is the single place that deletes audit rows.
@@ -232,6 +243,24 @@ def _prune_period_states(session: Session, cutoff) -> int:
         session,
         LimitPeriodState,
         (LimitPeriodState.period_end.is_not(None)) & (LimitPeriodState.period_end < cutoff),
+    )
+
+
+def _prune_auto_triage_charges(session: Session, cutoff) -> int:
+    """Auto-triage charges older than the window *and* the consumption window.
+
+    A charge still inside the lookback window the usage figures are read with
+    is part of someone's current figure, so it is kept even when the retention
+    setting is shorter: dropping it would quietly move those credits from the
+    person back to the project. A day of margin covers the window sliding
+    between cycles.
+    """
+    lookback = usage_api.PERIOD_DAYS.get(settings_store.usage_period(session), 365)
+    floor = utcnow() - timedelta(days=lookback + 1)
+    return _delete_where(
+        session,
+        AutoTriageCharge,
+        (AutoTriageCharge.window_end < cutoff) & (AutoTriageCharge.window_end < floor),
     )
 
 

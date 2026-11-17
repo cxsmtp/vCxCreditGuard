@@ -20,6 +20,7 @@ import {
   Th,
   type BadgeTone,
 } from "../components/ui";
+import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import { entityLabel, formatCredits, formatDateTime } from "../lib/format";
 import { useToast } from "../lib/ui-context";
@@ -37,6 +38,14 @@ const STATUS_LABEL: Record<RequestStatus, string> = {
   approved: "Approved",
   denied: "Denied",
 };
+
+const REQUEST_VIEW: ViewColumn<CreditRequest>[] = [
+  { key: "entity", value: (r) => r.entity_label ?? r.entity_id, filter: false },
+  { key: "requested", value: (r) => r.requested_limit, filter: false },
+  { key: "status", value: (r) => r.status, label: (v) => String(v).charAt(0).toUpperCase() + String(v).slice(1) },
+  { key: "by", value: (r) => r.requested_by_name },
+  { key: "when", value: (r) => r.requested_at, filter: false },
+];
 
 export function RequestsPage({ isAdmin }: { isAdmin: boolean }) {
   const [tab, setTab] = useState<StatusTab>(isAdmin ? "pending" : "all");
@@ -56,6 +65,7 @@ export function RequestsPage({ isAdmin }: { isAdmin: boolean }) {
   );
 
   const rows = requests.data ?? [];
+  const view = useTableView(rows, REQUEST_VIEW);
 
   return (
     <div>
@@ -107,20 +117,20 @@ export function RequestsPage({ isAdmin }: { isAdmin: boolean }) {
               }
             />
           ) : (
-            <Table>
+            <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
               <thead>
                 <tr>
-                  <Th>Entity</Th>
-                  <Th align="right">Requested</Th>
-                  <Th>Status</Th>
-                  <Th>Requested by</Th>
-                  <Th>When</Th>
+                  {view.th("entity", "Entity")}
+                  {view.th("requested", "Requested", "right")}
+                  {view.th("status", "Status")}
+                  {view.th("by", "Requested by")}
+                  {view.th("when", "When")}
                   <Th>Outcome</Th>
                   {isAdmin && <Th align="right">Actions</Th>}
                 </tr>
               </thead>
               <tbody>
-                {rows.map((request) => (
+                {view.rows.map((request) => (
                   <RequestRow
                     key={request.id}
                     request={request}

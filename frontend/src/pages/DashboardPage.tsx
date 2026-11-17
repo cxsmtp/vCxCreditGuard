@@ -73,7 +73,7 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
   const tiles = data.tiles;
   // Not counted towards anyone: no manual mapping, no auto-match, and not a bot.
   const unmatched = (unresolved.data ?? []).filter(
-    (row) => !row.counts_towards_user_id && !row.is_bot,
+    (row) => !row.counts_towards_user_id && !row.is_bot && row.source !== "scan_initiator",
   );
 
   const consumers = {
@@ -86,12 +86,11 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
   return (
     <div className={dashboard.loading ? "opacity-70 transition-opacity" : "transition-opacity"}>
       <PageHeader
-        title="Dashboard"
+        title="Overview"
         description={
           <>
-            Credit consumption for the {data.lookback_window.replace(/_/g, " ")} window as Checkmarx
-            reports it. Budget periods are measured from a baseline taken when each period opened,
-            which is what the Limits page shows.
+            AI credits used in the {data.lookback_window.replace(/_/g, " ")} window, as Checkmarx One
+            reports them. Each budget counts from when its period opened: see Budgets.
           </>
         }
         actions={
@@ -118,6 +117,19 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
         </div>
       )}
 
+      {(tiles.unresolved_scan_initiators ?? 0) > 0 && (
+        <div className="mb-5">
+          <InfoNote tone="warning">
+            {formatNumber(tiles.unresolved_scan_initiators ?? 0)} scan{" "}
+            {tiles.unresolved_scan_initiators === 1 ? "initiator is" : "initiators are"} not matched to
+            a person, so their share of auto-triage credits stays on the project.{" "}
+            <Link to="/settings/attribution#unmatched" className="underline">
+              Map them under Settings → Attribution
+            </Link>
+            .
+          </InfoNote>
+        </div>
+      )}
       {unmatched.length > 0 && (
         <div className="mb-5">
           <InfoNote tone="warning">
@@ -127,8 +139,8 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
               unmatched.reduce((sum, row) => sum + Number(row.credits_used), 0),
             )}{" "}
             credits are not counted towards any user limit.{" "}
-            <Link to="/settings#attribution" className="underline">
-              Map them on the Settings page
+            <Link to="/settings/attribution#unmatched" className="underline">
+              Map them under Settings → Attribution
             </Link>
             .
           </InfoNote>

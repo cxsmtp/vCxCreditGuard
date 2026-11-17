@@ -84,6 +84,7 @@ def get_dry_run(ctx: CurrentUser, db: DbSession) -> DryRunResponse:
                 would_enforce=row.would_enforce,
                 blast=_blast_to_response(row.blast) if row.blast is not None else None,
                 note=row.note,
+                auto_triage_attributed=row.auto_triage_attributed,
             )
             for row in result.rows
         ],

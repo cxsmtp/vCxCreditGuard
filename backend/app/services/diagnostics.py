@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -18,8 +19,15 @@ from app.db.base import utcnow
 from app.models.connection import CxConnection
 from app.models.enums import ConnectionStatus, EnforcementStatus, RunStatus, UsageView
 from app.models.limits import EnforcementAction
-from app.models.usage import DimensionState, SchedulerRun, UnresolvedSubject, UsageSnapshot
+from app.models.usage import (
+    AutoTriageProjectState,
+    DimensionState,
+    SchedulerRun,
+    UnresolvedSubject,
+    UsageSnapshot,
+)
 from app.services import settings_store
+from app.services.auto_triage_attribution import SOURCE_SCAN_INITIATOR
 
 OK = "ok"
 WARN = "warn"
@@ -56,6 +64,11 @@ _REMEDIATION: dict[tuple[str, str], str] = {
     ("attribution", WARN): (
         "Open Settings and map each unresolved consumer to a user so their usage counts "
         "towards that user's limit."
+    ),
+    ("auto_triage_attribution", WARN): (
+        "Map each scan initiator listed as unmatched under Settings → Attribution to the person it "
+        "acts for, so their share of auto-triage credits counts. If scans could not be read, "
+        "check the connection; those credits stay estimated until a later cycle reads them."
     ),
     ("enforcement", WARN): (
         "Restore the Checkmarx connection; the next healthy cycle retries the pending "
@@ -110,6 +123,10 @@ def run_diagnostics(
         _pending_enforcement_check(session),
         _dimensions_check(session),
     ]
+    if settings_store.auto_triage_to_initiator(session):
+        # Only while charging auto triage to scan initiators is on, so the
+        # report is unchanged for everyone who has not turned it on.
+        checks.append(_auto_triage_check(session))
     checks = [replace(c, remediation=_remediation_for(c)) for c in checks]
     overall = max((c.status for c in checks), key=lambda s: _RANK[s], default=OK)
     return Diagnostics(generated_at=moment, overall=overall, checks=checks)
@@ -223,7 +240,11 @@ def _attribution_check(session: Session) -> Check:
         session.scalar(
             select(func.count())
             .select_from(UnresolvedSubject)
-            .where(UnresolvedSubject.mapped_user_id.is_(None))
+            .where(
+                UnresolvedSubject.mapped_user_id.is_(None),
+                # Scan initiators have their own check (auto-triage attribution).
+                UnresolvedSubject.view_by != SOURCE_SCAN_INITIATOR,
+            )
         )
         or 0
     )
@@ -234,8 +255,56 @@ def _attribution_check(session: Session) -> Check:
         "Usage attribution",
         WARN,
         f"{count} consumer(s) could not be matched to a user, so that usage counts "
-        "towards no user limit. Resolve them on the Settings page.",
+        "towards no user limit. Resolve them under Settings → Attribution.",
     )
+
+
+def _auto_triage_check(session: Session) -> Check:
+    """How auto-triage credits are being charged to the people who scanned."""
+    from app.services import auto_triage_attribution
+
+    model = auto_triage_attribution.build_model(session)
+    label = "Auto-triage attribution"
+    if not model.available:
+        return Check(
+            "auto_triage_attribution",
+            label,
+            OK,
+            "On, but there is no project consumption reading yet (or this tenant does not "
+            "report consumption by project), so nothing is charged to people yet.",
+        )
+    total = sum((p.auto_triage_credits for p in model.projects.values()), Decimal("0"))
+    observed = sum((p.observed for p in model.projects.values()), Decimal("0"))
+    estimated = sum((p.estimated for p in model.projects.values()), Decimal("0"))
+    unresolved = sum((p.unresolved for p in model.projects.values()), Decimal("0"))
+    on_project = sum((p.unattributed for p in model.projects.values()), Decimal("0"))
+    initiators = sorted(
+        info.initiator
+        for info in model.initiators.values()
+        if info.outcome.counted_user_id is None and not info.outcome.is_bot
+    )
+    failing = sorted(
+        row.project_id
+        for row in session.scalars(
+            select(AutoTriageProjectState).where(AutoTriageProjectState.last_error.is_not(None))
+        )
+    )
+    detail = (
+        f"{total} auto-triage credits in the lookback window: {observed} traced to the scans "
+        f"that triggered them, {estimated} estimated from earlier scans, {unresolved} held by "
+        f"initiators that are not a synced user, {on_project} on the project only."
+    )
+    problems: list[str] = []
+    if initiators:
+        shown = ", ".join(initiators[:5]) + ("..." if len(initiators) > 5 else "")
+        problems.append(f"{len(initiators)} scan initiator(s) to map: {shown}.")
+    if failing:
+        problems.append(
+            f"{len(failing)} project(s) with a note from the last attempt to read their scans."
+        )
+    if problems:
+        return Check("auto_triage_attribution", label, WARN, f"{detail} {' '.join(problems)}")
+    return Check("auto_triage_attribution", label, OK, detail)
 
 
 def _pending_enforcement_check(session: Session) -> Check:

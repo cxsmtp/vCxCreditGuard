@@ -98,22 +98,11 @@ def _project(
     if window.end is None or not window.is_active or moment <= window.start:
         return None
 
-    reported_total, available = index.reported_total(limit)
+    credits_used, available, _attributed = evaluation.period_usage(
+        session, limit=limit, window=window, index=index, moment=moment
+    )
     if not available:
         return None
-    state = session.scalar(
-        select(LimitPeriodState).where(
-            LimitPeriodState.limit_id == limit.id, LimitPeriodState.period_key == window.key
-        )
-    )
-    baseline = (
-        state.baseline_credits
-        if state is not None
-        else evaluation.baseline_for(
-            limit, window=window, reported_total=reported_total, available=available
-        )
-    )
-    credits_used = max(Decimal("0"), reported_total - baseline)
     if credits_used <= 0:
         return None
 
@@ -176,27 +165,17 @@ def impact_summary(session: Session, *, now: datetime | None = None) -> Impact:
     monitor_only_breaches = 0
 
     limits = list(session.scalars(select(CreditLimit).where(CreditLimit.is_active.is_(True))))
+    moment = now or utcnow()
     for limit in limits:
-        reported_total, available = index.reported_total(limit)
-        if not available:
-            continue
         try:
-            window = current_window(limit, now or utcnow())
+            window = current_window(limit, moment)
         except PeriodError:
             continue
-        state = session.scalar(
-            select(LimitPeriodState).where(
-                LimitPeriodState.limit_id == limit.id, LimitPeriodState.period_key == window.key
-            )
+        used, available, _attributed = evaluation.period_usage(
+            session, limit=limit, window=window, index=index, moment=moment
         )
-        baseline = (
-            state.baseline_credits
-            if state is not None
-            else evaluation.baseline_for(
-                limit, window=window, reported_total=reported_total, available=available
-            )
-        )
-        used = max(Decimal("0"), reported_total - baseline)
+        if not available:
+            continue
         over = max(Decimal("0"), used - Decimal(limit.credit_limit))
         exempt = enforcement.is_exempt(
             session, entity_type=limit.entity_type, entity_id=limit.entity_id
@@ -303,29 +282,14 @@ def chargeback(session: Session, *, now: datetime | None = None) -> Chargeback:
         if not bu:
             unassigned += 1
             continue
-        reported_total, available = index.reported_total(limit)
-        if not available:
+        try:
+            window = current_window(limit, moment)
+        except PeriodError:
             used = Decimal("0")
         else:
-            try:
-                window = current_window(limit, moment)
-            except PeriodError:
-                used = Decimal("0")
-            else:
-                state = session.scalar(
-                    select(LimitPeriodState).where(
-                        LimitPeriodState.limit_id == limit.id,
-                        LimitPeriodState.period_key == window.key,
-                    )
-                )
-                baseline = (
-                    state.baseline_credits
-                    if state is not None
-                    else evaluation.baseline_for(
-                        limit, window=window, reported_total=reported_total, available=available
-                    )
-                )
-                used = max(Decimal("0"), reported_total - baseline)
+            used, _available, _attributed = evaluation.period_usage(
+                session, limit=limit, window=window, index=index, moment=moment
+            )
         bucket = totals.setdefault(bu, {"limits": 0, "used": Decimal("0")})
         bucket["limits"] = int(bucket["limits"]) + 1  # type: ignore[call-overload]
         bucket["used"] = Decimal(bucket["used"]) + used  # type: ignore[arg-type]

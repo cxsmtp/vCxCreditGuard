@@ -45,7 +45,7 @@ export function TrendChart({ points }: Props) {
     return (
       <EmptyState
         title="Not enough data for a trend yet"
-        description="A trend needs at least two completed polls. Run a cycle from the Settings page, or wait for the scheduler."
+        description="A trend needs at least two completed polls. Run a cycle from the Overview, or wait for the scheduler."
       />
     );
   }

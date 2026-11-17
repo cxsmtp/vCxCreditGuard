@@ -104,6 +104,21 @@ KEY_MAX_NEW_TARGETS = "enforcement.max_new_targets_per_cycle"
 KEY_CEILING_WAIVED_ONCE = "enforcement.ceiling_waived_once"
 KEY_PROTECTED_ROLES = "enforcement.protected_roles"
 
+# Attribution: when on, the Auto Triage credits a project reports are also
+# charged to the person (a synced Checkmarx user) whose scan triggered the auto
+# triage, so their user limit - and group limits that include member usage -
+# reflect it. Off by default: it changes who is counted for what, and turning it
+# on can push many people over budget at once (the enforcement safety ceilings
+# still apply). Project, application and tenant totals are unaffected either way.
+KEY_AUTO_TRIAGE_TO_INITIATOR = "attribution.auto_triage_to_scan_initiator"
+# When the setting above last became effective (switched on, or demo mode
+# switched off while it was on), as an ISO timestamp. Written by ``set_value``
+# itself, so every way of turning it on stamps it. Auto-triage attribution
+# restarts observation of every project whose cursor belongs to an earlier
+# stamp: credits that arrived while it was off are history (estimated), never
+# a single "observed" rise. Not part of the configuration backup.
+KEY_AUTO_TRIAGE_OBSERVATION_EPOCH = "attribution.auto_triage_observation_epoch"
+
 # Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
 # so it can never collide with a real Checkmarx lookback window, and so the read
 # path can hide demo snapshots whenever demo mode is off.
@@ -146,6 +161,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_MAX_NEW_TARGETS: 100,
     KEY_CEILING_WAIVED_ONCE: False,
     KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
+    KEY_AUTO_TRIAGE_TO_INITIATOR: False,
 }
 
 
@@ -173,6 +189,35 @@ def self_service_requests_enabled(session: Session) -> bool:
 def report_email_enabled(session: Session) -> bool:
     """Whether the weekly summary report is emailed to the notification recipients."""
     return bool(get_value(session, KEY_REPORT_EMAIL_ENABLED, DEFAULTS[KEY_REPORT_EMAIL_ENABLED]))
+
+
+def auto_triage_to_initiator(session: Session) -> bool:
+    """Whether auto-triage credits are also charged to the scan's initiator.
+
+    Never in demo mode: the charges are collected from the live tenant and must
+    not be laid over the seeded demo figures.
+    """
+    if demo_mode(session):
+        return False
+    return (
+        get_value(session, KEY_AUTO_TRIAGE_TO_INITIATOR, DEFAULTS[KEY_AUTO_TRIAGE_TO_INITIATOR])
+        is True
+    )
+
+
+def auto_triage_observation_epoch(session: Session) -> str | None:
+    """The stamp of the current auto-triage observation epoch, if one was taken."""
+    value = get_value(session, KEY_AUTO_TRIAGE_OBSERVATION_EPOCH, None)
+    return value if isinstance(value, str) and value else None
+
+
+def start_auto_triage_observation_epoch(session: Session) -> str:
+    """Stamp a new observation epoch: every project's observation restarts."""
+    from app.db.base import utcnow
+
+    stamp = utcnow().isoformat()
+    _write_value(session, KEY_AUTO_TRIAGE_OBSERVATION_EPOCH, stamp)
+    return stamp
 
 
 def demo_mode(session: Session) -> bool:
@@ -315,9 +360,22 @@ def encrypt_legacy_secrets(session: Session) -> int:
 
 
 def set_value(session: Session, key: str, value: Any, *, description: str | None = None) -> None:
-    """Store a non secret setting as JSON."""
+    """Store a non secret setting as JSON.
+
+    Turning auto-triage attribution on (directly, or by leaving demo mode while
+    it is on) also stamps a new observation epoch, whichever path made the
+    change: the route, a restore, a script.
+    """
     if key in SECRET_KEYS:
         raise ValueError(f"{key} is a secret; use set_secret()")
+    watched = key in (KEY_AUTO_TRIAGE_TO_INITIATOR, KEY_DEMO_MODE)
+    was_on = auto_triage_to_initiator(session) if watched else False
+    _write_value(session, key, value, description=description)
+    if watched and not was_on and auto_triage_to_initiator(session):
+        start_auto_triage_observation_epoch(session)
+
+
+def _write_value(session: Session, key: str, value: Any, *, description: str | None = None) -> None:
     row = get_raw(session, key)
     encoded = json.dumps(value)
     if row is None:

@@ -15,8 +15,10 @@ import { BlastSummary } from "./PreviewPage";
 import { EntityPicker } from "../components/EntityPicker";
 import { ExportMenu } from "../components/ExportMenu";
 import type { ExportColumn } from "../lib/export";
+import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import {
   Badge,
+  type BadgeTone,
   Button,
   Card,
   ConfirmDialog,
@@ -98,24 +100,38 @@ const EMPTY_FORM: LimitForm = {
   business_unit: "",
 };
 
-function statusBadge(limit: Limit) {
+function statusOf(limit: Limit): [BadgeTone, string] {
   const state = limit.current_period;
-  if (limit.exempt) return <Badge tone="neutral">Exempt</Badge>;
-  if (!limit.is_active) return <Badge tone="neutral">Disabled</Badge>;
-  if (state && !state.usage_available) return <Badge tone="neutral">Usage not reported</Badge>;
+  if (limit.exempt) return ["neutral", "Exempt"];
+  if (!limit.is_active) return ["neutral", "Disabled"];
+  if (state && !state.usage_available) return ["neutral", "Usage not reported"];
   switch (state?.status) {
     case "restricted":
-      return <Badge tone="critical">Restricted</Badge>;
+      return ["critical", "Restricted"];
     case "breached":
-      return <Badge tone="critical">Over limit</Badge>;
+      return ["critical", "Over limit"];
     case "warned":
-      return <Badge tone="warning">Near limit</Badge>;
+      return ["warning", "Near limit"];
     case "restored":
-      return <Badge tone="good">Restored</Badge>;
+      return ["good", "Restored"];
     default:
-      return <Badge tone="good">Within budget</Badge>;
+      return ["good", "Within budget"];
   }
 }
+
+function statusBadge(limit: Limit) {
+  const [tone, label] = statusOf(limit);
+  return <Badge tone={tone}>{label}</Badge>;
+}
+
+const LIMIT_VIEW: ViewColumn<Limit>[] = [
+  { key: "entity", value: (l) => l.entity_label ?? l.entity_id, filter: false },
+  { key: "level", value: (l) => entityLabel(l.entity_type) },
+  { key: "period", value: (l) => periodLabel(l.period_type) },
+  { key: "usage", value: (l) => l.current_period?.percent_used ?? null, filter: false },
+  { key: "status", value: (l) => statusOf(l)[1] },
+  { key: "mode", value: (l) => (l.enforce ? "Enforcing" : "Monitor only") },
+];
 
 function UsageBar({ limit }: { limit: Limit }) {
   const state = limit.current_period;
@@ -180,6 +196,29 @@ function UsageBar({ limit }: { limit: Limit }) {
           {formatCredits(state.baseline_credits)} before this period
         </p>
       )}
+      {state.auto_triage_attributed && Number(state.auto_triage_attributed.counted) > 0 && (
+        <p
+          className="mt-1 text-xs tabular"
+          style={{ color: "var(--text-muted)" }}
+          title={
+            "Auto triage that ran after scans this person started, charged to them (Settings → Attribution):\n" +
+            state.auto_triage_attributed.parts
+              .filter((part) => Number(part.counted) > 0)
+              .map(
+                (part) =>
+                  `${part.user_label ?? part.user_id} · ${part.project_label ?? part.project_id}: ${formatCredits(part.counted)} (${part.basis})`,
+              )
+              .join("\n") +
+            (state.auto_triage_attributed.evaluated_counted !== null &&
+            Number(state.auto_triage_attributed.evaluated_counted) !==
+              Number(state.auto_triage_attributed.counted)
+              ? `\n\nAs it would count now. The period figure above was evaluated with ${formatCredits(state.auto_triage_attributed.evaluated_counted)} and catches up at the next cycle.`
+              : "")
+          }
+        >
+          incl. {formatCredits(state.auto_triage_attributed.counted)} auto triage from their scans
+        </p>
+      )}
     </div>
   );
 }
@@ -220,6 +259,18 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
       );
     });
   }, [limits.data, tab, search]);
+
+  const view = useTableView(visible, LIMIT_VIEW);
+
+  // A bulk action applies to what is selected, so nothing hidden by a tab, the
+  // search or a column filter may stay selected.
+  useEffect(() => {
+    const shown = new Set(view.rows.map((limit) => limit.id));
+    setSelected((current) => {
+      const kept = [...current].filter((id) => shown.has(id));
+      return kept.length === current.size ? current : new Set(kept);
+    });
+  }, [view.rows]);
 
   const counts = useMemo(() => {
     const rows = limits.data ?? [];
@@ -309,12 +360,12 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
   return (
     <>
       <PageHeader
-        title="Limits"
-        description="Budgets for users, groups, projects and applications. A new limit is monitor only until you turn enforcement on."
+        title="Budgets"
+        description="Budgets for users, groups, projects and applications. A new budget only monitors until you set it to enforce."
         actions={
           <>
             <ExportMenu
-              rows={visible}
+              rows={view.rows}
               columns={LIMIT_EXPORT_COLUMNS}
               filenameBase="cxcreditguard-limits"
               title="CxCreditGuard limits"
@@ -340,7 +391,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
                   Add override
                 </Button>
                 <Button size="sm" variant="primary" onClick={() => setCreating(true)}>
-                  New limit
+                  New budget
                 </Button>
               </>
             )}
@@ -399,36 +450,43 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
           </div>
         ) : visible.length === 0 ? (
           <EmptyState
-            title="No limits here yet"
+            title="No budgets here yet"
             description={
               isAdmin
                 ? "Create one to start monitoring credit consumption. Monitoring has no side effects."
-                : "An Admin has not configured any limits at this level."
+                : "An admin has not set any budgets at this level."
             }
             action={
               isAdmin && (
                 <Button variant="primary" onClick={() => setCreating(true)}>
-                  New limit
+                  New budget
                 </Button>
               )
             }
           />
         ) : (
+          <>
+          <FilterNote
+            shown={view.rows.length}
+            total={view.total}
+            filtered={view.filtered}
+            onClear={view.clearFilters}
+          />
           <Table>
             <thead>
               <tr>
                 {isAdmin && <Th className="w-8" />}
-                <Th>Entity</Th>
-                <Th>Level</Th>
-                <Th>Period</Th>
-                <Th>Usage this period</Th>
-                <Th>Status</Th>
-                <Th>Mode</Th>
+                {view.th("entity", "Entity")}
+                {view.th("level", "Level")}
+                {view.th("period", "Period")}
+                {view.th("usage", "Usage this period")}
+                {view.th("status", "Status")}
+                {view.th("mode", "Mode")}
                 <Th align="right">Actions</Th>
               </tr>
             </thead>
             <tbody>
-              {visible.map((limit) => (
+              {view.rows.map((limit) => (
                 <tr
                   key={limit.id}
                   style={
@@ -533,6 +591,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
               ))}
             </tbody>
           </Table>
+          </>
         )}
       </Card>
 
@@ -630,7 +689,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
 
       <ConfirmDialog
         open={deleting !== null}
-        title="Delete this limit?"
+        title="Delete this budget?"
         destructive
         confirmLabel="Delete limit"
         busy={busy}
@@ -808,7 +867,7 @@ function LimitDialog({
   return (
     <Modal
       open
-      title={editing ? "Edit limit" : "New limit"}
+      title={editing ? "Edit budget" : "New budget"}
       description={
         editing
           ? `${limit?.entity_label ?? limit?.entity_id}`

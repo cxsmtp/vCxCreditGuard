@@ -26,6 +26,8 @@ from app.models.org import (
     CxUser,
 )
 from app.models.usage import (
+    AutoTriageCharge,
+    AutoTriageProjectState,
     CreditBalanceSnapshot,
     DimensionState,
     SchedulerLock,
@@ -41,6 +43,8 @@ install_length_guards(Base)
 __all__ = [
     "AppSetting",
     "AuditLogEntry",
+    "AutoTriageCharge",
+    "AutoTriageProjectState",
     "Base",
     "CreditBalanceSnapshot",
     "CreditLimit",

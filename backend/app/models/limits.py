@@ -156,6 +156,17 @@ class LimitPeriodState(Base):
     reported_total: Mapped[Decimal] = mapped_column(
         Numeric(18, 4), nullable=False, default=Decimal("0")
     )
+    # When the baseline above was taken. Auto-triage credits charged to a person
+    # from their scans are dated, and for a period that discounts what was
+    # already reported when it opened, only charges observed after this moment
+    # count - the same rule the baseline applies to the person's own credits.
+    # Null on periods opened before this column existed: the period start is
+    # used instead.
+    baseline_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # The auto-triage credits charged from scans that are included in
+    # credits_used. Null while that setting is off (credits_used is then
+    # reported_total - baseline_credits, exactly as before).
+    attributed_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     # False when the dimension needed for this entity is unsupported on the
     # tenant or the entity could not be resolved. Enforcement never acts on a
     # period whose usage is unknown.

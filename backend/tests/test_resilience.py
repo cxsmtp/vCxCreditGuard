@@ -1118,8 +1118,12 @@ class TestWatchdogIgnoresLockSkips:
         )
         db.flush()
 
-    def test_a_stuck_lock_is_not_reported_as_healthy(self, db: Session) -> None:
+    def test_a_stuck_lock_is_not_reported_as_healthy(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         now = utcnow()
+        # The process has been up throughout; this is not a restart after downtime.
+        monkeypatch.setattr(ops_hardening, "_PROCESS_STARTED_AT", now - timedelta(days=3))
         self._run(db, status=RunStatus.SUCCESS, when=now - timedelta(days=2))
         # The timer keeps firing, but every run bounces off a stuck lock.
         for minutes in (45, 30, 15, 0):

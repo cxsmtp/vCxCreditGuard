@@ -36,13 +36,16 @@ MAX_PAGES = 500
 PLATFORM_CLIENT_ID = "ast-app"
 
 # The roles stripped from a user when they exceed a credit limit: the AI Triage /
-# AI Remediation roles plus the scan-viewing role. Kept as a tuple in one place so
-# the enforcement service, the GUI copy and the docs cannot drift apart.
+# AI Remediation roles, and nothing else. Kept as a tuple in one place so the
+# enforcement service, the GUI copy and the docs cannot drift apart.
+#
+# The scan-viewing role ("view-scans") is deliberately not here. A credit
+# budget governs AI features; whether someone may look at scans is decided by
+# the permission they hold in Checkmarx One, and a restriction leaves it alone.
 AI_ROLE_NAMES: tuple[str, ...] = (
     "view-risk-management",
     "view-risk-management-dashboard",
     "view-risk-management-tab",
-    "view-scans",
 )
 
 

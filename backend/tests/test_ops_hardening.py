@@ -103,8 +103,10 @@ class TestWatchdog:
         assert watch.state == "ok"
         assert ops_hardening.scheduler_alive(db, now=now) is True
 
-    def test_long_silence_is_down(self, db: Session) -> None:
+    def test_long_silence_is_down(self, db: Session, monkeypatch) -> None:
         old = utcnow() - timedelta(days=2)
+        # A process that has been up the whole time: the silence is its own.
+        monkeypatch.setattr(ops_hardening, "_PROCESS_STARTED_AT", old - timedelta(days=1))
         db.add(
             SchedulerRun(
                 kind="cycle",
@@ -120,6 +122,25 @@ class TestWatchdog:
         assert (
             watch.seconds_since_last_run and watch.seconds_since_last_run > watch.tolerance_seconds
         )
+
+    def test_a_restart_after_downtime_is_not_a_dead_scheduler(self, db: Session) -> None:
+        """The host was off for two days and has just come back. The gap since
+        the last cycle is the downtime; the scheduler has not had its turn yet."""
+        old = utcnow() - timedelta(days=2)
+        db.add(
+            SchedulerRun(
+                kind="cycle",
+                trigger="schedule",
+                started_at=old,
+                finished_at=old,
+                status=RunStatus.SUCCESS,
+            )
+        )
+        db.flush()
+        assert ops_hardening.watchdog_status(db).state == "ok"
+        # ...but only for as long as one missed cycle would be tolerated anyway.
+        later = utcnow() + timedelta(days=1)
+        assert ops_hardening.watchdog_status(db, now=later).state == "down"
 
 
 class TestBackupRestore:

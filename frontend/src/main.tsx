@@ -9,7 +9,9 @@ import {
   applyAccent,
   applyTheme,
   readInitialAccent,
-  readInitialTheme,
+  readInitialLook,
+  readInitialMode,
+  readInitialPhosphor,
 } from "./lib/ui-context";
 
 // Applied before the first render, which is the earliest point available without
@@ -17,7 +19,7 @@ import {
 // server rendered markup to flash, so this is the right place for it. The accent
 // is pre-applied from its last-seen cache; /api/me re-applies the authoritative
 // organisation value once the session is known.
-applyTheme(readInitialTheme());
+applyTheme(readInitialMode(), readInitialLook(), readInitialPhosphor());
 applyAccent(readInitialAccent());
 
 const container = document.getElementById("root");

@@ -62,6 +62,53 @@ class LimitUpdateRequest(StrictModel):
     business_unit: str | None = Field(default=None, max_length=128)
 
 
+class AutoTriagePartResponse(BaseModel):
+    """One person's share of one project's auto-triage credits behind a figure."""
+
+    user_id: str
+    user_label: str | None = None
+    project_id: str
+    project_label: str | None = None
+    # "observed": traced to scans this person started, when the credits were
+    # spent. "estimated": credits from before observation began, split by how
+    # many scans each person ran on the auto-triage branches.
+    basis: str
+    # Attributed inside the consumption lookback window.
+    credits: Decimal
+    # Of which counts towards this period (see counts_existing_usage).
+    counted: Decimal
+
+
+class AutoTriageAttributionResponse(BaseModel):
+    """The auto-triage credits charged from scans that are part of a figure.
+
+    Present only while the setting "charge auto-triage credits to the person who
+    started the scan" is on, and only for user limits and group limits that
+    include member usage.
+    """
+
+    # Every figure below is as it would be counted now, from the same live
+    # rebuild, so counted + not_counted == window_total and the parts add up.
+    # The amount that counts towards this period.
+    counted: Decimal
+    # What the period's credits_used included at its last evaluation (null
+    # before the first). Differs from ``counted`` only between cycles, for
+    # example right after an initiator was mapped; the next cycle catches up.
+    evaluated_counted: Decimal | None = None
+    # Everything attributed to the person (or the group's members) inside the
+    # consumption window, counted or not.
+    window_total: Decimal
+    # window_total - counted: attributed, but from before this period's
+    # baseline, so it does not count against it.
+    not_counted: Decimal
+    # True for lifetime, custom and count_existing_usage limits, which count
+    # usage already reported. Otherwise only charges observed after
+    # counted_since count.
+    counts_existing_usage: bool
+    counted_since: datetime | None = None
+    parts: list[AutoTriagePartResponse] = Field(default_factory=list)
+
+
 class LimitPeriodStateResponse(BaseModel):
     period_key: str
     period_start: datetime
@@ -76,6 +123,8 @@ class LimitPeriodStateResponse(BaseModel):
     warned_at: datetime | None = None
     breached_at: datetime | None = None
     restricted_at: datetime | None = None
+    # Null unless auto-triage credits are being charged to scan initiators.
+    auto_triage_attributed: AutoTriageAttributionResponse | None = None
 
 
 class LimitResponse(BaseModel):

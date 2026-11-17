@@ -48,6 +48,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "max_new_enforcements_per_cycle": settings_store.KEY_MAX_NEW_ENFORCEMENTS,
     "max_new_targets_per_cycle": settings_store.KEY_MAX_NEW_TARGETS,
     "protected_roles": settings_store.KEY_PROTECTED_ROLES,
+    "charge_auto_triage_to_scan_initiator": settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR,
 }
 
 _SECRET_FIELDS: dict[str, str] = {
@@ -116,6 +117,9 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         max_new_enforcements_per_cycle=guard.max_new_per_cycle,
         max_new_targets_per_cycle=guard.max_new_targets_per_cycle,
         protected_roles=", ".join(sorted(guard.protected_roles)),
+        charge_auto_triage_to_scan_initiator=bool(
+            values.get(settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR) is True
+        ),
         current_schedule_description=scheduler.describe_schedule(),
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 
 from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import select
@@ -13,12 +14,15 @@ from app.checkmarx.client import CheckmarxClient
 from app.db.base import utcnow
 from app.models.enums import EnforcementStatus, EntityType, LimitStatus
 from app.models.limits import CreditLimit, EnforcementAction, Exemption, LimitPeriodState
+from app.models.org import CxProject, CxUser
 from app.schemas.dashboard import (
     BulkLimitResultResponse,
     BulkLimitUpdateRequest,
     CsvImportResultResponse,
 )
 from app.schemas.limits import (
+    AutoTriageAttributionResponse,
+    AutoTriagePartResponse,
     ExemptionCreateRequest,
     ExemptionResponse,
     LimitCreateRequest,
@@ -27,8 +31,8 @@ from app.schemas.limits import (
     LimitUpdateRequest,
 )
 from app.services import connection as connection_service
-from app.services import limits_csv, limits_service
-from app.services.periods import PeriodError, current_window
+from app.services import evaluation, limits_csv, limits_service, settings_store
+from app.services.periods import PeriodError, PeriodWindow, current_window
 
 logger = logging.getLogger(__name__)
 # A limits CSV is a few hundred rows at most. This is a guard, not a target.
@@ -42,7 +46,64 @@ def _optional_client(db: Session) -> CheckmarxClient | None:
     return connection_service.optional_client(db)
 
 
-def _to_response(db: Session, limit: CreditLimit) -> LimitResponse:
+def _attribution_index(db: Session) -> evaluation.UsageIndex | None:
+    """A usage index for explaining auto-triage charges, only when they are on."""
+    if not settings_store.auto_triage_to_initiator(db):
+        return None
+    return evaluation.UsageIndex(db)
+
+
+def _auto_triage_response(
+    db: Session,
+    *,
+    index: evaluation.UsageIndex,
+    limit: CreditLimit,
+    window: PeriodWindow,
+    state: LimitPeriodState,
+) -> AutoTriageAttributionResponse | None:
+    attributed = index.attributed_usage(limit, window=window, state=state, moment=utcnow())
+    if attributed is None:
+        return None
+    labels: dict[tuple[str, str], str | None] = {}
+
+    def label(model, entity_id: str) -> str | None:  # type: ignore[no-untyped-def]
+        key = (model.__tablename__, entity_id)
+        if key not in labels:
+            row = db.get(model, entity_id)
+            labels[key] = (
+                (row.display_name if isinstance(row, CxUser) else row.name) if row else None
+            )
+        return labels[key]
+
+    # Every figure here is from one live rebuild, so counted, not_counted and
+    # the parts always agree with each other. ``evaluated_counted`` is what the
+    # period's credits_used included at its last evaluation; the two differ
+    # only between cycles (an initiator mapped since, a reading since).
+    return AutoTriageAttributionResponse(
+        counted=attributed.counted,
+        evaluated_counted=state.attributed_credits,
+        window_total=attributed.window_total,
+        not_counted=max(Decimal("0"), attributed.not_counted),
+        counts_existing_usage=attributed.counts_existing,
+        counted_since=attributed.since,
+        parts=[
+            AutoTriagePartResponse(
+                user_id=part.user_id,
+                user_label=label(CxUser, part.user_id),
+                project_id=part.project_id,
+                project_label=label(CxProject, part.project_id),
+                basis=part.basis,
+                credits=part.credits,
+                counted=part.counted,
+            )
+            for part in attributed.parts
+        ],
+    )
+
+
+def _to_response(
+    db: Session, limit: CreditLimit, *, index: evaluation.UsageIndex | None = None
+) -> LimitResponse:
     exempt = (
         db.scalar(
             select(Exemption.id).where(
@@ -96,6 +157,12 @@ def _to_response(db: Session, limit: CreditLimit) -> LimitResponse:
                 breached_at=state.breached_at,
                 restricted_at=state.restricted_at,
             )
+            if index is None and limit.entity_type in {EntityType.USER, EntityType.GROUP}:
+                index = _attribution_index(db)
+            if index is not None:
+                period_response.auto_triage_attributed = _auto_triage_response(
+                    db, index=index, limit=limit, window=window, state=state
+                )
 
     return LimitResponse(
         id=limit.id,
@@ -133,7 +200,9 @@ def list_limits(
     if entity_type is not None:
         query = query.where(CreditLimit.entity_type == entity_type)
     limits = list(db.scalars(query.order_by(CreditLimit.entity_type, CreditLimit.entity_label)))
-    responses = [_to_response(db, limit) for limit in limits]
+    # Built once for the whole list, and only when auto-triage charging is on.
+    index = _attribution_index(db)
+    responses = [_to_response(db, limit, index=index) for limit in limits]
     if only_breached:
         responses = [
             response
@@ -338,6 +407,15 @@ async def import_limits(
         errors=result.errors,
         dry_run=result.dry_run,
     )
+
+
+@router.get("/{limit_id}", response_model=LimitResponse)
+def get_limit(limit_id: int, ctx: CurrentUser, db: DbSession) -> LimitResponse:
+    """One limit with its current period, including what makes up the figure."""
+    limit = db.get(CreditLimit, limit_id)
+    if limit is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such limit.")
+    return _to_response(db, limit)
 
 
 @exemptions_router.get("", response_model=list[ExemptionResponse])

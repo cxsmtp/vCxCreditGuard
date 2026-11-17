@@ -16,6 +16,7 @@ import {
   Td,
   Th,
 } from "../components/ui";
+import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import { useInterval, useResource } from "../hooks/useResource";
 import { enforcementLabel, formatDateTime, formatRelative, humanise } from "../lib/format";
 import { useToast } from "../lib/ui-context";
@@ -35,6 +36,13 @@ const CATEGORIES = [
   { value: "attribution", label: "Attribution" },
   { value: "sync_error", label: "Sync errors" },
   { value: "auth_failure", label: "Authentication" },
+];
+
+const RESTRICTION_VIEW: ViewColumn<EnforcementActionItem>[] = [
+  { key: "kind", value: (a) => enforcementLabel(a.kind) },
+  { key: "target", value: (a) => a.target_label ?? a.target_id, filter: false },
+  { key: "cause", value: (a) => `${humanise(a.entity_type)} ${a.entity_label ?? a.entity_id}` },
+  { key: "applied", value: (a) => a.applied_at, filter: false },
 ];
 
 export function NotificationsPage({
@@ -65,6 +73,7 @@ export function NotificationsPage({
     (signal) => api.get("/api/notifications/enforcements", { only_active: true }, signal),
     [],
   );
+  const view = useTableView(enforcements.data ?? [], RESTRICTION_VIEW);
 
   useInterval(() => {
     void feed.reload();
@@ -135,18 +144,18 @@ export function NotificationsPage({
             description="Currently in force in Checkmarx One. Restoring replays the exact state recorded before the change."
             padded={false}
           >
-            <Table>
+            <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
               <thead>
                 <tr>
-                  <Th>What changed</Th>
-                  <Th>Target</Th>
-                  <Th>Because of</Th>
-                  <Th>Applied</Th>
+                  {view.th("kind", "What changed")}
+                  {view.th("target", "Target")}
+                  {view.th("cause", "Because of")}
+                  {view.th("applied", "Applied")}
                   <Th align="right">Action</Th>
                 </tr>
               </thead>
               <tbody>
-                {(enforcements.data ?? []).map((action) => (
+                {view.rows.map((action) => (
                   <tr key={action.id}>
                     <Td>{enforcementLabel(action.kind)}</Td>
                     <Td>

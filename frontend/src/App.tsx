@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, onUnauthorized } from "./api/client";
 import type { Me, NotificationList } from "./api/types";
 import { AppShell } from "./components/AppShell";
 import { Spinner } from "./components/ui";
 import { applyAccent } from "./lib/ui-context";
+import { settingsDraft } from "./lib/settingsDraft";
 import { useInterval } from "./hooks/useResource";
 import { AccountPage, PasswordChangeRequired } from "./pages/AccountPage";
 import { AuditPage } from "./pages/AuditPage";
@@ -15,10 +16,57 @@ import { NotificationsPage } from "./pages/NotificationsPage";
 import { PreviewPage } from "./pages/PreviewPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { RequestsPage } from "./pages/RequestsPage";
-import { SettingsPage } from "./pages/SettingsPage";
+import { SettingsPage, type SettingsSection } from "./pages/SettingsPage";
+import { AboutPage } from "./pages/AboutPage";
 import { SetupPage } from "./pages/SetupPage";
 
 type AuthState = "checking" | "signedOut" | "signedIn";
+
+const SECTIONS: SettingsSection[] = [
+  "general",
+  "enforcement",
+  "requests",
+  "notifications",
+  "attribution",
+  "accounts",
+  "appearance",
+  "operations",
+];
+
+/** /settings itself, and the old single-page anchors, open the right page. */
+function SettingsIndex() {
+  const location = useLocation();
+  const target =
+    location.hash === "#attribution"
+      ? "/settings/attribution#unmatched"
+      : location.hash === "#enforcement-safety"
+        ? "/settings/enforcement"
+        : "/settings/general";
+  return <Navigate to={target} replace />;
+}
+
+function SettingsRoute({
+  isAdmin,
+  onSettingsSaved,
+}: {
+  isAdmin: boolean;
+  onSettingsSaved: () => Promise<unknown>;
+}) {
+  const { section } = useParams();
+  if (!SECTIONS.includes(section as SettingsSection)) return <Navigate to="/settings/general" replace />;
+  // Accounts, and backups and health, are an admin's only.
+  if (!isAdmin && (section === "accounts" || section === "operations")) {
+    return <Navigate to="/settings/general" replace />;
+  }
+  return (
+    <SettingsPage
+      key={section}
+      section={section as SettingsSection}
+      isAdmin={isAdmin}
+      onSettingsSaved={onSettingsSaved}
+    />
+  );
+}
 
 export function App() {
   const [authState, setAuthState] = useState<AuthState>("checking");
@@ -83,6 +131,7 @@ export function App() {
     }
     setAuthState("signedOut");
     setMe(null);
+    settingsDraft.clear();
     // Drop the cached org accent so a shared browser does not pre-apply one
     // organisation's accent for the next person who signs in.
     applyAccent("default");
@@ -150,9 +199,11 @@ export function App() {
           element={<NotificationsPage isAdmin={isAdmin} onUnreadChange={setUnread} />}
         />
         <Route path="/audit" element={<AuditPage isAdmin={isAdmin} />} />
+        <Route path="/settings" element={<SettingsIndex />} />
+        <Route path="/settings/about" element={<AboutPage me={me} />} />
         <Route
-          path="/settings"
-          element={<SettingsPage isAdmin={isAdmin} onSettingsSaved={loadMe} />}
+          path="/settings/:section"
+          element={<SettingsRoute isAdmin={isAdmin} onSettingsSaved={loadMe} />}
         />
         <Route
           path="/account"

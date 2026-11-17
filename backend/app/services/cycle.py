@@ -38,8 +38,8 @@ from app.db.base import utcnow
 from app.db.session import session_scope
 from app.models.enums import RunStatus, Severity
 from app.models.usage import CreditBalanceSnapshot, SchedulerLock, SchedulerRun
-from app.services import connection as connection_service
 from app.services import (
+    auto_triage_attribution,
     delivery,
     evaluation,
     ingestion,
@@ -49,6 +49,7 @@ from app.services import (
     retention,
     settings_store,
 )
+from app.services import connection as connection_service
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -400,6 +401,17 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
     _run_step(session, result, "ingest", ingest)
     usage_ok = usage_fresh["value"]
 
+    # Step 2a: charge auto-triage credits to whoever started the scan, when an
+    # admin has turned that on. With it off, nothing here runs and the run's
+    # record is unchanged. A tenant failure while listing scans is a warning
+    # inside the step (those credits stay estimated); it never stops the cycle.
+    def attribute_auto_triage() -> None:
+        outcome = auto_triage_attribution.collect(session, client)
+        result.steps["auto_triage_attribution"] = outcome.as_stats()
+
+    if settings_store.auto_triage_to_initiator(session):
+        _run_step(session, result, "auto_triage_attribution", attribute_auto_triage)
+
     # Step 2b: tenant credit pool. Best-effort and never fatal - an unreachable
     # pool is unknown, so we keep the last good snapshot and record no zero. A new
     # row is written only when the balance actually changed, so a steady-state
@@ -612,7 +624,13 @@ def _notify_unresolved(session: Session) -> None:
     from app.models.usage import UnresolvedSubject
 
     rows = list(
-        session.scalars(select(UnresolvedSubject).where(UnresolvedSubject.mapped_user_id.is_(None)))
+        session.scalars(
+            select(UnresolvedSubject).where(
+                UnresolvedSubject.mapped_user_id.is_(None),
+                # Scan initiators are raised by the auto-triage step, in its own words.
+                UnresolvedSubject.view_by != auto_triage_attribution.SOURCE_SCAN_INITIATOR,
+            )
+        )
     )
     for row in rows:
         notifications.notify(

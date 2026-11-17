@@ -117,6 +117,8 @@ export interface TopConsumer {
   credits_used_in_period: string | null;
   status: LimitStatus | null;
   resolved: boolean;
+  /** Auto-triage credits charged to this person from scans they started (setting on). */
+  auto_triage_attributed?: string | null;
 }
 
 export interface StatusTiles {
@@ -131,6 +133,8 @@ export interface StatusTiles {
   last_success_at: string | null;
   last_run_status: string | null;
   schedule: string;
+  /** Scan initiators whose auto-triage share is waiting to be mapped to a person. */
+  unresolved_scan_initiators?: number;
 }
 
 export interface Dashboard {
@@ -173,6 +177,80 @@ export interface LimitPeriodState {
   warned_at: string | null;
   breached_at: string | null;
   restricted_at: string | null;
+  /** The auto-triage part of credits_used, when it is charged to the scan's initiator. */
+  auto_triage_attributed?: AutoTriageAttributed | null;
+}
+
+export type AttributionBasis = "observed" | "estimated" | "unattributed";
+
+export interface AutoTriagePart {
+  user_id: string;
+  user_label: string | null;
+  project_id: string;
+  project_label: string | null;
+  basis: AttributionBasis;
+  credits: string;
+  counted: string;
+}
+
+export interface AutoTriageAttributed {
+  /** As it would be counted now; parts, window_total and not_counted agree with it. */
+  counted: string;
+  /** What credits_used included at the last evaluation (catches up next cycle). */
+  evaluated_counted: string | null;
+  window_total: string;
+  not_counted: string;
+  counts_existing_usage: boolean;
+  counted_since: string | null;
+  parts: AutoTriagePart[];
+}
+
+export interface AutoTriageOverview {
+  enabled: boolean;
+  available: boolean;
+  reference_at: string | null;
+  window_start: string | null;
+  projects: {
+    project_id: string;
+    project_label: string | null;
+    auto_triage_credits: string;
+    observed: string;
+    estimated: string;
+    unattributed: string;
+    unresolved: string;
+    charged_to_people: string;
+    scale: number;
+    history_status: string | null;
+    observing_since: string | null;
+  }[];
+  users: {
+    user_id: string;
+    user_label: string | null;
+    total: string;
+    observed: string;
+    estimated: string;
+    parts: { project_id: string; project_label: string | null; basis: AttributionBasis; credits: string }[];
+  }[];
+  initiators: {
+    initiator: string;
+    credits: string;
+    status: string;
+    counts_towards_user_id: string | null;
+    counts_towards_label: string | null;
+    subject_id: number | null;
+  }[];
+  recent_charges: {
+    id: number;
+    project_id: string;
+    basis: AttributionBasis;
+    initiator: string | null;
+    scan_ids: string[];
+    scan_count: number;
+    credits: string;
+    window_start: string;
+    window_end: string;
+    detail: string | null;
+  }[];
 }
 
 export interface Limit {
@@ -330,6 +408,7 @@ export interface AppSettings {
   ui_accent: string;
   allowed_accents: string[];
   self_service_requests: boolean;
+  charge_auto_triage_to_scan_initiator: boolean;
   report_email_enabled: boolean;
   credit_unit_cost: number;
   demo_mode: boolean;
@@ -395,6 +474,8 @@ export interface UnresolvedSubject {
   suggestions: SubjectSuggestion[];
   counts_towards_user_id: string | null;
   counts_towards_label: string | null;
+  /** Where the handle came from: a consumption row, or a scan's initiator. */
+  source?: "consumption" | "scan_initiator";
 }
 
 export interface UtilityAccount {
@@ -541,6 +622,8 @@ export interface DryRunRow {
   would_enforce: boolean;
   blast: BlastRadius | null;
   note: string | null;
+  /** The auto-triage part of credits_used, when charged to scan initiators. */
+  auto_triage_attributed?: string | null;
 }
 
 export interface DryRunResult {
