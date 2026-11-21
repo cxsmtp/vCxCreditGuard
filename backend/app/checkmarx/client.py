@@ -19,8 +19,10 @@ from __future__ import annotations
 import email.utils
 import logging
 import random
+import threading
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import quote
@@ -54,25 +56,62 @@ DEFAULT_PAGE_SIZE = 100
 # Guard against a server that never stops returning pages.
 MAX_PAGES = 1000
 
-# Called with (method, url) whenever Checkmarx answers 403, before the error is
-# raised. The API key permission checker registers here so a permission that is
-# only exercised at run time (a write it cannot probe) is still noticed, whoever
-# made the call and whether or not the caller swallows the error. A listener must
-# be cheap and must never raise; it touches no database.
-_forbidden_listeners: list[Callable[[str, str], None]] = []
+# Called with (method, url, key fingerprint) whenever Checkmarx answers 403,
+# before the error is raised. The API key permission checker registers here so a
+# permission that is only exercised at run time (a write it cannot probe) is
+# still noticed, whoever made the call and whether or not the caller swallows
+# the error. The fingerprint names the API key the call was made with (None for
+# a client built without one), so a refusal of a replaced key is not pinned on
+# its successor. A listener must be cheap and must never raise; it touches no
+# database.
+_forbidden_listeners: list[Callable[[str, str, str | None], None]] = []
+# Called the same way for every successful call that is not a GET, so a refused
+# change that later goes through can be cleared. Same rules: cheap, no raising,
+# no database.
+_success_listeners: list[Callable[[str, str, str | None], None]] = []
 
 
-def add_forbidden_listener(listener: Callable[[str, str], None]) -> None:
+_quiet = threading.local()
+
+
+@contextmanager
+def listeners_paused() -> Iterator[None]:
+    """Calls made inside (on this thread) are not reported to the listeners.
+
+    For calls that are themselves a test of the key (the permission probes, the
+    connection test): what they meet is their result, not a run-time event.
+    """
+    previous = getattr(_quiet, "paused", False)
+    _quiet.paused = True
+    try:
+        yield
+    finally:
+        _quiet.paused = previous
+
+
+def add_forbidden_listener(listener: Callable[[str, str, str | None], None]) -> None:
     if listener not in _forbidden_listeners:
         _forbidden_listeners.append(listener)
 
 
-def _notify_forbidden(method: str, url: str) -> None:
-    for listener in list(_forbidden_listeners):
+def add_success_listener(listener: Callable[[str, str, str | None], None]) -> None:
+    if listener not in _success_listeners:
+        _success_listeners.append(listener)
+
+
+def _notify(
+    listeners: list[Callable[[str, str, str | None], None]],
+    method: str,
+    url: str,
+    fingerprint: str | None,
+) -> None:
+    if getattr(_quiet, "paused", False):
+        return
+    for listener in list(listeners):
         try:
-            listener(method, url)
+            listener(method, url, fingerprint)
         except Exception:  # noqa: BLE001 - a listener must never change the call's outcome
-            logger.debug("A 403 listener failed", exc_info=True)
+            logger.debug("A call listener failed", exc_info=True)
 
 
 class CheckmarxClient:
@@ -86,8 +125,11 @@ class CheckmarxClient:
         client: httpx.Client | None = None,
         settings: Settings | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        key_fingerprint: str | None = None,
     ) -> None:
         self._settings = settings or get_settings()
+        # Which API key this client calls with; only passed to the listeners.
+        self.key_fingerprint = key_fingerprint
         self.api_base_url = api_base_url.rstrip("/")
         self.iam_base_url = iam_base_url.rstrip("/")
         self.tenant_name = tenant_name
@@ -230,6 +272,8 @@ class CheckmarxClient:
             )
 
             if response.is_success:
+                if _success_listeners and method.upper() != "GET":
+                    _notify(_success_listeners, method.upper(), url, self.key_fingerprint)
                 return response
 
             status = response.status_code
@@ -242,7 +286,7 @@ class CheckmarxClient:
                 continue
 
             if status == httpx.codes.FORBIDDEN:
-                _notify_forbidden(method.upper(), url)
+                _notify(_forbidden_listeners, method.upper(), url, self.key_fingerprint)
                 raise CheckmarxPermissionError(
                     f"Checkmarx denied {method.upper()} {url} with 403. The API key's "
                     "service account is missing a required permission.",

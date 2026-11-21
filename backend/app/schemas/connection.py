@@ -142,6 +142,10 @@ class KeyPermissionSummary(BaseModel):
 
     # ok | limited | insufficient | unknown
     verdict: str
+    # True only when something needed with the current setup is confirmed
+    # missing: the banner, the admin pop-up and the top bar light show then.
+    # Other gaps are shown on the Connection page only.
+    attention: bool = False
     summary: str
     # "CreditGuard can't ..." phrases, most serious first.
     missing: list[str] = Field(default_factory=list)

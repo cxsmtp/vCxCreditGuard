@@ -25,7 +25,10 @@ from sqlalchemy.orm import Session
 
 from app.checkmarx import iam, platform
 from app.checkmarx.client import CheckmarxClient
+from app.checkmarx.errors import CheckmarxPermissionError
 from app.db.base import utcnow
+from app.models.enums import EntityType
+from app.models.limits import CreditLimit
 from app.models.org import (
     CxApplication,
     CxApplicationProject,
@@ -82,13 +85,28 @@ def sync_org_model(
     # one is fetched, so nothing is left open in the database while we wait on
     # Checkmarx. A failure part way through leaves the earlier types refreshed.
     session.commit()
-    group_index = _sync_groups(session, client, result, now)
+    # Groups and applications are only needed by group and application limits.
+    # A key that may not read them (403) still syncs everything else; the
+    # refusal is on the API key permission report, and a warning is raised only
+    # when a limit of that kind exists.
+    try:
+        group_index = _sync_groups(session, client, result, now)
+        groups_refused = False
+    except CheckmarxPermissionError:
+        session.rollback()
+        group_index = _stored_group_index(session)
+        groups_refused = True
+        _refused(session, result, EntityType.GROUP, "groups")
     session.commit()
-    _sync_users(session, client, result, now, group_index)
+    _sync_users(session, client, result, now, group_index, warn_unresolved=not groups_refused)
     session.commit()
     project_ids = _sync_projects(session, client, result, now)
     session.commit()
-    _sync_applications(session, client, result, now, project_ids)
+    try:
+        _sync_applications(session, client, result, now, project_ids)
+    except CheckmarxPermissionError:
+        session.rollback()
+        _refused(session, result, EntityType.APPLICATION, "applications")
 
     record_audit(
         session,
@@ -100,6 +118,26 @@ def sync_org_model(
     )
     session.flush()
     return result
+
+
+def _refused(session: Session, result: OrgSyncResult, entity_type: EntityType, what: str) -> None:
+    in_use = (
+        session.scalar(
+            select(CreditLimit.id)
+            .where(CreditLimit.entity_type == entity_type, CreditLimit.is_active.is_(True))
+            .limit(1)
+        )
+        is not None
+    )
+    message = (
+        f"The API key may not read {what} (403), so {what} were not refreshed. "
+        f"{entity_type.capitalize()} limits are judged on what was synced before. The "
+        "Connection page's Key permissions card says what the key is missing."
+    )
+    if in_use:
+        result.warnings.append(message)
+    else:
+        logger.info("%s Nothing uses them while no %s limit exists.", message, entity_type)
 
 
 # ---------------------------------------------------------------------- groups
@@ -124,6 +162,24 @@ class GroupIndex:
         if group_id is not None:
             return group_id
         return self.by_path.get(f"/{candidate}".lower())
+
+
+def _stored_group_index(session: Session) -> GroupIndex:
+    """The lookups from the groups synced earlier, for when they cannot be read."""
+    by_name: dict[str, str] = {}
+    by_path: dict[str, str] = {}
+    duplicates: set[str] = set()
+    for row in session.scalars(select(CxGroup).where(CxGroup.is_deleted.is_(False))):
+        key = (row.name or "").strip().lower()
+        if key:
+            if key in by_name and by_name[key] != row.id:
+                duplicates.add(key)
+            by_name[key] = row.id
+        if row.path:
+            by_path[row.path.strip().lower()] = row.id
+    for name in duplicates:
+        by_name.pop(name, None)
+    return GroupIndex(by_name=by_name, by_path=by_path, ambiguous_names=frozenset(duplicates))
 
 
 def _sync_groups(
@@ -181,6 +237,8 @@ def _sync_users(
     result: OrgSyncResult,
     now,
     group_index: GroupIndex,
+    *,
+    warn_unresolved: bool = True,
 ) -> None:
     users, reported_total, warning = iam.fetch_users(client)
     if warning:
@@ -236,7 +294,7 @@ def _sync_users(
         )
         result.memberships += 1
 
-    if unresolved_group_names:
+    if unresolved_group_names and warn_unresolved:
         result.warnings.append(
             f"{len(unresolved_group_names)} group name(s) on users did not match any known "
             f"group ({', '.join(sorted(unresolved_group_names)[:5])}). Those memberships "

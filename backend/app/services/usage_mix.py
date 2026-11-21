@@ -8,10 +8,15 @@ next to the numbers is the difference between a useful alert and a puzzling one.
 The consumption feed reports **credits per entity** and **transactions per
 action type**, not credits per action type. So:
 
-* when the period's activity is a single action type, all of the period's
-  credits are attributed to it ("4 credits used in 2026-11: Fusion scan 4");
+* when exactly one action type's count rose in the period and none fell, all
+  of the period's credits are attributed to it ("4 credits used in 2026-11:
+  Fusion scan 4");
 * otherwise the credits are given as a total and the actions behind them as
-  transaction counts, and the message says why.
+  transaction counts, and the message says why. A count that fell means older
+  transactions left the feed's sliding lookback window, while the credit figure
+  was re-based on the window as well: the two do not line up, so neither the
+  credits per action nor the period's counts can be told, and the window's
+  counts are given instead.
 
 Period figures come from the same arithmetic as evaluation: the latest reading
 minus the reading the period's baseline was taken from (or everything, for a
@@ -34,6 +39,7 @@ from app.models.limits import CreditLimit, LimitPeriodState
 from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
 from app.models.usage import UsageRecord, UsageSnapshot
 from app.services import ingestion, settings_store
+from app.services.periods import PeriodWindow, describe_window
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +73,8 @@ class UsageMix:
     transactions: dict[str, int] = field(default_factory=dict)
     # Credits per action type, when the feed allows saying so; None otherwise.
     credits_by_action: dict[str, Decimal] | None = None
-    # True when the counts are the whole lookback window, because no reading
-    # from when the period's baseline was taken survives.
+    # True when the counts are the whole lookback window: no reading from when
+    # the period's baseline was taken survives, or the window slid (a count fell).
     from_window: bool = False
 
     def fusion_share(self) -> float:
@@ -78,6 +84,18 @@ class UsageMix:
             return float(fusion / total) if total > 0 else 0.0
         total_tx = sum(self.transactions.values())
         return self.transactions.get(FUSION, 0) / total_tx if total_tx else 0.0
+
+    def fusion_is_most(self) -> bool:
+        """Fusion is most of the spending, as far as the figures can say.
+
+        Credits per action say it outright. Transaction counts only for the
+        period itself; the whole window's counts are no basis for that.
+        """
+        if not self.has_fusion():
+            return False
+        if self.credits_by_action:
+            return self.fusion_share() >= LARGE_SHARE
+        return not self.from_window and self.fusion_share() >= LARGE_SHARE
 
     def has_fusion(self) -> bool:
         if self.credits_by_action is not None:
@@ -213,20 +231,23 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
             baseline[action] = baseline.get(action, 0) + count
     if from_window:
         baseline = {}
-    transactions = {
-        action: count - baseline.get(action, 0)
-        for action, count in latest.items()
-        if count - baseline.get(action, 0) > 0
+    deltas = {
+        action: latest.get(action, 0) - baseline.get(action, 0)
+        for action in set(latest) | set(baseline)
     }
+    if any(delta < 0 for delta in deltas.values()):
+        # The window slid: what left it and what is new cannot be told apart.
+        from_window = True
+        deltas = dict(latest)
+    transactions = {action: count for action, count in deltas.items() if count > 0}
 
     attributed = state.attributed_credits or Decimal("0")
     own = max(Decimal("0"), state.credits_used - attributed)
     credits_by_action: dict[str, Decimal] | None = None
-    active = [action for action, count in transactions.items() if count > 0]
     if own == 0:
         credits_by_action = {}
-    elif len(active) == 1 and not from_window:
-        credits_by_action = {active[0]: own}
+    elif len(transactions) == 1 and not from_window:
+        credits_by_action = {next(iter(transactions)): own}
     if credits_by_action is not None and attributed > 0:
         auto = ActionType.AUTO_TRIAGE.value
         credits_by_action[auto] = credits_by_action.get(auto, Decimal("0")) + attributed
@@ -251,11 +272,15 @@ def for_period(session: Session, limit: CreditLimit, period_key: str) -> UsageMi
 # ------------------------------------------------------------------ wording
 
 
-def _number(value: Decimal | int) -> str:
+def format_credits(value: Decimal | int | float) -> str:
+    """4, 2.5, 0.25: no trailing zeros, no exponent."""
     if isinstance(value, int):
         return str(value)
-    text = f"{value.normalize():f}"
+    text = f"{Decimal(str(value)).normalize():f}"
     return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+_number = format_credits
 
 
 def _ordered(mapping: dict[str, object]) -> list[str]:
@@ -263,17 +288,40 @@ def _ordered(mapping: dict[str, object]) -> list[str]:
 
 
 def period_phrase(period_key: str) -> str:
-    """ "in 2026-11" for a month or quarter, "in this budget period" otherwise."""
+    """ "in 2026-11" for a month or quarter, "in this budget period" otherwise.
+
+    A lifetime limit counts everything the consumption feed reports, which is
+    bounded by its lookback window (see evaluation.baseline_for), not
+    everything since the limit was created.
+    """
     if len(period_key) <= 8 and period_key[:4].isdigit():
         return f"in {period_key}"
     if period_key == "lifetime":
-        return "since the limit was created"
+        return "in the reporting window"
     return "in this budget period"
 
 
-def describe(mix: UsageMix, *, period_key: str, entity_type: str) -> str:
-    """One or two sentences: the credits, and what they were spent on."""
-    used = f"{_number(mix.credits_used)} credits used {period_phrase(period_key)}"
+def window_phrase(window: PeriodWindow) -> str:
+    """ "in November 2026", "in Q4 2026", "in the reporting window", or the dates."""
+    if window.period_type == PeriodType.LIFETIME:
+        return period_phrase("lifetime")
+    if window.period_type in (PeriodType.MONTHLY, PeriodType.QUARTERLY):
+        return f"in {describe_window(window)}"
+    return describe_window(window)
+
+
+def describe(
+    mix: UsageMix,
+    *,
+    period_key: str,
+    entity_type: str,
+    credit_limit: Decimal | int | None = None,
+    when: str | None = None,
+) -> str:
+    """One or two sentences: the credits (of the limit, when given), and what
+    they were spent on. ``when`` overrides the period wording."""
+    of = f" of {_number(credit_limit)}" if credit_limit is not None else ""
+    used = f"{_number(mix.credits_used)}{of} credits used {when or period_phrase(period_key)}"
     charged = " (charged from scans they started)"
     if mix.credits_by_action:
         parts = []
@@ -287,16 +335,22 @@ def describe(mix: UsageMix, *, period_key: str, entity_type: str) -> str:
             parts.append(f"{label} {_number(amount)}")
         return f"{used}: {', '.join(parts)}." if parts else f"{used}."
     if mix.transactions:
-        window = " in the lookback window" if mix.from_window else ""
         actions = ", ".join(
             f"{ACTION_LABELS[action]} {count} transaction{'s' if count != 1 else ''}"
             for action in _ordered(mix.transactions)
             for count in [mix.transactions[action]]
         )
-        text = (
-            f"{used}. Checkmarx reports credits per {entity_type}, not per action, so these "
-            f"are the actions behind them{window}: {actions}."
-        )
+        if mix.from_window:
+            text = (
+                f"{used}. Checkmarx reports credits per {entity_type}, not per action, and the "
+                "period's transactions cannot be told apart from older ones, so these are the "
+                f"actions in its whole lookback window: {actions}."
+            )
+        else:
+            text = (
+                f"{used}. Checkmarx reports credits per {entity_type}, not per action, so "
+                f"these are the actions behind them: {actions}."
+            )
         if mix.attributed > 0:
             text += (
                 f" Auto Triage charged from scans they started: {_number(mix.attributed)} credits."
@@ -313,7 +367,7 @@ def does_not_stop(kind: str, mix: UsageMix | None) -> str:
     turns off Auto Triage and PR triage and remediation and nothing else.
     """
     fusion_first = ""
-    if mix is not None and mix.has_fusion() and mix.fusion_share() >= LARGE_SHARE:
+    if mix is not None and mix.fusion_is_most():
         fusion_first = (
             "Most of these credits were Fusion scans. "
             if mix.credits_by_action
@@ -328,8 +382,8 @@ def does_not_stop(kind: str, mix: UsageMix | None) -> str:
     return (
         f"{fusion_first}Turning off Auto Triage and PR triage and remediation does not stop "
         "Fusion scans; CreditGuard cannot switch Fusion off yet. It leaves people's AI roles "
-        "alone, so AI Triage and AI Remediation they start themselves count only towards "
-        "user limits."
+        "alone, so AI Triage and AI Remediation they start themselves keep working (and keep "
+        "counting here); only a user limit can stop those."
     )
 
 

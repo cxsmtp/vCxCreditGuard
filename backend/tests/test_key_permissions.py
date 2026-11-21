@@ -11,15 +11,25 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.checkmarx.errors import CheckmarxPermissionError
 from app.checkmarx.iam import AI_ROLE_NAMES
 from app.db.base import utcnow
 from app.db.session import session_scope
-from app.models import AuditLogEntry, EnforcementAction, Notification
+from app.models import AuditLogEntry, EnforcementAction, LimitPeriodState, Notification
 from app.models.enums import EnforcementKind, EntityType, PeriodType, RunStatus
 from app.services import connection as connection_service
-from app.services import cycle, enforcement, key_permissions, limits_service, org_sync
+from app.services import (
+    cycle,
+    enforcement,
+    evaluation,
+    key_permissions,
+    limits_service,
+    org_sync,
+    usage_mix,
+)
 from app.services import notifications as notification_service
 from app.services.audit import AuditActor
+from app.services.periods import current_window
 from tests.conftest import make_api_key, sqlite_only
 from tests.fake_tenant import FakeTenant, access_token_with, populated_tenant
 from tests.test_cycle_transactions import _watch_for_write_locks
@@ -277,7 +287,8 @@ class TestNotifications:
         check(db)
         first = permission_notifications(db)
         assert len(first) == 1
-        assert first[0].severity == "warning"
+        # Not needed with this setup (no enforcing project limit): info only.
+        assert first[0].severity == "info"
 
         tenant.fail_requests[("GET", "/credits/consumption")] = 403
         check(db)
@@ -354,8 +365,10 @@ class TestRuntimeRefusals:
         # The probes cannot see it, so an automatic re-check keeps it...
         key_permissions.run_check(db, trigger=key_permissions.TRIGGER_CYCLE, actor=ACTOR)
         assert by_id(key_permissions.current_report(db))["role_mapping_write"]["problem"]
-        # ...and only "Check again" clears it.
-        assert check(db, clear_runtime=True)["verdict"] == key_permissions.VERDICT_OK
+        # ...and so does "Check again": pressing a button is no evidence.
+        report = check(db, clear_runtime=True)
+        assert report["verdict"] == key_permissions.VERDICT_INSUFFICIENT
+        assert by_id(report)["role_mapping_write"]["runtime_denied_at"] is not None
 
     def test_a_swallowed_403_in_a_cycle_is_recorded(self, db: Session, tenant: FakeTenant) -> None:
         assert cycle.run_cycle(trigger="manual", force_org_sync=True).status == RunStatus.SUCCESS
@@ -582,7 +595,11 @@ class TestBreachMessages:
             select(Notification).where(Notification.title.like("%reached its credit limit"))
         )
         assert breach is not None
-        assert f"4 credits used in {period}: Fusion scan 4." in breach.body
+        month = utcnow().strftime("%B %Y")
+        # One sentence: the credits against the limit, and what they went on.
+        assert breach.body.startswith(f"4 of 3 credits used in {month}: Fusion scan 4.\n")
+        assert "4.0000" not in breach.body
+        assert breach.body.count("credits used") == 1
         assert "does not stop Fusion scans; CreditGuard cannot switch Fusion off yet" in breach.body
 
         restricted = db.scalar(
@@ -631,3 +648,396 @@ def test_a_session_scope_reader_sees_the_report(tenant: FakeTenant) -> None:
         key_permissions.run_check(session, trigger="manual", actor=ACTOR)
     with session_scope() as session:
         assert key_permissions.summary(session)["verdict"] == "ok"
+
+
+# ------------------------------------------- review findings (reproductions)
+
+
+class TestRefusalsBelongToTheirKey:
+    """B1: a refusal met with one key never lands on the report of the next."""
+
+    def test_a_connection_test_403_is_not_queued_as_a_runtime_refusal(
+        self, admin_client: TestClient, tenant: FakeTenant
+    ) -> None:
+        tenant.fail_requests[("GET", "/projects")] = 403
+        admin_client.post("/api/connection/test")
+        # The connection test is itself a probe, not a run-time event.
+        assert key_permissions.pending_denials() == 0
+
+    def test_old_keys_connection_test_403_does_not_land_on_the_new_keys_report(
+        self, admin_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        # Admin pastes an under-privileged key: the connection test's project read is refused.
+        tenant.fail_requests[("GET", "/projects")] = 403
+        first = admin_client.put("/api/connection", json={"api_key": make_api_key(subject="key-a")})
+        assert first.json()["permissions"]["verdict"] == "insufficient"
+        # Then pastes the right key: everything is allowed.
+        tenant.fail_requests.clear()
+        second = admin_client.put(
+            "/api/connection", json={"api_key": make_api_key(subject="key-b")}
+        )
+        assert second.json()["permissions"]["verdict"] == "ok"
+        # The next cycle must not flush the old key's 403 onto the new key's report.
+        cycle.run_cycle(trigger="manual", force_org_sync=True)
+        db.expire_all()
+        report = key_permissions.current_report(db)
+        assert report["verdict"] == "ok", (report["summary"], report["runtime_denials"])
+
+    def test_a_refusal_tagged_with_another_key_is_dropped(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        check(db)
+        old_key = tenant.client()
+        old_key.key_fingerprint = "an-earlier-key"
+        tenant.fail_requests[("GET", "/credits/consumption")] = 403
+        with pytest.raises(CheckmarxPermissionError):
+            old_key.get_json("/api/credits/consumption")
+        assert key_permissions.pending_denials() == 1
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        db.commit()
+        report = key_permissions.current_report(db)
+        assert report["verdict"] == key_permissions.VERDICT_OK
+        assert report["runtime_denials"] == []
+
+    def test_saving_another_key_discards_the_queue(self, db: Session, tenant: FakeTenant) -> None:
+        tenant.fail_requests[("GET", "/credits/info")] = 403
+        with pytest.raises(CheckmarxPermissionError):
+            tenant.client().get_json("/api/credits/info")
+        assert key_permissions.pending_denials() == 1
+        connection_service.save_connection(db, api_key=make_api_key(subject="key-c"), actor=ACTOR)
+        db.commit()
+        assert key_permissions.pending_denials() == 0
+
+
+class TestRuntimeRefusalsClear:
+    """S1: a refusal goes when there is evidence it no longer happens, not before."""
+
+    def test_runtime_read_refusal_is_cleared_when_the_probe_later_succeeds(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        # A one-off 403 on a core read during a cycle...
+        assert cycle.run_cycle(trigger="manual", force_org_sync=True).status == RunStatus.SUCCESS
+        tenant.fail_requests[("GET", "/credits/consumption")] = 403
+        cycle.run_cycle(trigger="manual")
+        db.expire_all()
+        assert by_id(key_permissions.current_report(db))["consumption"]["runtime_denied_at"]
+        # ...goes away. The automatic 6-hourly re-check reads it fine.
+        tenant.fail_requests.clear()
+        report = key_permissions.run_check(db, trigger=key_permissions.TRIGGER_CYCLE, actor=ACTOR)
+        assert by_id(report)["consumption"]["status"] == key_permissions.STATUS_OK
+        assert report["verdict"] == key_permissions.VERDICT_OK, report["summary"]
+        assert report["runtime_denials"] == []
+
+    def test_a_refused_change_clears_when_the_same_change_later_succeeds(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        synced(db, tenant)
+        check(db)
+        limit = add_limit(db, EntityType.USER, "user-harsh", enforce=True)
+        tenant.fail_requests[("DELETE", "/role-mappings/")] = 403
+        enforcement.apply_enforcement(
+            db, tenant.client(), limit=limit, period_key=PERIOD, actor=ACTOR
+        )
+        db.commit()
+        assert key_permissions.current_report(db)["verdict"] == key_permissions.VERDICT_INSUFFICIENT
+        # Check again is no evidence the change works.
+        assert check(db, clear_runtime=True)["verdict"] == key_permissions.VERDICT_INSUFFICIENT
+
+        # The permission is granted; the next attempt goes through.
+        tenant.fail_requests.clear()
+        outcome = enforcement.apply_enforcement(
+            db, tenant.client(), limit=limit, period_key=PERIOD, actor=ACTOR
+        )
+        db.commit()
+        assert not outcome.failed
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        db.commit()
+        report = key_permissions.current_report(db)
+        assert by_id(report)["role_mapping_write"]["runtime_denied_at"] is None
+        assert report["runtime_denials"] == []
+        assert report["verdict"] == key_permissions.VERDICT_OK
+        recovered = permission_notifications(db)[-1]
+        assert recovered.title == "API key permissions are now sufficient"
+        assert "Every permission CreditGuard checked" not in recovered.body
+        assert "confirmed the first time CreditGuard makes it" in recovered.body
+
+    def test_a_successful_get_is_not_even_queued(self, db: Session, tenant: FakeTenant) -> None:
+        synced(db, tenant)
+        tenant.client().get_json("/api/projects")
+        assert key_permissions.pending_denials() == 0
+
+    def test_a_refusal_recorded_while_probing_is_kept(
+        self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M1: a flush from another thread during the probes is not overwritten."""
+        synced(db, tenant)
+        check(db)
+        real = key_permissions._run_probes
+
+        def probes_while_someone_flushes(*args, **kwargs):
+            results = real(*args, **kwargs)
+            key_permissions._on_forbidden(
+                "DELETE",
+                "https://iam.example/auth/admin/realms/acme-corp/users/u1/role-mappings/clients/c1",
+                None,
+            )
+            with session_scope() as other:
+                assert key_permissions.flush_runtime_denials(other, actor=ACTOR) == 1
+            return results
+
+        monkeypatch.setattr(key_permissions, "_run_probes", probes_while_someone_flushes)
+        report = check(db)
+        assert by_id(report)["role_mapping_write"]["runtime_denied_at"] is not None
+        db.expire_all()
+        stored = key_permissions.current_report(db)
+        assert by_id(stored)["role_mapping_write"]["runtime_denied_at"] is not None
+
+
+class TestNotificationPrivacy:
+    """S2: the notification body is readable by viewers, so it never carries roles."""
+
+    def test_viewer_cannot_read_key_roles_through_notifications(
+        self, viewer_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        tenant.fail_requests[("GET", "/credits/consumption")] = 403
+        tenant.access_token = access_token_with(
+            realm_roles=["secret-role-name"], groups=["/Secret Group"]
+        )
+        check(db)
+        report = viewer_client.get("/api/connection/permissions").json()["report"]
+        assert "secret-role-name" not in str(report)
+        items = viewer_client.get("/api/notifications", params={"category": "permissions"}).json()
+        assert items["items"]
+        assert "secret-role-name" not in str(items), "roles leak to viewers via notifications"
+        assert "Secret Group" not in str(items)
+        assert "Key permissions card on the Connection page" in items["items"][0]["body"]
+
+
+class TestAttention:
+    """S5, M4: only a confirmed gap in something needed now raises the alarm."""
+
+    def test_an_optional_gap_is_for_the_card_only(
+        self, viewer_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        tenant.fail_requests[("GET", "/credits/info")] = 403
+        report = check(db)
+        assert report["verdict"] == key_permissions.VERDICT_LIMITED
+        assert report["attention"] is False
+        assert "read the credit pool" in report["summary"]
+        me = viewer_client.get("/api/me").json()["key_permissions"]
+        assert me["attention"] is False
+        notes = permission_notifications(db)
+        assert [note.severity for note in notes] == ["info"]
+
+    def test_a_confirmed_required_gap_asks_for_attention(
+        self, viewer_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        tenant.fail_requests[("GET", "/credits/consumption")] = 403
+        assert check(db)["attention"] is True
+        assert viewer_client.get("/api/me").json()["key_permissions"]["attention"] is True
+
+    def test_applications_and_groups_matter_only_with_such_limits(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        synced(db, tenant)
+        tenant.fail_requests[("GET", "/api/applications")] = 403
+        tenant.fail_requests[("GET", "/groups")] = 403
+        report = check(db)
+        assert report["verdict"] == key_permissions.VERDICT_LIMITED
+        assert report["attention"] is False
+        assert by_id(report)["applications"]["required"] is False
+
+        add_limit(db, EntityType.APPLICATION, "app-payments", enforce=False)
+        report = key_permissions.current_report(db)
+        assert report["verdict"] == key_permissions.VERDICT_INSUFFICIENT
+        assert report["attention"] is True
+        assert by_id(report)["applications"]["required"] is True
+        assert by_id(report)["iam_groups"]["required"] is False
+
+        add_limit(db, EntityType.GROUP, "grp-payments", enforce=False)
+        assert by_id(key_permissions.current_report(db))["iam_groups"]["required"] is True
+
+    def test_org_sync_survives_refused_groups_and_applications(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        tenant.fail_requests[("GET", "/api/applications")] = 403
+        tenant.fail_requests[("GET", "/groups")] = 403
+        result = org_sync.sync_org_model(db, tenant.client())
+        db.commit()
+        assert result.users > 0 and result.projects > 0
+        assert result.warnings == []
+
+        # With a group limit in place the refusal is a warning.
+        tenant.fail_requests.clear()
+        org_sync.sync_org_model(db, tenant.client())
+        db.commit()
+        add_limit(db, EntityType.GROUP, "grp-payments", enforce=False)
+        tenant.fail_requests[("GET", "/groups")] = 403
+        result = org_sync.sync_org_model(db, tenant.client())
+        db.commit()
+        assert any("may not read groups" in warning for warning in result.warnings)
+        # Memberships still resolve from the groups synced before.
+        assert result.memberships > 0
+
+    def test_probably_refused_is_a_card_warning_not_a_red_verdict(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        synced(db, tenant)
+        add_limit(db, EntityType.USER, "user-harsh", enforce=True)
+        tenant.access_token = access_token_with(client_roles={"realm-management": ["view-users"]})
+        report = check(db)
+        checks = by_id(report)
+        assert checks["role_mapping_write"]["expectation"] == key_permissions.EXPECT_PROBABLY_DENIED
+        assert checks["role_mapping_write"]["severe"] is False
+        assert report["verdict"] == key_permissions.VERDICT_LIMITED
+        assert report["attention"] is False
+        assert report["summary"].startswith("The Checkmarx API key may be missing")
+
+    def test_problem_since_survives_a_failed_token_exchange(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        """M2: an unknown check in between does not start a new episode."""
+        tenant.fail_requests[("GET", "/credits/consumption")] = 403
+        check(db)
+        since = key_permissions.load(db)["problem_since"]
+        tenant.fail_requests[("POST", "/openid-connect/token")] = 401
+        connection_service.get_client(db).tokens.invalidate()
+        assert check(db)["verdict"] == key_permissions.VERDICT_UNKNOWN
+        assert key_permissions.load(db)["problem_since"] == since
+        del tenant.fail_requests[("POST", "/openid-connect/token")]
+        connection_service.get_client(db).tokens.invalidate()
+        check(db)
+        assert key_permissions.load(db)["problem_since"] == since
+        assert len(permission_notifications(db)) == 1
+
+
+class TestRoutes:
+    def test_changing_the_api_address_checks_the_key_again(
+        self, admin_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        """M3."""
+        tenant.fail_requests[("GET", "/credits/consumption")] = 403
+        response = admin_client.patch(
+            "/api/connection/api-base-url", json={"api_base_url": "https://eu.ast.checkmarx.net"}
+        )
+        assert response.status_code == httpx.codes.OK, response.text
+        assert response.json()["permissions"]["verdict"] == "insufficient"
+
+    def test_a_malformed_stored_report_reads_as_none(
+        self, admin_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        """M6."""
+        from app.services import settings_store
+
+        check(db)
+        stored = key_permissions.load(db)
+        stored["checks"][0]["runtime_denied_at"] = "not a date"
+        settings_store.set_value(db, settings_store.KEY_KEY_PERMISSIONS, stored)
+        db.commit()
+        response = admin_client.get("/api/connection/permissions")
+        assert response.status_code == httpx.codes.OK
+        assert response.json() == {"available": False, "report": None}
+
+
+class TestUnverifiedReapplyAudit:
+    def test_the_first_unverified_reapply_is_audited_once(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        """M5: the tenant was written to, so it is audited; once, not every cycle."""
+        synced(db, tenant)
+        limit = add_limit(db, EntityType.PROJECT, "proj-api", enforce=True)
+        enforcement.apply_enforcement(
+            db, tenant.client(), limit=limit, period_key=PERIOD, actor=ACTOR
+        )
+        db.commit()
+        tenant.fail_requests[("GET", "/repos-manager/")] = 500
+        for _ in range(3):
+            enforcement.apply_enforcement(
+                db, tenant.client(), limit=limit, period_key=PERIOD, actor=ACTOR
+            )
+            db.commit()
+        entries = list(
+            db.scalars(
+                select(AuditLogEntry).where(
+                    AuditLogEntry.action == enforcement.AUDIT_UNVERIFIED_REAPPLY
+                )
+            )
+        )
+        assert len(entries) == 1
+        assert entries[0].target_type == "enforcement_action"
+
+
+class TestUsageMixWording:
+    def test_sliding_window_does_not_attribute_all_credits_to_one_action(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        """S3."""
+        tenant.set_entity_credits(
+            view="project",
+            name="payments/web",
+            credits=10,
+            entity_id="proj-web",
+            actions={"fusion": 10, "triage": 5},
+        )
+        assert cycle.run_cycle(trigger="manual", force_org_sync=True).status == RunStatus.SUCCESS
+        add_limit(db, EntityType.PROJECT, "proj-web", enforce=False, credit_limit=3)
+        cycle.run_cycle(trigger="manual")  # baseline
+        # Window slid: 4 old Fusion transactions dropped out, 2 new Fusion and 1
+        # new triage happened. Fusion count falls by 2, triage rises by 1.
+        tenant.set_entity_credits(
+            view="project",
+            name="payments/web",
+            credits=14,
+            entity_id="proj-web",
+            actions={"fusion": 8, "triage": 6},
+        )
+        cycle.run_cycle(trigger="manual")
+        db.expire_all()
+        breach = db.scalar(
+            select(Notification).where(Notification.title.like("%reached its credit limit"))
+        )
+        assert breach is not None
+        assert ": AI Triage 4." not in breach.body, breach.body
+        assert "whole lookback window" in breach.body
+        assert "Most of" not in breach.body
+
+    def test_the_wording_of_a_lifetime_period_and_what_a_project_restriction_leaves(
+        self,
+    ) -> None:
+        """S4."""
+        assert usage_mix.period_phrase("lifetime") == "in the reporting window"
+        text = usage_mix.does_not_stop(EnforcementKind.DISABLE_AUTO_TRIAGE, None)
+        assert "count only towards user limits" not in text
+        assert "only a user limit can stop those" in text
+
+    def test_the_breakdown_is_computed_only_for_a_new_notification(
+        self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M8."""
+        tenant.set_entity_credits(
+            view="project", name="payments/web", credits=4, entity_id="proj-web"
+        )
+        assert cycle.run_cycle(trigger="manual", force_org_sync=True).status == RunStatus.SUCCESS
+        limit = add_limit(db, EntityType.PROJECT, "proj-web", enforce=False, credit_limit=3)
+        cycle.run_cycle(trigger="manual")
+        tenant.set_entity_credits(
+            view="project", name="payments/web", credits=8, entity_id="proj-web"
+        )
+        cycle.run_cycle(trigger="manual")
+        db.expire_all()
+        state = db.scalar(select(LimitPeriodState).where(LimitPeriodState.limit_id == limit.id))
+        assert state is not None and state.breached_at is not None
+        calls: list[int] = []
+        real = usage_mix.mix_for
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(usage_mix, "mix_for", counting)
+        # Raised again (a re-breach in the same period): the dedupe key exists.
+        evaluation._notify_breach(db, limit, state, current_window(limit), exempt=False)
+        assert calls == []
+        before = db.scalar(select(func.count()).select_from(Notification))
+        db.commit()
+        assert db.scalar(select(func.count()).select_from(Notification)) == before

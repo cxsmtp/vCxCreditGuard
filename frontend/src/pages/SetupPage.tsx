@@ -76,7 +76,9 @@ export function SetupPage({ isAdmin, onConnected }: { isAdmin: boolean; onConnec
           : {}),
       });
       setTestResult(result);
-      if (result.permissions) permissions.setReport(result.permissions);
+      // A new key: the last report was about the old one. Without a fresh
+      // report (the check could not run) show none rather than the old key's.
+      permissions.setReport(result.permissions ?? null);
       setApiKey("");
       setPreview(null);
       await connection.reload();
@@ -117,6 +119,8 @@ export function SetupPage({ isAdmin, onConnected }: { isAdmin: boolean; onConnec
         api_base_url: apiBaseUrl.trim(),
       });
       setTestResult(result);
+      if (result.permissions) permissions.setReport(result.permissions);
+      onConnected();
       await connection.reload();
       toast.info(result.message);
     } catch (caught) {

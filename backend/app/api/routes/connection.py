@@ -10,6 +10,7 @@ import logging
 from dataclasses import asdict
 
 from fastapi import APIRouter, HTTPException, status
+from pydantic import ValidationError
 
 from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.checkmarx.errors import ApiKeyError, CheckmarxError
@@ -125,8 +126,18 @@ def _with_permissions(result, ctx, db, *, trigger: str) -> ConnectionTestRespons
     if result.token_acquired:
         report = key_permissions.run_check(db, trigger=trigger, actor=ctx.actor)
         if report is not None:
-            response.permissions = report_model(report, details=True)
+            response.permissions = _safe_report_model(report, details=True)
     return response
+
+
+def _safe_report_model(report: dict, *, details: bool) -> KeyPermissionReport | None:  # type: ignore[type-arg]
+    """report_model, or None (logged) for a stored report that does not fit the
+    schema any more: a broken report must never fail the page that shows it."""
+    try:
+        return report_model(report, details=details)
+    except (ValidationError, KeyError, TypeError, ValueError):
+        logger.warning("The stored API key permission report could not be shown", exc_info=True)
+        return None
 
 
 def report_model(report: dict, *, details: bool) -> KeyPermissionReport:  # type: ignore[type-arg]
@@ -137,6 +148,7 @@ def report_model(report: dict, *, details: bool) -> KeyPermissionReport:  # type
     explanation["roles"] = []
     return KeyPermissionReport(
         verdict=report["verdict"],
+        attention=bool(report.get("attention")),
         summary=report["summary"],
         missing=report["missing"],
         checked_at=report["checked_at"],
@@ -151,16 +163,21 @@ def read_permissions(ctx: CurrentUser, db: DbSession) -> KeyPermissionsResponse:
     """The last API key permission report. Anyone signed in sees the summary and
     what stops working; an admin also sees each call, the key's roles and the
     refusals seen at run time."""
-    report = key_permissions.current_report(db)
-    if report is None:
+    try:
+        report = key_permissions.current_report(db)
+    except Exception:  # noqa: BLE001 - a broken stored report reads as no report
+        logger.warning("The stored API key permission report could not be read", exc_info=True)
+        report = None
+    model = _safe_report_model(report, details=ctx.is_admin) if report is not None else None
+    if model is None:
         return KeyPermissionsResponse(available=False)
-    return KeyPermissionsResponse(available=True, report=report_model(report, details=ctx.is_admin))
+    return KeyPermissionsResponse(available=True, report=model)
 
 
 @router.post("/permissions", response_model=KeyPermissionsResponse)
 def check_permissions(ctx: AdminUser, db: DbSession) -> KeyPermissionsResponse:
-    """Check the key again now ("Check again"). Clears refusals seen at run time:
-    one that still happens is recorded again at the next attempt."""
+    """Check the key again now ("Check again"). Every read is tried again; a
+    change refused at run time stays listed until it next goes through."""
     if connection_service.get_connection(db) is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -180,7 +197,8 @@ def check_permissions(ctx: AdminUser, db: DbSession) -> KeyPermissionsResponse:
                 ),
             },
         )
-    return KeyPermissionsResponse(available=True, report=report_model(report, details=True))
+    model = _safe_report_model(report, details=True)
+    return KeyPermissionsResponse(available=model is not None, report=model)
 
 
 @router.patch("/api-base-url", response_model=ConnectionTestResponse)
@@ -203,4 +221,5 @@ def override_api_base_url(
     db.commit()
     result = connection_service.test_connection(db)
     db.commit()
-    return ConnectionTestResponse(**asdict(result))
+    # Same key, other address: what the key may do there is checked again.
+    return _with_permissions(result, ctx, db, trigger=key_permissions.TRIGGER_CONNECTION_SAVED)

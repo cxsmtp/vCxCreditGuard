@@ -16,7 +16,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.checkmarx.apikey import ParsedApiKey, parse_api_key
-from app.checkmarx.client import CheckmarxClient
+from app.checkmarx.client import CheckmarxClient, listeners_paused
 from app.checkmarx.errors import CheckmarxError, NotConfiguredError
 from app.checkmarx.regions import check_tenant_url, derive_api_base_url, normalise_api_base_url
 from app.checkmarx.token import TokenManager
@@ -143,6 +143,12 @@ def save_connection(
             "api_base_url": connection.api_base_url,
             "api_key_fingerprint": connection.api_key_fingerprint,
         }
+
+    if before is not None and before["api_key_fingerprint"] != parsed.fingerprint:
+        # Refusals met with the old key are not the new key's to answer for.
+        from app.services import key_permissions
+
+        key_permissions.discard_pending_denials()
 
     connection.api_key_encrypted = ciphertext
     connection.iam_base_url = parsed.iam_base_url
@@ -297,6 +303,7 @@ def build_client(connection: CxConnection) -> CheckmarxClient:
         iam_base_url=connection.iam_base_url,
         tenant_name=connection.tenant_name,
         token_manager=token_manager,
+        key_fingerprint=parsed.fingerprint,
     )
 
 
@@ -337,6 +344,7 @@ def get_client(session: Session) -> CheckmarxClient:
             iam_base_url=connection.iam_base_url,
             tenant_name=connection.tenant_name,
             token_manager=_cached_token_manager,
+            key_fingerprint=parsed.fingerprint,
         )
         _cached_key = identity
         return _cached_client
@@ -383,9 +391,13 @@ def test_connection(
     cx = client or get_client(session)
     token_acquired = False
     try:
-        cx.tokens.get_access_token()
-        token_acquired = True
-        payload = cx.get_json(PROBE_PATH, params={"limit": 1, "offset": 0})
+        # A test of the key, not a run-time call: a 403 here is its result (and
+        # the permission check that follows records it), not a refusal to pin
+        # on whatever key is stored when the next cycle step runs.
+        with listeners_paused():
+            cx.tokens.get_access_token()
+            token_acquired = True
+            payload = cx.get_json(PROBE_PATH, params={"limit": 1, "offset": 0})
         projects_visible = _total_from(payload)
     except CheckmarxError as exc:
         message = str(exc)

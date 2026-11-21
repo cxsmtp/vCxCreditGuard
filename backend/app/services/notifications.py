@@ -91,6 +91,13 @@ def notify(
 DEDUPE_KEY_LENGTH = 160
 
 
+def already_raised(session: Session, dedupe_key: str) -> bool:
+    """True when ``notify`` would return None for this key: a cheap check for a
+    caller whose message is costly to build."""
+    key = _bounded_key(dedupe_key)
+    return session.scalar(select(Notification.id).where(Notification.dedupe_key == key)) is not None
+
+
 def _bounded_key(key: str | None) -> str | None:
     """A dedupe key that fits its column, without two long keys colliding.
 

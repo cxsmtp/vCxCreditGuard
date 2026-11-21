@@ -21,12 +21,19 @@ So the key is checked up front, with **read-only** calls only:
 
 Refusals seen at run time (a restriction, a restore, a cycle read) are recorded
 on the same report, so a write the probes could not test shows up the moment it
-is first refused.
+is first refused. Each one is tagged with the key it was made with, so a
+replaced key's refusals never land on its successor. A refused read is cleared
+by the next probe of that read that succeeds; a refused change is cleared only
+when CreditGuard later makes the same change successfully (nothing else is
+evidence that it works).
 
 How serious a gap is depends on what is configured right now (an enforcing user
 limit needs the role mapping calls, an enforcing project, group or application
-limit needs the project configuration calls), so the verdict is worked out
-again whenever the report is read, from the stored check results.
+limit needs the project configuration calls, a group or application limit needs
+the groups or applications), so the verdict is worked out again whenever the
+report is read, from the stored check results. Only a confirmed gap in something
+needed right now asks for everyone's attention (the banner, the admin pop-up,
+the top bar light); the rest is shown on the Connection page only.
 
 The report lives in ``app_setting`` as JSON (bookkeeping, never shown as a
 setting). Nothing here holds a database write lock across a Checkmarx call, and
@@ -42,8 +49,7 @@ import json
 import logging
 import re
 import threading
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -56,7 +62,12 @@ from app.checkmarx import credits as credits_api
 from app.checkmarx import iam, platform
 from app.checkmarx import scans as scans_api
 from app.checkmarx import usage as usage_api
-from app.checkmarx.client import CheckmarxClient, add_forbidden_listener
+from app.checkmarx.client import (
+    CheckmarxClient,
+    add_forbidden_listener,
+    add_success_listener,
+    listeners_paused,
+)
 from app.checkmarx.errors import (
     CheckmarxAuthError,
     CheckmarxError,
@@ -67,6 +78,7 @@ from app.checkmarx.errors import (
     CheckmarxUnavailableError,
 )
 from app.db.base import utcnow
+from app.models.connection import AppSetting
 from app.models.enums import EntityType, Severity
 from app.models.limits import CreditLimit
 from app.models.org import CxProject, CxUser
@@ -92,6 +104,8 @@ EXPECT_WILL_FAIL = "will_fail"
 EXPECT_PROBABLY_DENIED = "probably_denied"
 
 NEED_CORE = "core"
+NEED_GROUP_LIMITS = "group_limits"
+NEED_APPLICATION_LIMITS = "application_limits"
 NEED_ENFORCE_USERS = "enforce_users"
 NEED_ENFORCE_PROJECTS = "enforce_projects"
 NEED_AUTO_TRIAGE = "auto_triage_charging"
@@ -159,8 +173,11 @@ SPECS: tuple[CheckSpec, ...] = (
         method="GET",
         path="/auth/realms/<tenant>/groups",
         kind="read",
-        needed_for=(NEED_CORE,),
-        breaks="Groups and group membership cannot be synced, so group limits cannot be judged.",
+        needed_for=(NEED_GROUP_LIMITS,),
+        breaks=(
+            "New or changed groups cannot be synced, so group limits work from the groups "
+            "synced before (or none). Nothing else uses them."
+        ),
     ),
     CheckSpec(
         id="projects",
@@ -184,8 +201,11 @@ SPECS: tuple[CheckSpec, ...] = (
         method="GET",
         path="/api/applications",
         kind="read",
-        needed_for=(NEED_CORE,),
-        breaks="Application limits cannot find their projects.",
+        needed_for=(NEED_APPLICATION_LIMITS,),
+        breaks=(
+            "Application limits cannot find their projects (they keep what was synced "
+            "before). Nothing else uses applications."
+        ),
     ),
     CheckSpec(
         id="consumption",
@@ -333,7 +353,15 @@ SPECS: tuple[CheckSpec, ...] = (
     ),
 )
 SPEC_BY_ID: dict[str, CheckSpec] = {spec.id: spec for spec in SPECS}
-_SEVERE_NEEDS = frozenset({NEED_CORE, NEED_ENFORCE_USERS, NEED_ENFORCE_PROJECTS})
+_SEVERE_NEEDS = frozenset(
+    {
+        NEED_CORE,
+        NEED_GROUP_LIMITS,
+        NEED_APPLICATION_LIMITS,
+        NEED_ENFORCE_USERS,
+        NEED_ENFORCE_PROJECTS,
+    }
+)
 
 # A refusal at run time, matched to the check it concerns: (method, path regex).
 _RUNTIME_ROUTES: tuple[tuple[frozenset[str], re.Pattern[str], str], ...] = tuple(
@@ -417,31 +445,54 @@ def token_claims(token: str | None) -> dict[str, Any]:
 
 # --------------------------------------------------------- runtime refusals
 
-_pending: list[tuple[str, str, datetime]] = []
+_DENIED = "denied"
+_ALLOWED = "allowed"
+# (what happened, method, url, fingerprint of the key the call was made with or
+# None when the client does not say, when). Process wide; flushed onto the
+# stored report by the cycle steps and enforcement.
+_pending: list[tuple[str, str, str, str | None, datetime]] = []
 _pending_lock = threading.Lock()
-_local = threading.local()
+# (method, path template) of the refused changes on the stored report. A
+# successful change is only queued when it answers one of them, so the success
+# hook costs one set lookup in the normal case. Replaced whole, never mutated.
+_denied_routes: frozenset[tuple[str, str]] = frozenset()
 
 
-def _on_forbidden(method: str, url: str) -> None:
-    if getattr(_local, "probing", False):
-        return
+def _queue(kind: str, method: str, url: str, fingerprint: str | None) -> None:
     with _pending_lock:
         if len(_pending) < _MAX_RUNTIME_ENTRIES * 4:
-            _pending.append((method, url, utcnow()))
+            _pending.append((kind, method, url, fingerprint, utcnow()))
+
+
+def _on_forbidden(method: str, url: str, fingerprint: str | None) -> None:
+    _queue(_DENIED, method, url, fingerprint)
+
+
+def _on_success(method: str, url: str, fingerprint: str | None) -> None:
+    routes = _denied_routes
+    if not routes or method == "GET":
+        return
+    _check_id, path = _classify(method, url)
+    if (method, path) in routes:
+        _queue(_ALLOWED, method, url, fingerprint)
 
 
 add_forbidden_listener(_on_forbidden)
+add_success_listener(_on_success)
+
+# Refusals seen by the probes are results, not run-time events.
+_probing = listeners_paused
 
 
-@contextmanager
-def _probing() -> Iterator[None]:
-    """Refusals seen by the probes are results, not run-time events."""
-    previous = getattr(_local, "probing", False)
-    _local.probing = True
-    try:
-        yield
-    finally:
-        _local.probing = previous
+def _remember_denied_routes(report: dict[str, Any] | None) -> None:
+    global _denied_routes
+    routes = frozenset(
+        (str(entry.get("method")), str(entry.get("path")))
+        for entry in (report or {}).get("runtime_denials") or []
+        if isinstance(entry, dict) and entry.get("method") != "GET"
+    )
+    if routes != _denied_routes:
+        _denied_routes = routes
 
 
 def _classify(method: str, url: str) -> tuple[str | None, str]:
@@ -472,6 +523,8 @@ def _template(path: str) -> str:
 
 
 def pending_denials() -> int:
+    """Run-time events (refusals, and successful retries of refused changes)
+    waiting to be recorded."""
     with _pending_lock:
         return len(_pending)
 
@@ -642,10 +695,16 @@ class Context:
     enforce_users: bool
     enforce_projects: bool
     auto_triage_charging: bool
+    group_limits: bool = False
+    application_limits: bool = False
 
     def active(self, need: str) -> bool:
         if need == NEED_CORE:
             return True
+        if need == NEED_GROUP_LIMITS:
+            return self.group_limits
+        if need == NEED_APPLICATION_LIMITS:
+            return self.application_limits
         if need == NEED_ENFORCE_USERS:
             return self.enforce_users
         if need == NEED_ENFORCE_PROJECTS:
@@ -656,23 +715,33 @@ class Context:
 
 
 def current_context(session: Session) -> Context:
-    types = set(
-        session.scalars(
-            select(CreditLimit.entity_type)
-            .where(CreditLimit.enforce.is_(True), CreditLimit.is_active.is_(True))
-            .distinct()
-        )
-    )
+    rows = session.execute(
+        select(CreditLimit.entity_type, CreditLimit.enforce)
+        .where(CreditLimit.is_active.is_(True))
+        .distinct()
+    ).all()
+    present = {str(entity_type) for entity_type, _enforce in rows}
+    enforcing = {str(entity_type) for entity_type, enforce in rows if enforce}
     return Context(
-        enforce_users=EntityType.USER.value in types,
-        enforce_projects=bool(types - {EntityType.USER.value}),
+        enforce_users=EntityType.USER.value in enforcing,
+        enforce_projects=bool(enforcing - {EntityType.USER.value}),
         auto_triage_charging=settings_store.auto_triage_to_initiator(session),
+        group_limits=EntityType.GROUP.value in present,
+        application_limits=EntityType.APPLICATION.value in present,
     )
 
 
 _NEED_REASONS: dict[str, tuple[str, str]] = {
     # need -> (when active, when not)
     NEED_CORE: ("Needed all the time.", "Needed all the time."),
+    NEED_GROUP_LIMITS: (
+        "Needed now: at least one group limit exists.",
+        "Only needed once a group limit exists.",
+    ),
+    NEED_APPLICATION_LIMITS: (
+        "Needed now: at least one application limit exists.",
+        "Only needed once an application limit exists.",
+    ),
     NEED_ENFORCE_USERS: (
         "Needed now: at least one user limit enforces.",
         "Only needed once a user limit enforces.",
@@ -717,6 +786,7 @@ def _skeleton(fingerprint: str | None) -> dict[str, Any]:
         "runtime_denials": [],
         "token": None,
         "last_verdict": None,
+        "last_attention": None,
         "problem_since": None,
     }
 
@@ -755,12 +825,19 @@ def _infer_writes(checks: dict[str, dict[str, Any]], claims: dict[str, Any] | No
             )
 
 
-def _is_problem(check: dict[str, Any]) -> bool:
+def _confirmed(check: dict[str, Any]) -> bool:
+    """Refused, or certain to be: a 403 seen, or the read it depends on refused."""
     return (
         check.get("status") == STATUS_DENIED
-        or check.get("expectation") in (EXPECT_WILL_FAIL, EXPECT_PROBABLY_DENIED)
+        or check.get("expectation") == EXPECT_WILL_FAIL
         or bool(check.get("runtime_denied_at"))
     )
+
+
+def _is_problem(check: dict[str, Any]) -> bool:
+    # "Probably refused" is a guess from the token's role names: shown on the
+    # card as a warning, never on its own a reason for the banner or a red verdict.
+    return _confirmed(check) or check.get("expectation") == EXPECT_PROBABLY_DENIED
 
 
 def problem_ids(report: dict[str, Any]) -> list[str]:
@@ -792,6 +869,13 @@ def _join_or(items: list[str]) -> str:
     return f"{', '.join(items[:-1])} or {items[-1]}"
 
 
+def _shown(cant: list[str]) -> str:
+    shown = cant[:3]
+    if len(cant) > 3:
+        shown = [*shown[:2], f"{len(cant) - 2} more things"]
+    return _join_or(shown)
+
+
 def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None:
     """The stored report with requirement, verdict and explanation worked out for now."""
     if report is None:
@@ -803,6 +887,7 @@ def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None
         required, reason = _required(spec, ctx)
         active_needs = [need for need in spec.needed_for if ctx.active(need)]
         problem = _is_problem(stored)
+        confirmed = _confirmed(stored)
         checks.append(
             {
                 "id": spec.id,
@@ -820,10 +905,14 @@ def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None
                 "required_reason": reason,
                 "breaks": spec.breaks,
                 "problem": problem,
-                "severe": problem and any(need in _SEVERE_NEEDS for need in active_needs),
+                "severe": confirmed and any(need in _SEVERE_NEEDS for need in active_needs),
+                "_confirmed": confirmed,
             }
         )
     problems = [check for check in checks if check["problem"]]
+    # Only a confirmed gap in something needed right now is worth everyone's
+    # attention (banner, pop-up, top bar light); the rest is for the card.
+    attention = any(check["_confirmed"] and check["required"] for check in problems)
     if any(check["severe"] for check in problems):
         verdict = VERDICT_INSUFFICIENT
     elif problems:
@@ -834,15 +923,33 @@ def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None
         verdict = VERDICT_OK
 
     ordered = sorted(
-        problems, key=lambda c: (not c["severe"], not c["required"], c["kind"] != "write")
+        problems,
+        key=lambda c: (
+            not c["severe"],
+            not (c["_confirmed"] and c["required"]),
+            not c["required"],
+            c["kind"] != "write",
+        ),
     )
     cant = [SPEC_BY_ID[check["id"]].cant for check in ordered]
-    if verdict in PROBLEM_VERDICTS:
-        shown = cant[:3]
-        if len(cant) > 3:
-            shown = [*shown[:2], f"{len(cant) - 2} more things"]
+    maybe = [
+        SPEC_BY_ID[check["id"]].cant
+        for check in ordered
+        if check["required"] and not check["_confirmed"]
+    ]
+    for check in checks:
+        del check["_confirmed"]
+    if verdict in PROBLEM_VERDICTS and attention:
+        summary = f"The Checkmarx API key is missing permissions: CreditGuard can't {_shown(cant)}."
+    elif verdict in PROBLEM_VERDICTS and maybe:
         summary = (
-            f"The Checkmarx API key is missing permissions: CreditGuard can't {_join_or(shown)}."
+            "The Checkmarx API key may be missing a permission CreditGuard needs: it probably "
+            f"can't {_shown(maybe)}. This is confirmed the first time CreditGuard tries."
+        )
+    elif verdict in PROBLEM_VERDICTS:
+        summary = (
+            "The Checkmarx API key has what CreditGuard needs with the current setup. Not "
+            f"allowed, and not needed now: CreditGuard can't {_shown(cant)}."
         )
     elif verdict == VERDICT_UNKNOWN:
         summary = (
@@ -855,6 +962,7 @@ def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None
     claims = report.get("token") or None
     return {
         "verdict": verdict,
+        "attention": attention,
         "summary": summary,
         "checked_at": report.get("checked_at"),
         "trigger": report.get("trigger"),
@@ -867,7 +975,7 @@ def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None
         "problem_key": problem_key([check["id"] for check in problems]),
         "runtime_denials": list(report.get("runtime_denials") or []),
         "token": claims,
-        "explanation": _explain(verdict, ordered, claims, report),
+        "explanation": _explain(verdict, ordered, claims, report, attention=attention),
     }
 
 
@@ -876,6 +984,8 @@ def _explain(
     problems: list[dict[str, Any]],
     claims: dict[str, Any] | None,
     report: dict[str, Any],
+    *,
+    attention: bool,
 ) -> dict[str, list[str]]:
     if verdict == VERDICT_UNKNOWN:
         return {
@@ -889,10 +999,20 @@ def _explain(
         }
     if verdict == VERDICT_OK:
         return {"why": [], "missing": [], "roles": _roles_lines(claims), "what_to_do": []}
+    if any(_confirmed(check) for check in problems):
+        first = (
+            "Checkmarx One refused (403 Forbidden) calls CreditGuard makes with this API key. "
+            "The connection itself works, so the address and the key are right: the key is "
+            "missing permissions."
+        )
+    else:
+        first = (
+            "Nothing has been refused yet, but the roles in the key's access token suggest a "
+            "change CreditGuard makes will be. It is confirmed the first time CreditGuard "
+            "makes it."
+        )
     why = [
-        "Checkmarx One refused (403 Forbidden) calls CreditGuard makes with this API key. The "
-        "connection itself works, so the address and the key are right: the key is missing "
-        "permissions.",
+        first,
         "The likely reason: a Checkmarx One API key carries only the roles chosen when it was "
         "created, not automatically everything its owner can do. A key created under a tenant "
         "administrator's own account can therefore lack permissions the administrator has in "
@@ -918,13 +1038,19 @@ def _explain(
         "CreditGuard makes), or add them to the key's account and key in Checkmarx One "
         "Identity and Access Management.",
         "Paste the new key on the Connection page, or press Check again after changing the "
-        "existing key. Check again also clears refusals seen at run time; one that still "
-        "happens is recorded again at the next attempt.",
+        "existing key. Check again re-reads everything it can; a change refused at run time "
+        "stays listed until CreditGuard next makes that same change successfully, because a "
+        "change cannot be tested without making it.",
     ]
     if verdict == VERDICT_LIMITED:
         what_to_do.append(
             "Counting usage and warning are not affected. Only the features listed above stop "
             "working, and only when they are used."
+        )
+    if not attention:
+        what_to_do.append(
+            "Nothing CreditGuard needs with the current setup is confirmed missing, so this is "
+            "shown here only, not as a banner."
         )
     return {"why": why, "missing": missing, "roles": _roles_lines(claims), "what_to_do": what_to_do}
 
@@ -947,9 +1073,15 @@ def _roles_lines(claims: dict[str, Any] | None) -> list[str]:
 # ------------------------------------------------------------- persistence
 
 
-def load(session: Session) -> dict[str, Any] | None:
+def load(session: Session, *, fresh: bool = False) -> dict[str, Any] | None:
+    """The stored report. ``fresh`` re-reads the row even if this session has it
+    already, so what another process stored meanwhile is not overwritten."""
+    if fresh:
+        session.get(AppSetting, settings_store.KEY_KEY_PERMISSIONS, populate_existing=True)
     value = settings_store.get_value(session, settings_store.KEY_KEY_PERMISSIONS)
-    return value if isinstance(value, dict) and value.get("version") == REPORT_VERSION else None
+    report = value if isinstance(value, dict) and value.get("version") == REPORT_VERSION else None
+    _remember_denied_routes(report)
+    return report
 
 
 def _store(session: Session, report: dict[str, Any]) -> None:
@@ -959,6 +1091,7 @@ def _store(session: Session, report: dict[str, Any]) -> None:
         report,
         description="Latest Checkmarx API key permission report (bookkeeping).",
     )
+    _remember_denied_routes(report)
 
 
 def _current_fingerprint(session: Session) -> str | None:
@@ -988,6 +1121,7 @@ def summary(session: Session) -> dict[str, Any] | None:
         return None
     return {
         "verdict": assessed["verdict"],
+        "attention": assessed["attention"],
         "summary": assessed["summary"],
         "missing": assessed["missing"],
         "checked_at": assessed["checked_at"],
@@ -1062,9 +1196,10 @@ def _run_check(
     fingerprint = connection.api_key_fingerprint
     cx = client or connection_service.get_client(session)
     ctx = current_context(session)
-    previous = load(session)
-    if previous is not None and previous.get("key_fingerprint") != fingerprint:
-        previous = None
+    # Refusals met before this check go on the report first, so a read the
+    # probes now find allowed is not marked refused again afterwards.
+    if pending_denials():
+        flush_runtime_denials(session, actor=actor)
 
     targets = _ProbeTargets(
         period=settings_store.usage_period(session),
@@ -1090,18 +1225,9 @@ def _run_check(
     ) or connection_service.api_key_subject(session)
 
     skip: dict[str, str] = {}
-    carried: dict[str, Any] | None = None
     if trigger == TRIGGER_CYCLE and not ctx.auto_triage_charging:
         # With auto-triage charging off nothing in a cycle reads scans, and the
         # automatic re-check keeps it that way. Explicit checks still try it.
-        carried = next(
-            (
-                check
-                for check in (previous or {}).get("checks") or []
-                if check.get("id") == "scans" and check.get("status") != STATUS_NOT_TESTED
-            ),
-            None,
-        )
         skip["scans"] = (
             "Not read by the automatic check while auto-triage charging is off; "
             "press Check again to test it."
@@ -1129,38 +1255,87 @@ def _run_check(
                 for spec in SPECS
                 if spec.kind == "read"
             }
+
+    # Read the stored report only now: a refusal recorded while the probes ran
+    # (another thread's flush) must be kept, not overwritten.
+    previous = load(session, fresh=True)
+    if previous is not None and previous.get("key_fingerprint") != fingerprint:
+        previous = None
+
     report["checked_at"] = utcnow().isoformat()
     report["token"] = claims
     checks = {check["id"]: check for check in report["checks"]}
     for check_id, (status, detail) in results.items():
         checks[check_id]["status"] = status
         checks[check_id]["detail"] = detail
-    if carried is not None:
-        checks["scans"]["status"] = carried.get("status", STATUS_NOT_TESTED)
-        checks["scans"]["detail"] = (
-            f"{carried.get('detail') or ''} (from the last check that read scans)".strip()
+    if "scans" in skip:
+        carried = next(
+            (
+                check
+                for check in (previous or {}).get("checks") or []
+                if check.get("id") == "scans" and check.get("status") != STATUS_NOT_TESTED
+            ),
+            None,
         )
+        if carried is not None:
+            checks["scans"]["status"] = carried.get("status", STATUS_NOT_TESTED)
+            checks["scans"]["detail"] = (
+                f"{carried.get('detail') or ''} (from the last check that read scans)".strip()
+            )
     _infer_writes(checks, claims)
-
-    if previous is not None and not clear_runtime:
-        report["runtime_denials"] = list(previous.get("runtime_denials") or [])
-        for old in previous.get("checks") or []:
-            if old.get("runtime_denied_at") and old.get("id") in checks:
-                checks[old["id"]]["runtime_denied_at"] = old["runtime_denied_at"]
-    if clear_runtime:
-        discard_pending_denials()
+    if previous is not None:
+        _carry_runtime(report, checks, previous, results, clear_unlisted_reads=clear_runtime)
 
     _finish(session, report, previous, actor=actor)
     session.commit()
     return assess(report, current_context(session))
 
 
-def flush_runtime_denials(session: Session, *, actor: AuditActor | None = None) -> int:
-    """Record 403s seen since the last flush on the stored report.
+def _carry_runtime(
+    report: dict[str, Any],
+    checks: dict[str, dict[str, Any]],
+    previous: dict[str, Any],
+    results: dict[str, tuple[str, str | None]],
+    *,
+    clear_unlisted_reads: bool,
+) -> None:
+    """Keep the refusals seen at run time that this check cannot disprove.
 
-    Called where the caller is about to commit anyway (enforcement's error
-    handlers, the end of each cycle step). Never raises, and never disturbs the
-    caller's transaction: the work happens in a savepoint.
+    A read the probes just made successfully works now, so its refusal goes. A
+    refused change stays until the same change goes through at run time: a
+    probe cannot test it. ``clear_unlisted_reads`` ("Check again") also forgets
+    refused reads that match no check; one that still happens comes back.
+    """
+    allowed_now = {
+        check_id
+        for check_id, (status, _detail) in results.items()
+        if status == STATUS_OK and SPEC_BY_ID[check_id].kind == "read"
+    }
+    kept: list[dict[str, Any]] = []
+    for entry in previous.get("runtime_denials") or []:
+        if not isinstance(entry, dict):
+            continue
+        check_id = entry.get("check_id")
+        if check_id in allowed_now:
+            continue
+        if check_id is None and clear_unlisted_reads and entry.get("method") == "GET":
+            continue
+        kept.append(entry)
+    report["runtime_denials"] = kept
+    for old in previous.get("checks") or []:
+        check_id = old.get("id")
+        if old.get("runtime_denied_at") and check_id in checks and check_id not in allowed_now:
+            checks[check_id]["runtime_denied_at"] = old["runtime_denied_at"]
+
+
+def flush_runtime_denials(session: Session, *, actor: AuditActor | None = None) -> int:
+    """Record the run-time events seen since the last flush on the stored report:
+    403s, and successful retries of changes that were refused before.
+
+    Events made with a key other than the one stored now are dropped. Called
+    where the caller is about to commit anyway (enforcement's error handlers,
+    the end of each cycle step). Never raises, and never disturbs the caller's
+    transaction: the work happens in a savepoint.
     """
     with _pending_lock:
         items = list(_pending)
@@ -1172,58 +1347,100 @@ def flush_runtime_denials(session: Session, *, actor: AuditActor | None = None) 
             fingerprint = _current_fingerprint(session)
             if fingerprint is None:
                 return 0
-            previous = load(session)
+            items = [item for item in items if item[3] is None or item[3] == fingerprint]
+            if not items:
+                return 0
+            previous = load(session, fresh=True)
             if previous is not None and previous.get("key_fingerprint") != fingerprint:
                 previous = None
             report = json.loads(json.dumps(previous)) if previous else _skeleton(fingerprint)
-            checks = {check.get("id"): check for check in report.get("checks") or []}
-            for spec in SPECS:
-                if spec.id not in checks:
-                    report["checks"].append(_empty_check(spec))
-                    checks[spec.id] = report["checks"][-1]
-            entries = {
-                (entry.get("method"), entry.get("path")): entry
-                for entry in report.get("runtime_denials") or []
-                if isinstance(entry, dict)
-            }
-            for method, url, moment in items:
-                check_id, path = _classify(method, url)
-                at = moment.isoformat()
-                logger.warning(
-                    "Checkmarx refused %s %s (403) at run time: the API key is missing a "
-                    "permission. Recorded on the API key permission report.",
-                    method,
-                    path,
+            if _apply_runtime_events(report, items):
+                _finish(
+                    session,
+                    report,
+                    previous,
+                    actor=actor or AuditActor.system("permission-check"),
+                    runtime=True,
                 )
-                entry = entries.get((method, path))
-                if entry is None:
-                    entry = {
-                        "method": method,
-                        "path": path,
-                        "check_id": check_id,
-                        "first_seen": at,
-                        "last_seen": at,
-                        "count": 0,
-                    }
-                    entries[(method, path)] = entry
-                entry["last_seen"] = at
-                entry["count"] = int(entry.get("count") or 0) + 1
-                if check_id is not None:
-                    checks[check_id]["runtime_denied_at"] = at
-            report["runtime_denials"] = sorted(
-                entries.values(), key=lambda entry: str(entry.get("last_seen")), reverse=True
-            )[:_MAX_RUNTIME_ENTRIES]
-            _finish(
-                session,
-                report,
-                previous,
-                actor=actor or AuditActor.system("permission-check"),
-                runtime=True,
-            )
         return len(items)
     except Exception:  # noqa: BLE001 - recording a refusal must never break the caller
         logger.warning("Could not record a run-time 403 on the permission report", exc_info=True)
         return 0
+
+
+def _apply_runtime_events(
+    report: dict[str, Any], items: list[tuple[str, str, str, str | None, datetime]]
+) -> bool:
+    """Apply queued events to ``report`` in place. True when anything changed."""
+    checks = {check.get("id"): check for check in report.get("checks") or []}
+    for spec in SPECS:
+        if spec.id not in checks:
+            report["checks"].append(_empty_check(spec))
+            checks[spec.id] = report["checks"][-1]
+    entries = {
+        (entry.get("method"), entry.get("path")): entry
+        for entry in report.get("runtime_denials") or []
+        if isinstance(entry, dict)
+    }
+    changed = False
+    cleared: set[str] = set()
+    for kind, method, url, _fingerprint, moment in items:
+        check_id, path = _classify(method, url)
+        at = moment.isoformat()
+        if kind == _ALLOWED:
+            entry = entries.get((method, path))
+            if entry is None or str(entry.get("last_seen") or "") > at:
+                continue
+            logger.info(
+                "Checkmarx allowed %s %s, refused earlier: cleared from the API key "
+                "permission report.",
+                method,
+                path,
+            )
+            del entries[(method, path)]
+            changed = True
+            if check_id is not None:
+                cleared.add(check_id)
+            continue
+        logger.warning(
+            "Checkmarx refused %s %s (403) at run time: the API key is missing a "
+            "permission. Recorded on the API key permission report.",
+            method,
+            path,
+        )
+        entry = entries.get((method, path))
+        if entry is None:
+            entry = {
+                "method": method,
+                "path": path,
+                "check_id": check_id,
+                "first_seen": at,
+                "last_seen": at,
+                "count": 0,
+            }
+            entries[(method, path)] = entry
+        entry["last_seen"] = at
+        entry["count"] = int(entry.get("count") or 0) + 1
+        changed = True
+        if check_id is not None:
+            checks[check_id]["runtime_denied_at"] = at
+    for check_id in cleared:
+        remaining = [
+            str(entry.get("last_seen"))
+            for entry in entries.values()
+            if entry.get("check_id") == check_id
+        ]
+        checks[check_id]["runtime_denied_at"] = max(remaining) if remaining else None
+    report["runtime_denials"] = sorted(
+        entries.values(), key=lambda entry: str(entry.get("last_seen")), reverse=True
+    )[:_MAX_RUNTIME_ENTRIES]
+    return changed
+
+
+_SETUP_LINK = (
+    "The Key permissions card on the Connection page shows each call, the key's roles and "
+    "what to do."
+)
 
 
 def _finish(
@@ -1238,6 +1455,7 @@ def _finish(
     assessed = assess(report, current_context(session))
     assert assessed is not None
     verdict = assessed["verdict"]
+    attention = assessed["attention"]
     before = (previous or {}).get("last_verdict")
     ids = problem_ids(report)
     fingerprint = str(report.get("key_fingerprint") or "")
@@ -1249,7 +1467,8 @@ def _finish(
         else:
             report["problem_since"] = previous["problem_since"]  # type: ignore[index]
         if not runtime:
-            logger.warning(
+            log = logger.warning if attention else logger.info
+            log(
                 "The Checkmarx API key is missing permissions (%s): %s",
                 verdict,
                 "; ".join(
@@ -1260,24 +1479,31 @@ def _finish(
             )
         since = str(report["problem_since"]).replace(":", "").replace("-", "")[:15]
         explanation = assessed["explanation"]
+        # Readable by every signed-in user: the summary and what stops working
+        # (what a viewer sees on the card), never the key's roles.
         body = "\n\n".join(
             [
                 assessed["summary"],
                 "\n".join(explanation["why"]),
                 "What is missing:\n" + "\n".join(f"- {line}" for line in explanation["missing"]),
-                "What the key has now:\n" + "\n".join(explanation["roles"]),
                 "What to do:\n" + "\n".join(f"- {line}" for line in explanation["what_to_do"]),
+                _SETUP_LINK,
             ]
         )
+        if not attention:
+            severity = Severity.INFO
+            title = "The Checkmarx API key lacks permissions not needed now"
+        else:
+            severity = Severity.ERROR if verdict == VERDICT_INSUFFICIENT else Severity.WARNING
+            title = "The Checkmarx API key is missing permissions"
+        digest = f"{problem_key(ids) or 'none'}:{verdict}:{'a' if attention else 'n'}"
         notifications.notify(
             session,
             category=notifications.CATEGORY_PERMISSIONS,
-            severity=Severity.ERROR if verdict == VERDICT_INSUFFICIENT else Severity.WARNING,
-            title="The Checkmarx API key is missing permissions",
+            severity=severity,
+            title=title,
             body=body,
-            dedupe_key=notifications.key_permissions_key(
-                fingerprint, since, problem_key(ids) or "none"
-            ),
+            dedupe_key=notifications.key_permissions_key(fingerprint, since, digest),
         )
     elif verdict == VERDICT_OK:
         report["problem_since"] = None
@@ -1287,9 +1513,18 @@ def _finish(
                 category=notifications.CATEGORY_PERMISSIONS,
                 severity=Severity.INFO,
                 title="API key permissions are now sufficient",
-                body="Every permission CreditGuard checked is now granted to the API key.",
+                body=(
+                    "Every read CreditGuard checks is allowed, and no change CreditGuard "
+                    "makes is known to be refused. Changes (removing AI roles, turning Auto "
+                    "Triage or PR triage and remediation off and on) cannot be tested without "
+                    "making them, so each is confirmed the first time CreditGuard makes it."
+                ),
                 dedupe_key=notifications.key_permissions_ok_key(fingerprint, now.isoformat()),
             )
+    else:
+        # Nothing could be checked (the token exchange failed): not the end of
+        # a problem, so the episode, and its notification, carry on.
+        report["problem_since"] = (previous or {}).get("problem_since")
 
     if (
         verdict != before
@@ -1308,4 +1543,8 @@ def _finish(
         )
     if verdict != VERDICT_UNKNOWN:
         report["last_verdict"] = verdict
+        report["last_attention"] = attention
+    else:
+        report["last_verdict"] = before
+        report["last_attention"] = (previous or {}).get("last_attention")
     _store(session, report)

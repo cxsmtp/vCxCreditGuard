@@ -40,6 +40,7 @@ from app.checkmarx.errors import (
     CheckmarxResponseError,
 )
 from app.db.base import utcnow
+from app.models.audit import AuditLogEntry
 from app.models.enums import (
     EnforcementKind,
     EnforcementStatus,
@@ -742,13 +743,30 @@ def _verify_applied(
     if verdict == RECONCILE_UNVERIFIED:
         # The setting could not be read back. The restriction was written again
         # (it is idempotent, so a restriction that still holds is unchanged),
-        # but nothing says it had drifted: no alert, no audit entry.
+        # but nothing says it had drifted: no alert. The tenant was written to,
+        # so the first such re-apply of this restriction is audited; later ones
+        # (every cycle while the read keeps failing) are not.
         outcome.unverified.append(action)
         outcome.skipped.append(
             f"{target.kind} on {target.target_label} could not be verified (its setting could "
             "not be read back); the restriction was re-applied to keep it in force"
         )
         _record_refusals(session, actor)
+        if not _unverified_reapply_audited(session, action):
+            record_audit(
+                session,
+                action=AUDIT_UNVERIFIED_REAPPLY,
+                actor=actor,
+                target_type=AUDIT_TARGET_ACTION,
+                target_id=str(action.id),
+                target_label=target.target_label,
+                after={"kind": str(target.kind), "restricted": True, "verified": False},
+                detail=(
+                    f"The restriction on {target.target_label} could not be read back from "
+                    "Checkmarx One, so it was written again to keep it in force. Recorded once "
+                    "per restriction; later re-applies are not audited."
+                ),
+            )
         session.commit()
         return
     if verdict == RECONCILE_HELD:
@@ -975,6 +993,25 @@ def _merge_snapshots(previous: dict[str, Any] | None, fresh: dict[str, Any]) -> 
 
 
 # ---------------------------------------------------------------- reconciliation
+
+
+AUDIT_UNVERIFIED_REAPPLY = "enforcement.reapplied_unverified"
+AUDIT_TARGET_ACTION = "enforcement_action"
+
+
+def _unverified_reapply_audited(session: Session, action: EnforcementAction) -> bool:
+    return (
+        session.scalar(
+            select(AuditLogEntry.id)
+            .where(
+                AuditLogEntry.action == AUDIT_UNVERIFIED_REAPPLY,
+                AuditLogEntry.target_type == AUDIT_TARGET_ACTION,
+                AuditLogEntry.target_id == str(action.id),
+            )
+            .limit(1)
+        )
+        is not None
+    )
 
 
 # What _reconcile found.

@@ -16,9 +16,17 @@ import { Badge, Button, ErrorNote, InfoNote, Modal, Spinner, Table, Td, Th, type
  * pop-up after sign-in, and the table the Connection page shows.
  */
 
+/**
+ * True when something CreditGuard needs with the current setup is confirmed
+ * missing: only then the banner, the admin pop-up, the top bar light and the
+ * Command Center status show it. Other gaps (optional checks, features not in
+ * use, a guess from the token's roles) are shown on the Connection page only.
+ */
 export function permissionProblem(me: Me): boolean {
-  const verdict = me.key_permissions?.verdict;
-  return verdict === "limited" || verdict === "insufficient";
+  const permissions = me.key_permissions;
+  if (!permissions) return false;
+  const verdict = permissions.verdict;
+  return permissions.attention === true && (verdict === "limited" || verdict === "insufficient");
 }
 
 const STATUS_TEXT: Record<string, [string, BadgeTone]> = {

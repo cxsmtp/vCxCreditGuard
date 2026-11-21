@@ -1084,15 +1084,25 @@ def _notify_breach(
         severity = Severity.WARNING
         dedupe = notifications.monitor_only_key(limit.id, window.key)
 
-    lines = [
-        f"{state.credits_used} of {limit.credit_limit} credits used {describe_window(window)}."
-    ]
+    if notifications.already_raised(session, dedupe):
+        return  # the breakdown below is not worth computing for a duplicate
+    when = usage_mix.window_phrase(window)
     mix = usage_mix.mix_for(session, limit, period_key=window.key, state=state)
     if mix is not None:
-        lines.append(
-            usage_mix.describe(mix, period_key=window.key, entity_type=str(limit.entity_type))
+        # One sentence: the credits against the limit, and what they went on.
+        headline = usage_mix.describe(
+            mix,
+            period_key=window.key,
+            entity_type=str(limit.entity_type),
+            credit_limit=limit.credit_limit,
+            when=when,
         )
-    lines.append(tail)
+    else:
+        headline = (
+            f"{usage_mix.format_credits(state.credits_used)} of "
+            f"{usage_mix.format_credits(limit.credit_limit)} credits used {when}."
+        )
+    lines = [headline, tail]
     if limit.enforce and not exempt:
         kind = usage_mix.restriction_kind_for(limit.entity_type)
         lines.append(

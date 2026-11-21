@@ -42,6 +42,8 @@ export type KeyPermissionStatus = "ok" | "denied" | "not_found" | "error" | "ski
 
 export interface KeyPermissionSummary {
   verdict: KeyPermissionVerdict;
+  /** True only when something needed with the current setup is confirmed missing. */
+  attention?: boolean;
   summary: string;
   /** "CreditGuard can't ..." phrases, most serious first. */
   missing: string[];

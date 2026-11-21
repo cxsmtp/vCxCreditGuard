@@ -463,11 +463,24 @@ export function Modal({
   // of any input inside the modal (one letter typed, then focus jumps away).
   useEffect(() => {
     if (!open) return;
-    dialogRef.current?.focus();
+    // Whatever opened the dialog gets focus back when it closes, so a keyboard
+    // user carries on where they were instead of at the top of the page.
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    dialog?.focus();
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
       document.body.style.overflow = previousOverflow;
+      // Only when focus was still in the dialog (or went nowhere as it was
+      // removed), and the opener is still on the page: never pull focus away
+      // from something the user moved to, or onto an element a navigation
+      // removed.
+      const active = document.activeElement;
+      const focusLost = !active || active === document.body || (dialog?.contains(active) ?? false);
+      if (opener && opener !== document.body && opener.isConnected && focusLost) {
+        opener.focus({ preventScroll: true });
+      }
     };
   }, [open]);
 
