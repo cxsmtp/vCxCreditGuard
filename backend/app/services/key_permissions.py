@@ -23,9 +23,13 @@ Refusals seen at run time (a restriction, a restore, a cycle read) are recorded
 on the same report, so a write the probes could not test shows up the moment it
 is first refused. Each one is tagged with the key it was made with, so a
 replaced key's refusals never land on its successor. A refused read is cleared
-by the next probe of that read that succeeds; a refused change is cleared only
-when CreditGuard later makes the same change successfully (nothing else is
-evidence that it works).
+by the next probe of that read that succeeds; a read refused on one particular
+project, repository or user (a key can be refused one it cannot see while
+reading others fine) is cleared only by a read of that same one, which the
+check makes directly. A refused change is cleared only when CreditGuard later
+makes the same change successfully (nothing else is evidence that it works), or
+once nothing configured needs it any more ("Check again", or the automatic
+check when it is old).
 
 How serious a gap is depends on what is configured right now (an enforcing user
 limit needs the role mapping calls, an enforcing project, group or application
@@ -50,10 +54,10 @@ import logging
 import re
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -128,6 +132,15 @@ TRIGGER_RUNTIME = "runtime"
 REPORT_VERSION = 1
 _MAX_NAMES = 200
 _MAX_RUNTIME_ENTRIES = 50
+# Run-time events waiting to be recorded, at most.
+_MAX_PENDING = _MAX_RUNTIME_ENTRIES * 4
+# Per refused read: the projects, repositories or users it was refused on that
+# are remembered, and how many of them each check reads again directly.
+_MAX_RESOURCES = 10
+_MAX_RESOURCE_PROBES = 3
+# A run-time refusal of something nothing configured needs any more is dropped
+# by the automatic check once it is this old ("Check again" drops it at once).
+UNNEEDED_REFUSAL_AGE = timedelta(days=7)
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +402,17 @@ _RUNTIME_ROUTES: tuple[tuple[frozenset[str], re.Pattern[str], str], ...] = tuple
     )
 )
 
+# Reads made on one particular project, repository or user: the part of the
+# path that names it. A key can be refused one it cannot see while reading
+# others fine, so a refusal of one is only disproved by reading that same one.
+# Kept on the stored report (never returned by the API) so the check can read
+# it again directly.
+_RESOURCE_PATTERNS: dict[str, re.Pattern[str]] = {
+    "ai_config_read": re.compile(r"/ai-agents-coordinator/projects/([^/]+)/configuration/?$"),
+    "repo_read": re.compile(r"/repos-manager/repo/([^/]+)/?$"),
+    "iam_user_roles": re.compile(r"/users/([^/]+)/role-mappings/clients/([^/]+)/?$"),
+}
+
 
 # ------------------------------------------------------------ token claims
 
@@ -458,10 +482,23 @@ _pending_lock = threading.Lock()
 _denied_routes: frozenset[tuple[str, str]] = frozenset()
 
 
+# (check id, resource) of the reads refused on one particular project,
+# repository or user. A successful read is only queued when it answers one.
+_denied_resources: frozenset[tuple[str, str]] = frozenset()
+
+
 def _queue(kind: str, method: str, url: str, fingerprint: str | None) -> None:
     with _pending_lock:
-        if len(_pending) < _MAX_RUNTIME_ENTRIES * 4:
+        if len(_pending) < _MAX_PENDING:
             _pending.append((kind, method, url, fingerprint, utcnow()))
+
+
+def _requeue(items: list[tuple[str, str, str, str | None, datetime]]) -> None:
+    """Put events a flush could not record back, ahead of newer ones, keeping
+    the newest when that is more than the queue holds."""
+    with _pending_lock:
+        merged = [*items, *_pending]
+        _pending[:] = merged[-_MAX_PENDING:]
 
 
 def _on_forbidden(method: str, url: str, fingerprint: str | None) -> None:
@@ -469,8 +506,17 @@ def _on_forbidden(method: str, url: str, fingerprint: str | None) -> None:
 
 
 def _on_success(method: str, url: str, fingerprint: str | None) -> None:
+    if method == "GET":
+        resources = _denied_resources
+        if not resources:
+            return
+        check_id, _path = _classify(method, url)
+        resource = _resource(check_id, url)
+        if check_id is not None and resource is not None and (check_id, resource) in resources:
+            _queue(_ALLOWED, method, url, fingerprint)
+        return
     routes = _denied_routes
-    if not routes or method == "GET":
+    if not routes:
         return
     _check_id, path = _classify(method, url)
     if (method, path) in routes:
@@ -485,14 +531,48 @@ _probing = listeners_paused
 
 
 def _remember_denied_routes(report: dict[str, Any] | None) -> None:
-    global _denied_routes
+    global _denied_routes, _denied_resources
+    entries = [
+        entry for entry in (report or {}).get("runtime_denials") or [] if isinstance(entry, dict)
+    ]
     routes = frozenset(
         (str(entry.get("method")), str(entry.get("path")))
-        for entry in (report or {}).get("runtime_denials") or []
-        if isinstance(entry, dict) and entry.get("method") != "GET"
+        for entry in entries
+        if entry.get("method") != "GET"
+    )
+    resources = frozenset(
+        (str(entry.get("check_id")), item["id"])
+        for entry in entries
+        if entry.get("method") == "GET"
+        for item in _entry_resources(entry)
     )
     if routes != _denied_routes:
         _denied_routes = routes
+    if resources != _denied_resources:
+        _denied_resources = resources
+
+
+def _entry_resources(entry: dict[str, Any]) -> list[dict[str, str]]:
+    """The resources a stored refusal was met on ([] for one not tied to any)."""
+    resources = entry.get("resources")
+    if not isinstance(resources, list):
+        return []
+    return [
+        item
+        for item in resources
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+    ]
+
+
+def _resource(check_id: str | None, url: str) -> str | None:
+    """The project, repository or user (\"user/client\") a read was made on."""
+    pattern = _RESOURCE_PATTERNS.get(check_id or "")
+    if pattern is None:
+        return None
+    match = pattern.search(urlparse(url).path or url)
+    if match is None:
+        return None
+    return "/".join(unquote(part) for part in match.groups())[:300]
 
 
 def _classify(method: str, url: str) -> tuple[str | None, str]:
@@ -537,6 +617,18 @@ def discard_pending_denials() -> None:
 # -------------------------------------------------------------- the probes
 
 
+# A refused resource that cannot be read again because it is no longer known
+# (a repository whose project is gone): nothing needs it, so its refusal goes.
+_RESOURCE_GONE = "gone"
+_RESOURCE_CLEARED = frozenset({STATUS_OK, STATUS_NOT_FOUND, _RESOURCE_GONE})
+# check id -> (one, several) of what its resources are, for the card.
+_RESOURCE_NOUNS = {
+    "ai_config_read": ("project", "projects"),
+    "repo_read": ("repository", "repositories"),
+    "iam_user_roles": ("user", "users"),
+}
+
+
 @dataclass
 class _ProbeTargets:
     period: str
@@ -544,6 +636,12 @@ class _ProbeTargets:
     repo: tuple[str, str] | None  # (repo id, project id)
     user_id: str | None
     client_uuid: str | None = None
+    # check id -> resources a run-time read was refused on, to read again directly.
+    refused: dict[str, list[str]] = field(default_factory=dict)
+    # repo id -> project id, for reading a refused repository again.
+    repo_projects: dict[str, str] = field(default_factory=dict)
+    # (check id, resource) -> status, for every resource read by the probes.
+    resource_results: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
 def _outcome(call: Callable[[], Any]) -> tuple[str, str | None]:
@@ -646,6 +744,7 @@ def _run_probes(
         results["ai_config_read"] = _outcome(
             lambda: client.get_json(platform.AUTO_TRIAGE_PATH.format(project_id=project_id))
         )
+        targets.resource_results[("ai_config_read", project_id)] = results["ai_config_read"][0]
 
     if repo is None:
         results["repo_read"] = (
@@ -661,6 +760,7 @@ def _run_probes(
                 params={"projectId": repo_project},
             )
         )
+        targets.resource_results[("repo_read", repo_id)] = results["repo_read"][0]
 
     results["iam_clients"] = _outcome(client_lookup)
     if targets.client_uuid is None:
@@ -682,7 +782,47 @@ def _run_probes(
             results["iam_user_roles"] = _outcome(
                 lambda: iam.fetch_user_client_roles(client, user_id=user_id, client_uuid=uuid)
             )
+            targets.resource_results[("iam_user_roles", f"{user_id}/{uuid}")] = results[
+                "iam_user_roles"
+            ][0]
+
+    # The particular projects, repositories and users a read was refused on at
+    # run time: only reading that same one again says whether it is allowed now.
+    for check_id, resources in targets.refused.items():
+        for resource in resources[:_MAX_RESOURCE_PROBES]:
+            if (check_id, resource) not in targets.resource_results:
+                targets.resource_results[(check_id, resource)] = _read_resource(
+                    client, check_id, resource, targets.repo_projects
+                )
     return results
+
+
+def _read_resource(
+    client: CheckmarxClient, check_id: str, resource: str, repo_projects: dict[str, str]
+) -> str:
+    """Read one refused project, repository or user again: its status."""
+    if check_id == "ai_config_read":
+        return _outcome(
+            lambda: client.get_json(platform.AUTO_TRIAGE_PATH.format(project_id=resource))
+        )[0]
+    if check_id == "repo_read":
+        project_id = repo_projects.get(resource)
+        if project_id is None:
+            return _RESOURCE_GONE
+        return _outcome(
+            lambda: client.get_json(
+                platform.REPO_SETTINGS_PATH.format(repo_id=resource),
+                params={"projectId": project_id},
+            )
+        )[0]
+    if check_id == "iam_user_roles":
+        user_id, _, client_uuid = resource.partition("/")
+        if not user_id or not client_uuid:
+            return _RESOURCE_GONE
+        return _outcome(
+            lambda: iam.fetch_user_client_roles(client, user_id=user_id, client_uuid=client_uuid)
+        )[0]
+    return STATUS_NOT_TESTED
 
 
 # ----------------------------------------------------------- the report
@@ -786,7 +926,6 @@ def _skeleton(fingerprint: str | None) -> dict[str, Any]:
         "runtime_denials": [],
         "token": None,
         "last_verdict": None,
-        "last_attention": None,
         "problem_since": None,
     }
 
@@ -973,7 +1112,12 @@ def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None
         "checks": checks,
         "missing": cant,
         "problem_key": problem_key([check["id"] for check in problems]),
-        "runtime_denials": list(report.get("runtime_denials") or []),
+        # The resources a refusal was met on are bookkeeping for the check.
+        "runtime_denials": [
+            {key: value for key, value in entry.items() if key != "resources"}
+            for entry in report.get("runtime_denials") or []
+            if isinstance(entry, dict)
+        ],
         "token": claims,
         "explanation": _explain(verdict, ordered, claims, report, attention=attention),
     }
@@ -1040,7 +1184,8 @@ def _explain(
         "Paste the new key on the Connection page, or press Check again after changing the "
         "existing key. Check again re-reads everything it can; a change refused at run time "
         "stays listed until CreditGuard next makes that same change successfully, because a "
-        "change cannot be tested without making it.",
+        "change cannot be tested without making it, or until nothing configured needs it any "
+        "more.",
     ]
     if verdict == VERDICT_LIMITED:
         what_to_do.append(
@@ -1223,6 +1368,7 @@ def _run_check(
     targets.user_id = session.scalar(
         select(CxUser.id).where(CxUser.is_deleted.is_(False)).order_by(CxUser.id).limit(1)
     ) or connection_service.api_key_subject(session)
+    _refused_resources(session, targets, fingerprint)
 
     skip: dict[str, str] = {}
     if trigger == TRIGGER_CYCLE and not ctx.auto_triage_charging:
@@ -1283,12 +1429,72 @@ def _run_check(
                 f"{carried.get('detail') or ''} (from the last check that read scans)".strip()
             )
     _infer_writes(checks, claims)
+    _note_refused_resources(checks, results, targets)
     if previous is not None:
-        _carry_runtime(report, checks, previous, results, clear_unlisted_reads=clear_runtime)
+        _carry_runtime(
+            report,
+            checks,
+            previous,
+            results,
+            resource_results=targets.resource_results,
+            ctx=current_context(session),
+            clear_runtime=clear_runtime,
+            now=utcnow(),
+        )
 
     _finish(session, report, previous, actor=actor)
     session.commit()
     return assess(report, current_context(session))
+
+
+def _refused_resources(session: Session, targets: _ProbeTargets, fingerprint: str | None) -> None:
+    """The resources run-time reads were refused on, most recent first, for the
+    probes to read again; and the projects of refused repositories."""
+    stored = load(session)
+    if stored is None or stored.get("key_fingerprint") != fingerprint:
+        return
+    for entry in stored.get("runtime_denials") or []:
+        if not isinstance(entry, dict) or entry.get("method") != "GET":
+            continue
+        check_id = entry.get("check_id")
+        if check_id not in _RESOURCE_PATTERNS:
+            continue
+        items = sorted(
+            _entry_resources(entry), key=lambda item: str(item.get("last_seen")), reverse=True
+        )
+        listed = targets.refused.setdefault(str(check_id), [])
+        listed.extend(item["id"] for item in items if item["id"] not in listed)
+    repos = targets.refused.get("repo_read") or []
+    if repos:
+        for repo_id, project_id in session.execute(
+            select(CxProject.repo_id, CxProject.id)
+            .where(CxProject.is_deleted.is_(False), CxProject.repo_id.in_(repos))
+            .order_by(CxProject.id)
+        ):
+            targets.repo_projects.setdefault(str(repo_id), project_id)
+
+
+def _note_refused_resources(
+    checks: dict[str, dict[str, Any]],
+    results: dict[str, tuple[str, str | None]],
+    targets: _ProbeTargets,
+) -> None:
+    """Say so on a read the probe found allowed while it is still refused on a
+    project, repository or user CreditGuard used it on. Counts only, no ids."""
+    for check_id, (one, several) in _RESOURCE_NOUNS.items():
+        if results.get(check_id, (None, None))[0] != STATUS_OK:
+            continue
+        refused = sum(
+            1
+            for resource in targets.refused.get(check_id) or []
+            if targets.resource_results.get((check_id, resource)) == STATUS_DENIED
+        )
+        if refused:
+            checks[check_id]["detail"] = (
+                f"Allowed on the {one} checked, but still refused (403) on {refused} "
+                f"{one if refused == 1 else several} CreditGuard used it on: the key may not "
+                f"see {'it' if refused == 1 else 'them'}."
+            )
 
 
 def _carry_runtime(
@@ -1297,14 +1503,24 @@ def _carry_runtime(
     previous: dict[str, Any],
     results: dict[str, tuple[str, str | None]],
     *,
-    clear_unlisted_reads: bool,
+    resource_results: dict[tuple[str, str], str],
+    ctx: Context,
+    clear_runtime: bool,
+    now: datetime,
 ) -> None:
     """Keep the refusals seen at run time that this check cannot disprove.
 
-    A read the probes just made successfully works now, so its refusal goes. A
-    refused change stays until the same change goes through at run time: a
-    probe cannot test it. ``clear_unlisted_reads`` ("Check again") also forgets
-    refused reads that match no check; one that still happens comes back.
+    A read the probes just made successfully works now, so its refusal goes;
+    one refused on a particular project, repository or user goes only once
+    that same one was read successfully. A refused change stays until the same
+    change goes through at run time: a probe cannot test it. ``clear_runtime``
+    ("Check again") also forgets refused reads that match no check; one that
+    still happens comes back.
+
+    A refusal of something nothing configured needs any more (its limit was
+    deleted, or no longer enforces) goes on "Check again", and on any check
+    once it is older than ``UNNEEDED_REFUSAL_AGE``: it would otherwise stay
+    listed forever, since nothing makes that call again to clear it.
     """
     allowed_now = {
         check_id
@@ -1312,20 +1528,64 @@ def _carry_runtime(
         if status == STATUS_OK and SPEC_BY_ID[check_id].kind == "read"
     }
     kept: list[dict[str, Any]] = []
+    had_entries: set[str] = set()
     for entry in previous.get("runtime_denials") or []:
         if not isinstance(entry, dict):
             continue
         check_id = entry.get("check_id")
-        if check_id in allowed_now:
+        if check_id:
+            had_entries.add(str(check_id))
+        resources = _entry_resources(entry)
+        if resources:
+            remaining = [
+                item
+                for item in resources
+                if resource_results.get((str(check_id), item["id"])) not in _RESOURCE_CLEARED
+            ]
+            if not remaining:
+                continue
+            entry = {**entry, "resources": remaining}
+        elif check_id in allowed_now:
             continue
-        if check_id is None and clear_unlisted_reads and entry.get("method") == "GET":
+        if check_id is None and clear_runtime and entry.get("method") == "GET":
+            continue
+        if _unneeded(entry, ctx, clear=clear_runtime, now=now):
             continue
         kept.append(entry)
     report["runtime_denials"] = kept
+
+    latest: dict[str, str] = {}
+    for entry in kept:
+        check_id = entry.get("check_id")
+        if check_id in checks:
+            seen = str(entry.get("last_seen") or "")
+            latest[check_id] = max(latest.get(check_id, ""), seen)
+    for check_id, seen in latest.items():
+        checks[check_id]["runtime_denied_at"] = seen or None
     for old in previous.get("checks") or []:
         check_id = old.get("id")
-        if old.get("runtime_denied_at") and check_id in checks and check_id not in allowed_now:
+        if (
+            old.get("runtime_denied_at")
+            and check_id in checks
+            and check_id not in latest
+            and check_id not in allowed_now
+            # Its refusals were on the report and none is left: nothing to carry.
+            and check_id not in had_entries
+        ):
             checks[check_id]["runtime_denied_at"] = old["runtime_denied_at"]
+
+
+def _unneeded(entry: dict[str, Any], ctx: Context, *, clear: bool, now: datetime) -> bool:
+    """A refusal of something nothing configured needs now, to be dropped."""
+    spec = SPEC_BY_ID.get(str(entry.get("check_id") or ""))
+    if spec is not None and _required(spec, ctx)[0]:
+        return False
+    if spec is not None and clear:
+        return True
+    # Not tied to anything CreditGuard checks (so not known to be needed), or
+    # not needed now: dropped once nothing has met it for a while.
+    seen = _parse_time(entry.get("last_seen"))
+    return seen is not None and seen <= now - UNNEEDED_REFUSAL_AGE
 
 
 def flush_runtime_denials(session: Session, *, actor: AuditActor | None = None) -> int:
@@ -1346,6 +1606,8 @@ def flush_runtime_denials(session: Session, *, actor: AuditActor | None = None) 
         with session.begin_nested():
             fingerprint = _current_fingerprint(session)
             if fingerprint is None:
+                # Nothing to record them on yet; saving a key discards them.
+                _requeue(items)
                 return 0
             items = [item for item in items if item[3] is None or item[3] == fingerprint]
             if not items:
@@ -1365,6 +1627,8 @@ def flush_runtime_denials(session: Session, *, actor: AuditActor | None = None) 
         return len(items)
     except Exception:  # noqa: BLE001 - recording a refusal must never break the caller
         logger.warning("Could not record a run-time 403 on the permission report", exc_info=True)
+        # Kept for the next flush rather than lost (bounded, like the queue).
+        _requeue(items)
         return 0
 
 
@@ -1386,11 +1650,33 @@ def _apply_runtime_events(
     cleared: set[str] = set()
     for kind, method, url, _fingerprint, moment in items:
         check_id, path = _classify(method, url)
+        resource = _resource(check_id, url) if method == "GET" else None
         at = moment.isoformat()
         if kind == _ALLOWED:
             entry = entries.get((method, path))
-            if entry is None or str(entry.get("last_seen") or "") > at:
+            if entry is None:
                 continue
+            resources = _entry_resources(entry)
+            if not resources and (method == "GET" or str(entry.get("last_seen") or "") > at):
+                # A read is only queued for a refused resource; a change refused
+                # again after this success is still refused.
+                continue
+            if resources:
+                # Refused on particular ones: this one is allowed now.
+                remaining = [
+                    item
+                    for item in resources
+                    if item["id"] != resource or str(item.get("last_seen") or "") > at
+                ]
+                if len(remaining) == len(resources):
+                    continue
+                changed = True
+                if remaining:
+                    entry["resources"] = remaining
+                    entry["last_seen"] = max(str(item.get("last_seen")) for item in remaining)
+                    if check_id is not None:
+                        cleared.add(check_id)
+                    continue
             logger.info(
                 "Checkmarx allowed %s %s, refused earlier: cleared from the API key "
                 "permission report.",
@@ -1421,6 +1707,10 @@ def _apply_runtime_events(
             entries[(method, path)] = entry
         entry["last_seen"] = at
         entry["count"] = int(entry.get("count") or 0) + 1
+        if resource is not None:
+            others = [item for item in _entry_resources(entry) if item["id"] != resource]
+            # Most recent first; the oldest fall off.
+            entry["resources"] = [{"id": resource, "last_seen": at}, *others][:_MAX_RESOURCES]
         changed = True
         if check_id is not None:
             checks[check_id]["runtime_denied_at"] = at
@@ -1541,10 +1831,6 @@ def _finish(
             after={"verdict": verdict, "missing": ids},
             detail=assessed["summary"],
         )
-    if verdict != VERDICT_UNKNOWN:
-        report["last_verdict"] = verdict
-        report["last_attention"] = attention
-    else:
-        report["last_verdict"] = before
-        report["last_attention"] = (previous or {}).get("last_attention")
+    report["last_verdict"] = verdict if verdict != VERDICT_UNKNOWN else before
+    report.pop("last_attention", None)
     _store(session, report)

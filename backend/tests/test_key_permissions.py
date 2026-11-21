@@ -1041,3 +1041,348 @@ class TestUsageMixWording:
         before = db.scalar(select(func.count()).select_from(Notification))
         db.commit()
         assert db.scalar(select(func.count()).select_from(Notification)) == before
+
+
+# ----------------------------------------------------- follow-up review (kp2)
+
+_API = "https://eu.ast.checkmarx.net/api"
+_IAM = "https://eu.iam.checkmarx.net/auth/admin/realms/acme-corp"
+
+
+def permission_audits(db: Session) -> list[AuditLogEntry]:
+    return list(
+        db.scalars(
+            select(AuditLogEntry).where(AuditLogEntry.action == "connection.permissions_changed")
+        )
+    )
+
+
+class TestRefusalOnOneResource:
+    """A read refused on one project is not disproved by reading another one."""
+
+    def test_a_read_refused_on_one_project_does_not_flip_with_the_probe(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        synced(db, tenant)
+        check(db)
+        # The key cannot see proj-tools; the probe reads proj-api fine.
+        limit = add_limit(db, EntityType.PROJECT, "proj-tools", enforce=True)
+        tenant.fail_requests[("GET", "/projects/proj-tools/configuration")] = 403
+        verdicts = []
+        for _ in range(3):
+            enforcement.apply_enforcement(
+                db, tenant.client(), limit=limit, period_key=PERIOD, actor=ACTOR
+            )
+            db.commit()
+            verdicts.append(key_permissions.current_report(db)["verdict"])
+            key_permissions.run_check(db, trigger=key_permissions.TRIGGER_CYCLE, actor=ACTOR)
+            verdicts.append(key_permissions.current_report(db)["verdict"])
+        assert verdicts == [key_permissions.VERDICT_INSUFFICIENT] * 6
+        assert len(permission_notifications(db)) == 1
+        assert len(permission_audits(db)) == 1
+
+        report = key_permissions.current_report(db)
+        checks = by_id(report)
+        # The project the probe read is readable; the refusal on the other one stays.
+        assert checks["ai_config_read"]["status"] == key_permissions.STATUS_OK
+        assert checks["ai_config_read"]["runtime_denied_at"] is not None
+        assert "still refused (403) on 1 project" in checks["ai_config_read"]["detail"]
+        # The project id is kept internally only.
+        assert "proj-tools" not in str(report)
+        assert "proj-tools" in str(key_permissions.load(db)["runtime_denials"])
+        assert "last_attention" not in key_permissions.load(db)
+
+        # Once the key may read that project, the next check sees it and clears it.
+        tenant.fail_requests.clear()
+        report = key_permissions.run_check(db, trigger=key_permissions.TRIGGER_CYCLE, actor=ACTOR)
+        assert report["verdict"] == key_permissions.VERDICT_OK, report["summary"]
+        assert report["runtime_denials"] == []
+        assert by_id(report)["ai_config_read"]["runtime_denied_at"] is None
+
+    def test_admin_api_does_not_show_the_refused_resource(
+        self, admin_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        synced(db, tenant)
+        check(db)
+        key_permissions._on_forbidden(
+            "GET", f"{_API}/ai-agents-coordinator/projects/proj-tools/configuration", None
+        )
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        db.commit()
+        body = admin_client.get("/api/connection/permissions").json()
+        assert body["report"]["runtime_denials"]
+        assert "proj-tools" not in str(body)
+
+    def test_a_later_successful_read_of_the_same_project_clears_it(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        synced(db, tenant)
+        check(db)
+        tenant.fail_requests[("GET", "/projects/proj-tools/configuration")] = 403
+        with pytest.raises(CheckmarxPermissionError):
+            tenant.client().get_json("/ai-agents-coordinator/projects/proj-tools/configuration")
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        db.commit()
+        assert by_id(key_permissions.current_report(db))["ai_config_read"]["runtime_denied_at"]
+
+        tenant.fail_requests.clear()
+        # Reading another project is no evidence; it is not even queued.
+        tenant.client().get_json("/ai-agents-coordinator/projects/proj-api/configuration")
+        assert key_permissions.pending_denials() == 0
+        # Reading the refused one is.
+        tenant.client().get_json("/ai-agents-coordinator/projects/proj-tools/configuration")
+        assert key_permissions.pending_denials() == 1
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        db.commit()
+        report = key_permissions.current_report(db)
+        assert report["runtime_denials"] == []
+        assert by_id(report)["ai_config_read"]["runtime_denied_at"] is None
+
+    def test_a_repository_refused_at_run_time_is_probed_directly(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        synced(db, tenant)
+        tenant.add_project(project_id="proj-z", name="zz/other", repo_id="repo-9")
+        synced(db, tenant)
+        check(db)
+        tenant.fail_requests[("GET", "/repos-manager/repo/repo-9")] = 403
+        with pytest.raises(CheckmarxPermissionError):
+            tenant.client().get_json("/repos-manager/repo/repo-9", params={"projectId": "proj-z"})
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        db.commit()
+        # The probe reads repo-1 (proj-api) fine, but repo-9 is still refused.
+        report = key_permissions.run_check(db, trigger=key_permissions.TRIGGER_CYCLE, actor=ACTOR)
+        assert by_id(report)["repo_read"]["runtime_denied_at"] is not None
+        tenant.fail_requests.clear()
+        report = key_permissions.run_check(db, trigger=key_permissions.TRIGGER_CYCLE, actor=ACTOR)
+        assert by_id(report)["repo_read"]["runtime_denied_at"] is None
+        assert report["runtime_denials"] == []
+
+
+class TestRefusalsNotNeededNow:
+    """A refused change nothing needs any more does not stay listed forever."""
+
+    def _refuse_role_removal(self, db: Session, tenant: FakeTenant):
+        synced(db, tenant)
+        check(db)
+        limit = add_limit(db, EntityType.USER, "user-harsh", enforce=True)
+        tenant.fail_requests[("DELETE", "/role-mappings/")] = 403
+        enforcement.apply_enforcement(
+            db, tenant.client(), limit=limit, period_key=PERIOD, actor=ACTOR
+        )
+        db.commit()
+        assert key_permissions.current_report(db)["verdict"] == key_permissions.VERDICT_INSUFFICIENT
+        return limit
+
+    def test_check_again_drops_a_refused_change_no_limit_needs(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        limit = self._refuse_role_removal(db, tenant)
+        limit.enforce = False
+        db.commit()
+        # A recent refusal survives the automatic check (it is not needed now,
+        # so it is on the card only)...
+        report = key_permissions.run_check(db, trigger=key_permissions.TRIGGER_CYCLE, actor=ACTOR)
+        assert by_id(report)["role_mapping_write"]["runtime_denied_at"] is not None
+        assert report["attention"] is False
+        # ...and "Check again" drops it.
+        report = check(db, clear_runtime=True)
+        assert by_id(report)["role_mapping_write"]["runtime_denied_at"] is None
+        assert report["runtime_denials"] == []
+        assert report["verdict"] == key_permissions.VERDICT_OK
+
+    def test_an_old_refused_change_no_limit_needs_is_dropped_by_the_automatic_check(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        from app.services import settings_store
+
+        limit = self._refuse_role_removal(db, tenant)
+        stored = key_permissions.load(db)
+        old = (utcnow() - key_permissions.UNNEEDED_REFUSAL_AGE * 2).isoformat()
+        for entry in stored["runtime_denials"]:
+            entry["first_seen"] = entry["last_seen"] = old
+        for entry in stored["checks"]:
+            if entry["runtime_denied_at"]:
+                entry["runtime_denied_at"] = old
+        settings_store.set_value(db, settings_store.KEY_KEY_PERMISSIONS, stored)
+        db.commit()
+
+        # Still needed (the limit enforces): kept, however old.
+        report = key_permissions.run_check(db, trigger=key_permissions.TRIGGER_CYCLE, actor=ACTOR)
+        assert by_id(report)["role_mapping_write"]["runtime_denied_at"] is not None
+        # Not needed any more: dropped by the automatic check.
+        limit.enforce = False
+        db.commit()
+        report = key_permissions.run_check(db, trigger=key_permissions.TRIGGER_CYCLE, actor=ACTOR)
+        assert by_id(report)["role_mapping_write"]["runtime_denied_at"] is None
+        assert report["runtime_denials"] == []
+
+
+class TestFlushKeepsEvents:
+    def test_a_failed_flush_puts_the_events_back(
+        self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        check(db)
+        key_permissions._on_forbidden("GET", f"{_API}/credits/info", None)
+        real = key_permissions._finish
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("database went away")
+
+        monkeypatch.setattr(key_permissions, "_finish", broken)
+        assert key_permissions.flush_runtime_denials(db, actor=ACTOR) == 0
+        assert key_permissions.pending_denials() == 1
+        monkeypatch.setattr(key_permissions, "_finish", real)
+        assert key_permissions.flush_runtime_denials(db, actor=ACTOR) == 1
+        db.commit()
+        assert by_id(key_permissions.current_report(db))["credit_pool"]["runtime_denied_at"]
+
+    def test_the_put_back_queue_stays_bounded(
+        self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        check(db)
+        cap = key_permissions._MAX_PENDING
+        for _ in range(cap):
+            key_permissions._on_forbidden("GET", f"{_API}/credits/info", None)
+
+        def broken(*args, **kwargs):
+            # More arrive while the flush is under way.
+            for _ in range(5):
+                key_permissions._on_forbidden("GET", f"{_API}/credits/info", None)
+            raise RuntimeError("database went away")
+
+        monkeypatch.setattr(key_permissions, "_finish", broken)
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        assert key_permissions.pending_denials() == cap
+
+
+def test_events_wait_while_no_connection_is_stored(db: Session) -> None:
+    key_permissions.discard_pending_denials()
+    try:
+        key_permissions._on_forbidden("GET", f"{_API}/credits/info", None)
+        assert key_permissions.flush_runtime_denials(db, actor=ACTOR) == 0
+        assert key_permissions.pending_denials() == 1
+    finally:
+        key_permissions.discard_pending_denials()
+
+
+class TestListeners:
+    def test_an_unrelated_change_going_through_does_not_clear_a_refusal(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        check(db)
+        refused = f"{_API}/ai-agents-coordinator/projects/p1/configuration"
+        key_permissions._on_forbidden("PUT", refused, None)
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        db.commit()
+        key_permissions.load(db)
+        key_permissions._on_success("PATCH", f"{_API}/repos-manager/repo/r1?projectId=p1", None)
+        key_permissions._on_success("POST", refused, None)
+        key_permissions._on_success("DELETE", f"{_IAM}/users/u1/role-mappings/clients/c1", None)
+        assert key_permissions.pending_denials() == 0
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        db.commit()
+        assert by_id(key_permissions.current_report(db))["ai_config_write"]["runtime_denied_at"]
+        # The same change going through does clear it.
+        key_permissions._on_success(
+            "PUT", f"{_API}/ai-agents-coordinator/projects/p2/configuration", None
+        )
+        assert key_permissions.pending_denials() == 1
+        key_permissions.flush_runtime_denials(db, actor=ACTOR)
+        db.commit()
+        report = key_permissions.current_report(db)
+        assert by_id(report)["ai_config_write"]["runtime_denied_at"] is None
+
+    def test_pausing_the_listeners_is_per_thread(self, tenant: FakeTenant) -> None:
+        import threading
+
+        from app.checkmarx.client import listeners_paused
+
+        tenant.fail_requests[("GET", "/credits/info")] = 403
+        client = tenant.client()
+        inside = threading.Event()
+        release = threading.Event()
+        paused_calls: list[Exception] = []
+
+        def paused_thread() -> None:
+            with listeners_paused():
+                try:
+                    client.get_json("/api/credits/info")
+                except CheckmarxPermissionError as exc:
+                    paused_calls.append(exc)
+                inside.set()
+                release.wait(5)
+
+        worker = threading.Thread(target=paused_thread)
+        worker.start()
+        try:
+            assert inside.wait(5)
+            assert paused_calls
+            # The paused thread's own 403 was not queued...
+            assert key_permissions.pending_denials() == 0
+            # ...while another thread's, made during the pause, is.
+            with pytest.raises(CheckmarxPermissionError):
+                client.get_json("/api/credits/info")
+            assert key_permissions.pending_denials() == 1
+        finally:
+            release.set()
+            worker.join()
+
+
+class TestMaskedSlide:
+    def test_a_masked_slide_does_not_put_every_credit_on_one_action(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        """Fusion steady at 10 in a sliding window (5 left, 5 new); triage 2 -> 3."""
+        tenant.set_entity_credits(
+            view="project",
+            name="payments/web",
+            credits=10,
+            entity_id="proj-web",
+            actions={"fusion": 10, "triage": 2},
+        )
+        assert cycle.run_cycle(trigger="manual", force_org_sync=True).status == RunStatus.SUCCESS
+        add_limit(db, EntityType.PROJECT, "proj-web", enforce=False, credit_limit=3)
+        cycle.run_cycle(trigger="manual")
+        tenant.set_entity_credits(
+            view="project",
+            name="payments/web",
+            credits=16,
+            entity_id="proj-web",
+            actions={"fusion": 10, "triage": 3},
+        )
+        cycle.run_cycle(trigger="manual")
+        db.expire_all()
+        breach = db.scalar(
+            select(Notification).where(Notification.title.like("%reached its credit limit"))
+        )
+        assert breach is not None
+        assert ": AI Triage 6." not in breach.body, breach.body
+        assert "AI Triage 1 transaction" in breach.body
+        assert "can hide new ones" in breach.body
+
+    def test_one_action_alone_still_gets_the_credits(self, db: Session, tenant: FakeTenant) -> None:
+        tenant.set_entity_credits(
+            view="project",
+            name="payments/web",
+            credits=10,
+            entity_id="proj-web",
+            actions={"triage": 2},
+        )
+        assert cycle.run_cycle(trigger="manual", force_org_sync=True).status == RunStatus.SUCCESS
+        add_limit(db, EntityType.PROJECT, "proj-web", enforce=False, credit_limit=3)
+        cycle.run_cycle(trigger="manual")
+        tenant.set_entity_credits(
+            view="project",
+            name="payments/web",
+            credits=16,
+            entity_id="proj-web",
+            actions={"triage": 5},
+        )
+        cycle.run_cycle(trigger="manual")
+        db.expire_all()
+        breach = db.scalar(
+            select(Notification).where(Notification.title.like("%reached its credit limit"))
+        )
+        assert breach is not None
+        assert ": AI Triage 6." in breach.body, breach.body

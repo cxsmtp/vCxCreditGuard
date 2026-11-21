@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -15,7 +18,7 @@ from app.models import (
     CxProjectGroup,
     CxUser,
 )
-from app.services import org_sync
+from app.services import key_permissions, org_sync
 from tests.fake_tenant import FakeTenant, populated_tenant
 
 
@@ -256,3 +259,106 @@ def test_sync_is_idempotent(db: Session) -> None:
     assert len(list(db.scalars(select(CxUser)))) == 3
     assert len(list(db.scalars(select(CxApplication)))) == 1
     assert len(list(db.scalars(select(CxGroupMembership)))) == 4
+
+
+# ------------------------------------------ groups or applications refused (403)
+
+
+def _memberships(db: Session) -> set[tuple[str, str]]:
+    db.expire_all()
+    return {(row.group_id, row.user_id) for row in db.scalars(select(CxGroupMembership))}
+
+
+@pytest.fixture
+def quiet_listeners() -> Iterator[None]:
+    """The 403s below are queued for the key permission report; not this test's business."""
+    key_permissions.discard_pending_denials()
+    yield
+    key_permissions.discard_pending_denials()
+
+
+def test_groups_refused_memberships_resolve_to_the_stored_group_ids(
+    db: Session, quiet_listeners: None
+) -> None:
+    tenant = populated_tenant()
+    org_sync.sync_org_model(db, tenant.client())
+    db.commit()
+    before = _memberships(db)
+
+    tenant.fail_requests[("GET", "/groups")] = 403
+    result = org_sync.sync_org_model(db, tenant.client())
+    db.commit()
+    assert result.memberships == len(before)
+    assert before == {
+        ("grp-platform", "user-harsh"),
+        ("grp-payments", "user-sean"),
+        ("grp-platform", "user-akash"),
+        ("grp-payments", "user-akash"),
+    }
+    assert _memberships(db) == before
+    # The groups are kept as synced, not soft deleted.
+    assert not db.get(CxGroup, "grp-payments").is_deleted
+
+
+def test_sync_heals_once_groups_can_be_read_again(db: Session, quiet_listeners: None) -> None:
+    tenant = populated_tenant()
+    org_sync.sync_org_model(db, tenant.client())
+    db.commit()
+    # In Checkmarx: Payments is deleted and a new group takes its name, and a
+    # new group appears that Sean joins.
+    tenant.groups[:] = [group for group in tenant.groups if group["id"] != "grp-payments"]
+    tenant.add_group(group_id="grp-new", name="Payments")
+    tenant.add_group(group_id="grp-ops", name="Ops")
+    for user in tenant.users:
+        if user["id"] == "user-sean":
+            user["groups"] = ["Payments", "Ops"]
+
+    tenant.fail_requests[("GET", "/groups")] = 403
+    org_sync.sync_org_model(db, tenant.client())
+    db.commit()
+    # Known edge case while groups cannot be read: the reused name resolves to
+    # the group stored under it before, and the unknown group is not invented.
+    memberships = _memberships(db)
+    assert ("grp-payments", "user-sean") in memberships
+    assert not any(group == "grp-ops" for group, _user in memberships)
+
+    tenant.fail_requests.clear()
+    org_sync.sync_org_model(db, tenant.client())
+    db.commit()
+    memberships = _memberships(db)
+    assert not any(group == "grp-payments" for group, _user in memberships)
+    assert ("grp-new", "user-sean") in memberships
+    assert ("grp-ops", "user-sean") in memberships
+    assert db.get(CxGroup, "grp-payments").is_deleted
+
+
+def test_applications_refused_keep_the_links_synced_before(
+    db: Session, quiet_listeners: None
+) -> None:
+    tenant = populated_tenant()
+    org_sync.sync_org_model(db, tenant.client())
+    db.commit()
+    links = {
+        (row.application_id, row.project_id) for row in db.scalars(select(CxApplicationProject))
+    }
+    assert links == {("app-payments", "proj-api"), ("app-payments", "proj-web")}
+
+    # Changed in Checkmarx, but the key may not read applications any more.
+    tenant.applications[0]["projectIds"] = ["proj-tools"]
+    tenant.fail_requests[("GET", "/api/applications")] = 403
+    result = org_sync.sync_org_model(db, tenant.client())
+    db.commit()
+    assert result.applications == 0
+    db.expire_all()
+    assert {
+        (row.application_id, row.project_id) for row in db.scalars(select(CxApplicationProject))
+    } == links
+    assert not db.get(CxApplication, "app-payments").is_deleted
+
+    tenant.fail_requests.clear()
+    org_sync.sync_org_model(db, tenant.client())
+    db.commit()
+    db.expire_all()
+    assert {
+        (row.application_id, row.project_id) for row in db.scalars(select(CxApplicationProject))
+    } == {("app-payments", "proj-tools")}

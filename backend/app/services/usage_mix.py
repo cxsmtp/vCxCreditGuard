@@ -8,15 +8,21 @@ next to the numbers is the difference between a useful alert and a puzzling one.
 The consumption feed reports **credits per entity** and **transactions per
 action type**, not credits per action type. So:
 
-* when exactly one action type's count rose in the period and none fell, all
-  of the period's credits are attributed to it ("4 credits used in 2026-11:
-  Fusion scan 4");
+* all of the period's credits are attributed to one action type only when no
+  other action type has any transaction in the feed, neither now nor in the
+  reading the period's baseline came from ("4 credits used in 2026-11: Fusion
+  scan 4"). The feed's lookback window slides, so a count that stayed the same
+  (or rose by less than happened) can hide older transactions leaving it while
+  new ones arrive; with one action type alone in the feed every credit is that
+  action's however the window slid, and with more than one nothing says how the
+  credits split;
 * otherwise the credits are given as a total and the actions behind them as
   transaction counts, and the message says why. A count that fell means older
   transactions left the feed's sliding lookback window, while the credit figure
   was re-based on the window as well: the two do not line up, so neither the
   credits per action nor the period's counts can be told, and the window's
-  counts are given instead.
+  counts are given instead. When other action types were in the window already
+  the counts that rose are given, with a note that a slide can hide new ones.
 
 Period figures come from the same arithmetic as evaluation: the latest reading
 minus the reading the period's baseline was taken from (or everything, for a
@@ -76,6 +82,12 @@ class UsageMix:
     # True when the counts are the whole lookback window: no reading from when
     # the period's baseline was taken survives, or the window slid (a count fell).
     from_window: bool = False
+    # True when action types other than those that rose were in the window: a
+    # slide there could hide new transactions, so the counts are a floor.
+    masked: bool = False
+    # The most transactions such a slide could hide: no more can have left the
+    # window than were in it when the period's baseline was read.
+    may_hide: int = 0
 
     def fusion_share(self) -> float:
         if self.credits_by_action:
@@ -95,7 +107,13 @@ class UsageMix:
             return False
         if self.credits_by_action:
             return self.fusion_share() >= LARGE_SHARE
-        return not self.from_window and self.fusion_share() >= LARGE_SHARE
+        if self.from_window:
+            return False
+        if self.masked:
+            # Worst case: every hidden transaction was something else.
+            total_tx = sum(self.transactions.values()) + self.may_hide
+            return self.transactions.get(FUSION, 0) / total_tx >= LARGE_SHARE
+        return self.fusion_share() >= LARGE_SHARE
 
     def has_fusion(self) -> bool:
         if self.credits_by_action is not None:
@@ -240,13 +258,21 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
         from_window = True
         deltas = dict(latest)
     transactions = {action: count for action, count in deltas.items() if count > 0}
+    # Every action type with transactions in the feed, now or at the baseline.
+    # Only when that is the one action that rose are all credits provably its:
+    # otherwise older transactions of another type may have left the sliding
+    # window while as many new ones arrived, leaving its count unchanged.
+    in_feed = {action for action, count in latest.items() if count > 0} | {
+        action for action, count in baseline.items() if count > 0
+    }
+    masked = not from_window and bool(in_feed - set(transactions))
 
     attributed = state.attributed_credits or Decimal("0")
     own = max(Decimal("0"), state.credits_used - attributed)
     credits_by_action: dict[str, Decimal] | None = None
     if own == 0:
         credits_by_action = {}
-    elif len(transactions) == 1 and not from_window:
+    elif len(transactions) == 1 and not from_window and in_feed == set(transactions):
         credits_by_action = {next(iter(transactions)): own}
     if credits_by_action is not None and attributed > 0:
         auto = ActionType.AUTO_TRIAGE.value
@@ -257,6 +283,8 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
         transactions=transactions,
         credits_by_action=credits_by_action,
         from_window=from_window,
+        masked=masked,
+        may_hide=sum(count for count in baseline.values() if count > 0) if masked else 0,
     )
 
 
@@ -345,6 +373,13 @@ def describe(
                 f"{used}. Checkmarx reports credits per {entity_type}, not per action, and the "
                 "period's transactions cannot be told apart from older ones, so these are the "
                 f"actions in its whole lookback window: {actions}."
+            )
+        elif mix.masked:
+            text = (
+                f"{used}. Checkmarx reports credits per {entity_type}, not per action, so "
+                f"these are the transactions that rose: {actions}. Other actions were already "
+                "in its lookback window, and older transactions leaving that window can hide "
+                "new ones, so they may be behind some of these credits too."
             )
         else:
             text = (

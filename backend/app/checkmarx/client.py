@@ -65,9 +65,10 @@ MAX_PAGES = 1000
 # its successor. A listener must be cheap and must never raise; it touches no
 # database.
 _forbidden_listeners: list[Callable[[str, str, str | None], None]] = []
-# Called the same way for every successful call that is not a GET, so a refused
-# change that later goes through can be cleared. Same rules: cheap, no raising,
-# no database.
+# Called the same way for every successful call, so a refused change that later
+# goes through (or a read refused on one project that later succeeds on that same
+# project) can be cleared. Same rules: cheap, no raising, no database; a
+# listener returns at once for a call it has no interest in.
 _success_listeners: list[Callable[[str, str, str | None], None]] = []
 
 
@@ -272,7 +273,7 @@ class CheckmarxClient:
             )
 
             if response.is_success:
-                if _success_listeners and method.upper() != "GET":
+                if _success_listeners:
                     _notify(_success_listeners, method.upper(), url, self.key_fingerprint)
                 return response
 

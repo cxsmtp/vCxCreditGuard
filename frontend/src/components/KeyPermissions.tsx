@@ -336,7 +336,9 @@ export function PermissionPopup({
             onClick={async () => {
               const fresh = await checkAgain();
               await onChanged();
-              if (fresh && fresh.verdict === "ok") onOpenChange(false);
+              // Nothing needed now is confirmed missing any more: the pop-up has
+              // done its job (what is left, if anything, is on the card).
+              if (fresh && fresh.attention !== true) onOpenChange(false);
             }}
           >
             Check again

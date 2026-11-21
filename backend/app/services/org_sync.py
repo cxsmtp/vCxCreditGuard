@@ -94,6 +94,14 @@ def sync_org_model(
         groups_refused = False
     except CheckmarxPermissionError:
         session.rollback()
+        # Known edge case: users report their groups by name, and the stored
+        # groups cannot be compared with Checkmarx while groups are refused. A
+        # group deleted there whose name a new group took meanwhile still
+        # resolves to the old group's id here, so the new group's members count
+        # towards the old group's limit; a group created meanwhile is not known
+        # at all. The next sync that may read groups rebuilds the memberships
+        # from scratch and soft-deletes the old group, which heals both
+        # (tests/test_org_sync.py::test_sync_heals_once_groups_can_be_read_again).
         group_index = _stored_group_index(session)
         groups_refused = True
         _refused(session, result, EntityType.GROUP, "groups")

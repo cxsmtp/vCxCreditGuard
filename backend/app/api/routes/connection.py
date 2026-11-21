@@ -177,7 +177,8 @@ def read_permissions(ctx: CurrentUser, db: DbSession) -> KeyPermissionsResponse:
 @router.post("/permissions", response_model=KeyPermissionsResponse)
 def check_permissions(ctx: AdminUser, db: DbSession) -> KeyPermissionsResponse:
     """Check the key again now ("Check again"). Every read is tried again; a
-    change refused at run time stays listed until it next goes through."""
+    change refused at run time stays listed until it next goes through, unless
+    nothing configured needs it any more."""
     if connection_service.get_connection(db) is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

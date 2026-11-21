@@ -893,10 +893,15 @@ CreditGuard checks what the key may do instead of finding out at the first breac
   Each refusal belongs to the key it was made with: saving another key drops the
   old key's, and the connection test is a check of its own, not a run-time event.
   A refused read is cleared by the next check (automatic or Check again) that reads
-  it successfully. A refused change (role mapping, Auto Triage, repository
-  setting) is cleared only when CreditGuard next makes that same change
-  successfully: a change cannot be tested without making it, so Check again does
-  not clear it.
+  it successfully. A read refused on one particular project, repository or user
+  (the key cannot see it, though it reads others fine) is cleared only when that
+  same one is read successfully: the check reads it again directly, and
+  CreditGuard's own later reads of it count too. A refused change (role mapping,
+  Auto Triage, repository setting) is cleared only when CreditGuard next makes
+  that same change successfully: a change cannot be tested without making it, so
+  Check again does not clear it while it is needed. Once nothing configured needs
+  it any more (its limit was deleted or no longer enforces), Check again drops
+  it, and so does the automatic check once it is a week old.
 - **Verdict:** *ok*; *limited* when only something not in use is affected (enforce
   mode calls while no limit of that kind enforces, scans while auto-triage charging
   is off, the credit pool, groups while no group limit exists, applications while
