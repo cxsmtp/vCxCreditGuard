@@ -66,7 +66,8 @@ class Notification(Base):
     severity: Mapped[str] = mapped_column(
         String(16), nullable=False, default=Severity.INFO, index=True
     )
-    # "warning", "enforcement", "restoration", "sync_error", "auth_failure".
+    # "warning", "enforcement", "restoration", "sync_error", "auth_failure",
+    # "attribution", "permissions".
     category: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
 
     entity_type: Mapped[str | None] = mapped_column(String(16), index=True)

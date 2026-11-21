@@ -3,6 +3,7 @@ import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from "re
 import { api, onUnauthorized } from "./api/client";
 import type { Me, NotificationList } from "./api/types";
 import { AppShell } from "./components/AppShell";
+import { forgetPermissionPopup } from "./components/KeyPermissions";
 import { Spinner } from "./components/ui";
 import { applyAccent } from "./lib/ui-context";
 import { settingsDraft } from "./lib/settingsDraft";
@@ -101,6 +102,7 @@ export function App() {
       onUnauthorized(() => {
         setAuthState("signedOut");
         setMe(null);
+        forgetPermissionPopup();
       }),
     [],
   );
@@ -119,8 +121,19 @@ export function App() {
     void refreshUnread();
   }, [refreshUnread, location.pathname]);
 
+  // Re-read the bootstrap payload quietly: the top bar lights and the API key
+  // banner live on it. A failed refresh keeps what is shown.
+  const refreshMe = useCallback(async () => {
+    try {
+      setMe(await api.get<Me>("/api/me"));
+    } catch {
+      // The unauthorised listener handles an expired session.
+    }
+  }, []);
+
   useInterval(() => {
     void refreshUnread();
+    void refreshMe();
   }, authState === "signedIn" ? 60_000 : null);
 
   async function signOut() {
@@ -132,6 +145,7 @@ export function App() {
     setAuthState("signedOut");
     setMe(null);
     settingsDraft.clear();
+    forgetPermissionPopup();
     // Drop the cached org accent so a shared browser does not pre-apply one
     // organisation's accent for the next person who signs in.
     applyAccent("default");
@@ -181,7 +195,7 @@ export function App() {
   const isAdmin = me.role === "admin";
 
   return (
-    <AppShell me={me} unreadCount={unread} onSignOut={signOut}>
+    <AppShell me={me} unreadCount={unread} onSignOut={signOut} onMeChanged={refreshMe}>
       {me.setup_required && location.pathname !== "/setup" && (
         <Navigate to="/setup" replace />
       )}

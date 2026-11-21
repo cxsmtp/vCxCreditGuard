@@ -858,6 +858,76 @@ in monitor-only mode, which is a reasonable way to start. Enforcement then fails
 with a clear 403 message naming the missing permission rather than silently doing
 nothing.
 
+**Why a tenant admin's own key can still be refused.** A Checkmarx One API key
+most likely carries only the roles chosen when the key was created, not
+automatically everything its owner holds. So a key created under a tenant
+administrator's account can get 403 on a call the same administrator's browser
+session makes without trouble (seen in the field on
+`GET /api/ai-agents-coordinator/projects/{id}/configuration`): the path is right,
+the key has fewer permissions than the login. This is one more reason for a
+dedicated service account, with a key created for CreditGuard.
+
+#### The key permission check
+
+CreditGuard checks what the key may do instead of finding out at the first breach:
+
+- **When:** every time the connection is saved or tested, at most every six hours
+  at the start of a cycle, and whenever an admin presses **Check again**
+  (Settings → Connection → *Key permissions*, or the pop-up).
+- **What it can test:** one small read per call in the table above (`limit=1`
+  style; `GET /api/scans/` only when auto-triage charging is on or someone presses
+  Check again), on one synced project and one synced user where a call needs one.
+  Each is reported as allowed, refused (403), not found, error, or skipped with the
+  reason (for example when no project is linked to a repository yet).
+- **What it cannot test:** the writes (role mapping `POST`/`DELETE`, the Auto Triage
+  `PUT`, the repos-manager `PATCH`) cannot be tried without changing the tenant.
+  They are shown as *not tested*, and as *will fail* when the read on the same
+  service was refused. The role and group names in the key's access token are
+  shown too (never the token), and a token that lists `realm-management` roles
+  without `manage-users` marks role mapping as *probably refused*.
+- **Refusals at run time:** any 403 CreditGuard meets while it works (a restriction,
+  a restore, a read in a cycle, including reads whose failure is otherwise
+  tolerated) is added to the same report straight away, with the call and when.
+  Check again clears those; one that still happens is recorded again at the next
+  attempt.
+- **Verdict:** *ok*; *limited* when only something not in use is affected (enforce
+  mode calls while no limit of that kind enforces, scans while auto-triage charging
+  is off, the credit pool); *insufficient* when counting usage is broken, or an
+  enforce-mode call is missing while a limit that needs it enforces (user limits
+  need role mapping, project, group and application limits need the project
+  configuration calls). It is worked out again from the stored results whenever
+  limits change.
+- **Where it shows:** a banner at the top of every page while the verdict is not
+  ok (viewers are told to ask an admin), a *Key permissions* light in the top bar,
+  a pop-up for admins once per sign-in per distinct problem (never blocking; *Remind
+  me later*), the *Key permissions* card on the Connection page, a warning in the
+  log, one notification per distinct set of missing permissions (category *API key
+  permissions*; error when insufficient, warning when limited), an audit entry
+  (`connection.permissions_changed`) when the verdict changes, and an info
+  notification when it is fine again. `GET /api/connection/permissions` returns the
+  last report (details for admins), `POST` runs it again (admins).
+
+The fix is always the same: create a new key that includes the permissions for the
+calls listed as missing (or add them), paste it on the Connection page, or press
+Check again.
+
+#### What the breach and restriction messages say
+
+The *reached its credit limit* and *restricted* notifications give the credits the
+limit counted in the period and what they went on: for example *4 credits used in
+2026-11: Fusion scan 4.* The consumption feed reports credits per entity and
+transactions per action type, so when the period's activity is more than one
+action type the credits are given as a total and the actions behind them as
+transaction counts. They then say plainly what the restriction does and does not
+stop: turning off Auto Triage and PR triage and remediation does not stop Fusion
+scans, and removing a user's AI roles changes no project setting and does not stop
+Fusion scans either; CreditGuard cannot switch Fusion off yet.
+
+A restriction already in force whose setting cannot be read back (the repository
+settings read failing, for example) is re-applied quietly to keep it in force and
+counted as *could not verify* in the cycle's result. It is no longer reported as
+*re-disabled*: only a setting actually read back as switched on again is drift.
+
 Projects the key cannot see are projects whose usage cannot be counted. The org
 sync reports that as a warning rather than undercounting quietly.
 
@@ -1019,6 +1089,10 @@ these, because each one can stop something that used to work:
 - **Automatic approvals.** The auto-approve threshold is now a budget per
   30 days, per entity and per requester, not a size per request. Several small
   requests no longer add up past it.
+- **API key permission check (new).** No migration: the last report is kept in
+  `app_setting`. The first cycle after the upgrade, or the next connection test,
+  checks the key with read-only calls. If the key lacks something, a banner appears
+  on every page; see [The key permission check](#the-key-permission-check).
 - **Auto-triage charging (new, off).** The migration adds two tables
   (`auto_triage_charge`, `auto_triage_project_state`) and two nullable columns on
   `limit_period_state` (`baseline_at`, `attributed_credits`). Nothing changes until

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.checkmarx.client import CheckmarxClient
-from app.checkmarx.errors import CheckmarxError
+from app.checkmarx.errors import CheckmarxError, CheckmarxPermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -251,11 +251,27 @@ def get_pr_remediation_severities(
             REPO_SETTINGS_PATH.format(repo_id=repo_id),
             params={"projectId": project_id},
         )
-    except CheckmarxError:
+    except CheckmarxPermissionError as exc:
+        # The 403 itself is also recorded on the API key permission report by
+        # the client's refusal listener, even though it is swallowed here.
+        logger.warning(
+            "The PR triage and remediation setting of project %s could not be read: %s",
+            project_id,
+            exc,
+        )
+        return None
+    except CheckmarxError as exc:
+        logger.info(
+            "The PR triage and remediation setting of project %s could not be read: %s",
+            project_id,
+            exc,
+        )
         return None
     if not isinstance(payload, dict):
+        logger.info("Repository %s settings came back in an unexpected shape", repo_id)
         return None
     severities = payload.get("remediationSeverities")
     if not isinstance(severities, list):
+        logger.info("Repository %s settings carry no remediationSeverities list", repo_id)
         return None
     return [entry for entry in severities if isinstance(entry, str) and entry]

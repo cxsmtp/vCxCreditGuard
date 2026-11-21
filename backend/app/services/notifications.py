@@ -26,6 +26,8 @@ CATEGORY_RESTORATION = "restoration"
 CATEGORY_SYNC_ERROR = "sync_error"
 CATEGORY_AUTH_FAILURE = "auth_failure"
 CATEGORY_ATTRIBUTION = "attribution"
+# The stored Checkmarx API key lacks a permission CreditGuard needs.
+CATEGORY_PERMISSIONS = "permissions"
 
 
 def notify(
@@ -190,6 +192,16 @@ def restore_failed_key(action_id: int, day: str) -> str:
 def sync_error_key(step: str, day: str) -> str:
     """One sync error notification per step per day, so an outage is not a flood."""
     return f"sync:{step}:{day}"
+
+
+def key_permissions_key(fingerprint: str, since: str, problem_digest: str) -> str:
+    """One "API key is missing permissions" alert per distinct set of missing
+    permissions, per episode (``since`` is when the key last stopped being fine)."""
+    return f"keyperm:{fingerprint}:{since}:{problem_digest}"
+
+
+def key_permissions_ok_key(fingerprint: str, at: str) -> str:
+    return f"keyperm-ok:{fingerprint}:{at}"
 
 
 def attribution_key(subject_key: str) -> str:

@@ -4,6 +4,7 @@ import type { Me } from "../api/types";
 import { LOOKS, PHOSPHORS, useTheme, useToast } from "../lib/ui-context";
 import { settingsDraft, useSettingsDraft } from "../lib/settingsDraft";
 import { BrandMark, Icon, type IconName } from "./Icon";
+import { PermissionBanner, PermissionPopup, permissionProblem } from "./KeyPermissions";
 import { Modal } from "./ui";
 
 /* --------------------------------------------------------------- the map */
@@ -107,6 +108,11 @@ function OpsStrip({ me }: { me: Me }) {
     level = "DEFCON 3";
     state = `Tenant link ${me.connection_status}`;
     tone = "bad";
+  } else if (permissionProblem(me)) {
+    const insufficient = me.key_permissions?.verdict === "insufficient";
+    level = insufficient ? "DEFCON 3" : "DEFCON 4";
+    state = "API key missing permissions";
+    tone = insufficient ? "bad" : "warn";
   } else if (me.enforcement_paused) {
     level = "DEFCON 4";
     state = "Enforcement paused";
@@ -165,6 +171,15 @@ function Lights({ me }: { me: Me }) {
       label: "Tenant link",
       to: "/setup",
       title: `The tenant connection is ${me.connection_status}`,
+    });
+  }
+  if (permissionProblem(me) && me.key_permissions) {
+    lights.push({
+      key: "perm",
+      tone: me.key_permissions.verdict === "insufficient" ? "bad" : "warn",
+      label: "Key permissions",
+      to: "/setup#key-permissions",
+      title: me.key_permissions.summary,
     });
   }
   if (me.enforcement_paused) {
@@ -407,11 +422,14 @@ export function AppShell({
   me,
   unreadCount,
   onSignOut,
+  onMeChanged,
   children,
 }: {
   me: Me;
   unreadCount: number;
   onSignOut: () => void;
+  /** Re-reads /api/me, after something on it may have changed. */
+  onMeChanged: () => Promise<unknown>;
   children: ReactNode;
 }) {
   const location = useLocation();
@@ -421,6 +439,7 @@ export function AppShell({
   const [menuOpen, setMenuOpen] = useState(false);
   const [jumpOpen, setJumpOpen] = useState(false);
   const [lookOpen, setLookOpen] = useState(false);
+  const [permOpen, setPermOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const nav = mainNav(me);
   const settings = inSettings(location.pathname);
@@ -616,6 +635,7 @@ export function AppShell({
             </div>
           </header>
 
+          <PermissionBanner me={me} onOpen={() => setPermOpen(true)} />
           {me.demo_mode && (
             <div className="cg-banner" role="status">
               Demo mode: showing synthetic data. Enforcement is suppressed, so nothing is changed in
@@ -666,6 +686,7 @@ export function AppShell({
       </div>
 
       <JumpPalette me={me} open={jumpOpen} onClose={() => setJumpOpen(false)} />
+      <PermissionPopup me={me} open={permOpen} onOpenChange={setPermOpen} onChanged={onMeChanged} />
       <Modal open={lookOpen} title="Look" onClose={() => setLookOpen(false)} width="max-w-xl">
         <LookPicker />
       </Modal>

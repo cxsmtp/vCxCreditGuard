@@ -54,6 +54,26 @@ DEFAULT_PAGE_SIZE = 100
 # Guard against a server that never stops returning pages.
 MAX_PAGES = 1000
 
+# Called with (method, url) whenever Checkmarx answers 403, before the error is
+# raised. The API key permission checker registers here so a permission that is
+# only exercised at run time (a write it cannot probe) is still noticed, whoever
+# made the call and whether or not the caller swallows the error. A listener must
+# be cheap and must never raise; it touches no database.
+_forbidden_listeners: list[Callable[[str, str], None]] = []
+
+
+def add_forbidden_listener(listener: Callable[[str, str], None]) -> None:
+    if listener not in _forbidden_listeners:
+        _forbidden_listeners.append(listener)
+
+
+def _notify_forbidden(method: str, url: str) -> None:
+    for listener in list(_forbidden_listeners):
+        try:
+            listener(method, url)
+        except Exception:  # noqa: BLE001 - a listener must never change the call's outcome
+            logger.debug("A 403 listener failed", exc_info=True)
+
 
 class CheckmarxClient:
     def __init__(
@@ -222,6 +242,7 @@ class CheckmarxClient:
                 continue
 
             if status == httpx.codes.FORBIDDEN:
+                _notify_forbidden(method.upper(), url)
                 raise CheckmarxPermissionError(
                     f"Checkmarx denied {method.upper()} {url} with 403. The API key's "
                     "service account is missing a required permission.",
