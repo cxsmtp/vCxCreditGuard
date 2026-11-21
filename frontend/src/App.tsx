@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
-import { api, onUnauthorized } from "./api/client";
+import { ApiError, api, onUnauthorized } from "./api/client";
 import type { Me, NotificationList } from "./api/types";
 import { AppShell } from "./components/AppShell";
+import { forgetPermissionPopup } from "./components/KeyPermissions";
 import { Spinner } from "./components/ui";
 import { applyAccent } from "./lib/ui-context";
 import { settingsDraft } from "./lib/settingsDraft";
@@ -75,6 +76,13 @@ export function App() {
   const navigate = useNavigate();
   const location = useLocation();
 
+  // Whether a profile is on screen, for loadMe's error handling (a ref, so
+  // loadMe stays stable for the pages that take it as a callback).
+  const signedInRef = useRef(false);
+  useEffect(() => {
+    signedInRef.current = me !== null;
+  }, [me]);
+
   const loadMe = useCallback(async () => {
     try {
       const profile = await api.get<Me>("/api/me");
@@ -82,9 +90,15 @@ export function App() {
       applyAccent(profile.ui_accent);
       setAuthState("signedIn");
       return profile;
-    } catch {
-      setMe(null);
-      setAuthState("signedOut");
+    } catch (caught) {
+      // Only the server saying the session is gone signs the user out. A
+      // network error or a 5xx while signed in keeps what is shown; the next
+      // refresh tries again. Without a profile yet there is nothing to show.
+      const unauthorised = caught instanceof ApiError && caught.status === 401;
+      if (unauthorised || !signedInRef.current) {
+        setMe(null);
+        setAuthState("signedOut");
+      }
       return null;
     }
   }, []);
@@ -101,6 +115,7 @@ export function App() {
       onUnauthorized(() => {
         setAuthState("signedOut");
         setMe(null);
+        forgetPermissionPopup();
       }),
     [],
   );
@@ -119,8 +134,19 @@ export function App() {
     void refreshUnread();
   }, [refreshUnread, location.pathname]);
 
+  // Re-read the bootstrap payload quietly: the top bar lights and the API key
+  // banner live on it. A failed refresh keeps what is shown.
+  const refreshMe = useCallback(async () => {
+    try {
+      setMe(await api.get<Me>("/api/me"));
+    } catch {
+      // The unauthorised listener handles an expired session.
+    }
+  }, []);
+
   useInterval(() => {
     void refreshUnread();
+    void refreshMe();
   }, authState === "signedIn" ? 60_000 : null);
 
   async function signOut() {
@@ -132,6 +158,7 @@ export function App() {
     setAuthState("signedOut");
     setMe(null);
     settingsDraft.clear();
+    forgetPermissionPopup();
     // Drop the cached org accent so a shared browser does not pre-apply one
     // organisation's accent for the next person who signs in.
     applyAccent("default");
@@ -181,7 +208,7 @@ export function App() {
   const isAdmin = me.role === "admin";
 
   return (
-    <AppShell me={me} unreadCount={unread} onSignOut={signOut}>
+    <AppShell me={me} unreadCount={unread} onSignOut={signOut} onMeChanged={refreshMe}>
       {me.setup_required && location.pathname !== "/setup" && (
         <Navigate to="/setup" replace />
       )}

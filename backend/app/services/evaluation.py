@@ -52,6 +52,7 @@ from sqlalchemy.orm import Session
 from app.checkmarx.client import CheckmarxClient
 from app.db.base import utcnow
 from app.models.enums import (
+    EnforcementKind,
     EnforcementStatus,
     EntityType,
     LimitStatus,
@@ -67,6 +68,7 @@ from app.services import (
     ingestion,
     notifications,
     settings_store,
+    usage_mix,
 )
 from app.services.audit import AuditActor, record_audit
 from app.services.periods import PeriodError, PeriodWindow, current_window, describe_window
@@ -1082,6 +1084,38 @@ def _notify_breach(
         severity = Severity.WARNING
         dedupe = notifications.monitor_only_key(limit.id, window.key)
 
+    if notifications.already_raised(session, dedupe):
+        return  # the breakdown below is not worth computing for a duplicate
+    when = usage_mix.window_phrase(window)
+    mix = usage_mix.mix_for(session, limit, period_key=window.key, state=state)
+    if mix is not None:
+        # One sentence: the credits against the limit, and what they went on.
+        headline = usage_mix.describe(
+            mix,
+            period_key=window.key,
+            entity_type=str(limit.entity_type),
+            credit_limit=limit.credit_limit,
+            when=when,
+        )
+    else:
+        headline = (
+            f"{usage_mix.format_credits(state.credits_used)} of "
+            f"{usage_mix.format_credits(limit.credit_limit)} credits used {when}."
+        )
+    lines = [headline, tail]
+    if limit.enforce and not exempt:
+        kind = usage_mix.restriction_kind_for(limit.entity_type)
+        lines.append(
+            "What the restriction does: "
+            + (
+                "the AI roles are removed from the user."
+                if kind == EnforcementKind.REMOVE_USER_ROLES
+                else "Auto Triage and PR triage and remediation are turned off on "
+                + ("the project." if limit.entity_type == EntityType.PROJECT else "its projects.")
+            )
+            + " "
+            + usage_mix.does_not_stop(kind, mix)
+        )
     notifications.notify(
         session,
         category=notifications.CATEGORY_WARNING
@@ -1089,10 +1123,7 @@ def _notify_breach(
         else notifications.CATEGORY_ENFORCEMENT,
         severity=severity,
         title=f"{limit.entity_type.capitalize()} {entity} reached its credit limit",
-        body=(
-            f"{state.credits_used} of {limit.credit_limit} credits used "
-            f"{describe_window(window)}.\n{tail}"
-        ),
+        body="\n".join(lines),
         entity_type=limit.entity_type,
         entity_id=limit.entity_id,
         entity_label=limit.entity_label,

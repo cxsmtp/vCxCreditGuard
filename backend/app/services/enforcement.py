@@ -40,6 +40,7 @@ from app.checkmarx.errors import (
     CheckmarxResponseError,
 )
 from app.db.base import utcnow
+from app.models.audit import AuditLogEntry
 from app.models.enums import (
     EnforcementKind,
     EnforcementStatus,
@@ -48,7 +49,7 @@ from app.models.enums import (
 )
 from app.models.limits import CreditLimit, EnforcementAction, Exemption
 from app.models.org import CxApplicationProject, CxProject, CxProjectGroup, CxUser
-from app.services import notifications, settings_store
+from app.services import key_permissions, notifications, settings_store, usage_mix
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,10 @@ class EnforcementOutcome:
     # Restrictions that had already been applied and were verified this run and
     # re-asserted after they had drifted back on in Checkmarx One.
     reconciled: list[EnforcementAction] = field(default_factory=list)
+    # Restrictions whose current state could not be read back, so whether they
+    # still hold is unknown. They were re-applied (harmless if they still hold),
+    # but this is not drift and nobody is told it was.
+    unverified: list[EnforcementAction] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -126,9 +131,25 @@ class EnforcementOutcome:
         return {
             "applied": len(self.applied),
             "reconciled": len(self.reconciled),
+            "unverified": len(self.unverified),
             "skipped": self.skipped,
             "failed": self.failed,
         }
+
+
+def _permission_hint(exc: Exception) -> str:
+    if isinstance(exc, CheckmarxPermissionError):
+        return (
+            "The API key is missing this permission. Settings → Connection → Key permissions "
+            "shows what is missing and why.\n\n"
+        )
+    return ""
+
+
+def _record_refusals(session: Session, actor: AuditActor) -> None:
+    """Put any 403 met so far on the API key permission report (no commit)."""
+    if key_permissions.pending_denials():
+        key_permissions.flush_runtime_denials(session, actor=actor)
 
 
 def idempotency_key(*, limit_id: int, period_key: str, kind: str, target_id: str) -> str:
@@ -568,6 +589,7 @@ def _enforce_target(
                 target_label=target.target_label,
                 detail=str(exc),
             )
+        _record_refusals(session, actor)
         session.commit()
         return
     except CheckmarxError as exc:
@@ -594,7 +616,7 @@ def _enforce_target(
             category=notifications.CATEGORY_ENFORCEMENT,
             severity=Severity.ERROR,
             title=f"Could not restrict {target.target_label}",
-            body=f"{exc}\n\nIt will be tried again on the next cycle.",
+            body=f"{exc}\n\n{_permission_hint(exc)}It will be tried again on the next cycle.",
             entity_type=limit.entity_type,
             entity_id=limit.entity_id,
             entity_label=limit.entity_label,
@@ -613,6 +635,7 @@ def _enforce_target(
                 target_label=target.target_label,
                 detail=f"{target.kind} failed: {exc}",
             )
+        _record_refusals(session, actor)
         session.commit()
         return
 
@@ -645,7 +668,13 @@ def _enforce_target(
         category=notifications.CATEGORY_ENFORCEMENT,
         severity=Severity.CRITICAL,
         title=_enforcement_title(target),
-        body=_enforcement_body(limit, target, period_key, snapshot),
+        body=_enforcement_body(
+            limit,
+            target,
+            period_key,
+            snapshot,
+            mix=usage_mix.mix_for(session, limit, period_key=period_key),
+        ),
         entity_type=limit.entity_type,
         entity_id=limit.entity_id,
         entity_label=limit.entity_label,
@@ -700,7 +729,7 @@ def _verify_applied(
         return
     session.commit()  # nothing held open while we wait on Checkmarx
     try:
-        reasserted = _reconcile(session, client, action=action, target=target, resolver=resolver)
+        verdict = _reconcile(session, client, action=action, target=target, resolver=resolver)
     except CheckmarxError as exc:
         logger.warning(
             "Could not verify %s on %s this cycle: %s", target.kind, target.target_label, exc
@@ -708,8 +737,39 @@ def _verify_applied(
         outcome.skipped.append(
             f"{target.kind} on {target.target_label} could not be verified this cycle: {exc}"
         )
+        _record_refusals(session, actor)
+        session.commit()
         return
-    if not reasserted:
+    if verdict == RECONCILE_UNVERIFIED:
+        # The setting could not be read back. The restriction was written again
+        # (it is idempotent, so a restriction that still holds is unchanged),
+        # but nothing says it had drifted: no alert. The tenant was written to,
+        # so the first such re-apply of this restriction is audited; later ones
+        # (every cycle while the read keeps failing) are not.
+        outcome.unverified.append(action)
+        outcome.skipped.append(
+            f"{target.kind} on {target.target_label} could not be verified (its setting could "
+            "not be read back); the restriction was re-applied to keep it in force"
+        )
+        _record_refusals(session, actor)
+        if not _unverified_reapply_audited(session, action):
+            record_audit(
+                session,
+                action=AUDIT_UNVERIFIED_REAPPLY,
+                actor=actor,
+                target_type=AUDIT_TARGET_ACTION,
+                target_id=str(action.id),
+                target_label=target.target_label,
+                after={"kind": str(target.kind), "restricted": True, "verified": False},
+                detail=(
+                    f"The restriction on {target.target_label} could not be read back from "
+                    "Checkmarx One, so it was written again to keep it in force. Recorded once "
+                    "per restriction; later re-applies are not audited."
+                ),
+            )
+        session.commit()
+        return
+    if verdict == RECONCILE_HELD:
         outcome.skipped.append(
             f"{target.kind} on {target.target_label} already applied and verified in Checkmarx"
         )
@@ -935,6 +995,31 @@ def _merge_snapshots(previous: dict[str, Any] | None, fresh: dict[str, Any]) -> 
 # ---------------------------------------------------------------- reconciliation
 
 
+AUDIT_UNVERIFIED_REAPPLY = "enforcement.reapplied_unverified"
+AUDIT_TARGET_ACTION = "enforcement_action"
+
+
+def _unverified_reapply_audited(session: Session, action: EnforcementAction) -> bool:
+    return (
+        session.scalar(
+            select(AuditLogEntry.id)
+            .where(
+                AuditLogEntry.action == AUDIT_UNVERIFIED_REAPPLY,
+                AuditLogEntry.target_type == AUDIT_TARGET_ACTION,
+                AuditLogEntry.target_id == str(action.id),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+# What _reconcile found.
+RECONCILE_HELD = "held"  # read back, still in force
+RECONCILE_REASSERTED = "reasserted"  # read back, had drifted, re-applied
+RECONCILE_UNVERIFIED = "unverified"  # could not be read back, re-applied anyway
+
+
 def _reconcile(
     session: Session,
     client: CheckmarxClient,
@@ -942,13 +1027,16 @@ def _reconcile(
     action: EnforcementAction,
     target: Target,
     resolver: RoleResolver,
-) -> bool:
+) -> str:
     """Verify an already-applied restriction is still in force, re-asserting it if
     it drifted back on in Checkmarx One.
 
-    Returns True when the restriction had to be re-asserted, False when it still
-    holds. The ``undo_snapshot`` is left untouched here so a future restore still
-    puts back the exact pre-restriction state.
+    Only a state actually read back and found switched on again is drift
+    (``RECONCILE_REASSERTED``). A state that cannot be read is not evidence of
+    anything (``RECONCILE_UNVERIFIED``): the restriction is written again,
+    which changes nothing if it still holds, and the caller raises no alarm.
+    The ``undo_snapshot`` is left untouched here so a future restore still puts
+    back the exact pre-restriction state.
     """
     snapshot = action.undo_snapshot or {}
     kind = action.kind
@@ -960,18 +1048,21 @@ def _reconcile(
         )
         to_remove = [role for role in current if role.name in iam.AI_ROLE_NAMES]
         if not to_remove:
-            return False
+            return RECONCILE_HELD
         iam.remove_user_client_roles(
             client, user_id=target.target_id, client_uuid=client_uuid, roles=to_remove
         )
-        return True
+        return RECONCILE_REASSERTED
 
     project = session.get(CxProject, target.target_id)
 
     if kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
+        # A read that fails raises (the caller reports "could not be verified");
+        # a read that succeeds but has no Auto Triage entry, or one that is off,
+        # is not drift. Only an entry read back as enabled is.
         state = platform.get_auto_triage(client, project_id=target.target_id)
         if not state.enabled:
-            return False
+            return RECONCILE_HELD
         config = snapshot.get("config_before")
         platform.set_auto_triage(
             client,
@@ -983,32 +1074,32 @@ def _reconcile(
             project.auto_triage_enabled = False
             project.auto_triage_config = config or None
             project.ai_state_checked_at = utcnow()
-        return True
+        return RECONCILE_REASSERTED
 
     if kind == EnforcementKind.DISABLE_PR_REMEDIATION:
         repo_id = snapshot.get("repo_id") or (project.repo_id if project else None)
         if not repo_id:
-            return False
+            return RECONCILE_HELD
         current = platform.get_pr_remediation_severities(
             client, repo_id=repo_id, project_id=target.target_id
         )
-        # None means "cannot read" (re-assert to be safe); a non-empty list means
-        # severities were re-enabled, i.e. drift. Empty means already disabled.
-        need_reassert = True if current is None else bool(current)
-        if need_reassert:
-            platform.set_pr_remediation_severities(
-                client,
-                repo_id=repo_id,
-                project_id=target.target_id,
-                severities=DISABLED_SEVERITIES,
-            )
-            if project is not None:
-                project.pr_remediation_severities = []
-                project.ai_state_checked_at = utcnow()
-            return True
-        return False
+        if current is not None and not current:
+            return RECONCILE_HELD  # read back as disabled
+        # Either severities were read back re-enabled (drift), or the setting
+        # could not be read at all. Both re-apply the restriction; only the
+        # first is drift.
+        platform.set_pr_remediation_severities(
+            client,
+            repo_id=repo_id,
+            project_id=target.target_id,
+            severities=DISABLED_SEVERITIES,
+        )
+        if project is not None:
+            project.pr_remediation_severities = []
+            project.ai_state_checked_at = utcnow()
+        return RECONCILE_UNVERIFIED if current is None else RECONCILE_REASSERTED
 
-    return False
+    return RECONCILE_HELD
 
 
 def _reconciled_title(action: EnforcementAction) -> str:
@@ -1182,6 +1273,8 @@ def return_roles_outside_the_restriction(
                     label,
                     exc,
                 )
+                _record_refusals(session, actor)
+                session.commit()
                 continue
             for action in actions:
                 snapshot = dict(action.undo_snapshot or {})
@@ -1332,7 +1425,8 @@ def _restore_action_locked(
             severity=Severity.ERROR,
             title=f"Could not restore {action.target_label}",
             body=(
-                f"{exc}\n\nIt will be tried again on the next cycle. If it keeps failing, "
+                f"{exc}\n\n{_permission_hint(exc)}It will be tried again on the next cycle. "
+                "If it keeps failing, "
                 "restore it directly in Checkmarx One; the snapshot of the previous state "
                 "is on the audit entry."
             ),
@@ -1355,6 +1449,7 @@ def _restore_action_locked(
                 before=snapshot,
                 detail=str(exc),
             )
+        _record_refusals(session, actor)
         session.commit()
         raise
 
@@ -1536,17 +1631,26 @@ def _enforcement_title(target: Target) -> str:
 
 
 def _enforcement_body(
-    limit: CreditLimit, target: Target, period_key: str, snapshot: dict[str, Any]
+    limit: CreditLimit,
+    target: Target,
+    period_key: str,
+    snapshot: dict[str, Any],
+    *,
+    mix: usage_mix.UsageMix | None = None,
 ) -> str:
     entity = limit.entity_label or limit.entity_id
     lines = [
         f"The {limit.entity_type} limit on {entity} was reached in {period_key} "
         f"({limit.credit_limit} credits).",
     ]
+    if mix is not None:
+        lines.append(
+            usage_mix.describe(mix, period_key=period_key, entity_type=str(limit.entity_type))
+        )
     if target.kind == EnforcementKind.REMOVE_USER_ROLES:
         removed = [entry.get("name") for entry in snapshot.get("removed_roles") or []]
         lines.append(
-            f"Removed roles: {', '.join(name for name in removed if name)}"
+            f"The AI roles were removed: {', '.join(name for name in removed if name)}."
             if removed
             else "The user did not hold the AI roles, so nothing was removed."
         )
@@ -1559,6 +1663,7 @@ def _enforcement_body(
     else:
         before = snapshot.get("severities_before") or []
         lines.append(f"PR remediation severities cleared (were: {', '.join(before) or 'none'}).")
+    lines.append(usage_mix.does_not_stop(target.kind, mix))
     lines.append("Use Restore access to reverse this.")
     return "\n".join(lines)
 

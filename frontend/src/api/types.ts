@@ -33,6 +33,74 @@ export interface Me {
   demo_mode: boolean;
   /** Why new restrictions are not being applied, or null when they are. */
   enforcement_paused: string | null;
+  /** The last API key permission check, compact. Null until one has run. */
+  key_permissions?: KeyPermissionSummary | null;
+}
+
+export type KeyPermissionVerdict = "ok" | "limited" | "insufficient" | "unknown";
+export type KeyPermissionStatus = "ok" | "denied" | "not_found" | "error" | "skipped" | "not_tested";
+
+export interface KeyPermissionSummary {
+  verdict: KeyPermissionVerdict;
+  /** True only when something needed with the current setup is confirmed missing. */
+  attention?: boolean;
+  summary: string;
+  /** "CreditGuard can't ..." phrases, most serious first. */
+  missing: string[];
+  checked_at: string | null;
+  /** Changes whenever the set of missing permissions changes. */
+  problem_key: string | null;
+}
+
+export interface KeyPermissionCheck {
+  id: string;
+  label: string;
+  purpose: string;
+  method: string;
+  path: string;
+  kind: "read" | "write";
+  status: KeyPermissionStatus;
+  detail: string | null;
+  expectation: "will_fail" | "probably_denied" | null;
+  runtime_denied_at: string | null;
+  needed_for: string[];
+  required: boolean;
+  required_reason: string;
+  breaks: string;
+  problem: boolean;
+  severe: boolean;
+}
+
+export interface KeyPermissionReport extends KeyPermissionSummary {
+  /** False for a viewer: checks, roles and run-time refusals are admin only. */
+  details_visible: boolean;
+  trigger: string | null;
+  key_fingerprint: string | null;
+  enforce_users: boolean;
+  enforce_projects: boolean;
+  auto_triage_charging: boolean;
+  checks: KeyPermissionCheck[];
+  runtime_denials: {
+    method: string;
+    path: string;
+    check_id: string | null;
+    first_seen: string | null;
+    last_seen: string | null;
+    count: number;
+  }[];
+  token: {
+    readable: boolean;
+    realm_roles: string[];
+    client_roles: Record<string, string[]>;
+    roles: string[];
+    groups: string[];
+  } | null;
+  explanation: { why: string[]; missing: string[]; roles: string[]; what_to_do: string[] };
+}
+
+export interface KeyPermissionsResponse {
+  available: boolean;
+  report: KeyPermissionReport | null;
 }
 
 export type RequestStatus = "pending" | "approved" | "denied";
@@ -91,6 +159,8 @@ export interface ConnectionTestResult {
   api_base_url: string | null;
   token_seconds_remaining: number | null;
   projects_visible: number | null;
+  /** What the key may do, checked right after a successful token exchange. */
+  permissions?: KeyPermissionReport | null;
 }
 
 export interface ActionBreakdownItem {

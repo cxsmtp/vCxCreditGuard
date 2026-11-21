@@ -811,6 +811,47 @@ code,
   font-weight: 600;
   text-decoration: underline;
 }
+.cg-banner.bad {
+  background: color-mix(in srgb, var(--status-critical) 14%, var(--page));
+  border-bottom-color: color-mix(in srgb, var(--status-critical) 45%, var(--border));
+}
+.cg-banner-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* API key permission report */
+.cg-perm-table td {
+  vertical-align: top;
+}
+.cg-perm-table td:first-child {
+  min-width: 180px;
+}
+.cg-perm-table td:nth-child(2) {
+  min-width: 230px;
+}
+.cg-perm-call {
+  display: inline-block;
+  max-width: 320px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+}
+.cg-perm-problem td {
+  background: color-mix(in srgb, var(--status-critical) 6%, transparent);
+}
+.cg-perm-roles summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
 
 /* -------------------------------------------------------------- headings */
 

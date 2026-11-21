@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.models.enums import ActorType, EntityType, LimitStatus, Severity, UtilityRole
 from app.schemas.auth import StrictModel
+from app.schemas.connection import KeyPermissionSummary
 
 
 class ActionBreakdownItem(BaseModel):
@@ -325,6 +326,9 @@ class MeResponse(BaseModel):
     # Why new restrictions are not being applied, when they are not (paused by
     # an admin or by the safety ceiling). None when enforcement is running.
     enforcement_paused: str | None = None
+    # The last API key permission check, compact, so every page can show the
+    # "missing permissions" banner without another request. None until checked.
+    key_permissions: KeyPermissionSummary | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
