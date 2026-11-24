@@ -109,6 +109,11 @@ total from **416 to 237**:
   coreutils, tar) was the source of ~175 OS-package CVEs; Alpine carries a small
   fraction. psycopg runs in its pure-Python mode against the system `libpq`, since
   `psycopg[binary]` ships glibc-only wheels.
+  Since then the runtime base is `python:3.13-alpine3.24` (the 3.11 images still
+  carry pip 24.0, setuptools and wheel with known CVEs), the build runs
+  `apk upgrade` so the base's OS packages take Alpine's later fixes, and every
+  base image (Python, Node, `postgres:16.16-alpine3.24`, the proxy's
+  `nginx:1.30.8-alpine3.24-slim`) is pinned by tag and digest.
 - **IaC (KICS).** `HEALTHCHECK` on both images; the unpinned `apt-get install curl`
   layer removed (the health check uses the bundled interpreter); `cap_drop: ALL`
   plus a minimal `cap_add` and `no-new-privileges` on the `db` and `proxy`
@@ -1612,7 +1617,7 @@ failed to start (`failed.json`).
 
 **When the image itself must be replaced.** Each image carries a *dependency
 hash* (`io.cxcreditguard.deps`, also inside the signed file list): the base
-image **by digest** (`python:3.11-alpine@sha256:…`), the OS packages installed on
+image **by digest** (`python:3.13-alpine3.24@sha256:…`), the OS packages installed on
 it (`apk info -v`), the pinned Python packages, the launcher and the entrypoint.
 A release with a different signed hash cannot run as a layer on this image; the
 page says *needs a new image*, notifies admins once and shows the command. So
@@ -1621,7 +1626,7 @@ built on the **same base**: the release workflow reuses the latest release's bas
 digest unless the tag's message has a line `base: refresh`, which builds on the
 base tag's current digest (OS, Python, OpenSSL fixes) and makes that release a
 full image replacement. Even on the same base, a new revision of an OS package
-installed on it (libpq) changes the hash: such a release is a replacement too.
+installed on it (libpq, or a fix the build's `apk upgrade` takes) changes the hash: such a release is a replacement too.
 When the newest release needs a new image, auto-update installs the newest one
 that does fit, if any, whether the label or the signed file list said so.
 

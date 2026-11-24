@@ -20,7 +20,9 @@ x-logging: &default-logging
 
 services:
   db:
-    image: postgres:16-alpine
+    # Images are pinned by tag and digest: a moved tag cannot change what runs,
+    # and an update is a reviewed change. Bump the tag and digest together.
+    image: postgres:16.16-alpine3.24@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     restart: unless-stopped
     logging: *default-logging
     # A ceiling, not a reservation: enough for this workload, and a bound on
@@ -67,7 +69,8 @@ services:
   # losing it means losing the ability to give that access back automatically.
   # See "Backup and restore" in the README, and copy the dumps off this host.
   backup:
-    image: postgres:16-alpine
+    # The same image as db, so pg_dump matches the server's major version.
+    image: postgres:16.16-alpine3.24@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     restart: unless-stopped
     logging: *default-logging
     depends_on:
@@ -90,6 +93,14 @@ services:
       - db-backups:/backups
     mem_limit: 256m
     cpus: 0.5
+    # Healthy while the database it backs up answers (PGHOST etc. come from the
+    # environment above); the loop itself is the container's main process.
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     # Runs as the image's default user (root) with every capability dropped:
     # the named volume's directory is owned by root, and writing to a directory
     # you own needs no capability.
@@ -159,7 +170,9 @@ services:
     # The -slim variant drops the xslt/image-filter/geoip modules (and their
     # libxml2/libxslt/libgd dependencies, a recurring source of CVEs) that this
     # plain reverse-proxy config never uses.
-    image: nginx:1.27-alpine-slim
+    # 1.30 is the current stable branch (1.27 is end of life and its Alpine
+    # 3.21 base carries an old OpenSSL); pinned by tag and digest.
+    image: nginx:1.30.8-alpine3.24-slim@sha256:e9eaa7298465eab06d618c51556fdcf3fb5061f9ff40bd28ee898fbd7ee7f900
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 256m

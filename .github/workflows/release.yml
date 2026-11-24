@@ -31,9 +31,8 @@ on:
     tags:
       - "v*.*.*"
 
-permissions:
-  contents: read
-  packages: write
+# Nothing at the workflow level; the one job asks for exactly what it uses.
+permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -44,13 +43,16 @@ env:
   # The base image's tag; its digest is resolved below and is what the image is
   # built FROM and what the dependency hash names. Keep in step with the default
   # in deploy/podman/Dockerfile.
-  PYTHON_TAG: python:3.11-alpine
+  PYTHON_TAG: python:3.13-alpine3.24
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: release
+    permissions:
+      contents: read
+      packages: write
     steps:
       # Third-party actions are pinned by full commit SHA (the tag in the comment).
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
