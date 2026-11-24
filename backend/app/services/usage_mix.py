@@ -79,6 +79,9 @@ LARGE_SHARE = 0.5
 # rate 2, about 108.9 credits per transaction observed) or DAST correlation
 # (rate 14, about 156.8).
 PRICE_TOLERANCE = Decimal("0.10")
+# Action types whose listed rate is not taken as their price unless the feed
+# confirms it: without a feed figure their cost per transaction is unknown.
+FEED_PRICED = frozenset({ActionType.FUSION.value, ActionType.DAST_CORRELATION.value})
 PRICE_RATE = "rate"
 PRICE_OBSERVED = "observed"
 
@@ -149,6 +152,10 @@ class UsageMix:
     # known and priced (see price_table for where each price comes from).
     # None otherwise.
     fusion_priced: list[PricedFusion] | None = None
+    # True when the period has Fusion scans whose cost per scan this tenant's
+    # data does not give (the listed rate is not a Fusion price; see
+    # price_table), so no credit figure is put on them.
+    fusion_price_unknown: bool = False
     # Tenant-wide credits per transaction for each action type (bucketed),
     # from the action dimension: what a transaction count is weighed by when
     # the credits cannot be split per action. Empty when not known.
@@ -168,7 +175,7 @@ class UsageMix:
             total = sum(self.credits_by_action.values(), Decimal("0"))
             fusion = self.credits_by_action.get(FUSION, Decimal("0"))
             return float(fusion / total) if total > 0 else 0.0
-        if self.transactions and all(action in self.unit_prices for action in self.transactions):
+        if self.weighted:
             # A Fusion scan costs far more than a triage (about 109 credits
             # against 1 on a live tenant), so counts alone would understate
             # Fusion many times over: each count is weighed by what one
@@ -182,6 +189,17 @@ class UsageMix:
                 return float(weighed.get(FUSION, Decimal("0")) / total)
         total_tx = sum(self.transactions.values())
         return self.transactions.get(FUSION, 0) / total_tx if total_tx else 0.0
+
+    @property
+    def weighted(self) -> bool:
+        """The share comes from transaction counts weighed by what a
+        transaction of each type costs tenant wide (an estimate of credits)."""
+        return (
+            not self.fusion_priced
+            and not self.credits_by_action
+            and bool(self.transactions)
+            and all(action in self.unit_prices for action in self.transactions)
+        )
 
     def fusion_is_most(self) -> bool:
         """Fusion is most of the spending, as far as the figures can say.
@@ -403,16 +421,27 @@ def observed_prices(session: Session) -> dict[str, tuple[Decimal, str]]:
     snapshot = ingestion.latest_snapshot(session, UsageView.ACTION)
     if snapshot is None:
         return {}
-    observed: dict[str, tuple[Decimal, str]] = {}
+    # Every row a key stands for is summed (credits over transactions), in id
+    # order for the name, so the figure never depends on the order rows come
+    # back in.
+    sums: dict[str, list] = {}
     for record in session.scalars(
-        select(UsageRecord).where(UsageRecord.snapshot_id == snapshot.id)
+        select(UsageRecord).where(UsageRecord.snapshot_id == snapshot.id).order_by(UsageRecord.id)
     ):
         transactions = _row_transactions(record)
         if transactions <= 0 or record.credits_used <= 0:
             continue
-        per = (Decimal(record.credits_used) / Decimal(transactions)).quantize(Decimal("0.0001"))
         for key in _action_keys(record):
-            observed.setdefault(key, (per, record.subject_name or record.subject_key))
+            entry = sums.setdefault(
+                key, [Decimal("0"), 0, record.subject_name or record.subject_key]
+            )
+            entry[0] += Decimal(record.credits_used)
+            entry[1] += transactions
+    observed: dict[str, tuple[Decimal, str]] = {
+        key: ((credits / count).quantize(Decimal("0.0001")), name)
+        for key, (credits, count, name) in sums.items()
+        if count > 0
+    }
     return observed
 
 
@@ -452,7 +481,13 @@ def price_table(session: Session) -> dict[str, ActionPrice]:
     for key in set(rates) | set(observed):
         rate, display = rates.get(key, (None, None))
         seen, name = observed.get(key, (None, None))
-        if rate is not None and (seen is None or abs(seen - rate) <= rate * PRICE_TOLERANCE):
+        # Fusion and DAST correlation are known to cost far more than their
+        # listed rate: their rate is used only when the feed confirms it.
+        needs_feed = usage_api.normalise_action_type(key) in FEED_PRICED
+        if rate is not None and (
+            (seen is None and not needs_feed)
+            or (seen is not None and abs(seen - rate) <= rate * PRICE_TOLERANCE)
+        ):
             table[key] = ActionPrice(rate, display, PRICE_RATE, rate=rate, observed=seen)
         elif seen is not None:
             table[key] = ActionPrice(
@@ -584,8 +619,14 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
             fusion_rise=transactions[FUSION],
             own=own,
         )
+    fusion_price_unknown = False
+    if fusion_priced is None and transactions.get(FUSION, 0) > 0:
+        prices = price_table(session)
+        models = set(latest_models) | set(baseline_models)
+        fusion_price_unknown = not models or any(key not in prices for key in models)
     return UsageMix(
         credits_used=state.credits_used,
+        fusion_price_unknown=fusion_price_unknown,
         attributed=attributed,
         transactions=transactions,
         credits_by_action=credits_by_action,
@@ -697,6 +738,11 @@ def describe(
                 f"{used}. Checkmarx reports credits per {entity_type}, not per action, so "
                 f"these are the actions behind them: {actions}."
             )
+        if mix.fusion_price_unknown:
+            text += (
+                " What a Fusion scan costs is not known from this tenant's data: the listed "
+                "rate is not its price, and the consumption feed has no figure for it yet."
+            )
         if mix.attributed > 0:
             text += (
                 f" Auto Triage charged from scans they started: {_number(mix.attributed)} credits."
@@ -792,11 +838,17 @@ def does_not_stop(
     """
     fusion_first = ""
     if mix is not None and mix.fusion_is_most():
-        fusion_first = (
-            "Most of these credits were Fusion scans. "
-            if mix.credits_by_action or mix.fusion_priced
-            else "Most of the actions behind them were Fusion scans. "
-        )
+        if mix.credits_by_action or mix.fusion_priced:
+            fusion_first = "Most of these credits were Fusion scans. "
+        elif mix.weighted:
+            # Most of the credits, estimated by weighing each count by what one
+            # action of its type costs; not most of the actions.
+            fusion_first = (
+                "Most of these credits were probably Fusion scans (weighing each action by "
+                "what one costs on this tenant). "
+            )
+        else:
+            fusion_first = "Most of the actions behind them were Fusion scans. "
     if kind == EnforcementKind.REMOVE_USER_ROLES:
         return (
             f"{fusion_first}Removing the AI roles changes no project setting, so Auto Triage, "

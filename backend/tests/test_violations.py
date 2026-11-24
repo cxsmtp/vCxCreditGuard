@@ -71,6 +71,25 @@ def restrict(db: Session, tenant: FakeTenant, *, entity_id: str = "proj-api", ac
     return limit
 
 
+def feed_confirms_the_rate(db: Session, tenant: FakeTenant) -> None:
+    """An action-dimension reading where an Opus 5.5 Fusion scan cost its listed
+    rate (8 credits for 4): only then is the rate taken as its price."""
+    from app.models.enums import UsageView
+    from app.services import ingestion
+    from tests.fake_tenant import action_row
+
+    tenant.consumption["action"].append(
+        action_row(
+            "Fusion Scan - Opus 5.5",
+            credits="8",
+            action_type="fusion_scan_-_opus_5.5",
+            transactions=4,
+        )
+    )
+    ingestion.ingest_usage(db, tenant.client(), views=(UsageView.ACTION,))
+    db.commit()
+
+
 def rows(db: Session, kind: str | None = None) -> list[PolicyViolation]:
     db.expire_all()
     query = select(PolicyViolation).order_by(PolicyViolation.id)
@@ -168,7 +187,7 @@ class TestScans:
             settings_store.KEY_ACTION_RATES,
             {"rates": list(tenant.action_rates or [])},
         )
-        db.commit()
+        feed_confirms_the_rate(db, tenant)
         result = violations.detect(db, tenant.client())
         assert result.errors == []
         fusion = rows(db, KIND_FUSION_SCAN)
@@ -537,7 +556,7 @@ class TestScansFollowUp:
         settings_store.set_value(
             db, settings_store.KEY_ACTION_RATES, {"rates": list(tenant.action_rates or [])}
         )
-        db.commit()
+        feed_confirms_the_rate(db, tenant)
         fusion = {"fusionEnabled": "true", "llmModel": "opus-5.5"}
         for scan_id, status in (
             ("queued", "Queued"),
@@ -562,6 +581,30 @@ class TestScansFollowUp:
         found = rows(db, KIND_FUSION_SCAN)
         assert [v.evidence["scan_id"] for v in found] == ["queued"]
         assert found[0].credits == 2
+
+    def test_without_a_feed_figure_a_fusion_scan_is_not_priced(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        """The listed rate is known not to be a Fusion price (live tenant: 2 vs
+        about 109), so without the feed's figure no cost is put on the scan."""
+        restrict(db, tenant)
+        settings_store.set_value(
+            db, settings_store.KEY_ACTION_RATES, {"rates": list(tenant.action_rates or [])}
+        )
+        db.commit()
+        tenant.add_scan(
+            project_id="proj-api",
+            scan_id="unpriced",
+            initiator="dev@example.com",
+            completed_at=later(30),
+            engines=["ai"],
+            ai={"fusionEnabled": "true", "llmModel": "opus-5.5"},
+        )
+        violations.detect(db, tenant.client())
+        found = rows(db, KIND_FUSION_SCAN)
+        assert [v.evidence["scan_id"] for v in found] == ["unpriced"]
+        assert found[0].credits is None
+        assert "not known from this tenant's data" in found[0].detail
 
     def test_a_scan_still_running_after_a_day_is_recorded_unpriced(
         self, db: Session, tenant: FakeTenant

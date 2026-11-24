@@ -47,7 +47,11 @@ function labelOf(row: ActionBreakdownItem): string {
 
 /** "108.86 (feed; rate 2)": what one action cost, and whether that is the listed rate. */
 function priceOf(row: ActionBreakdownItem): string {
-  if (!row.credits_per_transaction) return "";
+  if (!row.credits_per_transaction) {
+    // Fusion and DAST correlation are not priced at their listed rate.
+    const bucket = row.action_bucket ?? row.action_type;
+    return bucket === "fusion" || bucket === "dast_correlation" ? "not known" : "";
+  }
   const per = formatCredits(row.credits_per_transaction);
   if (row.price_source === "observed") {
     return row.listed_rate ? `${per} (feed; rate ${formatCredits(row.listed_rate)})` : `${per} (feed)`;
@@ -99,7 +103,7 @@ export function BreakdownChart({ items }: Props) {
   const shared = new Set(buckets).size < buckets.length;
   const slotOf = (row: ActionBreakdownItem) =>
     shared ? `row:${row.action_type}` : (row.action_bucket ?? row.action_type);
-  const anyPrice = rows.some((row) => row.credits_per_transaction);
+  const anyPrice = rows.some((row) => row.credits_per_transaction || priceOf(row));
   const usesCredits = rows.some((row) => Number(row.credits) > 0);
   const valueOf = (row: ActionBreakdownItem) =>
     usesCredits ? Number(row.credits) : (row.transactions ?? 0);

@@ -994,6 +994,11 @@ def _record_scan(
     }
     who = scan.initiator or "someone Checkmarx One does not name"
     cost = ""
+    if price is None and model and finished:
+        cost = (
+            f" What a Fusion scan with {model} costs is not known from this tenant's data: the "
+            "listed rate is not its price, and the consumption feed has no figure for it yet."
+        )
     if price is not None and model:
         if price.source == usage_mix.PRICE_OBSERVED:
             cost = (

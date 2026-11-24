@@ -40,7 +40,7 @@ from app.services import (
 )
 from app.services.audit import AuditActor
 from tests.conftest import USING_SQLITE, make_api_key
-from tests.fake_tenant import FakeTenant, populated_tenant
+from tests.fake_tenant import FakeTenant, action_row, populated_tenant
 
 ACTOR = AuditActor.system("test")
 PERIOD = "2026-08"
@@ -184,6 +184,17 @@ class TestRates:
 
     def test_priced_fusion_in_the_breach_message(self, db: Session, monkeypatch) -> None:
         tenant = _connected(db, monkeypatch)
+        # The feed confirms the listed rate (8 credits for 4 Opus 5.5 scans), so
+        # the rate is the price; without that it would not be (see
+        # test_real_tenant_usage).
+        tenant.consumption["action"].append(
+            action_row(
+                "Fusion Scan - Opus 5.5",
+                credits="8",
+                action_type="fusion_scan_-_opus_5.5",
+                transactions=4,
+            )
+        )
         tenant.set_entity_credits(
             view="project",
             name="payments/web",
