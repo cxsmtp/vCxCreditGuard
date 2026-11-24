@@ -44,6 +44,10 @@ const placeOrder = db.transaction((email, quantities) => {
 // Accept a cart of { productId, quantity } items, verify stock, compute the
 // total from server-side prices, decrement stock and record the order.
 router.post('/', (req, res) => {
+  // helmet (security.js) already sends this header app-wide. Checkout handles
+  // the shopper's email and order, so it also sets HSTS itself: the header
+  // stays even if this router is ever mounted without the app-wide middleware.
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const email = validate.email(body.email);
   const { items } = body;
