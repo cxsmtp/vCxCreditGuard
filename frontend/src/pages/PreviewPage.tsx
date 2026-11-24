@@ -17,7 +17,7 @@ import {
   Th,
   type BadgeTone,
 } from "../components/ui";
-import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
+import { FilterNote, Pager, usePaged, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import { entityLabel, formatCredits, formatDateTime, formatPercent } from "../lib/format";
 
@@ -46,6 +46,7 @@ export function PreviewPage() {
   const reload = useCallback(() => void dryRun.reload(), [dryRun]);
   const data = dryRun.data;
   const view = useTableView(data?.rows ?? [], DRY_RUN_VIEW);
+  const paged = usePaged(view.rows, 100);
 
   const exportColumns: ExportColumn<DryRunRow>[] = [
     { key: "entity", header: "Entity", value: (r) => r.entity_label ?? r.entity_id },
@@ -120,7 +121,10 @@ export function PreviewPage() {
                 description="There are no active limits to simulate yet."
               />
             ) : (
-              <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
+              <Table
+                before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}
+                after={<Pager {...paged} noun="limits" />}
+              >
                 <thead>
                   <tr>
                     {view.th("entity", "Entity")}
@@ -132,7 +136,7 @@ export function PreviewPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {view.rows.map((row) => (
+                  {paged.rows.map((row) => (
                     <tr key={row.limit_id}>
                       <Td>
                         <span className="font-medium">{row.entity_label ?? row.entity_id}</span>
@@ -229,6 +233,10 @@ export function BlastSummary({ blast }: { blast: BlastRadius }) {
   );
 }
 
+// A large group can have hundreds of projects with a warning: the first few
+// are spelled out, the rest counted.
+const WARNINGS_SHOWN = 10;
+
 /** What each person would lose and keep, and where a project setting may not hold. */
 export function BlastDetails({ blast }: { blast: BlastRadius }) {
   const users = blast.user_roles ?? [];
@@ -242,11 +250,17 @@ export function BlastDetails({ blast }: { blast: BlastRadius }) {
       {blast.user_roles_truncated && blast.user_roles_note && (
         <p style={{ color: "var(--text-muted)" }}>{blast.user_roles_note}</p>
       )}
-      {warnings.map((warning) => (
+      {warnings.slice(0, WARNINGS_SHOWN).map((warning) => (
         <p key={warning.project_id} style={{ color: "var(--status-warning)" }}>
           {warning.message}
         </p>
       ))}
+      {(blast.warnings_total ?? warnings.length) > Math.min(warnings.length, WARNINGS_SHOWN) && (
+        <p style={{ color: "var(--status-warning)" }}>
+          …and {((blast.warnings_total ?? warnings.length) - Math.min(warnings.length, WARNINGS_SHOWN)).toLocaleString()}{" "}
+          more projects where turning Auto Triage off may not hold.
+        </p>
+      )}
     </div>
   );
 }

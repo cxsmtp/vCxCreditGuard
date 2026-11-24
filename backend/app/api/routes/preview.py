@@ -26,7 +26,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/preview", tags=["preview"])
 
 
-def _blast_to_response(blast: preview_service.BlastRadius) -> BlastRadiusResponse:
+# A group or application can hold thousands of projects. The counts are always
+# complete; the lists are cut to their first entries ("and 1,950 more").
+MAX_TARGETS_SHOWN = 200
+MAX_TARGETS_PER_DRY_RUN_ROW = 20
+MAX_WARNINGS_SHOWN = 100
+
+
+def _blast_to_response(
+    blast: preview_service.BlastRadius, *, max_targets: int | None = None
+) -> BlastRadiusResponse:
+    if max_targets is None:
+        max_targets = MAX_TARGETS_SHOWN
     return BlastRadiusResponse(
         entity_type=blast.entity_type,  # type: ignore[arg-type]
         entity_id=blast.entity_id,
@@ -72,8 +83,11 @@ def _blast_to_response(blast: preview_service.BlastRadius) -> BlastRadiusRespons
                 project_label=warning.project_label,
                 message=warning.message,
             )
-            for warning in blast.warnings
+            for warning in blast.warnings[:MAX_WARNINGS_SHOWN]
         ],
+        warnings_total=len(blast.warnings),
+        targets_total=len(blast.targets),
+        targets_truncated=len(blast.targets) > max_targets,
         targets=[
             TargetPreviewResponse(
                 kind=target.kind,
@@ -81,7 +95,7 @@ def _blast_to_response(blast: preview_service.BlastRadius) -> BlastRadiusRespons
                 target_id=target.target_id,
                 target_label=target.target_label,
             )
-            for target in blast.targets
+            for target in blast.targets[:max_targets]
         ],
     )
 
@@ -177,7 +191,11 @@ def get_dry_run(ctx: CurrentUser, db: DbSession) -> DryRunResponse:
                 percent_used=row.percent_used,
                 projected_status=row.projected_status,  # type: ignore[arg-type]
                 would_enforce=row.would_enforce,
-                blast=_blast_to_response(row.blast) if row.blast is not None else None,
+                blast=(
+                    _blast_to_response(row.blast, max_targets=MAX_TARGETS_PER_DRY_RUN_ROW)
+                    if row.blast is not None
+                    else None
+                ),
                 note=row.note,
                 auto_triage_attributed=row.auto_triage_attributed,
             )

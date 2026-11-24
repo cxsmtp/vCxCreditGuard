@@ -252,6 +252,10 @@ export interface LimitPeriodState {
   restricted_at: string | null;
   /** The auto-triage part of credits_used, when it is charged to the scan's initiator. */
   auto_triage_attributed?: AutoTriageAttributed | null;
+  /** Set when the limit's restriction is spread over several cycles: users or
+   * projects it restricts, and how many have been dealt with so far. */
+  rollout_total?: number | null;
+  rollout_done?: number | null;
 }
 
 export type AttributionBasis = "observed" | "estimated" | "unattributed";
@@ -430,6 +434,15 @@ export interface EnforcementActionItem {
   error: string | null;
 }
 
+/** One page of restrictions (GET /api/notifications/enforcements/page). */
+export interface EnforcementActionPage {
+  items: EnforcementActionItem[];
+  total: number;
+  offset: number;
+  limit: number;
+  by_kind: Record<string, number>;
+}
+
 export interface AuditEntry {
   id: number;
   occurred_at: string;
@@ -508,6 +521,15 @@ export interface AppSettings {
   ai_roles: string[];
   default_ai_roles: string[];
   current_schedule_description: string;
+  /** Pacing for large tenants, per cycle (0 = no budget). */
+  verify_interval_minutes: number;
+  max_verifications_per_cycle: number;
+  max_writes_per_cycle: number;
+  violation_projects_per_cycle: number;
+  attribution_projects_per_cycle: number;
+  attribution_requests_per_cycle: number;
+  read_concurrency: number;
+  cycle_time_budget_pct: number;
 }
 
 export interface SchedulerStatus {
@@ -742,15 +764,19 @@ export interface BlastRadius {
   disable_fusion?: number;
   disable_repo_fusion?: number;
   total_actions: number;
+  /** The first targets only for a large group or application (targets_total in all). */
   targets: TargetPreview[];
+  targets_total?: number;
+  targets_truncated?: boolean;
   project_actions?: ProjectAction[];
   /** The roles a user restriction removes, and per user what they would lose. */
   ai_roles?: string[];
   user_roles?: UserRolesPreview[];
   user_roles_truncated?: boolean;
   user_roles_note?: string | null;
-  /** Projects where turning Auto Triage off may not hold. */
+  /** Projects where turning Auto Triage off may not hold (the first ones; warnings_total in all). */
   warnings?: ProjectWarning[];
+  warnings_total?: number;
 }
 
 export interface DryRunRow {

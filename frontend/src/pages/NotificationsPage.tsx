@@ -1,6 +1,12 @@
 import { useState } from "react";
 import { ApiError, api } from "../api/client";
-import type { EnforcementActionItem, NotificationItem, NotificationList, Severity } from "../api/types";
+import type {
+  EnforcementActionItem,
+  EnforcementActionPage,
+  NotificationItem,
+  NotificationList,
+  Severity,
+} from "../api/types";
 import {
   Badge,
   Button,
@@ -16,7 +22,7 @@ import {
   Td,
   Th,
 } from "../components/ui";
-import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
+import { FilterNote, Pager, useTableView, type ViewColumn } from "../components/tableView";
 import { useInterval, useResource } from "../hooks/useResource";
 import { enforcementLabel, formatDateTime, formatRelative, humanise } from "../lib/format";
 import { useToast } from "../lib/ui-context";
@@ -71,11 +77,29 @@ export function NotificationsPage({
       ),
     [severity, category, unreadOnly],
   );
-  const enforcements = useResource<EnforcementActionItem[]>(
-    (signal) => api.get("/api/notifications/enforcements", { only_active: true }, signal),
-    [],
+  // Restrictions in force are paged and searched on the server: a large
+  // tenant can have thousands. Sorting and the column filters apply to the
+  // page shown.
+  const RESTRICTIONS_PER_PAGE = 50;
+  const [restrictionSearch, setRestrictionSearch] = useState("");
+  const [restrictionTerm, setRestrictionTerm] = useState("");
+  const [restrictionPage, setRestrictionPage] = useState(0);
+  const enforcements = useResource<EnforcementActionPage>(
+    (signal) =>
+      api.get(
+        "/api/notifications/enforcements/page",
+        {
+          only_active: true,
+          q: restrictionTerm || undefined,
+          offset: restrictionPage * RESTRICTIONS_PER_PAGE,
+          limit: RESTRICTIONS_PER_PAGE,
+        },
+        signal,
+      ),
+    [restrictionTerm, restrictionPage],
   );
-  const view = useTableView(enforcements.data ?? [], RESTRICTION_VIEW);
+  const restrictionTotal = enforcements.data?.total ?? 0;
+  const view = useTableView(enforcements.data?.items ?? [], RESTRICTION_VIEW);
 
   useInterval(() => {
     void feed.reload();
@@ -139,14 +163,58 @@ export function NotificationsPage({
         }
       />
 
-      {(enforcements.data ?? []).length > 0 && (
+      {(restrictionTotal > 0 || restrictionTerm !== "") && (
         <div className="mb-6">
           <Card
-            title="Active restrictions"
+            title={`Active restrictions (${restrictionTotal.toLocaleString()})`}
             description="Currently in force in Checkmarx One. Restoring replays the exact state recorded before the change."
             padded={false}
           >
-            <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
+            <form
+              className="flex flex-wrap items-center gap-2 px-3 pt-3"
+              onSubmit={(event) => {
+                event.preventDefault();
+                setRestrictionPage(0);
+                setRestrictionTerm(restrictionSearch.trim());
+              }}
+            >
+              <Input
+                aria-label="Find a restriction"
+                placeholder="Find a project, user or limit"
+                value={restrictionSearch}
+                onChange={(event) => setRestrictionSearch(event.target.value)}
+              />
+              <Button size="sm" type="submit">
+                Find
+              </Button>
+              {restrictionTerm && (
+                <Button
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    setRestrictionSearch("");
+                    setRestrictionTerm("");
+                    setRestrictionPage(0);
+                  }}
+                >
+                  Show all
+                </Button>
+              )}
+            </form>
+            <Table
+              before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}
+              after={
+                <Pager
+                  page={restrictionPage}
+                  pages={Math.max(1, Math.ceil(restrictionTotal / RESTRICTIONS_PER_PAGE))}
+                  size={RESTRICTIONS_PER_PAGE}
+                  total={restrictionTotal}
+                  setPage={setRestrictionPage}
+                  noun="restrictions"
+                />
+              }
+            >
               <thead>
                 <tr>
                   {view.th("kind", "What changed")}

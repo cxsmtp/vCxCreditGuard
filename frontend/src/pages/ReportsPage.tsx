@@ -15,7 +15,7 @@ import {
   Td,
   Th,
 } from "../components/ui";
-import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
+import { FilterNote, Pager, usePaged, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import type { ExportColumn } from "../lib/export";
 import { entityLabel, formatCredits, formatDate, formatDateTime } from "../lib/format";
@@ -60,6 +60,7 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
   const data = report.data;
   const projections = data?.projections ?? [];
   const view = useTableView(projections, PROJECTION_VIEW);
+  const paged = usePaged(view.rows, 100);
 
   return (
     <div>
@@ -140,7 +141,10 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
                 description="Projections appear once limits have usage within an open budget period."
               />
             ) : (
-              <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
+              <Table
+                before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}
+                after={<Pager {...paged} noun="limits" />}
+              >
                 <thead>
                   <tr>
                     {view.th("entity", "Entity")}
@@ -152,7 +156,7 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {view.rows.map((p) => (
+                  {paged.rows.map((p) => (
                     <tr key={p.limit_id}>
                       <Td>
                         <span className="font-medium">{p.entity_label ?? p.entity_id}</span>

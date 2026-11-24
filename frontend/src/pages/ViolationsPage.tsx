@@ -19,7 +19,7 @@ import {
   Td,
   Textarea,
 } from "../components/ui";
-import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
+import { FilterNote, Pager, usePaged, useTableView, type ViewColumn } from "../components/tableView";
 import { useInterval, useResource } from "../hooks/useResource";
 import { formatCredits, formatDateTime, formatRelative, humanise } from "../lib/format";
 import { useToast } from "../lib/ui-context";
@@ -89,6 +89,7 @@ export function ViolationsPage({ onChanged }: { onChanged?: () => void }) {
   useInterval(() => void feed.reload(), 60_000);
   const rows = useMemo(() => feed.data?.items ?? [], [feed.data]);
   const view = useTableView(rows, VIEW);
+  const paged = usePaged(view.rows, 100);
 
   async function changed(updated: PolicyViolation) {
     setOpen(updated);
@@ -163,6 +164,7 @@ export function ViolationsPage({ onChanged }: { onChanged?: () => void }) {
                 onClear={view.clearFilters}
               />
             }
+            after={<Pager {...paged} noun="violations" />}
           >
             <thead>
               <tr>
@@ -177,7 +179,7 @@ export function ViolationsPage({ onChanged }: { onChanged?: () => void }) {
               </tr>
             </thead>
             <tbody>
-              {view.rows.map((v) => (
+              {paged.rows.map((v) => (
                 <tr
                   key={v.id}
                   className="cursor-pointer"

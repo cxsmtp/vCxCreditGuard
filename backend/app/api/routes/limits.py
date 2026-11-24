@@ -6,7 +6,7 @@ import logging
 from decimal import Decimal
 
 from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import AdminUser, CurrentUser, DbSession
@@ -107,28 +107,66 @@ def _auto_triage_response(
     )
 
 
-def _to_response(
-    db: Session, limit: CreditLimit, *, index: evaluation.UsageIndex | None = None
-) -> LimitResponse:
-    exempt = (
-        db.scalar(
-            select(Exemption.id).where(
-                Exemption.entity_type == limit.entity_type,
-                Exemption.entity_id == limit.entity_id,
+class _ListContext:
+    """What every row of the limits list needs, read once for the whole list."""
+
+    def __init__(self, db: Session, limits: list[CreditLimit]) -> None:
+        keys: set[str] = set()
+        for limit in limits:
+            try:
+                keys.add(current_window(limit).key)
+            except PeriodError:
+                continue
+        self.exempt = {
+            (entity_type, entity_id)
+            for entity_type, entity_id in db.execute(
+                select(Exemption.entity_type, Exemption.entity_id)
             )
+        }
+        self.active: dict[int | None, int] = dict(
+            db.execute(
+                select(EnforcementAction.limit_id, func.count())
+                .where(EnforcementAction.status == EnforcementStatus.APPLIED)
+                .group_by(EnforcementAction.limit_id)
+            ).all()
         )
-        is not None
-    )
-    active_restrictions = len(
-        list(
-            db.scalars(
-                select(EnforcementAction.id).where(
+        self.states = {
+            (state.limit_id, state.period_key): state
+            for state in db.scalars(
+                select(LimitPeriodState).where(LimitPeriodState.period_key.in_(sorted(keys)))
+            )
+        }
+
+
+def _to_response(
+    db: Session,
+    limit: CreditLimit,
+    *,
+    index: evaluation.UsageIndex | None = None,
+    context: _ListContext | None = None,
+) -> LimitResponse:
+    if context is not None:
+        exempt = (limit.entity_type, limit.entity_id) in context.exempt
+        active_restrictions = context.active.get(limit.id, 0)
+    else:
+        exempt = (
+            db.scalar(
+                select(Exemption.id).where(
+                    Exemption.entity_type == limit.entity_type,
+                    Exemption.entity_id == limit.entity_id,
+                )
+            )
+            is not None
+        )
+        active_restrictions = int(
+            db.scalar(
+                select(func.count()).where(
                     EnforcementAction.limit_id == limit.id,
                     EnforcementAction.status == EnforcementStatus.APPLIED,
                 )
             )
+            or 0
         )
-    )
 
     period_response: LimitPeriodStateResponse | None = None
     try:
@@ -136,12 +174,15 @@ def _to_response(
     except PeriodError:
         window = None
     if window is not None:
-        state = db.scalar(
-            select(LimitPeriodState).where(
-                LimitPeriodState.limit_id == limit.id,
-                LimitPeriodState.period_key == window.key,
+        if context is not None:
+            state = context.states.get((limit.id, window.key))
+        else:
+            state = db.scalar(
+                select(LimitPeriodState).where(
+                    LimitPeriodState.limit_id == limit.id,
+                    LimitPeriodState.period_key == window.key,
+                )
             )
-        )
         if state is not None:
             percent = (
                 float(state.credits_used) / limit.credit_limit * 100
@@ -162,6 +203,8 @@ def _to_response(
                 warned_at=state.warned_at,
                 breached_at=state.breached_at,
                 restricted_at=state.restricted_at,
+                rollout_total=state.rollout_total,
+                rollout_done=state.rollout_done,
             )
             if index is None and limit.entity_type in {EntityType.USER, EntityType.GROUP}:
                 index = _attribution_index(db)
@@ -210,7 +253,8 @@ def list_limits(
     limits = list(db.scalars(query.order_by(CreditLimit.entity_type, CreditLimit.entity_label)))
     # Built once for the whole list, and only when auto-triage charging is on.
     index = _attribution_index(db)
-    responses = [_to_response(db, limit, index=index) for limit in limits]
+    context = _ListContext(db, limits)
+    responses = [_to_response(db, limit, index=index, context=context) for limit in limits]
     if only_breached:
         responses = [
             response

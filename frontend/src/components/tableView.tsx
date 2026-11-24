@@ -294,3 +294,84 @@ export function FilterNote({
     </div>
   );
 }
+
+/**
+ * Shows a long table a page at a time (sorting and filters still apply to every
+ * row): thousands of rows render as one page of `size`, with a pager.
+ */
+export function usePaged<T>(rows: readonly T[], size = 100) {
+  const [page, setPage] = useState(0);
+  const pages = Math.max(1, Math.ceil(rows.length / size));
+  // A new sort or filter starts again from the first page.
+  useEffect(() => setPage(0), [rows]);
+  const current = Math.min(page, pages - 1);
+  return {
+    rows: rows.slice(current * size, (current + 1) * size),
+    page: current,
+    pages,
+    size,
+    total: rows.length,
+    setPage,
+  };
+}
+
+/** "Rows 101–200 of 3,545 · Previous · Next"; nothing when one page holds them all. */
+export function Pager({
+  page,
+  pages,
+  size,
+  total,
+  setPage,
+  noun = "rows",
+}: {
+  page: number;
+  pages: number;
+  size: number;
+  total: number;
+  setPage: (page: number) => void;
+  noun?: string;
+}) {
+  if (pages <= 1) return null;
+  const from = page * size + 1;
+  const to = Math.min(total, (page + 1) * size);
+  return (
+    <div
+      className="flex flex-wrap items-center justify-between gap-3 px-3 py-2 text-xs"
+      style={{ color: "var(--text-secondary)" }}
+      role="navigation"
+      aria-label="Pages"
+    >
+      <span className="tabular">
+        {noun.charAt(0).toUpperCase() + noun.slice(1)} {from.toLocaleString()}–{to.toLocaleString()} of{" "}
+        {total.toLocaleString()}
+      </span>
+      <span className="inline-flex items-center gap-2">
+        <button type="button" className="cg-btn sm ghost" disabled={page === 0} onClick={() => setPage(0)}>
+          First
+        </button>
+        <button type="button" className="cg-btn sm ghost" disabled={page === 0} onClick={() => setPage(page - 1)}>
+          Previous
+        </button>
+        <span className="tabular">
+          Page {page + 1} of {pages.toLocaleString()}
+        </span>
+        <button
+          type="button"
+          className="cg-btn sm ghost"
+          disabled={page >= pages - 1}
+          onClick={() => setPage(page + 1)}
+        >
+          Next
+        </button>
+        <button
+          type="button"
+          className="cg-btn sm ghost"
+          disabled={page >= pages - 1}
+          onClick={() => setPage(pages - 1)}
+        >
+          Last
+        </button>
+      </span>
+    </div>
+  );
+}

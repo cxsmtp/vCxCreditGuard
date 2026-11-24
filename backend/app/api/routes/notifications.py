@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.checkmarx.errors import CheckmarxError
@@ -13,6 +13,7 @@ from app.models.audit import Notification
 from app.models.enums import Severity
 from app.models.limits import EnforcementAction
 from app.schemas.limits import (
+    EnforcementActionPage,
     EnforcementActionResponse,
     MarkReadRequest,
     NotificationListResponse,
@@ -123,26 +124,100 @@ def list_enforcements(
                 .limit(limit)
             )
         )
-    return [
-        EnforcementActionResponse(
-            id=row.id,
-            kind=row.kind,
-            status=row.status,
-            entity_type=row.entity_type,  # type: ignore[arg-type]
-            entity_id=row.entity_id,
-            entity_label=row.entity_label,
-            target_type=row.target_type,
-            target_id=row.target_id,
-            target_label=row.target_label,
-            period_key=row.period_key,
-            created_at=row.created_at,
-            applied_at=row.applied_at,
-            reversed_at=row.reversed_at,
-            reversal_reason=row.reversal_reason,
-            error=row.error,
+    return [_action_response(row) for row in rows]
+
+
+def _action_response(row: EnforcementAction) -> EnforcementActionResponse:
+    return EnforcementActionResponse(
+        id=row.id,
+        kind=row.kind,
+        status=row.status,
+        entity_type=row.entity_type,  # type: ignore[arg-type]
+        entity_id=row.entity_id,
+        entity_label=row.entity_label,
+        target_type=row.target_type,
+        target_id=row.target_id,
+        target_label=row.target_label,
+        period_key=row.period_key,
+        created_at=row.created_at,
+        applied_at=row.applied_at,
+        reversed_at=row.reversed_at,
+        reversal_reason=row.reversal_reason,
+        error=row.error,
+    )
+
+
+@router.get("/enforcements/page", response_model=EnforcementActionPage)
+def page_enforcements(
+    ctx: CurrentUser,
+    db: DbSession,
+    only_active: bool = True,
+    q: str = Query(default="", max_length=200),
+    kind: str | None = Query(default=None, max_length=32),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> EnforcementActionPage:
+    """Restrictions, newest first, a page at a time, searchable.
+
+    For a tenant with thousands of restrictions in force: the list is filtered
+    and counted in the database, and only one page is sent.
+    """
+    query = select(EnforcementAction.id, EnforcementAction.status, EnforcementAction.kind).order_by(
+        EnforcementAction.created_at.desc(), EnforcementAction.id.desc()
+    )
+    if only_active:
+        query = query.where(EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES))
+    term = q.strip()
+    if term:
+        pattern = f"%{term}%"
+        query = query.where(
+            or_(
+                EnforcementAction.target_label.ilike(pattern),
+                EnforcementAction.target_id.ilike(pattern),
+                EnforcementAction.entity_label.ilike(pattern),
+                EnforcementAction.entity_id.ilike(pattern),
+            )
         )
-        for row in rows
-    ]
+    if kind:
+        query = query.where(EnforcementAction.kind == kind)
+    rows = db.execute(query).all()
+    if only_active:
+        # A pending or failed attempt counts only when it may be in force,
+        # which its snapshot says: read for those rows alone (there are few).
+        unsettled = [row.id for row in rows if row.status != "applied"]
+        in_force: set[int] = set()
+        for start in range(0, len(unsettled), 1000):
+            in_force.update(
+                action.id
+                for action in db.scalars(
+                    select(EnforcementAction).where(
+                        EnforcementAction.id.in_(unsettled[start : start + 1000])
+                    )
+                )
+                if enforcement.may_be_in_force(action)
+            )
+        rows = [row for row in rows if row.status == "applied" or row.id in in_force]
+    by_kind: dict[str, int] = {}
+    for row in rows:
+        by_kind[row.kind] = by_kind.get(row.kind, 0) + 1
+    page_ids = [row.id for row in rows[offset : offset + limit]]
+    found = (
+        {
+            action.id: action
+            for action in db.scalars(
+                select(EnforcementAction).where(EnforcementAction.id.in_(page_ids))
+            )
+        }
+        if page_ids
+        else {}
+    )
+    return EnforcementActionPage(
+        items=[_action_response(found[action_id]) for action_id in page_ids if action_id in found],
+        total=len(rows),
+        offset=offset,
+        limit=limit,
+        by_kind=by_kind,
+    )
 
 
 @router.post("/enforcements/{action_id}/restore")

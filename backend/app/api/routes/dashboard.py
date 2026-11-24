@@ -260,7 +260,10 @@ def search_entities(
         else:
             query = query.where(model.name.ilike(pattern))
 
-    rows = list(db.scalars(query.limit(limit)))
+    # Ordered before the cut, so the first ``limit`` matches are always the same
+    # ones (a tenant can have thousands: the picker asks the user to type more).
+    order = CxUser.username if entity_type == EntityType.USER else model.name
+    rows = list(db.scalars(query.order_by(order, model.id).limit(limit)))
     entity_ids = [row.id for row in rows]
     limited = set(
         db.scalars(

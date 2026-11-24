@@ -231,6 +231,15 @@ class SettingsResponse(BaseModel):
     # triggered it. Off by default.
     charge_auto_triage_to_scan_initiator: bool = False
     current_schedule_description: str
+    # Pacing for large tenants (per cycle; 0 = no budget). See pacing.py.
+    verify_interval_minutes: int = 60
+    max_verifications_per_cycle: int = 2000
+    max_writes_per_cycle: int = 1000
+    violation_projects_per_cycle: int = 150
+    attribution_projects_per_cycle: int = 150
+    attribution_requests_per_cycle: int = 600
+    read_concurrency: int = 4
+    cycle_time_budget_pct: int = 80
 
 
 class SettingsUpdateRequest(StrictModel):
@@ -271,6 +280,14 @@ class SettingsUpdateRequest(StrictModel):
     # that look like administration roles (settings_store.ADMIN_ROLE_PATTERNS).
     confirm_admin_roles: bool | None = None
     charge_auto_triage_to_scan_initiator: bool | None = None
+    verify_interval_minutes: int | None = Field(default=None, ge=0, le=10080)
+    max_verifications_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    max_writes_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    violation_projects_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    attribution_projects_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    attribution_requests_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    read_concurrency: int | None = Field(default=None, ge=1, le=16)
+    cycle_time_budget_pct: int | None = Field(default=None, ge=0, le=100)
 
     @field_validator("schedule_mode")
     @classmethod
