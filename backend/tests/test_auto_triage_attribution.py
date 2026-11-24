@@ -43,7 +43,7 @@ from app.services import (
 from app.services import connection as connection_service
 from app.services.audit import AuditActor
 from tests.conftest import make_api_key, sqlite_only
-from tests.fake_tenant import FakeTenant, populated_tenant
+from tests.fake_tenant import FakeTenant, action_row, populated_tenant
 
 ACTOR = AuditActor.system("test")
 HARSH = "harsh.gokani@checkmarx.com"
@@ -902,14 +902,24 @@ def test_ingestion_is_untouched_by_the_setting(db: Session) -> None:
 
 def set_price(tenant: FakeTenant, credits: int, transactions: int = 100) -> None:
     """The tenant-wide credits per auto-triage transaction (action dimension)."""
-    rows = [row for row in tenant.consumption["action"] if row["actionType"] != "auto_triage"]
-    rows.append(
-        {
-            "name": "auto_triage",
-            "actionType": "auto_triage",
-            "transactionCount": transactions,
-            "creditsUsed": credits,
+    rows = [
+        row
+        for row in tenant.consumption["action"]
+        if "auto_triage"
+        not in {
+            entry.get("actionType")
+            for entry in (row.get("actionsPerformed") or {}).get("actions", [])
         }
+        | {row.get("actionType")}
+    ]
+    # In the shape a live tenant returns an action row.
+    rows.append(
+        action_row(
+            "Auto Triage",
+            credits=str(credits),
+            action_type="auto_triage",
+            transactions=transactions,
+        )
     )
     tenant.consumption["action"] = rows
 

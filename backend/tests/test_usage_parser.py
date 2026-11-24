@@ -231,3 +231,72 @@ class TestFetchUsage:
         pages = list(usage.fetch_usage(tenant.client(), view_by=UsageView.USER))
         assert len(pages) == 1
         assert pages[0].items == []
+
+
+class TestLiveTenantShapes:
+    """Shapes a live tenant returned (2026-11), with synthetic values."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("31024", Decimal("31024")),
+            ("252.5", Decimal("252.5")),
+            (" 43.5 ", Decimal("43.5")),
+            ("1e3", Decimal("1000")),
+            (7, Decimal("7")),
+            (2.5, Decimal("2.5")),
+            (0.1, Decimal("0.1")),
+            (None, Decimal("0")),
+        ],
+    )
+    def test_credits_in_every_numeric_form(self, value, expected: Decimal) -> None:
+        assert usage.parse_credits(value) == expected
+
+    @pytest.mark.parametrize(
+        "value", ["", "n/a", "1,234.5", "1.234,5", "NaN", "Infinity", "-inf", True, [], {}]
+    )
+    def test_anything_else_is_zero_not_a_guess(self, value) -> None:
+        assert usage.parse_credits(value) == Decimal("0")
+
+    def test_an_action_row_nests_its_type_like_every_other_row(self) -> None:
+        row = {
+            "name": "Fusion Scan - Opus 5.5",
+            "creditsUsed": "31024",
+            "percentOfTotal": 78.56,
+            "actionsPerformed": {
+                "actions": [{"actionType": "fusion_scan_-_opus_5.5", "transactionCount": 285}],
+                "total": 285,
+            },
+        }
+        item = usage.parse_usage_item(row)
+        assert item is not None
+        assert item.subject_name == "Fusion Scan - Opus 5.5"
+        assert item.credits_used == Decimal("31024")
+        assert item.transactions == 285
+        assert item.actions == {ActionType.FUSION.value: 285}
+        # No id on a live row: matching is by name.
+        assert item.reported_id is None
+
+    def test_an_older_flat_action_row_is_still_read(self) -> None:
+        item = usage.parse_usage_item(
+            {"name": "triage", "actionType": "triage", "transactionCount": 9, "creditsUsed": 9}
+        )
+        assert item is not None
+        assert item.actions == {ActionType.TRIAGE.value: 9}
+        assert item.credits_used == Decimal("9")
+
+    def test_a_project_row_has_a_name_and_no_id(self) -> None:
+        item = usage.parse_usage_item(
+            {
+                "name": "example-org/example-repo",
+                "creditsUsed": "120",
+                "percentOfTotal": 1.5,
+                "actionsPerformed": {
+                    "actions": [{"actionType": "triage", "transactionCount": 120}],
+                    "total": 120,
+                },
+            }
+        )
+        assert item is not None
+        assert item.subject_key == "example-org/example-repo"
+        assert item.reported_id is None

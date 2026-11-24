@@ -1533,6 +1533,24 @@ class _Captured:
     outcome: dict[str, Any] = field(default_factory=dict)
 
 
+def _recorded_pr_form(session: Session, *, repo_id: str) -> dict[str, Any] | None:
+    """The shape a repository's PR severities were last read in, from the newest
+    restriction of it that recorded one. Database only."""
+    for snapshot in session.scalars(
+        select(EnforcementAction.undo_snapshot)
+        .where(EnforcementAction.kind == EnforcementKind.DISABLE_PR_REMEDIATION)
+        .order_by(EnforcementAction.id.desc())
+        .limit(200)
+    ):
+        if (
+            isinstance(snapshot, dict)
+            and str(snapshot.get("repo_id")) == str(repo_id)
+            and isinstance(snapshot.get("severities_form"), dict)
+        ):
+            return dict(snapshot["severities_form"])
+    return None
+
+
 def _capture(
     session: Session,
     client: CheckmarxClient,
@@ -1569,17 +1587,40 @@ def _capture(
                 "remediation cannot be changed."
             )
         repo_id = project.repo_id
-        read = platform.get_pr_remediation_severities(
-            client, repo_id=repo_id, project_id=target.target_id
-        )
+        try:
+            read = platform.read_pr_remediation(
+                client, repo_id=repo_id, project_id=target.target_id
+            )
+        except platform.PrSeveritiesShapeError as exc:
+            # Read, but not in a shape CreditGuard knows how to write back. A
+            # write in a guessed shape could be refused or, worse, misread, so
+            # nothing is changed and the admin is told what came back.
+            raise NotRestricted(
+                f"The PR triage and remediation setting of {target.target_label}'s repository "
+                f"was left unchanged. {exc} Auto Triage on the project is restricted as normal.",
+                title=f"{target.target_label}: PR triage and remediation left unchanged",
+            ) from exc
         if read is not None:
             # The real, current severities (captured before disabling) - this is
-            # what a Restore must reproduce, including MEDIUM/LOW if configured.
-            severities_before = read
+            # what a Restore must reproduce, including MEDIUM/LOW if configured -
+            # and the shape they came in, which every write sends back.
+            severities_before = read.severities
+            form = read.form()
         elif project.pr_remediation_severities is not None:
             # The tenant cannot be read, but the last sync recorded the setting.
             # Used as it is, empty included: "already off" must restore to off.
+            # The shape is the one recorded by an earlier restriction of this
+            # repository; with none, nothing is written (see below).
             severities_before = list(project.pr_remediation_severities)
+            form = _recorded_pr_form(session, repo_id=repo_id)
+            if form is None:
+                raise NotRestricted(
+                    f"The PR triage and remediation setting for {target.target_label}'s "
+                    "repository cannot be read from Checkmarx One right now, and the shape it "
+                    "must be written in has never been seen, so it was left unchanged. Auto "
+                    "Triage on the project is restricted as normal.",
+                    title=f"{target.target_label}: PR triage and remediation left unchanged",
+                )
         else:
             # Nothing says what the setting is now, so nothing could put it back
             # afterwards. A restriction that cannot be undone faithfully is not
@@ -1599,6 +1640,7 @@ def _capture(
                 repo_id=repo_id,
                 project_id=target.target_id,
                 severities=DISABLED_SEVERITIES,
+                form=form,
             )
             # Read back once, as for Fusion. Severities still listed may be a
             # stale read: the outcome stays in doubt (what was there before is
@@ -1635,6 +1677,10 @@ def _capture(
                 "kind": str(target.kind),
                 "repo_id": repo_id,
                 "severities_before": severities_before,
+                # How remediationSeverities was read ({"shape": "wrapped",
+                # "fields": {"isEditable": true}}), so Restore and every re-assert
+                # write it back the same way.
+                "severities_form": form,
             },
             apply=disable_pr_remediation,
             mirror=mirror_pr_remediation,
@@ -1841,8 +1887,10 @@ def _capture_auto_triage(
         if not state.enabled:
             outcome["auto_triage_seen_off"] = True
             return
+        # The configuration is sent back as read, with only auto_triage changed:
+        # auto_remediation and every allowOverride stay exactly as they were.
         platform.set_auto_triage(
-            client, project_id=target.target_id, enabled=False, config=state.config
+            client, project_id=target.target_id, enabled=False, config=state.config, current=state
         )
         # Read back once, as for Fusion. Still on may be a stale read: the
         # outcome stays in doubt and the next cycle tries again, quietly. Still
@@ -1899,6 +1947,11 @@ def _capture_auto_triage(
             # interpreted.
             "auto_triage_allow_override": state.allow_override,
             "auto_triage_scope": state.scope,
+            # The whole configuration as read (other features such as
+            # auto_remediation, their allowOverride, allowAiUsage), verbatim. Not
+            # written back from here: Restore reads the configuration again and
+            # changes only auto_triage, so a later change to the rest is kept.
+            "payload_before": state.raw,
         },
         apply=disable_auto_triage,
         mirror=mirror_auto_triage,
@@ -2103,9 +2156,15 @@ def _capture_fusion(session: Session, client: CheckmarxClient, *, target: Target
             "fusion_enabled_before": enabled_before,
             "value_before": setting.value,
             "allow_override_before": setting.allow_override,
-            # "Project" when the project set it itself; "Tenant" (or another
-            # level) when it was inherited. Writing it back sets it on the project.
+            # As reported. A level other than "Project" names where an inherited
+            # value came from; an unset entry still says "Project", and its
+            # isPersisted false is what says it had no value of its own.
             "origin_level_before": setting.origin_level,
+            "is_persisted_before": setting.is_persisted,
+            # True when the project had no value of its own (it inherited one).
+            # Restore still writes the previous value back at the project level
+            # (no per-key delete is known), which then pins it there.
+            "inherited_before": setting.inherited,
             "entry_before": setting.entry,
             "lock_requested": wants_lock,
             # Whether anything is written at all (and so put back on restore).
@@ -2267,6 +2326,8 @@ def _merge_snapshots(previous: dict[str, Any] | None, fresh: dict[str, Any]) -> 
             merged = dict(fresh)
             merged["enabled_before"] = True
             merged["config_before"] = previous.get("config_before") or {}
+            if "payload_before" in previous:
+                merged["payload_before"] = previous["payload_before"]
             return merged
         return fresh
 
@@ -2294,6 +2355,8 @@ def _merge_snapshots(previous: dict[str, Any] | None, fresh: dict[str, Any]) -> 
                 "value_before",
                 "allow_override_before",
                 "origin_level_before",
+                "is_persisted_before",
+                "inherited_before",
                 "entry_before",
             ):
                 if key in previous:
@@ -2521,6 +2584,7 @@ def _reconcile_once(
             project_id=target.target_id,
             enabled=False,
             config=config if isinstance(config, dict) and config else None,
+            current=state,
         )
         if project is not None:
             project.auto_triage_enabled = False
@@ -2532,17 +2596,29 @@ def _reconcile_once(
         repo_id = snapshot.get("repo_id") or (project.repo_id if project else None)
         if not repo_id:
             return RECONCILE_HELD
-        current = resolver.read(
+        # An unknown shape raises (PrSeveritiesShapeError): reported as not
+        # verified, and nothing is written in a guessed shape.
+        read = resolver.read(
             ("pr_remediation", str(repo_id), target.target_id),
-            lambda: platform.get_pr_remediation_severities(
+            lambda: platform.read_pr_remediation(
                 client, repo_id=repo_id, project_id=target.target_id
             ),
         )
-        if current is not None and not current:
+        if read is not None and not read.severities:
             return RECONCILE_HELD  # read back as disabled
-        _act_on_reads(resolver, may_write, unreadable=current is None)
-        if current is not None:
-            found.update({"found": {"remediationSeverities": current}})
+        # Written in the shape just read; unreadable, in the shape recorded when
+        # the restriction was applied. A restriction recorded before the shape
+        # was kept, and unreadable now, is not written at all.
+        form = read if read is not None else snapshot.get("severities_form")
+        if form is None:
+            _conclude_on_reads(resolver)  # a stale read-ahead is read again first
+            raise platform.PrSeveritiesShapeError(
+                "The repository's PR triage and remediation setting cannot be read, and the "
+                "shape it is written in was not recorded, so it was not written again."
+            )
+        _act_on_reads(resolver, may_write, unreadable=read is None)
+        if read is not None:
+            found.update({"found": {"remediationSeverities": read.severities}})
         # Either severities were read back re-enabled (drift), or the setting
         # could not be read at all. Both re-apply the restriction; only the
         # first is drift.
@@ -2551,11 +2627,12 @@ def _reconcile_once(
             repo_id=repo_id,
             project_id=target.target_id,
             severities=DISABLED_SEVERITIES,
+            form=form,
         )
         if project is not None:
             project.pr_remediation_severities = []
             project.ai_state_checked_at = utcnow()
-        return RECONCILE_UNVERIFIED if current is None else RECONCILE_REASSERTED
+        return RECONCILE_UNVERIFIED if read is None else RECONCILE_REASSERTED
 
     if kind == EnforcementKind.DISABLE_FUSION:
         lock = bool(snapshot.get("lock_applied"))
@@ -3127,6 +3204,8 @@ def _undo(
         if not snapshot.get("enabled_before"):
             return
         config = snapshot.get("config_before")
+        # Reads the configuration first and changes only auto_triage in it, so
+        # the project's other AI features are left as they are now.
         platform.set_auto_triage(
             client,
             project_id=action.target_id,
@@ -3152,8 +3231,25 @@ def _undo(
                 "The repository id recorded for this action is missing, so PR triage and "
                 "remediation cannot be restored automatically."
             )
+        form = snapshot.get("severities_form")
+        if not isinstance(form, dict):
+            # Recorded before the shape was kept: read it now, so the value goes
+            # back in the shape the tenant uses. Unreadable or unknown, nothing
+            # is written and the restore is reported as failed (and retried).
+            form = platform.read_pr_remediation(
+                client, repo_id=repo_id, project_id=action.target_id
+            )
+            if form is None:
+                raise CheckmarxError(
+                    "The repository's PR triage and remediation setting cannot be read, so "
+                    "the shape to restore it in is not known; it was not written."
+                )
         platform.set_pr_remediation_severities(
-            client, repo_id=repo_id, project_id=action.target_id, severities=severities
+            client,
+            repo_id=repo_id,
+            project_id=action.target_id,
+            severities=severities,
+            form=form,
         )
         if project is not None:
             project.pr_remediation_severities = severities
@@ -3319,7 +3415,7 @@ def prefetch_verification(
             if kind == EnforcementKind.DISABLE_PR_REMEDIATION:
                 reads.setdefault(
                     ("pr_remediation", str(repo_id), target_id),
-                    lambda r=repo_id, t=target_id: platform.get_pr_remediation_severities(
+                    lambda r=repo_id, t=target_id: platform.read_pr_remediation(
                         client, repo_id=r, project_id=t
                     ),
                 )
@@ -3636,12 +3732,10 @@ def _fusion_lines(snapshot: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     if snapshot.get("fusion_enabled_before"):
         lines.append(f"Fusion was turned off for this project ({platform.FUSION_SETTING_KEY}).")
-        origin = snapshot.get("origin_level_before")
-        if origin and str(origin).lower() != "project":
-            lines.append(
-                f"It was inherited from the {str(origin).lower()} level; it is now set on the "
-                "project itself."
-            )
+        if _was_inherited(snapshot):
+            level = _origin_words(snapshot)
+            where = f"from {level}" if level else "(the project had no value of its own)"
+            lines.append(f"It was inherited {where}; it is now set on the project itself.")
     else:
         lines.append("Fusion was already off for this project.")
     if snapshot.get("lock_applied") is True:
@@ -3810,12 +3904,32 @@ def _fusion_restore_detail(snapshot: dict[str, Any]) -> str:
             ", with per-scan override allowed" if lock else ", locked against per-scan override"
         )
     detail += ", as it was before the restriction."
-    origin = snapshot.get("origin_level_before")
-    if origin and str(origin).lower() != "project":
+    if _was_inherited(snapshot):
+        level = _origin_words(snapshot)
+        where = f" from {level}" if level else ""
         detail += (
-            f" Before the restriction it was inherited from the {str(origin).lower()} level. "
-            "Checkmarx One offers no known way to remove a project's own value, so it is now "
-            "set on the project with the same value, and a later change at the "
-            f"{str(origin).lower()} level no longer reaches this project."
+            f" Before the restriction it was inherited{where}: the project had no value of "
+            "its own. Checkmarx One offers no known way to remove a project's own value, so "
+            "it is now set on the project with the same value, and a later change at "
+            f"{level or 'the level it was inherited from'} no longer reaches this project."
         )
     return detail
+
+
+def _origin_words(snapshot: dict[str, Any]) -> str | None:
+    origin = snapshot.get("origin_level_before")
+    if origin and str(origin).lower() != "project":
+        return f"the {str(origin).lower()} level"
+    return None
+
+
+def _was_inherited(snapshot: dict[str, Any]) -> bool:
+    """Whether the project had no Fusion value of its own before the restriction.
+
+    ``inherited_before`` (from ``isPersisted``) decides; a snapshot recorded
+    before it was kept falls back to ``origin_level_before``.
+    """
+    inherited = snapshot.get("inherited_before")
+    if inherited is None:
+        return _origin_words(snapshot) is not None
+    return bool(inherited)

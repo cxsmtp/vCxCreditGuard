@@ -20,11 +20,29 @@ through two different services:
   That the repos-manager read returns it, and that a ``PATCH`` of it changes
   it, is **not verified**: when the read does not include it, that half is
   skipped and the record says so.
+
+Shapes seen on a live tenant (2026-11), which the code below is written to:
+
+* The repos-manager read wraps ``remediationSeverities`` as
+  ``{"value": ["CRITICAL", ...], "isEditable": true}``; older payloads carry a
+  bare list. A write sends back the shape that was read, and nothing is
+  written when the shape is not one of those two.
+* The project Auto Triage read lists more than ``auto_triage``: an
+  ``auto_remediation`` feature, each feature's ``allowOverride``, and a top
+  level ``allowAiUsage``. A ``PUT`` takes the whole configuration, so the
+  payload is sent back as it was read with only the ``auto_triage`` entry's
+  ``enabled`` and ``config`` changed.
+* An unset project configuration entry still reports ``originLevel``
+  ``Project`` (with an empty value); its ``isPersisted`` false is what says the
+  project has no value of its own. An inherited entry reports the level it
+  comes from (``Tenant``) with that level's ``isPersisted``.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -81,9 +99,11 @@ class AutoTriageState:
     config: dict[str, Any] = field(default_factory=dict)
     scope: str | None = None
     raw: dict[str, Any] | None = None
-    # The entry's ``allowOverride`` exactly as Checkmarx One sent it (seen as
-    # ``{"projects": false, "branches": true, ...}`` on a project-scope read), or
-    # None when absent. Recorded verbatim; its meaning is not documented.
+    # The entry's ``allowOverride`` exactly as Checkmarx One sent it, or None
+    # when absent. Seen as ``{"projects": false, "branches": true, ...}`` in a
+    # captured HAR and as ``{"projects": true, "branches": true, "scannerTypes":
+    # true, "riskStatuses": true, "severityLevels": true}`` on a live tenant.
+    # Recorded verbatim; its meaning is not documented.
     allow_override: Any = None
 
 
@@ -196,28 +216,62 @@ def get_auto_triage(client: CheckmarxClient, *, project_id: str) -> AutoTriageSt
     return parse_auto_triage(payload)
 
 
+def auto_triage_put_body(
+    payload: Any, *, enabled: bool, config: dict[str, Any] | None
+) -> dict[str, Any]:
+    """The ``PUT`` body that changes Auto Triage and nothing else.
+
+    ``payload`` is the configuration exactly as it was read. It is sent back
+    whole - other features (``auto_remediation``), every ``allowOverride`` and
+    the top level fields included - with only the ``auto_triage`` entry's
+    ``enabled`` and ``config`` changed, so a tenant that treats the ``PUT`` as
+    the whole configuration does not reset what CreditGuard does not own.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("configurations"), list):
+        raise CheckmarxResponseError(
+            "The project's AI agent configuration could not be read in a known shape, so Auto "
+            "Triage was not changed: writing it without the rest of the configuration could "
+            "reset the project's other AI features."
+        )
+    body = copy.deepcopy(payload)
+    entries: list[Any] = body["configurations"]
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("feature") == AUTO_TRIAGE_FEATURE:
+            entry["enabled"] = enabled
+            if config:
+                entry["config"] = copy.deepcopy(config)
+            elif not isinstance(entry.get("config"), dict) or not entry.get("config"):
+                entry["config"] = dict(FALLBACK_AUTO_TRIAGE_CONFIG)
+            return body
+    entries.append(
+        {
+            "feature": AUTO_TRIAGE_FEATURE,
+            "enabled": enabled,
+            "config": copy.deepcopy(config) if config else dict(FALLBACK_AUTO_TRIAGE_CONFIG),
+        }
+    )
+    return body
+
+
 def set_auto_triage(
     client: CheckmarxClient,
     *,
     project_id: str,
     enabled: bool,
     config: dict[str, Any] | None = None,
+    current: AutoTriageState | None = None,
 ) -> None:
     """Enable or disable Auto Triage, preserving the rest of the configuration.
 
-    The API takes the whole feature entry, so a caller that does not pass the
-    existing ``config`` would silently reset branches and severity levels. The
-    enforcement service always passes the config it captured before acting.
+    The API takes the whole configuration, so the body is the configuration as
+    read (``current``, or a fresh read when it is not given) with only the
+    ``auto_triage`` entry changed: see :func:`auto_triage_put_body`. ``config``
+    is the entry's ``config`` to write (the one captured before acting); without
+    it the entry keeps the one it was read with.
     """
-    body = {
-        "configurations": [
-            {
-                "feature": AUTO_TRIAGE_FEATURE,
-                "enabled": enabled,
-                "config": config if config else dict(FALLBACK_AUTO_TRIAGE_CONFIG),
-            }
-        ]
-    }
+    if current is None or current.raw is None:
+        current = get_auto_triage(client, project_id=project_id)
+    body = auto_triage_put_body(current.raw, enabled=enabled, config=config)
     client.request(
         "PUT",
         AUTO_TRIAGE_PATH.format(project_id=project_id),
@@ -226,73 +280,156 @@ def set_auto_triage(
     )
 
 
+PR_SEVERITIES_FIELD = "remediationSeverities"
+# How ``remediationSeverities`` was read, and so how it is written back.
+PR_SHAPE_LIST = "list"  # ["CRITICAL", "HIGH"] (older payloads)
+PR_SHAPE_WRAPPED = "wrapped"  # {"value": ["CRITICAL", "HIGH"], "isEditable": true} (live tenant)
+
+
+class PrSeveritiesShapeError(CheckmarxResponseError):
+    """``remediationSeverities`` is in a shape CreditGuard does not know.
+
+    Nothing is written then: a write in the wrong shape could be rejected, or
+    worse, accepted and misread.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class PrSeverities:
+    """The PR triage and remediation severities of a repository, as read.
+
+    ``shape`` and ``fields`` say how the value was sent, so a write can send it
+    back the same way: ``fields`` holds the wrapped form's other keys exactly as
+    read (``{"isEditable": true}``), and is empty for a bare list.
+    """
+
+    severities: list[str]
+    shape: str
+    fields: dict[str, Any] = field(default_factory=dict)
+
+    def form(self) -> dict[str, Any]:
+        """The shape, for an undo snapshot (JSON)."""
+        return {"shape": self.shape, "fields": copy.deepcopy(self.fields)}
+
+
+def parse_pr_severities(value: Any) -> PrSeverities:
+    """Read ``remediationSeverities`` in either known shape.
+
+    Raises :class:`PrSeveritiesShapeError` for anything else, a list holding
+    something other than strings included.
+    """
+    if isinstance(value, list) and all(isinstance(entry, str) for entry in value):
+        return PrSeverities(severities=[entry for entry in value if entry], shape=PR_SHAPE_LIST)
+    if isinstance(value, dict):
+        inner = value.get("value")
+        if isinstance(inner, list) and all(isinstance(entry, str) for entry in inner):
+            return PrSeverities(
+                severities=[entry for entry in inner if entry],
+                shape=PR_SHAPE_WRAPPED,
+                fields={key: copy.deepcopy(item) for key, item in value.items() if key != "value"},
+            )
+    raise PrSeveritiesShapeError(
+        f"The repository's {PR_SEVERITIES_FIELD} came back as {_shape_words(value)}, which is "
+        'neither a list of severities nor {"value": [...]}, so CreditGuard does not change it.'
+    )
+
+
+def _shape_words(value: Any) -> str:
+    if value is None:
+        return "nothing"
+    if isinstance(value, dict):
+        return "an object with " + (", ".join(sorted(str(key) for key in value)[:6]) or "no keys")
+    if isinstance(value, list):
+        return "a list holding something other than severity names"
+    return f"a {type(value).__name__}"
+
+
+def pr_severities_body(severities: list[str], *, form: PrSeverities | Mapping[str, Any]) -> Any:
+    """``remediationSeverities`` in the shape it was read in.
+
+    ``form`` is the read itself or its :meth:`PrSeverities.form` record.
+    Raises :class:`PrSeveritiesShapeError` when the shape is not a known one.
+    """
+    if isinstance(form, PrSeverities):
+        shape, fields = form.shape, form.fields
+    else:
+        shape = form.get("shape")
+        fields = form.get("fields") if isinstance(form.get("fields"), dict) else {}
+    values = [entry for entry in severities if isinstance(entry, str) and entry]
+    if shape == PR_SHAPE_LIST:
+        return values
+    if shape == PR_SHAPE_WRAPPED:
+        wrapped = copy.deepcopy(dict(fields or {}))
+        wrapped["value"] = values
+        return wrapped
+    raise PrSeveritiesShapeError(
+        f"The shape {PR_SEVERITIES_FIELD} was read in is not known, so it is not written."
+    )
+
+
 def set_pr_remediation_severities(
-    client: CheckmarxClient, *, repo_id: str, project_id: str, severities: list[str]
+    client: CheckmarxClient,
+    *,
+    repo_id: str,
+    project_id: str,
+    severities: list[str],
+    form: PrSeverities | Mapping[str, Any] | None,
 ) -> None:
     """Set the severities eligible for PR triage and remediation.
 
     An empty list disables the feature. Restoring means writing the severities
-    that were captured before the change.
+    that were captured before the change. ``form`` is how the setting was read
+    (see :func:`pr_severities_body`); without a known one nothing is written.
     """
     if not repo_id:
         raise CheckmarxError(
             "No repository id is known for this project, so PR triage and remediation "
             "cannot be changed."
         )
+    if form is None:
+        raise PrSeveritiesShapeError(
+            "The shape of the repository's PR triage and remediation setting is not known "
+            "(it has not been read), so it is not written."
+        )
     client.request(
         "PATCH",
         REPO_SETTINGS_PATH.format(repo_id=repo_id),
         params={"projectId": project_id},
-        json={"remediationSeverities": severities},
+        json={PR_SEVERITIES_FIELD: pr_severities_body(severities, form=form)},
         headers={"Content-Type": "application/json"},
     )
 
 
-def get_pr_remediation_severities(
+def read_pr_remediation(
     client: CheckmarxClient, *, repo_id: str, project_id: str
-) -> list[str] | None:
-    """Read the severities currently eligible for PR triage and remediation.
+) -> PrSeverities | None:
+    """The severities currently eligible for PR triage and remediation, as read.
 
     This is what a Restore must reproduce, so capturing it *before* disabling the
     feature (rather than assuming ``CRITICAL``/``HIGH``) is what lets re-enabling
     put back the exact configuration that was in place.
 
-    Returns ``None`` when the value cannot be read - no repository id, the tenant
-    does not expose a read for the repo settings, or the payload is unexpected -
-    so callers can fall back to a cached or default value rather than guessing.
-    An empty list is a real, meaningful answer: the feature is already disabled.
+    Returns ``None`` when the settings cannot be read (no repository id, a
+    refusal, an outage). Raises :class:`PrSeveritiesShapeError` when they were
+    read and ``remediationSeverities`` is absent or in an unknown shape. An
+    empty list is a real, meaningful answer: the feature is already disabled.
     """
-    if not repo_id:
+    payload = get_repo_settings(client, repo_id=repo_id, project_id=project_id)
+    if payload is None:
         return None
+    return parse_pr_severities(payload.get(PR_SEVERITIES_FIELD))
+
+
+def get_pr_remediation_severities(
+    client: CheckmarxClient, *, repo_id: str, project_id: str
+) -> list[str] | None:
+    """The severities alone, or ``None`` when they cannot be read or understood."""
     try:
-        payload = client.get_json(
-            REPO_SETTINGS_PATH.format(repo_id=repo_id),
-            params={"projectId": project_id},
-        )
-    except CheckmarxPermissionError as exc:
-        # The 403 itself is also recorded on the API key permission report by
-        # the client's refusal listener, even though it is swallowed here.
-        logger.warning(
-            "The PR triage and remediation setting of project %s could not be read: %s",
-            project_id,
-            exc,
-        )
+        read = read_pr_remediation(client, repo_id=repo_id, project_id=project_id)
+    except PrSeveritiesShapeError as exc:
+        logger.info("Repository %s: %s", repo_id, exc)
         return None
-    except CheckmarxError as exc:
-        logger.info(
-            "The PR triage and remediation setting of project %s could not be read: %s",
-            project_id,
-            exc,
-        )
-        return None
-    if not isinstance(payload, dict):
-        logger.info("Repository %s settings came back in an unexpected shape", repo_id)
-        return None
-    severities = payload.get("remediationSeverities")
-    if not isinstance(severities, list):
-        logger.info("Repository %s settings carry no remediationSeverities list", repo_id)
-        return None
-    return [entry for entry in severities if isinstance(entry, str) and entry]
+    return None if read is None else read.severities
 
 
 # ------------------------------------------------------------------ Fusion
@@ -307,6 +444,27 @@ class ProjectSetting:
     origin_level: str | None
     allow_override: bool | None
     entry: dict[str, Any]
+    # ``isPersisted`` as reported: whether the level ``origin_level`` names holds
+    # a value (see ``inherited``). None when the entry does not carry it.
+    is_persisted: bool | None = None
+
+    @property
+    def inherited(self) -> bool:
+        """True when the project has no value of its own for this setting.
+
+        ``isPersisted`` belongs to the level ``originLevel`` names: on a live
+        tenant an inherited entry reads ``originLevel`` ``Tenant`` with
+        ``isPersisted`` true (the tenant's value), and an unset one still reads
+        ``originLevel`` ``Project``, with ``isPersisted`` false and an empty
+        value. So the project has its own value only when the level is
+        ``Project`` and ``isPersisted`` is not false.
+        """
+        origin = (self.origin_level or "").strip().lower()
+        if not origin:
+            return False
+        if origin != "project":
+            return True
+        return self.is_persisted is False
 
     @property
     def enabled(self) -> bool:
@@ -342,12 +500,14 @@ def parse_project_setting(payload: Any, *, key: str) -> ProjectSetting | None:
         if isinstance(entry, dict) and entry.get("key") == key:
             allow = entry.get("allowOverride")
             origin = entry.get("originLevel")
+            persisted = entry.get("isPersisted")
             return ProjectSetting(
                 key=key,
                 value=entry.get("value"),
                 origin_level=origin if isinstance(origin, str) else None,
                 allow_override=allow if isinstance(allow, bool) else None,
                 entry=dict(entry),
+                is_persisted=persisted if isinstance(persisted, bool) else None,
             )
     return None
 
