@@ -166,9 +166,12 @@ export function NotificationsPage({
         title="Notification Center"
         description="Warnings, enforcement actions, restorations and sync problems. Every enforcement here can be reversed."
         actions={
-          <Button size="sm" onClick={markAllRead} loading={busy} disabled={(feed.data?.unread ?? 0) === 0}>
-            Mark all as read
-          </Button>
+          // One read state, shared by everyone: only an admin may clear it.
+          isAdmin ? (
+            <Button size="sm" onClick={markAllRead} loading={busy} disabled={(feed.data?.unread ?? 0) === 0}>
+              Mark all as read
+            </Button>
+          ) : undefined
         }
       />
 

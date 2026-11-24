@@ -24,8 +24,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import pyotp
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.config import Settings, get_settings
 from app.core.crypto import PURPOSE_RECOVERY_CODE, PURPOSE_TOTP_SECRET, get_secret_box
@@ -37,6 +38,7 @@ from app.core.passwords import (
     verify_password,
 )
 from app.core.tokens import hash_token, new_token, tokens_equal
+from app.db import locking
 from app.db.base import utcnow
 from app.models.auth import (
     LoginAttempt,
@@ -204,12 +206,29 @@ def create_user(
 def set_password(
     session: Session, *, user: UtilityUser, new_password: str, actor: AuditActor
 ) -> None:
+    _store_password_hash(
+        session, user=user, password_hash=_new_password_hash(user, new_password), actor=actor
+    )
+
+
+def _new_password_hash(user: UtilityUser, new_password: str) -> str:
+    """Check ``new_password`` against the policy and hash it. Writes nothing.
+
+    The slow part of a password change (two Argon2 operations), kept apart so a
+    caller can do it before it takes any lock.
+    """
     validate_password(new_password, username=user.username)
     if user.password_hash and verify_password(user.password_hash, new_password):
         # Otherwise a forced change is satisfied by typing the temporary
         # password again, and the password an admin handed out lives on.
         raise PasswordPolicyError(["must be different from the current password"])
-    user.password_hash = hash_password(new_password)
+    return hash_password(new_password)
+
+
+def _store_password_hash(
+    session: Session, *, user: UtilityUser, password_hash: str, actor: AuditActor
+) -> None:
+    user.password_hash = password_hash
     user.password_changed_at = utcnow()
     user.must_change_password = False
     session.flush()
@@ -324,13 +343,31 @@ def complete_password_reset(
     )
     now = utcnow()
     user = session.get(UtilityUser, row.user_id) if row is not None else None
-    if (
-        row is None
-        or row.used_at is not None
-        or row.expires_at <= now
-        or user is None
-        or not user.is_active
-    ):
+    usable = (
+        row is not None
+        and row.used_at is None
+        and row.expires_at > now
+        and user is not None
+        and user.is_active
+    )
+    password_hash: str | None = None
+    if usable and row is not None and user is not None:
+        # The policy check and the hashing (Argon2) first, before any lock is
+        # taken: a weak password is refused with nothing written.
+        password_hash = _new_password_hash(user, new_password)
+        # Spend the token in one conditional statement, before anything else is
+        # changed. Two redemptions of the same token at the same moment both see
+        # it unused above; only one of them gets to mark it used.
+        claimed = session.execute(
+            update(PasswordResetToken)
+            .where(PasswordResetToken.id == row.id, PasswordResetToken.used_at.is_(None))
+            .values(used_at=now)
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        usable = claimed == 1
+        if usable:
+            row.used_at = now
+    if not usable or user is None or row is None or password_hash is None:
         # Audited so repeated invalid redemptions (a brute-force or a stale link
         # being retried) are visible; the endpoint that calls this is rate limited.
         record_audit(
@@ -344,12 +381,13 @@ def complete_password_reset(
         )
         raise InvalidResetToken
 
-    # Validates policy before any mutation, then revokes sessions and audits.
-    set_password(session, user=user, new_password=new_password, actor=actor)
-    row.used_at = now
+    # The sign-in counters first, then the account: the order a sign-in takes
+    # them in (LOCK ORDER, above authenticate), so a sign-in at the same moment
+    # waits instead of deadlocking.
+    clear_login_throttle(session, username=user.username)
+    _store_password_hash(session, user=user, password_hash=password_hash, actor=actor)
     user.failed_login_count = 0
     user.locked_until = None
-    clear_login_throttle(session, username=user.username)
     session.flush()
     record_audit(
         session,
@@ -423,24 +461,7 @@ def _check_rate_limit(
     allowance = limit if limit is not None else settings.login_rate_limit_per_minute
     now = utcnow()
     window_start = now - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
-    row = session.scalar(
-        select(LoginAttempt).where(
-            LoginAttempt.identifier == identifier, LoginAttempt.ip_address == ip_address
-        )
-    )
-    if row is None:
-        row = LoginAttempt(
-            identifier=identifier,
-            ip_address=ip_address,
-            window_started_at=now,
-            attempt_count=1,
-            last_attempt_at=now,
-            failure_count=0,
-        )
-        session.add(row)
-        session.flush()
-        return row
-
+    row = _locked_attempt_row(session, identifier=identifier, ip_address=ip_address, now=now)
     if row.window_started_at < window_start:
         row.window_started_at = now
         row.attempt_count = 1
@@ -503,23 +524,44 @@ def _account_row(session: Session, identifier: str) -> LoginAttempt:
     Kept for every username that is tried, real or not, so that the account-wide
     lock behaves identically either way and reveals nothing about which exist.
     """
-    row = session.scalar(
-        select(LoginAttempt).where(
-            LoginAttempt.identifier == identifier, LoginAttempt.ip_address == ACCOUNT_WIDE
-        )
+    return _locked_attempt_row(
+        session, identifier=identifier, ip_address=ACCOUNT_WIDE, now=utcnow()
     )
+
+
+def _locked_attempt_row(
+    session: Session, *, identifier: str, ip_address: str, now: datetime
+) -> LoginAttempt:
+    """The counter row for (identifier, address), locked until the transaction ends.
+
+    Concurrent sign-ins must not each read the same count and each write it back
+    plus one: a burst of guesses would then cost a single attempt, and a lockout
+    one of them set would go unseen by the rest. So the row is locked before it
+    is read (and created, ignoring a concurrent creation, if it is missing); a
+    second request for the same row waits here for the first to commit and then
+    reads what it wrote. A new row starts at zero attempts in a fresh window.
+    """
+    locking.begin_write(session)
+    query = (
+        select(LoginAttempt)
+        .where(LoginAttempt.identifier == identifier, LoginAttempt.ip_address == ip_address)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    row = session.scalar(query)
     if row is None:
-        now = utcnow()
-        row = LoginAttempt(
-            identifier=identifier,
-            ip_address=ACCOUNT_WIDE,
-            window_started_at=now,
-            attempt_count=0,
-            last_attempt_at=now,
-            failure_count=0,
+        session.execute(
+            locking.insert_ignoring_conflict(session, LoginAttempt).values(
+                identifier=identifier,
+                ip_address=ip_address,
+                window_started_at=now,
+                attempt_count=0,
+                last_attempt_at=now,
+                failure_count=0,
+            )
         )
-        session.add(row)
-        session.flush()
+        row = session.scalar(query)
+        assert row is not None  # inserted above, or by whoever beat us to it
     return row
 
 
@@ -576,9 +618,79 @@ def _register_failure(
 
 
 def clear_login_throttle(session: Session, *, username: str) -> None:
-    """Forget every per-address lockout for this username (unlock, password reset)."""
+    """Forget every per-address lockout for this username (unlock, password reset).
+
+    In the lock order (see LOCK ORDER): the per-address rows, in id order, then
+    the account-wide row. One DELETE of them all would lock them in whatever
+    order the scan meets them, and a sign-in holding its per-address row while
+    it waits for the account-wide one would deadlock against it.
+    """
+    identifier = username.strip().lower()[:128]
+    locking.begin_write(session)
+    session.scalars(
+        select(LoginAttempt.id)
+        .where(LoginAttempt.identifier == identifier, LoginAttempt.ip_address != ACCOUNT_WIDE)
+        .order_by(LoginAttempt.id)
+        .with_for_update()
+    ).all()
     session.execute(
-        delete(LoginAttempt).where(LoginAttempt.identifier == username.strip().lower()[:128])
+        delete(LoginAttempt).where(
+            LoginAttempt.identifier == identifier, LoginAttempt.ip_address != ACCOUNT_WIDE
+        )
+    )
+    session.execute(
+        delete(LoginAttempt).where(
+            LoginAttempt.identifier == identifier, LoginAttempt.ip_address == ACCOUNT_WIDE
+        )
+    )
+
+
+# LOCK ORDER. Everything that locks more than one of these takes them in this
+# order, so two transactions can wait for each other but never deadlock:
+#   1. the per-address row of all usernames (ANY_ACCOUNT, address)
+#   2. per-address rows of one username (username, address), in id order
+#   3. the username's account-wide row (username, ACCOUNT_WIDE)
+#   4. the utility_user row
+#   5. the audit chain's append lock (record_audit)
+# No lock is held while a password is hashed or verified (Argon2): a sign-in
+# commits its attempt count first, checks the password with nothing locked,
+# then locks again for the short write that records the outcome.
+
+
+def _blocked(
+    session: Session,
+    *,
+    source: LoginAttempt | None,
+    account: LoginAttempt | None,
+    user: UtilityUser | None,
+    ip_address: str,
+) -> tuple[int, str] | None:
+    """(retry after, audit detail) when a lockout applies to this sign-in."""
+    now = utcnow()
+    if source is not None and source.locked_until is not None and source.locked_until > now:
+        retry_after = max(1, int((source.locked_until - now).total_seconds()))
+        return retry_after, f"Sign-ins from this address are locked for another {retry_after}s."
+    if (
+        account is not None
+        and account.locked_until is not None
+        and account.locked_until > now
+        # The owner, at an address they have used before, is not kept out by
+        # other people's guesses.
+        and not _known_address(session, user, ip_address)
+    ):
+        retry_after = max(1, int((account.locked_until - now).total_seconds()))
+        return retry_after, (
+            f"Account locked for another {retry_after}s after failures from many addresses."
+        )
+    return None
+
+
+def _read_attempt_row(session: Session, identifier: str, ip_address: str) -> LoginAttempt | None:
+    """The counter row as last committed, without locking it."""
+    return session.scalar(
+        select(LoginAttempt)
+        .where(LoginAttempt.identifier == identifier, LoginAttempt.ip_address == ip_address)
+        .execution_options(populate_existing=True)
     )
 
 
@@ -592,11 +704,23 @@ def authenticate(
     user_agent: str | None = None,
     settings: Settings | None = None,
 ) -> UtilityUser:
-    """Verify credentials, returning the user or raising an AuthError subclass."""
+    """Verify credentials, returning the user or raising an AuthError subclass.
+
+    Commits as it goes (the attempt is counted whatever happens next). In three
+    steps, so that no lock is held while the password is verified (LOCK ORDER):
+    count the attempt and commit; decide the lockouts and verify the password
+    with nothing locked; lock the counters again, re-check the lockouts and
+    record the outcome. Concurrent sign-ins for one username therefore verify
+    their passwords side by side, and the owner is not queued behind someone
+    else's guesses.
+    """
     settings = settings or get_settings()
     identifier = username.strip().lower()[:128]
     address = throttle_address(ip_address)
-    # Per address across all usernames first, then per username from this address.
+    actor = AuditActor.anonymous(ip_address=ip_address, user_agent=user_agent)
+
+    # 1. Count the attempt: per address across all usernames first, then per
+    #    username from this address. Locked, written and committed at once.
     _check_rate_limit(
         session,
         identifier=ANY_ACCOUNT,
@@ -604,80 +728,64 @@ def authenticate(
         settings=settings,
         limit=settings.login_rate_limit_per_minute * ADDRESS_RATE_MULTIPLIER,
     )
-    source = _check_rate_limit(
-        session, identifier=identifier, ip_address=address, settings=settings
-    )
-    account = _account_row(session, identifier)
+    _check_rate_limit(session, identifier=identifier, ip_address=address, settings=settings)
+    session.commit()
 
-    actor = AuditActor.anonymous(ip_address=ip_address, user_agent=user_agent)
+    # 2. Nothing locked from here to the password's verdict. Both lockouts are
+    #    decided before the password is looked at and apply whether or not the
+    #    account exists, so neither says which usernames are real.
     user = get_user_by_username(session, identifier)
-    now = utcnow()
-
-    # Both lockouts are decided before the password is looked at and apply
-    # whether or not the account exists, so neither says which usernames are real.
-    if source.locked_until is not None and source.locked_until > now:
-        retry_after = max(1, int((source.locked_until - now).total_seconds()))
-        record_audit(
-            session,
-            action="auth.login_blocked",
-            actor=actor,
-            target_type="utility_user",
-            target_id=str(user.id) if user is not None else None,
-            target_label=identifier,
-            detail=f"Sign-ins from this address are locked for another {retry_after}s.",
-        )
-        raise AccountLocked(retry_after_seconds=retry_after)
-
-    if (
-        account.locked_until is not None
-        and account.locked_until > now
-        # The owner, at an address they have used before, is not kept out by
-        # other people's guesses.
-        and not _known_address(session, user, ip_address)
-    ):
-        retry_after = max(1, int((account.locked_until - now).total_seconds()))
-        record_audit(
-            session,
-            action="auth.login_blocked",
-            actor=actor,
-            target_type="utility_user",
-            target_id=str(user.id) if user is not None else None,
-            target_label=identifier,
-            detail=(
-                f"Account locked for another {retry_after}s after failures from many addresses."
-            ),
-        )
-        raise AccountLocked(retry_after_seconds=retry_after)
-
-    if user is None:
-        # Constant work for unknown accounts.
-        with _verification_slot():
-            verify_password(_DUMMY_HASH, password)
-        _register_failure(session, source, account, None, settings)
-        record_audit(
-            session,
-            action="auth.login_failed",
-            actor=actor,
-            target_type="utility_user",
-            target_label=identifier,
-            detail="No such account.",
-        )
-        raise InvalidCredentials
+    blocked = _blocked(
+        session,
+        source=_read_attempt_row(session, identifier, address),
+        account=_read_attempt_row(session, identifier, ACCOUNT_WIDE),
+        user=user,
+        ip_address=ip_address,
+    )
+    if blocked is not None:
+        _audit_blocked(session, actor, user, identifier, blocked[1])
+        raise AccountLocked(retry_after_seconds=blocked[0])
 
     with _verification_slot():
-        password_ok = verify_password(user.password_hash, password)
-    if not password_ok:
+        # Constant work for unknown accounts.
+        password_ok = verify_password(
+            user.password_hash if user is not None else _DUMMY_HASH, password
+        )
+    password_ok = password_ok and user is not None
+    new_hash = (
+        hash_password(password)
+        if password_ok and user is not None and needs_rehash(user.password_hash)
+        else None
+    )
+
+    # 3. Lock the counters again (LOCK ORDER) and record the outcome. Another
+    #    sign-in may have changed them meanwhile: they are read afresh.
+    source = _locked_attempt_row(session, identifier=identifier, ip_address=address, now=utcnow())
+    account = _account_row(session, identifier)
+
+    if not password_ok or user is None:
         _register_failure(session, source, account, user, settings)
         record_audit(
             session,
             action="auth.login_failed",
             actor=actor,
             target_type="utility_user",
-            target_id=str(user.id),
-            target_label=user.username,
-            detail=f"Wrong password. Failure count is now {user.failed_login_count}.",
+            target_id=str(user.id) if user is not None else None,
+            target_label=user.username if user is not None else identifier,
+            detail=(
+                f"Wrong password. Failure count is now {user.failed_login_count}."
+                if user is not None
+                else "No such account."
+            ),
         )
         raise InvalidCredentials
+
+    # A lockout set by guesses that were verified alongside this one still
+    # applies: the right password then gets the same answer as any other.
+    blocked = _blocked(session, source=source, account=account, user=user, ip_address=ip_address)
+    if blocked is not None:
+        _audit_blocked(session, actor, user, identifier, blocked[1])
+        raise AccountLocked(retry_after_seconds=blocked[0])
 
     # Only someone who knows the password learns that the account is disabled.
     if not user.is_active:
@@ -698,7 +806,9 @@ def authenticate(
             # password was already verified, so this cannot be used as an oracle
             # by anyone who does not already know the password.
             raise TotpRequired
-        if verify_totp(user, totp_code, consume=True):
+        # Each is spent in the database, under a condition or a lock, so two
+        # sign-ins presenting the same code at once cannot both use it.
+        if _consume_totp(session, user, totp_code):
             pass
         elif use_recovery_code(session, user=user, code=totp_code):
             remaining = len(user.totp_recovery_codes or [])
@@ -724,8 +834,8 @@ def authenticate(
             )
             raise InvalidCredentials
 
-    if needs_rehash(user.password_hash):
-        user.password_hash = hash_password(password)
+    if new_hash is not None:
+        user.password_hash = new_hash
 
     user.failed_login_count = 0
     user.locked_until = None
@@ -744,6 +854,24 @@ def authenticate(
         target_label=user.username,
     )
     return user
+
+
+def _audit_blocked(
+    session: Session,
+    actor: AuditActor,
+    user: UtilityUser | None,
+    identifier: str,
+    detail: str,
+) -> None:
+    record_audit(
+        session,
+        action="auth.login_blocked",
+        actor=actor,
+        target_type="utility_user",
+        target_id=str(user.id) if user is not None else None,
+        target_label=identifier,
+        detail=detail,
+    )
 
 
 # -------------------------------------------------------------------- sessions
@@ -869,23 +997,52 @@ def verify_totp(user: UtilityUser, code: str, *, consume: bool = False) -> bool:
     code from that step or an earlier one is accepted again, so a code observed
     in transit (or over a shoulder) cannot be replayed within its window.
     """
-    if not user.totp_secret_encrypted or not code:
+    step = _totp_step(user, code)
+    if step is None:
         return False
+    if user.totp_last_step is not None and step <= user.totp_last_step:
+        return False
+    if consume:
+        user.totp_last_step = step
+    return True
+
+
+def _totp_step(user: UtilityUser, code: str) -> int | None:
+    """The time step ``code`` is valid for, within the window, or None."""
+    if not user.totp_secret_encrypted or not code:
+        return None
     candidate = code.strip().replace(" ", "")
     if not candidate.isdigit():
-        return False
+        return None
     secret = get_secret_box().decrypt(user.totp_secret_encrypted, purpose=PURPOSE_TOTP_SECRET)
     totp = pyotp.TOTP(secret)
     current_step = int(utcnow().timestamp()) // totp.interval
     for step in range(current_step - TOTP_VALID_WINDOW, current_step + TOTP_VALID_WINDOW + 1):
-        if not hmac.compare_digest(totp.at(step * totp.interval), candidate):
-            continue
-        if user.totp_last_step is not None and step <= user.totp_last_step:
-            return False
-        if consume:
-            user.totp_last_step = step
-        return True
-    return False
+        if hmac.compare_digest(totp.at(step * totp.interval), candidate):
+            return step
+    return None
+
+
+def _consume_totp(session: Session, user: UtilityUser, code: str) -> bool:
+    """Accept an authenticator code once: its step is recorded by a conditional
+    UPDATE, so of two sign-ins presenting the same code (or an older one) only
+    the first succeeds, whatever either of them read before."""
+    step = _totp_step(user, code)
+    if step is None:
+        return False
+    claimed = session.execute(
+        update(UtilityUser)
+        .where(
+            UtilityUser.id == user.id,
+            or_(UtilityUser.totp_last_step.is_(None), UtilityUser.totp_last_step < step),
+        )
+        .values(totp_last_step=step)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if claimed != 1:
+        return False
+    set_committed_value(user, "totp_last_step", step)
+    return True
 
 
 def _normalise_recovery_code(code: str) -> str:
@@ -916,9 +1073,10 @@ def use_recovery_code(session: Session, *, user: UtilityUser, code: str) -> bool
     candidate = _normalise_recovery_code(code)
     if len(candidate) != RECOVERY_CODE_BYTES * 2 or not user.totp_recovery_codes:
         return False
-    # Re-read the row under a lock: two sign-ins presenting the same code at the
-    # same moment must not both find it unused.
-    session.refresh(user, with_for_update=True)
+    # Re-read the row under a lock (FOR UPDATE; on SQLite the write lock): two
+    # sign-ins presenting the same code at the same moment must not both find
+    # it unused. Held only for this short write, never across Argon2.
+    locking.lock_row(session, user)
     stored = list(user.totp_recovery_codes or [])
     digest = _recovery_digest(candidate)
     match = next((item for item in stored if hmac.compare_digest(str(item), digest)), None)
@@ -997,14 +1155,15 @@ def confirm_current_password(
     has to continue at the sign-in form, with its lockouts. Raises
     :class:`RateLimited` or :class:`ReauthLocked`.
     """
-    row = _check_rate_limit(
-        session,
-        identifier=f"reauth:{user.id}",
-        ip_address=throttle_address(ip_address),
-        settings=get_settings(),
-    )
+    identifier = f"reauth:{user.id}"
+    address = throttle_address(ip_address)
+    _check_rate_limit(session, identifier=identifier, ip_address=address, settings=get_settings())
+    # Counted and committed before the password is verified: no lock is held
+    # across Argon2 (LOCK ORDER, above authenticate).
+    session.commit()
     with _verification_slot():
         correct = verify_password(user.password_hash, password)
+    row = _locked_attempt_row(session, identifier=identifier, ip_address=address, now=utcnow())
     if correct:
         row.failure_count = 0
         session.flush()

@@ -98,7 +98,10 @@ def list_notifications(
 
 
 @router.post("/read")
-def mark_read(payload: MarkReadRequest, ctx: CurrentUser, db: DbSession) -> dict[str, int]:
+def mark_read(payload: MarkReadRequest, ctx: AdminUser, db: DbSession) -> dict[str, int]:
+    """Mark notifications read. Admins only: there is one read state, shared by
+    everyone, and a viewer (read only) must not clear what the admins have not
+    seen yet."""
     marked = notification_service.mark_read(db, notification_ids=payload.notification_ids)
     db.commit()
     return {"marked_read": marked}
