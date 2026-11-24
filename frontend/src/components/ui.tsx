@@ -429,16 +429,20 @@ export function Table({
   children,
   className = "",
   before,
+  after,
 }: {
   children: ReactNode;
   className?: string;
   /** Shown above the table, such as how many rows a filter left. */
   before?: ReactNode;
+  /** Shown below the table, such as a pager. */
+  after?: ReactNode;
 }) {
   return (
     <div className="overflow-x-auto">
       {before}
       <table className={`cg-table ${className}`}>{children}</table>
+      {after}
     </div>
   );
 }

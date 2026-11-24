@@ -23,6 +23,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Float,
     ForeignKey,
@@ -56,8 +57,11 @@ class UsageSnapshot(Base):
         Numeric(18, 4), nullable=False, default=Decimal("0")
     )
     pages_fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    # Full response bodies, page by page, kept for audit and reparsing.
-    raw: Mapped[list | None] = mapped_column(JSONColumn)
+    # Full response bodies, page by page: kept only on a held snapshot (the
+    # evidence of what was returned, as it has no records). Null on believed
+    # snapshots since snapshot thinning; older values are cleared by the
+    # retention job after a week.
+    raw: Mapped[list | None] = mapped_column(JSON(none_as_null=True))
     # Set when the read looked wrong (consumption collapsed against the previous
     # read) and is being held back until later reads confirm it. A held snapshot
     # is kept as evidence but is never the "latest" one and carries no records.
@@ -101,7 +105,11 @@ class UsageRecord(Base):
     transactions: Mapped[int | None] = mapped_column(Integer)
     # Per action breakdown: {"triage": 3, "remediation": 1}
     actions: Mapped[dict | None] = mapped_column(JSONColumn)
-    raw: Mapped[dict | None] = mapped_column(JSONColumn)
+    # The row as the feed sent it. Kept for a week (RAW_KEEP_DAYS in
+    # app/services/retention.py), and for as long as the snapshot is one a
+    # reader needs it on (the latest, the readings a period's usage breakdown
+    # starts from) or the row matched no entity; then cleared to save space.
+    raw: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
 
     snapshot: Mapped[UsageSnapshot] = relationship(back_populates="records")
 

@@ -645,12 +645,17 @@ def _store_dimension(
         collected_at=now,
         view_by=str(view),
         period_param=period_param,
-        raw=fetched.raw_pages,
         total_items=fetched.total_items,
         pages_fetched=fetched.pages,
         total_credits=fetched.total_credits,
         held_reason=held_reason,
     )
+    if held_reason is not None:
+        # A held read carries no records: its response pages are the only
+        # evidence of what was returned. A believed read's pages are not kept
+        # (nothing reads them; every row is in its records, with its own raw
+        # row for a week, see retention.py).
+        snapshot.raw = fetched.raw_pages
     session.add(snapshot)
     session.flush()
 

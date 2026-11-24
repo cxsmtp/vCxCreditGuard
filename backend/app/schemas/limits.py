@@ -140,6 +140,15 @@ class LimitPeriodStateResponse(BaseModel):
     restricted_at: datetime | None = None
     # Null unless auto-triage credits are being charged to scan initiators.
     auto_triage_attributed: AutoTriageAttributionResponse | None = None
+    # Set when the limit's restriction is spread over several cycles (more
+    # targets than one cycle's write budget): users or projects it restricts,
+    # and how many have been dealt with so far.
+    rollout_total: int | None = None
+    rollout_done: int | None = None
+    # Set while the period's restrictions are being lifted over several cycles
+    # (the budget covers the usage again, or the limit no longer enforces, and
+    # more are in force than one cycle lifts): how many are still in force.
+    lifting_remaining: int | None = None
 
 
 class LimitResponse(BaseModel):
@@ -230,6 +239,17 @@ class EnforcementActionResponse(BaseModel):
     reversed_at: datetime | None
     reversal_reason: str | None
     error: str | None
+
+
+class EnforcementActionPage(BaseModel):
+    """One page of restrictions, with how many match in all."""
+
+    items: list[EnforcementActionResponse]
+    total: int
+    offset: int
+    limit: int
+    # Restrictions in force per kind, over everything that matches.
+    by_kind: dict[str, int] = Field(default_factory=dict)
 
 
 class CycleRunResponse(BaseModel):

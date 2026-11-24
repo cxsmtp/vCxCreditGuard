@@ -182,6 +182,7 @@ class SettingsResponse(BaseModel):
     usage_period_param: str
     usage_page_size: int
     retention_days: int
+    retention_thin_snapshots: bool = True
     notify_min_severity: Severity
     smtp_host: str | None
     smtp_port: int
@@ -231,6 +232,15 @@ class SettingsResponse(BaseModel):
     # triggered it. Off by default.
     charge_auto_triage_to_scan_initiator: bool = False
     current_schedule_description: str
+    # Pacing for large tenants (per cycle; 0 = no budget). See pacing.py.
+    verify_interval_minutes: int = 60
+    max_verifications_per_cycle: int = 2000
+    max_writes_per_cycle: int = 1000
+    violation_projects_per_cycle: int = 150
+    attribution_projects_per_cycle: int = 150
+    attribution_requests_per_cycle: int = 600
+    read_concurrency: int = 4
+    cycle_time_budget_pct: int = 80
 
 
 class SettingsUpdateRequest(StrictModel):
@@ -242,6 +252,7 @@ class SettingsUpdateRequest(StrictModel):
     usage_period_param: str | None = Field(default=None, max_length=32)
     usage_page_size: int | None = Field(default=None, ge=1, le=1000)
     retention_days: int | None = Field(default=None, ge=7, le=3650)
+    retention_thin_snapshots: bool | None = None
     notify_min_severity: Severity | None = None
     smtp_host: str | None = Field(default=None, max_length=256)
     smtp_port: int | None = Field(default=None, ge=1, le=65535)
@@ -271,6 +282,14 @@ class SettingsUpdateRequest(StrictModel):
     # that look like administration roles (settings_store.ADMIN_ROLE_PATTERNS).
     confirm_admin_roles: bool | None = None
     charge_auto_triage_to_scan_initiator: bool | None = None
+    verify_interval_minutes: int | None = Field(default=None, ge=0, le=10080)
+    max_verifications_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    max_writes_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    violation_projects_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    attribution_projects_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    attribution_requests_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
+    read_concurrency: int | None = Field(default=None, ge=1, le=16)
+    cycle_time_budget_pct: int | None = Field(default=None, ge=0, le=100)
 
     @field_validator("schedule_mode")
     @classmethod

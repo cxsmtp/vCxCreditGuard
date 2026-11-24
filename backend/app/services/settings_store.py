@@ -43,6 +43,10 @@ KEY_USAGE_PAGE_SIZE = "usage.page_size"
 
 # Retention
 KEY_RETENTION_DAYS = "retention.days"
+# Thin old usage snapshots (app/services/retention.py): every one of the last
+# 3 days, one an hour per dimension up to 40 days, one a day after that, never
+# one anything refers to. Off: every snapshot is kept for the whole window.
+KEY_RETENTION_THIN_SNAPSHOTS = "retention.thin_snapshots"
 
 # Notifications
 KEY_SMTP_HOST = "notify.smtp.host"
@@ -137,6 +141,38 @@ KEY_AUTO_TRIAGE_TO_INITIATOR = "attribution.auto_triage_to_scan_initiator"
 # a single "observed" rise. Not part of the configuration backup.
 KEY_AUTO_TRIAGE_OBSERVATION_EPOCH = "attribution.auto_triage_observation_epoch"
 
+# Pacing for large tenants (app/services/pacing.py). Each is a per-cycle budget;
+# 0 means no budget: everything, every cycle (see pacing.py for how that
+# compares with before pacing).
+# How often each restriction in force is read back from Checkmarx One, at most
+# (minutes). 0: every restriction, every cycle.
+KEY_VERIFY_INTERVAL_MINUTES = "enforcement.verify_interval_minutes"
+# At most this many restrictions read back in one cycle.
+KEY_MAX_VERIFICATIONS = "enforcement.max_verifications_per_cycle"
+# At most this many restrictions applied or lifted in one cycle; a larger
+# first enforcement (or restore) carries on over the next cycles.
+KEY_MAX_WRITES = "enforcement.max_writes_per_cycle"
+# Restricted projects whose scans the policy violation check lists per cycle.
+KEY_VIOLATION_PROJECTS = "violations.max_projects_per_cycle"
+# Projects and scan requests auto-triage attribution works through per cycle.
+KEY_ATTRIBUTION_PROJECTS = "attribution.max_projects_per_cycle"
+KEY_ATTRIBUTION_REQUESTS = "attribution.max_requests_per_cycle"
+# Independent read-only Checkmarx calls made at the same time (1: one by one).
+KEY_READ_CONCURRENCY = "cycle.read_concurrency"
+# Share of the interval a cycle may spend before it stops starting new
+# per-target work and leaves the rest to the next cycle (0: no time budget).
+KEY_CYCLE_TIME_BUDGET_PCT = "cycle.time_budget_pct"
+PACING_KEYS: tuple[str, ...] = (
+    KEY_VERIFY_INTERVAL_MINUTES,
+    KEY_MAX_VERIFICATIONS,
+    KEY_MAX_WRITES,
+    KEY_VIOLATION_PROJECTS,
+    KEY_ATTRIBUTION_PROJECTS,
+    KEY_ATTRIBUTION_REQUESTS,
+    KEY_READ_CONCURRENCY,
+    KEY_CYCLE_TIME_BUDGET_PCT,
+)
+
 # Updates (app/updates). Auto-update is on by default: a newer release is
 # installed in the quiet hour (UTC). The registry token is a read-only GitHub
 # token (read:packages) for the private release images; a secret like the
@@ -158,6 +194,9 @@ KEY_VIOLATION_SCAN_CURSORS = "violations.scan_cursors"
 # database, not beside the events, so a database restored by a rollback reports
 # again what its restored copy does not hold.
 KEY_UPDATE_REPORTED_EVENTS = "updates.reported_events"
+# How far the retention job has cleared old raw consumption rows (an ISO
+# timestamp: snapshots collected before it are done). Bookkeeping.
+KEY_RETENTION_RAW_CLEARED_UNTIL = "retention.raw_cleared_until"
 # Rows kept in app_setting that are state rather than settings.
 INTERNAL_KEYS: frozenset[str] = frozenset(
     {
@@ -165,6 +204,7 @@ INTERNAL_KEYS: frozenset[str] = frozenset(
         KEY_ACTION_RATES,
         KEY_VIOLATION_SCAN_CURSORS,
         KEY_UPDATE_REPORTED_EVENTS,
+        KEY_RETENTION_RAW_CLEARED_UNTIL,
     }
 )
 
@@ -194,6 +234,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_USAGE_PERIOD: DEFAULT_PERIOD,
     KEY_USAGE_PAGE_SIZE: 100,
     KEY_RETENTION_DAYS: 365,
+    KEY_RETENTION_THIN_SNAPSHOTS: True,
     KEY_SMTP_PORT: 587,
     KEY_SMTP_USE_TLS: True,
     KEY_NOTIFY_MIN_SEVERITY: "warning",
@@ -214,6 +255,14 @@ DEFAULTS: dict[str, Any] = {
     KEY_FUSION_LOCK: True,
     KEY_AI_ROLES: list(DEFAULT_AI_ROLE_NAMES),
     KEY_AUTO_TRIAGE_TO_INITIATOR: False,
+    KEY_VERIFY_INTERVAL_MINUTES: 60,
+    KEY_MAX_VERIFICATIONS: 2000,
+    KEY_MAX_WRITES: 1000,
+    KEY_VIOLATION_PROJECTS: 150,
+    KEY_ATTRIBUTION_PROJECTS: 150,
+    KEY_ATTRIBUTION_REQUESTS: 600,
+    KEY_READ_CONCURRENCY: 4,
+    KEY_CYCLE_TIME_BUDGET_PCT: 80,
     KEY_UPDATE_AUTO: True,
     KEY_UPDATE_QUIET_HOUR: 3,
 }
@@ -341,6 +390,14 @@ def enforcement_guard(session: Session) -> EnforcementGuard:
         ),
         ceiling_waived_once=bool(get_value(session, KEY_CEILING_WAIVED_ONCE, False)),
         protected_roles=parse_protected_roles(roles),
+    )
+
+
+def thin_snapshots(session: Session) -> bool:
+    """Whether the retention job thins old usage snapshots (on unless switched off)."""
+    return (
+        get_value(session, KEY_RETENTION_THIN_SNAPSHOTS, DEFAULTS[KEY_RETENTION_THIN_SNAPSHOTS])
+        is not False
     )
 
 

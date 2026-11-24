@@ -89,6 +89,7 @@ Listing is bounded per project and per cycle.
 from __future__ import annotations
 
 import logging
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -116,7 +117,7 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
-from app.services import ingestion, notifications, settings_store
+from app.services import error_text, ingestion, notifications, pacing, settings_store
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome
 
@@ -778,6 +779,13 @@ class CollectResult:
     no_reading: int = 0
     unresolved_initiators: int = 0
     warnings: list[str] = field(default_factory=list)
+    # Coverage: projects worked through per cycle at most, the projects left
+    # waiting for a later cycle, how long the longest-waiting one has waited,
+    # and at this backlog within how many cycles each one is reached.
+    per_cycle: int = 0
+    backlog: int = 0
+    oldest_waiting_minutes: int | None = None
+    each_within_cycles: int = 0
 
     def as_stats(self) -> dict[str, object]:
         return {
@@ -794,6 +802,10 @@ class CollectResult:
             "restarted_unidentified": self.restarted_unidentified,
             "no_reading": self.no_reading,
             "unresolved_initiators": self.unresolved_initiators,
+            "per_cycle": self.per_cycle,
+            "backlog": self.backlog,
+            "oldest_waiting_minutes": self.oldest_waiting_minutes,
+            "each_within_cycles": self.each_within_cycles,
             "warnings": self.warnings,
         }
 
@@ -824,13 +836,24 @@ class _History:
 
 
 class _Budget:
-    def __init__(self) -> None:
+    def __init__(self, *, max_projects: int | None = None, max_requests: int | None = None) -> None:
         self.requests = 0
         self.projects = 0
+        # 0 in the settings: no cap.
+        self.max_projects = MAX_PROJECTS_PER_CYCLE if max_projects is None else max_projects
+        self.max_requests = MAX_REQUESTS_PER_CYCLE if max_requests is None else max_requests
 
     @property
     def exhausted(self) -> bool:
-        return self.requests >= MAX_REQUESTS_PER_CYCLE or self.projects >= MAX_PROJECTS_PER_CYCLE
+        return bool(
+            (self.max_requests and self.requests >= self.max_requests)
+            or (self.max_projects and self.projects >= self.max_projects)
+        )
+
+
+def _waiting_since(task: _Increase | _History) -> datetime:
+    """Since when this project's work has been waiting to be done."""
+    return task.window_start if isinstance(task, _Increase) else task.until
 
 
 def collect(
@@ -865,17 +888,38 @@ def collect(
     # Nothing is left open in the database while Checkmarx is being called.
     session.commit()
 
-    budget = _Budget()
+    config = pacing.pacing(session)
+    budget = _Budget(
+        max_projects=config.attribution_projects_per_cycle,
+        max_requests=config.attribution_requests_per_cycle,
+    )
     window_start = snapshot.collected_at - timedelta(days=lookback_days(snapshot.period_param))
-    pending: list[_Increase | _History] = [*increases, *histories]
+    # The longest waiting first, increases and histories alike, so a cycle that
+    # reaches its cap leaves the newest work and nothing waits for ever: a
+    # deferred project keeps its place (its cursor did not move) and comes
+    # first next cycle.
+    pending: list[_Increase | _History] = sorted(
+        [*increases, *histories], key=lambda task: (_waiting_since(task), task.project_id)
+    )
+    result.per_cycle = budget.max_projects or len(pending)
+    result.each_within_cycles = math.ceil(len(pending) / max(1, result.per_cycle)) if pending else 0
     for position, task in enumerate(pending):
-        if budget.exhausted:
+        if budget.exhausted or pacing.out_of_time():
             left = pending[position:]
             result.deferred = sum(1 for item in left if isinstance(item, _Increase))
+            result.backlog = len(left)
+            result.oldest_waiting_minutes = int(
+                (moment - min(_waiting_since(item) for item in left)).total_seconds() // 60
+            )
+            why = (
+                "its time budget for this cycle"
+                if not budget.exhausted
+                else f"its per-cycle cap ({budget.max_projects or 'no'} projects, "
+                f"{budget.max_requests or 'no'} requests)"
+            )
             message = (
-                f"Auto-triage attribution reached its per-cycle cap ({MAX_PROJECTS_PER_CYCLE} "
-                f"projects, {MAX_REQUESTS_PER_CYCLE} requests); {len(left)} project(s) are "
-                "left on the project for now and caught up on the next cycle."
+                f"Auto-triage attribution reached {why}; {len(left)} project(s) are left on the "
+                "project for now and caught up on the next cycle (the longest waiting first)."
             )
             result.warnings.append(message)
             logger.warning(message)
@@ -898,7 +942,7 @@ def collect(
             else:
                 message = (
                     f"Auto triage of project {task.project_id} could not be attributed: "
-                    f"{type(exc).__name__}: {str(exc)[:300]}"
+                    f"{error_text.public_error(exc)}"
                 )
                 logger.exception("Auto-triage attribution: %s", message)
             result.warnings.append(message)

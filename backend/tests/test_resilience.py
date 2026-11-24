@@ -948,7 +948,11 @@ class TestStepIsolation:
         result = cycle.run_cycle(trigger="manual", force_org_sync=True)
 
         assert result.status == RunStatus.PARTIAL
-        assert result.steps["org_sync"] == {"ok": False, "error": "org sync blew up"}
+        # Named, not quoted: the detail is in the server log (test_error_exposure.py).
+        assert result.steps["org_sync"] == {
+            "ok": False,
+            "error": "Unexpected error (RuntimeError); see the server log.",
+        }
         assert result.steps["ingest"]["user"]["supported"] is True
         assert "evaluate" in result.steps and "deliver" in result.steps
 

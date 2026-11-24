@@ -337,6 +337,17 @@ _SETTING_FIELD_BY_KEY: dict[str, str] = {
     settings_store.KEY_AUTOMATION_ENABLED: "automation_enabled",
     settings_store.KEY_AUTO_APPROVE_MAX_INCREASE: "auto_approve_max_increase",
     settings_store.KEY_AUTO_APPROVE_EXPIRY_DAYS: "auto_approve_expiry_days",
+    settings_store.KEY_RETENTION_THIN_SNAPSHOTS: "retention_thin_snapshots",
+    # Pacing for large tenants: how much a cycle does, not a guard rail (the
+    # safety ceilings are separate and stay out of the backup, see above).
+    settings_store.KEY_VERIFY_INTERVAL_MINUTES: "verify_interval_minutes",
+    settings_store.KEY_MAX_VERIFICATIONS: "max_verifications_per_cycle",
+    settings_store.KEY_MAX_WRITES: "max_writes_per_cycle",
+    settings_store.KEY_VIOLATION_PROJECTS: "violation_projects_per_cycle",
+    settings_store.KEY_ATTRIBUTION_PROJECTS: "attribution_projects_per_cycle",
+    settings_store.KEY_ATTRIBUTION_REQUESTS: "attribution_requests_per_cycle",
+    settings_store.KEY_READ_CONCURRENCY: "read_concurrency",
+    settings_store.KEY_CYCLE_TIME_BUDGET_PCT: "cycle_time_budget_pct",
 }
 
 

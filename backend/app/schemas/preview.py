@@ -62,7 +62,11 @@ class BlastRadiusResponse(BaseModel):
     disable_fusion: int = 0
     disable_repo_fusion: int = 0
     total_actions: int
+    # The first targets only, for a large group or application: ``targets_total``
+    # says how many there are in all (the counts above are always complete).
     targets: list[TargetPreviewResponse]
+    targets_total: int = 0
+    targets_truncated: bool = False
     # What the limit turns off on its projects ([] for a user limit).
     project_actions: list[str] = []
     # The roles a user restriction removes, and per user what they would lose.
@@ -70,8 +74,10 @@ class BlastRadiusResponse(BaseModel):
     user_roles: list[UserRolesPreviewResponse] = []
     user_roles_truncated: bool = False
     user_roles_note: str | None = None
-    # Projects where turning Auto Triage off may not hold.
+    # Projects where turning Auto Triage off may not hold (the first ones;
+    # ``warnings_total`` in all).
     warnings: list[ProjectWarningResponse] = []
+    warnings_total: int = 0
 
 
 class DryRunRowResponse(BaseModel):

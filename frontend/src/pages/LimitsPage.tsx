@@ -16,7 +16,7 @@ import { BlastDetails, BlastSummary } from "./PreviewPage";
 import { EntityPicker } from "../components/EntityPicker";
 import { ExportMenu } from "../components/ExportMenu";
 import type { ExportColumn } from "../lib/export";
-import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
+import { FilterNote, Pager, usePaged, useTableView, type ViewColumn } from "../components/tableView";
 import {
   Badge,
   type BadgeTone,
@@ -249,6 +249,37 @@ function UsageBar({ limit }: { limit: Limit }) {
   );
 }
 
+/** "Restricting 1,240 of 2,000 projects" while a large restriction is spread over
+ * cycles, and "Lifting: 760 left" while a large one is being lifted. */
+function rolloutNote(limit: Limit) {
+  const period = limit.current_period;
+  const lifting = period?.lifting_remaining ?? null;
+  if (lifting != null && lifting > 0) {
+    return (
+      <span
+        className="text-xs"
+        style={{ color: "var(--status-warning)" }}
+        title="More restrictions to lift than one cycle changes: the next cycles lift the rest, before anything new is restricted. The period shows as restored once the last one is lifted."
+      >
+        Lifting: {lifting.toLocaleString()} still in force
+      </span>
+    );
+  }
+  const total = period?.rollout_total ?? null;
+  const done = period?.rollout_done ?? null;
+  if (total == null || done == null || done >= total) return null;
+  const noun = limit.entity_type === "user" ? "users" : "projects";
+  return (
+    <span
+      className="text-xs"
+      style={{ color: "var(--status-warning)" }}
+      title="More targets than one cycle changes: the rest are restricted by the next cycles."
+    >
+      Restricting {done.toLocaleString()} of {total.toLocaleString()} {noun}
+    </span>
+  );
+}
+
 export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
   const toast = useToast();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -287,6 +318,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
   }, [limits.data, tab, search]);
 
   const view = useTableView(visible, LIMIT_VIEW);
+  const paged = usePaged(view.rows, 100);
 
   // A bulk action applies to what is selected, so nothing hidden by a tab, the
   // search or a column filter may stay selected.
@@ -498,7 +530,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
             filtered={view.filtered}
             onClear={view.clearFilters}
           />
-          <Table>
+          <Table after={<Pager {...paged} noun="budgets" />}>
             <thead>
               <tr>
                 {isAdmin && <Th className="w-8" />}
@@ -512,7 +544,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
               </tr>
             </thead>
             <tbody>
-              {view.rows.map((limit) => (
+              {paged.rows.map((limit) => (
                 <tr
                   key={limit.id}
                   style={
@@ -561,9 +593,10 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
                       {statusBadge(limit)}
                       {limit.active_restrictions > 0 && (
                         <span className="text-xs" style={{ color: "var(--text-muted)" }}>
-                          {limit.active_restrictions} active
+                          {limit.active_restrictions.toLocaleString()} active
                         </span>
                       )}
+                      {rolloutNote(limit)}
                     </div>
                   </Td>
                   <Td>

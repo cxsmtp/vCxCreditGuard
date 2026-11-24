@@ -41,11 +41,13 @@ from app.models.usage import CreditBalanceSnapshot, SchedulerLock, SchedulerRun
 from app.services import (
     auto_triage_attribution,
     delivery,
+    error_text,
     evaluation,
     ingestion,
     key_permissions,
     notifications,
     org_sync,
+    pacing,
     requests_service,
     retention,
     settings_store,
@@ -77,6 +79,9 @@ class CycleResult:
     steps: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     skipped_reason: str | None = None
+    # The client's call counters, while the cycle talks to the tenant, so each
+    # step's share of the calls can be recorded.
+    call_stats: Any = None
 
     @property
     def ok(self) -> bool:
@@ -240,7 +245,13 @@ def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> Cyc
             run_id = run.id
         result.run_id = run_id
 
-        with _LockKeeper(holder), session_scope() as session:
+        with session_scope() as session:
+            budget_seconds = pacing.cycle_budget_seconds(pacing.pacing(session))
+        with (
+            _LockKeeper(holder),
+            pacing.cycle_deadline(budget_seconds),
+            session_scope() as session,
+        ):
             _execute_steps(session, result, force_org_sync=force_org_sync)
 
         with session_scope() as session:
@@ -253,14 +264,17 @@ def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> Cyc
     except Exception as exc:  # noqa: BLE001 - the scheduler thread must survive anything
         logger.exception("Cycle failed unexpectedly")
         result.status = RunStatus.FAILED
-        result.errors.append(str(exc))
+        # Shown in the run history: an unexpected error is named, not quoted
+        # (its detail is in the server log, logged just above).
+        shown = error_text.public_error(exc)
+        result.errors.append(shown)
         with session_scope() as session:
             if result.run_id is not None:
                 run = session.get(SchedulerRun, result.run_id)
                 if run is not None:
                     run.finished_at = utcnow()
                     run.status = RunStatus.FAILED
-                    run.error = str(exc)[:4000]
+                    run.error = shown[:4000]
                     run.stats = result.steps
     finally:
         with session_scope() as session:
@@ -287,6 +301,7 @@ def _run_step(
     ``degrades_run`` is False for housekeeping (mail, pruning) whose failure is an
     operational nuisance rather than a governance problem.
     """
+    calls_before = result.call_stats.snapshot() if result.call_stats is not None else None
     try:
         work()
         session.commit()
@@ -297,14 +312,20 @@ def _run_step(
             logger.warning("Cycle step %s failed: %s", name, exc)
         else:
             logger.exception("Cycle step %s failed", name)
-        result.steps[name] = {"ok": False, "error": str(exc)}
+        shown = error_text.public_error(exc)
+        result.steps[name] = {"ok": False, "error": shown}
         if degrades_run:
-            result.errors.append(f"{name}: {exc}")
+            result.errors.append(f"{name}: {shown}")
             result.status = RunStatus.PARTIAL
-            _warn_committed(session, name, str(exc))
+            _warn_committed(session, name, shown)
         return False
     finally:
         _record_refusals(session)
+        if calls_before is not None:
+            after = result.call_stats.snapshot()
+            spent = {key: round(after[key] - calls_before[key], 1) for key in after}
+            if spent["requests"]:
+                result.steps.setdefault("http", {}).setdefault("by_step", {})[name] = spent
 
 
 def _record_refusals(session: Session) -> None:
@@ -381,6 +402,44 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
         result.skipped_reason = str(exc)
         result.steps["connection"] = {"ok": False, "reason": str(exc)}
         return
+    stats = getattr(client, "stats", None)
+    if stats is not None:
+        result.call_stats = stats
+        started_calls = stats.snapshot()
+        result.steps["http"] = {"by_step": {}}
+    try:
+        _execute_tenant_steps(session, result, client, force_org_sync=force_org_sync)
+    finally:
+        if stats is not None:
+            totals = stats.snapshot()
+            result.steps["http"].update(
+                {key: round(totals[key] - started_calls[key], 1) for key in totals}
+            )
+            left = pacing.seconds_left()
+            result.steps["http"]["time_budget_left_seconds"] = (
+                round(left) if left is not None else None
+            )
+            result.call_stats = None
+
+
+def _execute_tenant_steps(
+    session: Session, result: CycleResult, client: CheckmarxClient, *, force_org_sync: bool
+) -> None:
+    """The steps that talk to the tenant, in order (see ``_execute_steps``)."""
+    actor = AuditActor.system("scheduler")
+
+    def deliver() -> None:
+        result.steps["deliver"] = delivery.deliver_pending(session).as_stats()
+
+    def prune() -> None:
+        if _retention_due(session):
+            result.steps["retention"] = retention.prune(
+                session,
+                retention_days=int(
+                    settings_store.get_value(session, settings_store.KEY_RETENTION_DAYS) or 365
+                ),
+                actor=actor,
+            ).as_stats()
 
     # Step 0: what the API key may do, at most every few hours. Read only and
     # cheap; it commits before calling Checkmarx and never fails the cycle.

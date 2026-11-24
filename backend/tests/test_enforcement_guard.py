@@ -684,7 +684,20 @@ class TestBackupsDoNotLoosenTheGuard:
         from app.services import ops_hardening
 
         exported = ops_hardening.export_config_backup(db)
-        assert not any(key.startswith("enforcement.") for key in exported["settings"])
+        # The guard rails are never in a backup (the pacing budgets, which are
+        # not guard rails, are: see test_scale_review.py).
+        guard_keys = {
+            settings_store.KEY_ENFORCEMENT_PAUSED,
+            settings_store.KEY_ENFORCEMENT_PAUSE_REASON,
+            settings_store.KEY_MAX_NEW_ENFORCEMENTS,
+            settings_store.KEY_MAX_NEW_TARGETS,
+            settings_store.KEY_CEILING_WAIVED_ONCE,
+            settings_store.KEY_PROTECTED_ROLES,
+        }
+        assert not guard_keys & set(exported["settings"])
+        assert {key for key in exported["settings"] if key.startswith("enforcement.")} <= set(
+            settings_store.PACING_KEYS
+        )
 
         backup = {
             "backup_version": 1,

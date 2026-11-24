@@ -407,8 +407,13 @@ def blast_radius(
     project_actions: list[str] | None = None,
     client: CheckmarxClient | None = None,
     roles: RolePreviewer | None = None,
+    warnings: bool = True,
+    protected_roles: frozenset[str] | None = None,
 ) -> BlastRadius:
     """What enforcing this entity's limit would change, computed read-only.
+
+    ``warnings`` False leaves out the Auto Triage warnings (the cycle's safety
+    check needs only the targets).
 
     ``project_actions`` previews a choice that is not saved yet (the limit
     form); without it the entity's limit's own choice is used, or the legacy
@@ -427,7 +432,11 @@ def blast_radius(
         )
         actions = effective_project_actions(limit) if limit is not None else LEGACY_PROJECT_ACTIONS
     targets = enforcement.plan_targets(
-        session, entity_type=entity_type, entity_id=entity_id, project_actions=actions
+        session,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        project_actions=actions,
+        protected_roles=protected_roles,
     )
 
     projects: set[str] = set()
@@ -481,7 +490,7 @@ def blast_radius(
         user_roles=user_roles,
         user_roles_truncated=roles.truncated,
         user_roles_note=roles.truncation_note,
-        warnings=auto_triage_warnings(session, auto_triage_projects),
+        warnings=auto_triage_warnings(session, auto_triage_projects) if warnings else [],
     )
 
 
@@ -535,8 +544,12 @@ def dry_run(
     now: datetime | None = None,
     client: CheckmarxClient | None = None,
     roles: RolePreviewer | None = None,
+    light: bool = False,
 ) -> DryRunResult:
     """Project what the next evaluation cycle would decide, writing nothing.
+
+    ``light``: targets only, without the Auto Triage warnings (the cycle's
+    safety check, every cycle).
 
     With a ``client``, the roles of users who would be restricted are read
     (best effort, at most ``MAX_USERS_READ`` of them).
@@ -556,6 +569,7 @@ def dry_run(
     connection_configured = connection_service.get_connection(session) is not None
 
     limits = list(session.scalars(select(CreditLimit).where(CreditLimit.is_active.is_(True))))
+    protected_roles = settings_store.enforcement_guard(session).protected_roles
     for limit in limits:
         row = _project_one(
             session,
@@ -564,6 +578,8 @@ def dry_run(
             moment=moment,
             connection_configured=connection_configured,
             roles=roles,
+            light=light,
+            protected_roles=protected_roles,
         )
         result.rows.append(row)
         if row.projected_status == LimitStatus.WARNED:
@@ -593,10 +609,10 @@ def _project_one(
     moment: datetime,
     connection_configured: bool = True,
     roles: RolePreviewer | None = None,
+    light: bool = False,
+    protected_roles: frozenset[str] | None = None,
 ) -> DryRunRow:
-    exempt = enforcement.is_exempt(
-        session, entity_type=limit.entity_type, entity_id=limit.entity_id
-    )
+    exempt = index.is_exempt(limit.entity_type, limit.entity_id)
 
     try:
         window = current_window(limit, moment)
@@ -679,6 +695,8 @@ def _project_one(
                 entity_id=limit.entity_id,
                 project_actions=list(effective_project_actions(limit)),
                 roles=roles,
+                warnings=not light,
+                protected_roles=protected_roles,
             )
             would_enforce = blast.total_actions > 0
             if not would_enforce:

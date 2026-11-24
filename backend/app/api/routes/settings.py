@@ -18,7 +18,7 @@ from app.schemas.dashboard import (
     SettingsResponse,
     SettingsUpdateRequest,
 )
-from app.services import delivery, role_sources, settings_store
+from app.services import delivery, pacing, role_sources, settings_store
 from app.services.audit import record_audit
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "usage_period_param": settings_store.KEY_USAGE_PERIOD,
     "usage_page_size": settings_store.KEY_USAGE_PAGE_SIZE,
     "retention_days": settings_store.KEY_RETENTION_DAYS,
+    "retention_thin_snapshots": settings_store.KEY_RETENTION_THIN_SNAPSHOTS,
     "notify_min_severity": settings_store.KEY_NOTIFY_MIN_SEVERITY,
     "smtp_host": settings_store.KEY_SMTP_HOST,
     "smtp_port": settings_store.KEY_SMTP_PORT,
@@ -57,6 +58,14 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "fusion_lock_override": settings_store.KEY_FUSION_LOCK,
     "ai_roles": settings_store.KEY_AI_ROLES,
     "charge_auto_triage_to_scan_initiator": settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR,
+    "verify_interval_minutes": settings_store.KEY_VERIFY_INTERVAL_MINUTES,
+    "max_verifications_per_cycle": settings_store.KEY_MAX_VERIFICATIONS,
+    "max_writes_per_cycle": settings_store.KEY_MAX_WRITES,
+    "violation_projects_per_cycle": settings_store.KEY_VIOLATION_PROJECTS,
+    "attribution_projects_per_cycle": settings_store.KEY_ATTRIBUTION_PROJECTS,
+    "attribution_requests_per_cycle": settings_store.KEY_ATTRIBUTION_REQUESTS,
+    "read_concurrency": settings_store.KEY_READ_CONCURRENCY,
+    "cycle_time_budget_pct": settings_store.KEY_CYCLE_TIME_BUDGET_PCT,
 }
 
 _SECRET_FIELDS: dict[str, str] = {
@@ -87,6 +96,7 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
     values = settings_store.all_public_settings(db)
     policy = settings_store.automation_policy(db)
     guard = settings_store.enforcement_guard(db)
+    paced = pacing.pacing(db)
     return SettingsResponse(
         scheduler_enabled=bool(values.get(settings_store.KEY_SCHEDULER_ENABLED, True)),
         schedule_mode=str(values.get(settings_store.KEY_SCHEDULE_MODE) or "interval"),
@@ -96,6 +106,7 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         usage_period_param=str(values.get(settings_store.KEY_USAGE_PERIOD) or "last_year"),
         usage_page_size=int(values.get(settings_store.KEY_USAGE_PAGE_SIZE, 100)),
         retention_days=int(values.get(settings_store.KEY_RETENTION_DAYS, 365)),
+        retention_thin_snapshots=settings_store.thin_snapshots(db),
         notify_min_severity=values.get(settings_store.KEY_NOTIFY_MIN_SEVERITY) or Severity.WARNING,
         smtp_host=values.get(settings_store.KEY_SMTP_HOST),
         smtp_port=int(values.get(settings_store.KEY_SMTP_PORT, 587)),
@@ -132,6 +143,14 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
             values.get(settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR) is True
         ),
         current_schedule_description=scheduler.describe_schedule(),
+        verify_interval_minutes=paced.verify_interval_minutes,
+        max_verifications_per_cycle=paced.max_verifications_per_cycle,
+        max_writes_per_cycle=paced.max_writes_per_cycle,
+        violation_projects_per_cycle=paced.violation_projects_per_cycle,
+        attribution_projects_per_cycle=paced.attribution_projects_per_cycle,
+        attribution_requests_per_cycle=paced.attribution_requests_per_cycle,
+        read_concurrency=paced.read_concurrency,
+        cycle_time_budget_pct=paced.time_budget_pct,
     )
 
 

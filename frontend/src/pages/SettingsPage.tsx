@@ -105,6 +105,91 @@ const SECTION_HEAD: Record<SettingsSection, { title: string; description: string
   },
 };
 
+type PacingKey =
+  | "verify_interval_minutes"
+  | "max_verifications_per_cycle"
+  | "max_writes_per_cycle"
+  | "violation_projects_per_cycle"
+  | "attribution_projects_per_cycle"
+  | "attribution_requests_per_cycle"
+  | "read_concurrency"
+  | "cycle_time_budget_pct";
+
+/** The per-cycle budgets (pacing.py), with what each one means. */
+const PACING_FIELDS: {
+  key: PacingKey;
+  label: string;
+  hint: string;
+  min: number;
+  max: number;
+  fallback: number;
+}[] = [
+  {
+    key: "verify_interval_minutes",
+    label: "Verify each restriction every (minutes)",
+    hint: "How often each restriction in force is read back from Checkmarx One, at most, spread over the cycles: including those kept in force outside a limit's current plan (a project that left the group, a held earlier period), not those being lifted. A new restriction is always read back at once, and one whose limit changed what it turns off is next. 0 reads every one back every cycle.",
+    min: 0,
+    max: 10080,
+    fallback: 60,
+  },
+  {
+    key: "max_verifications_per_cycle",
+    label: "Read-backs per cycle (most)",
+    hint: "The oldest-verified first. If more are in force than this covers within the interval above, each is verified less often; the cycle record says how often, and a notification says when any goes unverified for more than twice the interval. 0: no cap.",
+    min: 0,
+    max: 1000000,
+    fallback: 2000,
+  },
+  {
+    key: "max_writes_per_cycle",
+    label: "Restriction changes per cycle (most)",
+    hint: "Changes made in one cycle: lifts first, then drift re-asserted, then new restrictions (small limits first), so giving access back is never held up. A larger group or application is restricted (or lifted) over several cycles, resuming where it stopped, with its progress on the Budgets page. The safety ceilings judge each target of such a rollout once. 0: no cap.",
+    min: 0,
+    max: 1000000,
+    fallback: 1000,
+  },
+  {
+    key: "violation_projects_per_cycle",
+    label: "Projects checked for violations per cycle",
+    hint: "Restricted projects whose scans are listed, the least recently checked first: each is checked at least every (restricted projects / this) cycles.",
+    min: 0,
+    max: 1000000,
+    fallback: 150,
+  },
+  {
+    key: "attribution_projects_per_cycle",
+    label: "Auto-triage projects per cycle",
+    hint: "Projects whose new Auto Triage is traced to a scan per cycle, the longest waiting first. Credits not traced yet stay on the project meanwhile.",
+    min: 0,
+    max: 1000000,
+    fallback: 150,
+  },
+  {
+    key: "attribution_requests_per_cycle",
+    label: "Auto-triage scan requests per cycle",
+    hint: "Scan listings auto-triage attribution may make in one cycle.",
+    min: 0,
+    max: 1000000,
+    fallback: 600,
+  },
+  {
+    key: "read_concurrency",
+    label: "Parallel reads",
+    hint: "Independent read-only calls (read-backs, scan listings) made at the same time. Writes are always one at a time. 1 makes every call one after another.",
+    min: 1,
+    max: 16,
+    fallback: 4,
+  },
+  {
+    key: "cycle_time_budget_pct",
+    label: "Cycle time budget (% of interval)",
+    hint: "Once a cycle has run this long, it stops starting new per-project work and leaves the rest to the next cycle instead of overrunning. 0 removes the budget.",
+    min: 0,
+    max: 100,
+    fallback: 80,
+  },
+];
+
 export function SettingsPage({
   isAdmin,
   onSettingsSaved,
@@ -416,6 +501,15 @@ export function SettingsPage({
               />
             </Field>
           </div>
+          <div className="mt-4 border-t border-hairline pt-4">
+            <Toggle
+              checked={value("retention_thin_snapshots") ?? true}
+              disabled={!isAdmin}
+              onChange={(next) => set({ retention_thin_snapshots: next })}
+              label="Thin old consumption readings"
+              description="Keep every reading of the last 3 days, one an hour for each dimension up to 40 days, and one a day after that. A reading anything refers to (a restriction's baseline, a budget period's usage breakdown, the latest) is always kept. Off: every reading is kept for the whole retention period."
+            />
+          </div>
         </Card>
         )}
 
@@ -700,6 +794,37 @@ export function SettingsPage({
                     spellCheck={false}
                   />
                 </Field>
+              </div>
+              <div className="mt-4 border-t border-hairline pt-4">
+                <p className="text-sm font-medium">Pacing for large tenants</p>
+                <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                  How much one cycle does, so a tenant of thousands of projects is worked through
+                  over several cycles and every cycle finishes well within its interval. 0 means no
+                  budget: everything, every cycle (for the violation check and auto-triage
+                  attribution that is no cap at all, where they had fixed caps before pacing).
+                </p>
+                <div className="mt-3 grid gap-4 sm:grid-cols-3">
+                  {PACING_FIELDS.map((field) => (
+                    <Field key={field.key} label={field.label} fold={false} hint={field.hint}>
+                      <Input
+                        type="number"
+                        min={field.min}
+                        max={field.max}
+                        step="1"
+                        disabled={!isAdmin}
+                        value={String(value(field.key) ?? field.fallback)}
+                        onChange={(event) =>
+                          set({
+                            [field.key]: Math.min(
+                              field.max,
+                              Math.max(field.min, Math.floor(Number(event.target.value) || 0)),
+                            ),
+                          })
+                        }
+                      />
+                    </Field>
+                  ))}
+                </div>
               </div>
               <div className="mt-4 border-t border-hairline pt-4">
                 <AiRolesPicker

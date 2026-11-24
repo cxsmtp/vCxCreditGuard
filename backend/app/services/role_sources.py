@@ -547,6 +547,7 @@ def tenant_client_roles(session: Session, *, fresh: bool = False) -> ClientRoleL
     a failed read (no connection, a refusal, an outage) says so instead."""
     global _listing_cache
     from app.services import connection as connection_service
+    from app.services import error_text
 
     connection = connection_service.get_connection(session)
     if connection is None:
@@ -578,7 +579,8 @@ def tenant_client_roles(session: Session, *, fresh: bool = False) -> ClientRoleL
     except Exception as exc:  # noqa: BLE001 - listing roles must never break a page
         logger.warning("Could not list the tenant's client roles", exc_info=True)
         return ClientRoleListing(
-            available=False, message=f"The tenant's roles could not be read: {exc}"
+            available=False,
+            message=f"The tenant's roles could not be read: {error_text.public_error(exc)}",
         )
     listing = ClientRoleListing(
         available=True, roles=tuple(sorted(roles.values(), key=lambda role: role.name))
