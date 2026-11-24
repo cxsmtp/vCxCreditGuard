@@ -13,6 +13,7 @@ import {
   PageHeader,
 } from "../components/ui";
 import { AuthFrame } from "../components/AppShell";
+import { BrandMark } from "../components/Icon";
 import { downloadText } from "../lib/export";
 import { useToast } from "../lib/ui-context";
 
@@ -132,22 +133,28 @@ export function PasswordChangeRequired({
   onSignOut: () => void;
 }) {
   return (
-    <AuthFrame title="Choose a new password" description="One step before you carry on">
-      <div className="w-full max-w-[560px]">
-        <Card
-          title="Choose a new password"
-          description={`${username}, the password you signed in with was set by someone else. Choose your own before continuing. You will be asked to sign in again with it.`}
+    <AuthFrame
+      title="Choose a new password"
+      description="One step before you carry on"
+      status="Temporary password"
+    >
+      <div className="cg-panel cg-auth-card">
+        <span className="cg-auth-mark" aria-hidden="true">
+          <BrandMark />
+        </span>
+        <p className="mt-4 mb-5 text-sm" style={{ color: "var(--text-secondary)" }}>
+          {username}, the password you signed in with was set by someone else. Choose your own
+          before continuing. You will be asked to sign in again with it.
+        </p>
+        <ChangePasswordForm onChanged={onChanged} submitLabel="Set password and sign in again" />
+        <button
+          type="button"
+          className="mt-4 text-xs underline"
+          style={{ color: "var(--text-secondary)" }}
+          onClick={onSignOut}
         >
-          <ChangePasswordForm onChanged={onChanged} submitLabel="Set password and sign in again" />
-          <button
-            type="button"
-            className="mt-4 text-xs underline"
-            style={{ color: "var(--text-secondary)" }}
-            onClick={onSignOut}
-          >
-            Sign out instead
-          </button>
-        </Card>
+          Sign out instead
+        </button>
       </div>
     </AuthFrame>
   );

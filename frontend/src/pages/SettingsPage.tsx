@@ -575,7 +575,11 @@ export function SettingsPage({
                 isAdmin={isAdmin}
                 value={value("ui_accent") ?? "default"}
                 options={current.allowed_accents ?? ["default"]}
-                onPick={(accent) => set({ ui_accent: accent })}
+                onPick={(accent) => {
+                  // Picking what is stored (or the swatch a legacy accent shows as) is no change.
+                  const stored = current.ui_accent ?? "default";
+                  set({ ui_accent: accent === (LEGACY_ACCENT[stored] ?? stored) ? undefined : accent });
+                }}
               />
             </>
           )}

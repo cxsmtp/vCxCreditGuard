@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import type { Me } from "../api/types";
 import { LOOKS, PHOSPHORS, useTheme, useToast } from "../lib/ui-context";
 import { settingsDraft, useSettingsDraft } from "../lib/settingsDraft";
 import { BrandMark, Icon, type IconName } from "./Icon";
 import { PermissionBanner, PermissionPopup, permissionProblem } from "./KeyPermissions";
-import { Modal, PageTitleSlot } from "./ui";
+import { Modal, PageTitleSlot, type PageTitleSlotValue } from "./ui";
 
 /* --------------------------------------------------------------- the map */
 
@@ -78,11 +78,18 @@ function inSettings(pathname: string): boolean {
   );
 }
 
-/** The menu's name for the page open, shown in the top bar until the page puts its own title there. */
+/** Pages whose own title is longer than their name in the menu. */
+const PAGE_TITLES: Record<string, string> = {
+  "/requests": "Credit requests",
+  "/notifications": "Notification Center",
+  "/violations": "Policy violations",
+};
+
+/** The page's title as the menu knows it, shown in the top bar until the page puts its own title there. */
 function menuTitle(me: Me, pathname: string): string {
   for (const item of mainNav(me)) {
     const match = item.exact ? pathname === item.to : pathname === item.to || pathname.startsWith(`${item.to}/`);
-    if (match && item.to !== "/settings") return item.to === "/violations" ? "Policy violations" : item.label;
+    if (match && item.to !== "/settings") return PAGE_TITLES[item.to] ?? item.label;
   }
   for (const [, links] of settingsNav(me)) {
     const link = links.find((candidate) => candidate.to === pathname);
@@ -465,6 +472,15 @@ export function AppShell({
   const [lookOpen, setLookOpen] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
   const [titleSlot, setTitleSlot] = useState<HTMLElement | null>(null);
+  // How many PageHeaders have put a title in the slot; none, and the menu's name stands in.
+  const [pageTitles, setPageTitles] = useState(0);
+  const titleId = useId();
+  const registerTitle = useCallback((delta: 1 | -1) => setPageTitles((count) => count + delta), []);
+  const slotValue = useMemo<PageTitleSlotValue>(
+    () => ({ element: titleSlot, titleId, register: registerTitle }),
+    [titleSlot, titleId, registerTitle],
+  );
+  const fallbackTitle = menuTitle(me, location.pathname);
   const menuRef = useRef<HTMLDivElement>(null);
   const nav = mainNav(me);
   const settings = inSettings(location.pathname);
@@ -515,8 +531,13 @@ export function AppShell({
   }, [location.pathname]);
 
   const main = (
-    <main key={location.pathname} className="cg-main">
-      <PageTitleSlot.Provider value={titleSlot}>{children}</PageTitleSlot.Provider>
+    <main
+      key={location.pathname}
+      className="cg-main"
+      aria-labelledby={pageTitles > 0 ? titleId : undefined}
+      aria-label={pageTitles > 0 ? undefined : fallbackTitle || undefined}
+    >
+      <PageTitleSlot.Provider value={slotValue}>{children}</PageTitleSlot.Provider>
     </main>
   );
 
@@ -594,9 +615,11 @@ export function AppShell({
               <Icon name="menu" />
             </button>
             <div className="cg-topbar-title">
-              <span className="cg-title cg-title-fallback" aria-hidden="true">
-                {menuTitle(me, location.pathname)}
-              </span>
+              {pageTitles === 0 && (
+                <span className="cg-title cg-title-fallback" aria-hidden="true">
+                  {fallbackTitle}
+                </span>
+              )}
               <div className="cg-title-slot" ref={setTitleSlot} />
             </div>
             <div className="cg-topbar-tools">
@@ -745,18 +768,23 @@ export function AppShell({
 
 /**
  * The frame without a session (sign in, a forced password change): the console
- * with the brand on the left, the title in the top bar, the page's card below.
+ * with the brand on the left, the title in the top bar, the description as the
+ * first line of the page, then the page's card.
  */
 export function AuthFrame({
   title,
   description,
+  status = "Signed out",
   children,
 }: {
   title: string;
   description?: string;
+  /** The pill at the top right; null for none. */
+  status?: string | null;
   children: ReactNode;
 }) {
   const { theme, toggle } = useTheme();
+  const titleId = useId();
   return (
     <>
       <div className="cg-bg" aria-hidden="true">
@@ -779,20 +807,20 @@ export function AuthFrame({
           <header className="cg-topbar">
             <span className="cg-auth-topmark">
               <BrandMark />
+              <b>CxCreditGuard</b>
             </span>
             <div className="cg-topbar-title">
-              <h1 className="cg-title">{title}</h1>
-              {description && (
-                <p className="cg-subtitle" title={description}>
-                  {description}
-                </p>
-              )}
+              <h1 id={titleId} className="cg-title">
+                {title}
+              </h1>
             </div>
             <div className="cg-topbar-tools">
-              <span className="cg-light off">
-                <i />
-                Signed out
-              </span>
+              {status && (
+                <span className="cg-light off cg-auth-status">
+                  <i />
+                  {status}
+                </span>
+              )}
               <button
                 type="button"
                 className="cg-icon-btn"
@@ -804,7 +832,12 @@ export function AuthFrame({
               </button>
             </div>
           </header>
-          <main className="cg-auth-main">{children}</main>
+          <main className="cg-auth-main" aria-labelledby={titleId}>
+            <div className="cg-auth-body">
+              {description && <p className="cg-page-desc">{description}</p>}
+              {children}
+            </div>
+          </main>
         </div>
       </div>
       <Toasts />

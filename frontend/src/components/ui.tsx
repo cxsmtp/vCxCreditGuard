@@ -5,6 +5,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -76,14 +77,24 @@ export function HelpToggle({ open, onToggle }: { open: boolean; onToggle: () => 
 
 /**
  * Where the app frame wants each page's title: the left of its top bar. The
- * frame provides the element (null until it has mounted); outside the frame
- * there is no provider, and a PageHeader renders where it stands.
+ * frame provides the element (null until it has mounted), the id the title
+ * takes, so the page's main landmark can be named by it, and a way for a page
+ * header to say it is there, so the frame's stand-in title steps aside.
+ * Outside the frame there is no provider, and a PageHeader renders where it
+ * stands.
  */
-export const PageTitleSlot = createContext<HTMLElement | null | undefined>(undefined);
+export type PageTitleSlotValue = {
+  element: HTMLElement | null;
+  titleId: string;
+  /** +1 when a PageHeader mounts, -1 when it unmounts. */
+  register: (delta: 1 | -1) => void;
+};
+export const PageTitleSlot = createContext<PageTitleSlotValue | undefined>(undefined);
 
 /**
- * The page's title and one-line description, which the frame shows left aligned
- * in the top bar, and the page's actions, at the top right of the page itself.
+ * The page's title, which the frame shows left aligned in the top bar, then
+ * the page's description in full as the first line of the page, with its
+ * actions on the same row at the right (they stack on narrow screens).
  */
 export function PageHeader({
   title,
@@ -95,32 +106,21 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   const slot = useContext(PageTitleSlot);
-  const descriptionRef = useRef<HTMLParagraphElement>(null);
+  const register = slot?.register;
 
-  // The description is cut to one line in the top bar: the whole of it stays
-  // a hover away.
-  useEffect(() => {
-    const element = descriptionRef.current;
-    if (element) element.title = element.textContent ?? "";
-  });
-
-  const heading = (
-    <>
-      <h1 className="cg-title" title={title}>
-        {title}
-      </h1>
-      {description && (
-        <p ref={descriptionRef} className="cg-subtitle">
-          {description}
-        </p>
-      )}
-    </>
-  );
+  useLayoutEffect(() => {
+    if (!register) return;
+    register(1);
+    return () => register(-1);
+  }, [register]);
 
   if (slot === undefined) {
     return (
       <div className="cg-head">
-        <div className="min-w-0">{heading}</div>
+        <div className="min-w-0">
+          <h1 className="cg-title">{title}</h1>
+          {description && <p className="cg-subtitle">{description}</p>}
+        </div>
         {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
       </div>
     );
@@ -128,8 +128,19 @@ export function PageHeader({
 
   return (
     <>
-      {slot && createPortal(heading, slot)}
-      {actions && <div className="cg-page-actions">{actions}</div>}
+      {slot.element &&
+        createPortal(
+          <h1 id={slot.titleId} className="cg-title">
+            {title}
+          </h1>,
+          slot.element,
+        )}
+      {(description || actions) && (
+        <div className="cg-page-intro">
+          {description && <p className="cg-page-desc">{description}</p>}
+          {actions && <div className="cg-page-actions">{actions}</div>}
+        </div>
+      )}
     </>
   );
 }

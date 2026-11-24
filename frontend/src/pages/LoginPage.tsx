@@ -120,7 +120,6 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
         <span className="cg-auth-mark" aria-hidden="true">
           <BrandMark />
         </span>
-        <h2 className="cg-auth-heading">{heading}</h2>
 
         {mode === "login" && (
           <form

@@ -578,39 +578,22 @@ code,
 }
 
 /*
-  The page's title and its one-line description, left aligned in the top bar.
-  Each page's PageHeader puts them here (components/ui.tsx); until it has, the
-  menu's name for the page stands in. The description gives way first.
+  The page's title, left aligned in the top bar. Each page's PageHeader puts it
+  here (components/ui.tsx); until it has, the menu's name for the page stands
+  in. A long title wraps rather than being cut.
 */
 .cg-topbar-title {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
-  align-items: baseline;
-  gap: 14px;
+  align-items: center;
 }
 .cg-title-slot {
   display: contents;
 }
-.cg-topbar-title:has(.cg-title-slot > *) .cg-title-fallback {
-  display: none;
-}
 .cg-topbar-title .cg-title {
-  flex: 0 1 auto;
   min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.cg-topbar-title .cg-subtitle {
-  flex: 1 1 0;
-  min-width: 0;
-  max-width: none;
-  margin: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  font-size: 13px;
+  overflow-wrap: anywhere;
 }
 .cg-topbar-tools {
   flex: none;
@@ -647,14 +630,36 @@ code,
   color: var(--text-secondary);
 }
 
-/* Page actions (Run a cycle now, New budget, Export): at the top right of the page, under the top bar. */
+/*
+  The first line of a page: its description in full on the left, its actions
+  (Run a cycle now, New budget, Export) on the right. Narrow, they stack.
+*/
+.cg-page-intro {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px 24px;
+  margin: -6px 0 18px;
+}
+.cg-page-desc {
+  flex: 1 1 380px;
+  min-width: 0;
+  max-width: 80ch;
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
 .cg-page-actions {
+  flex: 0 1 auto;
+  min-width: 0;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
-  margin: -6px 0 16px;
+  margin-left: auto;
 }
 
 .cg-light {
@@ -1013,9 +1018,10 @@ code,
 :root[data-look="command"][data-theme="light"] .cg-title {
   text-shadow: none;
 }
-:root[data-look="command"] .cg-topbar-title .cg-subtitle {
+:root[data-look="command"] .cg-page-desc {
   font-family: var(--font-mono);
   font-size: 11.5px;
+  line-height: 1.6;
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
@@ -1625,6 +1631,13 @@ textarea.cg-input {
   align-items: flex-start;
   padding: 72px 28px 48px;
 }
+.cg-auth-body {
+  width: 100%;
+  max-width: 560px;
+}
+.cg-auth-body > .cg-page-desc {
+  margin-bottom: 14px;
+}
 .cg-auth-card {
   width: 100%;
   max-width: 560px;
@@ -1644,21 +1657,6 @@ textarea.cg-input {
   height: 28px;
   color: inherit;
 }
-.cg-auth-heading {
-  margin: 14px 0 0;
-  font-family: var(--heading-font);
-  font-size: 22px;
-  font-weight: 600;
-  line-height: 1.25;
-}
-:root[data-look="standard"] .cg-auth-heading {
-  font-weight: 560;
-}
-:root[data-look="command"] .cg-auth-heading {
-  font-size: 16px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
 .cg-auth-tagline {
   margin-top: auto;
   padding: 0 8px 8px;
@@ -1668,6 +1666,12 @@ textarea.cg-input {
 }
 .cg-auth-topmark {
   display: none;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 650;
+  white-space: nowrap;
 }
 :root[data-look] .cg-auth-topmark .cg-brand-mark {
   width: 28px;
@@ -1926,9 +1930,15 @@ textarea.cg-input {
   display: none;
 }
 
-/* Narrower: the description gives way, so the title keeps its line. */
+/* Narrower: Jump to folds to its icon, so the page's title keeps its line. */
 @media (max-width: 1100px) {
-  .cg-topbar-title .cg-subtitle {
+  .cg-jump {
+    justify-content: center;
+    width: 36px;
+    padding: 0;
+  }
+  .cg-jump span,
+  .cg-jump .cg-kbd {
     display: none;
   }
 }
@@ -1948,9 +1958,22 @@ textarea.cg-input {
     transform: translateX(-100%);
     transition: transform 0.18s ease;
   }
+  /* Off screen it is hidden from everyone, screen readers and the Tab key included. */
+  .cg-side {
+    visibility: hidden;
+    transition:
+      transform 0.18s ease,
+      visibility 0s linear 0.18s;
+  }
   .cg-side.open {
+    visibility: visible;
     transform: none;
     box-shadow: var(--shadow-pop);
+    transition: transform 0.18s ease;
+  }
+  /* Signed out the console has nothing to open: the brand moves to the top bar. */
+  .cg-app.bare .cg-side {
+    display: none;
   }
   :root[data-look="command"] .cg-side {
     top: 0;
@@ -1978,18 +2001,15 @@ textarea.cg-input {
     font-size: 15px;
     letter-spacing: 0.04em;
   }
-  .cg-jump {
-    justify-content: center;
-    width: 36px;
-    padding: 0;
-  }
-  .cg-jump span,
-  .cg-jump .cg-kbd,
   .cg-who > span:not(.cg-avatar) {
     display: none;
   }
-  .cg-page-actions {
+  .cg-page-intro {
     margin-top: 0;
+  }
+  .cg-page-actions {
+    justify-content: flex-start;
+    margin-left: 0;
   }
   .cg-auth-main {
     padding: 24px 16px 32px;
@@ -2036,6 +2056,13 @@ textarea.cg-input {
     display: none;
   }
   .cg-lights {
+    display: none;
+  }
+}
+
+/* A phone: signed out, the brand and the title share the top bar, so the status pill gives way. */
+@media (max-width: 560px) {
+  .cg-auth-status {
     display: none;
   }
 }
