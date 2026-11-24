@@ -1094,19 +1094,24 @@ summarised in the prune's audit entry (`thinned_snapshots`, `raw_cleared_records
   restriction in force, and rows that matched no user, project or application.
   The response pages of a reading (`usage_snapshot.raw`) are no longer stored at
   all, except for a held reading (the evidence of a collapsed answer, which has
-  no rows). Cleared in batches, at most 20,000 readings a run, oldest first.
+  no rows). Cleared in batches, at most 20,000 readings a run, oldest first; a
+  reading passed over while something referred to it is cleared once nothing does.
 * **Old readings are thinned** (*Thin old consumption readings*, Settings →
   General, on by default): every reading of the last 3 days is kept, then one an
-  hour per dimension up to 40 days (longer than the longest monthly period plus
-  the week raw rows are kept), then one a day. Whole readings only, never single
-  rows. A reading anything refers to is never removed: the latest of each
-  dimension and lookback window, each restriction's baseline (the reading a rise
-  in usage since it was applied is measured from, see
-  [Policy violations](#policy-violations)), the readings open periods' usage
-  breakdowns start from, each project's auto-triage cursor and the readings
-  auto-triage charges were observed on. Held and demo readings are never thinned.
-  Deleted in batches of 100 readings, a transaction each, at most 20,000 a run.
-  Off: every reading is kept for the whole retention window, as before.
+  hour per dimension up to 40 days, then one a day. The tiers are a choice of
+  resolution for the trend and for reading the history; correctness rests on
+  the pins: a reading any calculation refers to is never removed, whatever its
+  age: the latest of each dimension and lookback window, each restriction's
+  baseline (the reading a rise in usage since it was applied is measured from,
+  see [Policy violations](#policy-violations)), and the readings open periods'
+  usage breakdowns start from. Auto-triage charges and each project's
+  auto-triage cursor record a reading's id but never read it back, so they pin
+  nothing (the charges themselves are kept, for the consumption window). Whole
+  readings only, never single rows; held and demo readings are never thinned.
+  Deleted in batches of 100 readings, a transaction each, at most 20,000 a run;
+  the retention window's own prune deletes in batches of 1,000 (never one list
+  of ids, which PostgreSQL limits to 65,535). Off: every reading is kept for the
+  whole retention window, as before.
 
 ## Configuration
 
@@ -1376,6 +1381,11 @@ counted as *could not verify* in the cycle's result. It is no longer reported as
 *re-disabled*: only a setting actually read back as switched on again is drift.
 The first such re-apply of a restriction is audited
 (`enforcement.reapplied_unverified`), once per restriction, not every cycle.
+Such a restriction is written again at most once per verification interval
+(it then moves behind the others in the rotation), and only after the cycle's
+new restrictions, so an unreadable setting never takes the budget a new
+breach needs; it stays counted, and the daily "not read back" notification
+names it.
 
 Projects the key cannot see are projects whose usage cannot be counted. The org
 sync reports that as a warning rather than undercounting quietly.
@@ -1995,10 +2005,12 @@ the progress on the Budgets page.
 | Growth after the first 40 days | ≈ 5.5 GB a month | ≈ 21 MB a month (one reading a day) |
 
 The simulation in the load test (`--simulate-thinning-days 45`: 45 days of
-readings at 15 minutes, 25 rows each, then one retention run) kept 1,188
-readings per dimension of 4,327, and the two tables went from 177 MB to 44 MB
-after `VACUUM FULL` (the run took 3 s); the figures above scale its per-row
-sizes to the real 3,033 rows. With thinning switched off, readings are kept
+readings at 15 minutes, 25 rows each, with auto-triage attribution on and so a
+charge on every project reading, 4,470 in all, then one retention run) kept
+1,184 readings per dimension of 4,322 (the project dimension too: charges pin
+nothing, and all 4,470 were kept), and the two tables went from 169 MB to
+35 MB after `VACUUM FULL` (the run took 3 s); the figures above scale its
+per-row sizes to the real 3,033 rows. With thinning switched off, readings are kept
 whole for the whole window (raw copies are still cleared after a week:
 ≈ 2.7 GB a month, ≈ 25 GB a year). Restrictions, notifications and
 audit entries add a few MB per thousand restrictions, once. At this size use
@@ -2030,9 +2042,9 @@ project each cycle.
 
 | Setting | Default | What it means |
 | ------- | ------- | ------------- |
-| Verify each restriction every (`verify_interval_minutes`) | 60 | Each restriction in force is read back at most this often, spread evenly over the cycles, the oldest-verified first. That is every restriction the cycle keeps in force, including those no limit's current plan still includes (a project that left the group or application, which stays restricted until its period ends; a hold-until-released limit's earlier periods), but not those being lifted. A new restriction is read back as it is applied; a limit whose enforcement, active state or project actions change has its restrictions read back first on the next cycle. One that cannot be read back moves behind the others (it stays due). A notification (once a day) says when any restriction in force has gone unread for more than twice the interval. 0: every restriction, every cycle. |
+| Verify each restriction every (`verify_interval_minutes`) | 60 | Each restriction in force is read back at most this often, spread evenly over the cycles, the oldest-verified first. That is every restriction the cycle keeps in force, including those no limit's current plan still includes (a project that left the group or application, which stays restricted until its period ends; a hold-until-released limit's earlier periods), but not those being lifted. A new restriction is read back as it is applied; a limit whose enforcement, active state or project actions change has its restrictions read back first on the next cycle. One that cannot be read back (an error, or no readable answer) moves behind the others and is not due again for an interval; one with no readable answer is written again then, to keep it in force. A notification (once a day, decided after the cycle's read-backs) says when any restriction in force has gone unread for more than twice the interval, also naming attempts whose outcome has stayed unknown that long and restrictions whose lifting keeps failing. A restriction on a user or project deleted in Checkmarx One is not read back (counted as `target_deleted`). 0: every restriction, every cycle. |
 | Read-backs per cycle (`max_verifications_per_cycle`) | 2000 | At most this many read-backs in one cycle. With more in force than this covers within the interval, each is verified less often; the cycle record says how often (`each_verified_within_minutes`). At the defaults and a 15 minute interval every restriction is read back within the hour up to 8,000 in force, if the cycle has the time. |
-| Restriction changes per cycle (`max_writes_per_cycle`) | 1000 | Every change a cycle makes to the tenant, spent in this order: **lifts** first (a limit switched off or within budget again, an exemption, the period rollover), then **drift re-asserted** by the verification (and restrictions that could not be read back, written again), then **new restrictions**, small limits first. Giving access back therefore never waits behind a rollout, and a re-assert the budget does not reach is done first on the next cycle (the restriction stays due); at worst a drift found waits as many cycles as lifts and re-asserts fill. A larger group or application is restricted over several cycles, resuming where it stopped ("Restricting 1,240 of 2,000 projects" on the Budgets page, one notification when it starts); a large lift likewise ("Lifting: 760 still in force"; the period shows *restored* only once the last is lifted). A limit needing more than 50 changes waits until every other limit has had its turn in the cycle. A limit switched off in the GUI lifts at most 200 at once (whatever the cycle is doing meanwhile), the rest by the cycles. The safety ceilings judge each user or project of a rollout once: the ones it has still to restrict are remembered by id, and anything else (a project added to the group since, a new breach after the period was lifted) is judged again. |
+| Restriction changes per cycle (`max_writes_per_cycle`) | 1000 | Every change a cycle makes to the tenant, spent in this order: **lifts** first (a limit switched off or within budget again, an exemption, the period rollover), then **drift re-asserted** by the verification, then **new restrictions**, small limits first, and last **restrictions that could not be read back, written again** to keep them in force (each at most once per verification interval). Giving access back therefore never waits behind a rollout, and a re-assert the budget does not reach is done first on the next cycle (the restriction stays due); at worst a drift found waits as many cycles as lifts and re-asserts fill. A larger group or application is restricted over several cycles, resuming where it stopped ("Restricting 1,240 of 2,000 projects" on the Budgets page, one notification when it starts); a large lift likewise ("Lifting: 760 still in force"; the period shows *restored* only once the last is lifted). A limit needing more than 50 changes waits until every other limit has had its turn in the cycle. A limit switched off in the GUI lifts at most 200 at once (whatever the cycle is doing meanwhile), the rest by the cycles. The safety ceilings judge each user or project of a rollout once: the ones it has still to restrict are remembered by id, and anything else (a project added to the group since, a new breach after the period was lifted) is judged again. |
 | Projects checked for violations per cycle (`violation_projects_per_cycle`) | 150 | Restricted projects whose scans are listed, least recently checked first: each at least every ceil(restricted / 150) cycles. |
 | Auto-triage projects per cycle (`attribution_projects_per_cycle`) | 150 | Projects whose new Auto Triage is traced to scans, longest waiting first. |
 | Auto-triage scan requests per cycle (`attribution_requests_per_cycle`) | 600 | Scan listings attribution may make in one cycle. |
@@ -2041,12 +2053,15 @@ project each cycle.
 
 **Coverage is on every cycle's record** (`scheduler_run.stats`, also
 returned by `POST /api/ops/run-cycle`): `evaluate.pacing.verification` (restrictions in
-force, `rotation` = `in_a_plan` + `outside_a_plan`, `being_lifted`,
-`target_deleted`, due, read back, `reasserted`, `unverified`,
-`reasserts_deferred`, `failed`, `each_verified_within_minutes`,
-`oldest_verified_minutes_ago`, `unverified_beyond_twice_the_interval`),
+force (applied, plus `outcome_unknown`), `rotation` = `in_a_plan` +
+`outside_a_plan`, `being_lifted` (of which `lift_failing`), `target_deleted`,
+due, `verified` (read back: `held` + `reasserted`), `unverified` (no readable
+answer, written again), `reapplies_deferred`, `reasserts_deferred`, `failed`,
+`each_verified_within_minutes`, `oldest_verified_minutes_ago`,
+`unverified_beyond_twice_the_interval`,
+`outcome_unknown_beyond_twice_the_interval`, `lift_failing_still_in_force`),
 `evaluate.pacing.writes` (budget, used, deferred, `lifts`, `reasserts`,
-`stopped_for_time`), `evaluate.rollouts` (limit, done, total),
+`reapplies_unreadable`, `stopped_for_time`), `evaluate.rollouts` (limit, done, total),
 `violations` (`watched`, `per_cycle`, `each_checked_every_cycles`,
 `oldest_check_minutes`), `auto_triage_attribution` (`backlog`,
 `oldest_waiting_minutes`, `each_within_cycles`) and `http` (requests, 429s,

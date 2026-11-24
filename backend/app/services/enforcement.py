@@ -190,7 +190,11 @@ class EnforcementOutcome:
 # What a write is for, in a budget's accounting.
 WRITE_APPLY = "apply"  # a new restriction (or one re-applied after an automatic lift)
 WRITE_LIFT = "lift"  # giving access back
-WRITE_REASSERT = "reassert"  # drift re-asserted, or an unreadable restriction re-applied
+WRITE_REASSERT = "reassert"  # drift read back, and re-asserted
+# A restriction that could not be read back, written again to keep it in force
+# (nothing says it drifted). Spent after new restrictions, at most once per
+# verification interval per restriction (evaluation.evaluate_all).
+WRITE_UNREADABLE = "reapply_unreadable"
 
 
 @dataclass
@@ -225,6 +229,8 @@ class EnforcementBudget:
     lifts_deferred: int = 0
     reasserts: int = 0
     reasserts_deferred: int = 0
+    reapplies: int = 0
+    reapplies_deferred: int = 0
     verified: int = 0
     stopped_for_time: bool = False
     _verified_ids: set[int] = field(default_factory=set)
@@ -248,6 +254,8 @@ class EnforcementBudget:
             self.lifts += 1
         elif kind == WRITE_REASSERT:
             self.reasserts += 1
+        elif kind == WRITE_UNREADABLE:
+            self.reapplies += 1
         if self.writes is not None:
             self.writes -= 1
 
@@ -257,6 +265,8 @@ class EnforcementBudget:
             self.lifts_deferred += 1
         elif kind == WRITE_REASSERT:
             self.reasserts_deferred += 1
+        elif kind == WRITE_UNREADABLE:
+            self.reapplies_deferred += 1
 
     def take_write(self, kind: str) -> bool:
         """``may_write`` and, if it may, spend it; otherwise count it deferred."""
@@ -266,15 +276,22 @@ class EnforcementBudget:
         self.spend_write(kind)
         return True
 
-    def may_verify(self, action_id: int) -> bool:
-        if action_id in self._verified_ids:
-            return False  # once a cycle, whichever pass met it first
-        if self.verify_ids is not None and action_id not in self.verify_ids:
-            return False
+    def may_verify(self, action_id: int, *, again: bool = False) -> bool:
+        """``again``: the late pass, for a restriction the verification pass met
+        and left its re-apply for after the new restrictions."""
+        if not again:
+            if action_id in self._verified_ids:
+                return False  # once a cycle, whichever pass met it first
+            if self.verify_ids is not None and action_id not in self.verify_ids:
+                return False
         return not self._out_of_time()
 
     def mark_verified(self, action_id: int) -> None:
+        """Claim this restriction for this cycle (it is met once). Counted as
+        verified only once it is read back (``count_verified``)."""
         self._verified_ids.add(action_id)
+
+    def count_verified(self) -> None:
         self.verified += 1
 
     @property
@@ -290,6 +307,8 @@ class EnforcementBudget:
             "lifts_deferred": self.lifts_deferred,
             "reasserts": self.reasserts,
             "reasserts_deferred": self.reasserts_deferred,
+            "reapplies_unreadable": self.reapplies,
+            "reapplies_unreadable_deferred": self.reapplies_deferred,
             "verified": self.verified,
             "stopped_for_time": self.stopped_for_time,
         }
@@ -793,7 +812,7 @@ def apply_enforcement(
         # its outcome, so waiting on it with a write open would stall both.
         session.commit()
         with _target_lock(target.target_type, target.target_id):
-            _enforce_target(
+            verdict = _enforce_target(
                 session,
                 client,
                 limit=limit,
@@ -805,6 +824,8 @@ def apply_enforcement(
                 protected_roles=protected_roles,
                 budget=budget,
             )
+        if budget is not None and verdict in READ_BACK:
+            budget.count_verified()
     return outcome
 
 
@@ -826,8 +847,11 @@ def _enforce_target(
     outcome: EnforcementOutcome,
     protected_roles: frozenset[str] = frozenset(),
     budget: EnforcementBudget | None = None,
-) -> None:
+) -> str | None:
     """Restrict one target, or verify an existing restriction. Caller holds its lock.
+
+    Returns the verification verdict when it verified one (``_verify_applied``),
+    else None.
 
     Every tenant write is bracketed by commits: the intent and the undo snapshot
     are durable *before* Checkmarx is changed, and the outcome is committed right
@@ -864,7 +888,7 @@ def _enforce_target(
         return
 
     if action is not None and action.status == EnforcementStatus.APPLIED:
-        _verify_applied(
+        return _verify_applied(
             session,
             client,
             limit=limit,
@@ -876,7 +900,6 @@ def _enforce_target(
             outcome=outcome,
             budget=budget,
         )
-        return
 
     if action is not None and action.status == EnforcementStatus.REVERSED:
         if action.reversal_reason != ADMIN_REASON:
@@ -1268,6 +1291,7 @@ def _verify_applied(
     resolver: RoleResolver,
     outcome: EnforcementOutcome,
     budget: EnforcementBudget | None = None,
+    postpone_unreadable: bool = False,
 ) -> str:
     """Already restricted: re-verify, and re-assert if it drifted back on.
 
@@ -1279,7 +1303,9 @@ def _verify_applied(
     ``VERIFY_FAILED`` (could not be read back) or ``VERIFY_SKIPPED``.
 
     With a ``budget``, a re-assert (or an unverified re-apply) is a write like
-    any other and is counted against it.
+    any other and is counted against it. ``postpone_unreadable``: a restriction
+    that cannot be read back is not written again now (``VERIFY_POSTPONED``):
+    the cycle does that after its new restrictions.
     """
     if action.reversal_reason == ADMIN_REASON:
         # An admin's Restore was started and did not finish. Re-asserting the
@@ -1308,6 +1334,12 @@ def _verify_applied(
         return VERIFY_SKIPPED
     session.commit()  # nothing held open while we wait on Checkmarx
     found: dict[str, Any] = {}
+
+    def may_write(kind: str) -> bool:
+        if kind == WRITE_UNREADABLE and postpone_unreadable:
+            raise _ReapplyPostponed()
+        return budget is None or budget.take_write(kind)
+
     try:
         verdict = _reconcile(
             session,
@@ -1316,9 +1348,19 @@ def _verify_applied(
             target=target,
             resolver=resolver,
             found=found,
-            may_write=(None if budget is None else lambda: budget.take_write(WRITE_REASSERT)),
+            may_write=may_write,
         )
-    except _ReassertDeferred:
+    except _ReapplyPostponed:
+        session.commit()
+        return VERIFY_POSTPONED
+    except _ReassertDeferred as deferred:
+        if deferred.args and deferred.args[0] == WRITE_UNREADABLE:
+            outcome.skipped.append(
+                f"{target.kind} on {target.target_label} could not be read back; this cycle's "
+                "restriction changes are spent, so it is written again later"
+            )
+            session.commit()
+            return VERIFY_REAPPLY_DEFERRED
         # Nothing was written. It stays due (its last verification is
         # unchanged), so the next cycle reads it back first and, with the
         # budget spent on lifts and re-asserts before any new restriction,
@@ -2305,10 +2347,21 @@ def _unverified_reapply_audited(session: Session, action: EnforcementAction) -> 
 VERIFY_DEFERRED = "deferred"  # a write was needed and the cycle's write budget is spent
 VERIFY_FAILED = "failed"  # could not be read back (a Checkmarx error)
 VERIFY_SKIPPED = "skipped"  # not checked: a restore in progress, or lifted as now protected
+# Could not be read back; writing it again waits for the late pass, after new
+# restrictions (evaluation.evaluate_all).
+VERIFY_POSTPONED = "postponed"
+# Could not be read back, and the write budget was spent before it was written again.
+VERIFY_REAPPLY_DEFERRED = "reapply_deferred"
+# Verdicts that mean "read back from Checkmarx One" (verified).
+READ_BACK = ("held", "reasserted", "lock_not_kept")
 
 
 class _ReassertDeferred(Exception):  # noqa: N818 - a decision, not an error
     """_reconcile needs to write and the budget says not this cycle."""
+
+
+class _ReapplyPostponed(Exception):  # noqa: N818 - a decision, not an error
+    """_reconcile would write an unreadable restriction again: not in this pass."""
 
 
 class _StaleReadAhead(Exception):  # noqa: N818 - a decision, not an error
@@ -2338,7 +2391,7 @@ def _reconcile(
     target: Target,
     resolver: RoleResolver,
     found: dict[str, Any] | None = None,
-    may_write: Callable[[], bool] | None = None,
+    may_write: Callable[[str], bool] | None = None,
 ) -> str:
     """Verify an already-applied restriction is still in force, re-asserting it if
     it drifted back on in Checkmarx One.
@@ -2378,11 +2431,19 @@ def _reconcile(
     raise AssertionError("a fresh read is never stale")  # pragma: no cover
 
 
-def _act_on_reads(resolver: RoleResolver, may_write: Callable[[], bool] | None) -> None:
-    """Called right before _reconcile writes to the tenant."""
+def _act_on_reads(
+    resolver: RoleResolver,
+    may_write: Callable[[str], bool] | None,
+    *,
+    unreadable: bool = False,
+) -> None:
+    """Called right before _reconcile writes to the tenant. ``unreadable``: the
+    write keeps a restriction that could not be read back in force (no drift
+    was seen); otherwise it re-asserts drift."""
     _conclude_on_reads(resolver)
-    if may_write is not None and not may_write():
-        raise _ReassertDeferred()
+    kind = WRITE_UNREADABLE if unreadable else WRITE_REASSERT
+    if may_write is not None and not may_write(kind):
+        raise _ReassertDeferred(kind)
 
 
 def _conclude_on_reads(resolver: RoleResolver) -> None:
@@ -2399,7 +2460,7 @@ def _reconcile_once(
     target: Target,
     resolver: RoleResolver,
     found: dict[str, Any],
-    may_write: Callable[[], bool] | None,
+    may_write: Callable[[str], bool] | None,
 ) -> str:
     """One attempt of ``_reconcile``.
 
@@ -2479,7 +2540,7 @@ def _reconcile_once(
         )
         if current is not None and not current:
             return RECONCILE_HELD  # read back as disabled
-        _act_on_reads(resolver, may_write)
+        _act_on_reads(resolver, may_write, unreadable=current is None)
         if current is not None:
             found.update({"found": {"remediationSeverities": current}})
         # Either severities were read back re-enabled (drift), or the setting
@@ -2511,7 +2572,7 @@ def _reconcile_once(
             base = snapshot.get("entry_before")
             if not isinstance(base, dict) or not base:
                 raise
-            _act_on_reads(resolver, may_write)
+            _act_on_reads(resolver, may_write, unreadable=True)
             # A setting that is locked (by this restriction, or already before
             # it) is written locked, with no unlocked fallback: falling back to
             # the value as it was before could unlock it.
@@ -2558,7 +2619,7 @@ def _reconcile_once(
             # The lock was never seen to hold, so its absence is not evidence
             # that anyone removed it: it is written again, without an alarm, and
             # the next read decides.
-            _act_on_reads(resolver, may_write)
+            _act_on_reads(resolver, may_write, unreadable=True)
             _write_fusion_off(
                 client,
                 project_id=target.target_id,
@@ -2601,7 +2662,7 @@ def _reconcile_once(
         base = read.config if read.config is not None else snapshot.get("repo_fusion_before")
         if not isinstance(base, dict):
             return RECONCILE_HELD
-        _act_on_reads(resolver, may_write)
+        _act_on_reads(resolver, may_write, unreadable=not read.readable)
         if read.readable:
             found.update({"found": dict(base)})
         platform.set_repo_fusion(
@@ -3283,19 +3344,43 @@ class VerificationPass:
 
     held: int = 0  # read back and found in force
     reasserted: int = 0  # read back drifted, and re-asserted
-    unverified: int = 0  # could not be read back, so written again (stays due)
-    deferred: int = 0  # needs a write; the write budget is spent (done first next cycle)
+    deferred: int = 0  # drift to re-assert; the write budget is spent (done first next cycle)
     not_reached: int = 0  # the cycle's time ran out, or it was no longer in force
+    # Read back (held, re-asserted, lock concluded): verified this cycle.
+    read_back: set[int] = field(default_factory=set)
+    # Could not be read back without an error (RECONCILE_UNVERIFIED): written
+    # again (or, budget spent, not this cycle). Stays due; behind the others.
+    unreadable: list[int] = field(default_factory=list)
+    # Could not be read back; written again after the new restrictions.
+    postponed: list[int] = field(default_factory=list)
+    # Unreadable and the write budget was spent: not written this cycle.
+    reapply_deferred: list[int] = field(default_factory=list)
     # Could not be read back at all (a Checkmarx error, or anything unexpected).
     failed: list[int] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+    def merge(self, other: VerificationPass) -> None:
+        self.held += other.held
+        self.reasserted += other.reasserted
+        self.deferred += other.deferred
+        self.read_back |= other.read_back
+        self.unreadable += other.unreadable
+        self.reapply_deferred += other.reapply_deferred
+        self.failed += other.failed
+        self.errors += other.errors
+
+    @property
+    def out_of_rotation(self) -> list[int]:
+        """Not read back: moved behind the others, not due again for an interval."""
+        return [*self.unreadable, *self.reapply_deferred, *self.failed]
 
     def as_stats(self) -> dict[str, Any]:
         return {
             "held": self.held,
             "reasserted": self.reasserted,
-            "unverified": self.unverified,
+            "unverified": len(self.unreadable),
             "reasserts_deferred": self.deferred,
+            "reapplies_deferred": len(self.reapply_deferred),
             "not_reached": self.not_reached,
             "failed": len(self.failed),
         }
@@ -3309,6 +3394,7 @@ def verify_in_force(
     actor: AuditActor,
     resolver: RoleResolver,
     budget: EnforcementBudget,
+    late: bool = False,
 ) -> VerificationPass:
     """Read back these restrictions in force, one by one, and re-assert drift.
 
@@ -3319,6 +3405,11 @@ def verify_in_force(
     a hold-until-released limit's earlier periods). Each is read back under its
     target lock, exactly as the enforcement of its limit would
     (``_verify_applied``); a re-assert counts against ``budget``.
+
+    A restriction that cannot be read back (no error, but no readable answer)
+    is not written again here (``postponed``): the cycle comes back to it with
+    ``late=True`` after its new restrictions, so keeping an unreadable
+    restriction in force never takes the budget a new breach needs.
 
     One restriction failing never stops the others; nothing is held open in
     the database while Checkmarx is called.
@@ -3340,7 +3431,7 @@ def verify_in_force(
         if action is None or action.status != EnforcementStatus.APPLIED:
             result.not_reached += 1
             continue
-        if not budget.may_verify(action_id):
+        if not budget.may_verify(action_id, again=late):
             result.not_reached += 1
             continue
         if action.limit_id is not None and action.limit_id not in limits:
@@ -3378,6 +3469,7 @@ def verify_in_force(
                     resolver=resolver,
                     outcome=outcome,
                     budget=budget,
+                    postpone_unreadable=not late,
                 )
         except Exception as exc:  # noqa: BLE001 - one restriction must not stop the others
             session.rollback()
@@ -3385,16 +3477,24 @@ def verify_in_force(
             result.failed.append(action_id)
             result.errors.append(f"verify {action_id}: {error_text.public_error(exc)}")
             continue
-        if verdict == RECONCILE_REASSERTED:
-            result.reasserted += 1
+        if verdict in READ_BACK:
+            # Counted once read back, never before.
+            budget.count_verified()
+            result.read_back.add(action_id)
+            if verdict == RECONCILE_REASSERTED:
+                result.reasserted += 1
+            else:
+                result.held += 1
         elif verdict == RECONCILE_UNVERIFIED:
-            result.unverified += 1
+            result.unreadable.append(action_id)
+        elif verdict == VERIFY_POSTPONED:
+            result.postponed.append(action_id)
         elif verdict == VERIFY_DEFERRED:
             result.deferred += 1
+        elif verdict == VERIFY_REAPPLY_DEFERRED:
+            result.reapply_deferred.append(action_id)
         elif verdict == VERIFY_FAILED:
             result.failed.append(action_id)
-        elif verdict in (RECONCILE_HELD, RECONCILE_LOCK_NOT_KEPT):
-            result.held += 1
         else:
             result.not_reached += 1
     return result

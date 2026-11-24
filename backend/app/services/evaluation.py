@@ -67,7 +67,13 @@ from app.models.limits import (
     LimitPeriodState,
     effective_project_actions,
 )
-from app.models.org import CxApplicationProject, CxGroupMembership, CxProject, CxProjectGroup
+from app.models.org import (
+    CxApplicationProject,
+    CxGroupMembership,
+    CxProject,
+    CxProjectGroup,
+    CxUser,
+)
 from app.services import (
     auto_triage_attribution,
     enforcement,
@@ -495,9 +501,8 @@ def evaluate_all(
             resolver=resolver,
             budget=budget,
         )
-        verification.update(checked.as_stats())
-        result.errors.extend(checked.errors)
-        _take_out_of_rotation(session, checked.failed, moment)
+    else:
+        checked = enforcement.VerificationPass()
     # Whatever is in force and was not chosen is not read back again by the
     # limits' enforcement below.
     budget.verify_ids = frozenset()
@@ -527,6 +532,29 @@ def evaluate_all(
             result=result,
             budget=budget,
         )
+
+    # Pass 4: restrictions that could not be read back are written again to
+    # keep them in force - after the new restrictions, so that never takes
+    # the budget a new breach needs. Each is then out of the rotation for an
+    # interval: written again at most once per verification interval.
+    if checked.postponed and result.enforcement_paused is None:
+        late = enforcement.verify_in_force(
+            session,
+            client,
+            action_ids=checked.postponed,
+            actor=actor,
+            resolver=resolver,
+            budget=budget,
+            late=True,
+        )
+        checked.merge(late)
+    elif checked.postponed:
+        checked.reapply_deferred += checked.postponed
+    checked.postponed = []
+    verification.update(checked.as_stats())
+    result.errors.extend(checked.errors)
+    _take_out_of_rotation(session, checked.out_of_rotation, moment)
+    _alert_unverified(session, plan, checked.read_back, moment)
     result.pacing["writes"] = budget.as_stats()
     verification["verified"] = budget.verified
     return result
@@ -536,7 +564,7 @@ def evaluate_all(
 OWNER_PLAN = "plan"  # its breached limit's enforcement: the target is in its plan
 OWNER_KEPT = "kept"  # stays in force outside any plan: verified on its own
 OWNER_LIFTING = "lifting"  # being lifted (the sweep, the rollover, a raised budget)
-OWNER_GONE = "gone"  # the project was deleted in Checkmarx One: nothing to read
+OWNER_GONE = "gone"  # the project or user was deleted in Checkmarx One: nothing to read
 
 
 @dataclass
@@ -544,6 +572,13 @@ class VerificationPlan:
     stats: dict[str, object]
     # The restrictions to read back this cycle, oldest-verified first.
     chosen: list[int]
+    # (id, target) unverified for more than ``stale_after`` before the pass,
+    # outcome unknown that long, and being lifted with the last lift failed.
+    stale: list[tuple[int, str]] = field(default_factory=list)
+    stale_unsettled: list[tuple[int, str]] = field(default_factory=list)
+    lift_failing: list[tuple[int, str]] = field(default_factory=list)
+    stale_after: timedelta = timedelta(hours=2)
+    paused: bool = False
 
 
 def _owners(
@@ -572,7 +607,7 @@ def _owners(
       protected, an admin's restore did not finish), or the rollover does (an
       earlier period of a limit that does not hold), or a budget that covers
       the usage again does. Not verified: it is being given back;
-    * ``gone``: the project was deleted in Checkmarx One.
+    * ``gone``: the project or user was deleted in Checkmarx One.
     """
     limit_ids = {row.limit_id for row in rows if row.limit_id is not None}
     limits = {
@@ -586,7 +621,15 @@ def _owners(
     protected = enforcement.protected_users(
         session, {row.target_id for row in rows if row.target_type == enforcement.TARGET_USER}
     )
-    deleted = set(session.scalars(select(CxProject.id).where(CxProject.is_deleted.is_(True))))
+    deleted = {
+        (enforcement.TARGET_PROJECT, project_id)
+        for project_id in session.scalars(
+            select(CxProject.id).where(CxProject.is_deleted.is_(True))
+        )
+    } | {
+        (enforcement.TARGET_USER, user_id)
+        for user_id in session.scalars(select(CxUser.id).where(CxUser.is_deleted.is_(True)))
+    }
     windows: dict[int, PeriodWindow | None] = {}
     for limit in limits.values():
         try:
@@ -648,7 +691,11 @@ def _owners(
             owners[row.id] = OWNER_LIFTING
             continue
         if row.idempotency_key in planned:
-            owners[row.id] = OWNER_PLAN
+            # A deleted user is still in a user limit's plan (only deleted
+            # projects drop out of plans): nothing is there to read back.
+            owners[row.id] = (
+                OWNER_GONE if (row.target_type, row.target_id) in deleted else OWNER_PLAN
+            )
             continue
         window = windows.get(limit.id)
         if window is not None and row.period_key != window.key:
@@ -671,9 +718,7 @@ def _owners(
                 and state.credits_used < Decimal(limit.credit_limit)
             )
             owners[row.id] = OWNER_LIFTING if within_budget else OWNER_KEPT
-        if owners[row.id] == OWNER_KEPT and (
-            row.target_type == enforcement.TARGET_PROJECT and row.target_id in deleted
-        ):
+        if owners[row.id] == OWNER_KEPT and ((row.target_type, row.target_id) in deleted):
             owners[row.id] = OWNER_GONE
     return owners
 
@@ -693,9 +738,13 @@ def _plan_verification(
     outside any plan (``_owners``); not the ones being lifted. Each is read
     back at most every ``verify_interval_minutes``, spread over the cycles,
     never more than the per-cycle cap; with the interval at 0, every one,
-    every cycle. A restriction that could not be read back at all moves to the
-    back of the rotation (``last_checked_at``), so a persistent failure never
-    takes the slots of the others; it stays due and is counted.
+    every cycle.
+
+    A restriction that could not be read back (an error, or no readable
+    answer) moves to the back of the rotation (``last_checked_at``) and is
+    not due again for an interval, so a persistent failure never takes the
+    slots of the others every cycle; it stays unverified and is counted, and
+    the alert decided after the pass (``_alert_unverified``) names it.
 
     While enforcement is paused nothing is read back or re-asserted (as before
     pacing): restrictions in force are left as they are until it resumes.
@@ -712,25 +761,57 @@ def _plan_verification(
             EnforcementAction.target_type,
             EnforcementAction.target_id,
             EnforcementAction.reversal_reason,
+            EnforcementAction.error,
             EnforcementAction.last_verified_at,
             EnforcementAction.last_checked_at,
             EnforcementAction.applied_at,
         ).where(EnforcementAction.status == EnforcementStatus.APPLIED)
     ).all()
+    # Attempts whose outcome is unknown and that may have taken something: in
+    # force as far as anyone can tell. Not read back by the rotation (the
+    # enforcement of their limit completes them, or the sweep lifts them;
+    # reading one back as "held" would record an outcome that was never
+    # recorded), but counted, and named by the alert if they stay that way.
+    unsettled = [
+        action
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.status.in_(
+                    [
+                        status
+                        for status in enforcement.RESTORABLE_STATUSES
+                        if status != EnforcementStatus.APPLIED
+                    ]
+                )
+            )
+        )
+        if enforcement.may_be_in_force(action)
+    ]
     owners = _owners(session, rows, moment, enforcing) if rows else {}
     candidates = [row for row in rows if owners.get(row.id) in (OWNER_PLAN, OWNER_KEPT)]
     by_owner = dict.fromkeys((OWNER_PLAN, OWNER_KEPT, OWNER_LIFTING, OWNER_GONE), 0)
     for owner in owners.values():
         by_owner[owner] += 1
+    # Being lifted, and the last attempt failed: it is still in force.
+    lift_failing = [
+        row
+        for row in rows
+        if owners.get(row.id) == OWNER_LIFTING and row.error and row.reversal_reason
+    ]
     never = datetime.min.replace(tzinfo=UTC)
     interval = config.verify_interval_minutes
     paced = interval > 0
     # Due a little early (a tenth of the interval), so the time the cycles
     # themselves take never pushes a read-back past the interval.
     cutoff = moment - timedelta(minutes=interval - max(1, interval // 10)) if paced else moment
-    due = sum(
-        1 for row in candidates if row.last_verified_at is None or row.last_verified_at <= cutoff
-    )
+
+    def due(row) -> bool:  # type: ignore[no-untyped-def]
+        verified_due = row.last_verified_at is None or row.last_verified_at <= cutoff
+        # One that could not be read back is not due again for an interval.
+        checked_due = row.last_checked_at is None or row.last_checked_at <= cutoff
+        return verified_due and checked_due
+
+    due_count = sum(1 for row in candidates if due(row))
     ordered = sorted(
         candidates,
         key=lambda row: (
@@ -741,28 +822,37 @@ def _plan_verification(
     if paused is not None:
         chosen: list = []  # type: ignore[type-arg]
     elif paced:
-        chosen = ordered[: config.verifications_per_cycle(len(candidates), due) or 0]
+        eligible = [
+            row for row in ordered if row.last_checked_at is None or row.last_checked_at <= cutoff
+        ]
+        chosen = eligible[: config.verifications_per_cycle(len(candidates), due_count) or 0]
     else:
         chosen = ordered
     verified_at = [row.last_verified_at for row in candidates if row.last_verified_at is not None]
     oldest = min(verified_at) if verified_at else None
     # Unverified for more than twice the interval (or, at interval 0, two
     # cycles): the rotation is not keeping up, or these cannot be read back.
+    # Decided after the pass (those read back this cycle are not named).
     stale_after = timedelta(minutes=2 * (interval if paced else config.interval_minutes))
     stale = [
         row
         for row in candidates
         if (row.last_verified_at or row.applied_at or moment) < moment - stale_after
     ]
+    stale_unsettled = [
+        action for action in unsettled if (action.created_at or moment) < moment - stale_after
+    ]
     stats: dict[str, object] = {
-        "in_force": len(rows),
+        "in_force": len(rows) + len(unsettled),
         "rotation": len(candidates),
         "in_a_plan": by_owner[OWNER_PLAN],
         "outside_a_plan": by_owner[OWNER_KEPT],
         "being_lifted": by_owner[OWNER_LIFTING],
+        "lift_failing": len(lift_failing),
         "target_deleted": by_owner[OWNER_GONE],
+        "outcome_unknown": len(unsettled),
         "interval_minutes": interval,
-        "due": due,
+        "due": due_count,
         "selected": len(chosen),
         "oldest_verified_minutes_ago": (
             int((moment - oldest).total_seconds() // 60) if oldest is not None else None
@@ -771,42 +861,115 @@ def _plan_verification(
         # At this size and these settings, the longest a restriction in force
         # (in a plan or not) goes without being read back.
         "each_verified_within_minutes": config.coverage_minutes(len(candidates)),
-        "unverified_beyond_twice_the_interval": len(stale),
     }
     if paused is not None:
         stats["paused"] = True
-    elif stale:
-        _notify_unverified(session, stale, stale_after=stale_after, moment=moment)
-    return VerificationPlan(stats=stats, chosen=[row.id for row in chosen])
+    return VerificationPlan(
+        stats=stats,
+        chosen=[row.id for row in chosen],
+        stale=[(row.id, row.target_id) for row in stale],
+        stale_unsettled=[(action.id, action.target_id) for action in stale_unsettled],
+        lift_failing=[(row.id, row.target_id) for row in lift_failing],
+        stale_after=stale_after,
+        paused=paused is not None,
+    )
+
+
+def _alert_unverified(
+    session: Session,
+    plan: VerificationPlan,
+    read_back: set[int],
+    moment: datetime,
+) -> None:
+    """After the verification pass: name what is still unverified too long.
+
+    Restrictions read back this cycle are not named (after downtime the first
+    cycle reads them all back). Attempts whose outcome is still unknown are
+    named only if they are still unknown now; so are lifts that keep failing.
+    """
+    stale = [(aid, target) for aid, target in plan.stale if aid not in read_back]
+    unsettled = []
+    for action_id, target in plan.stale_unsettled:
+        action = session.get(EnforcementAction, action_id, populate_existing=True)
+        if (
+            action is not None
+            and action.status != EnforcementStatus.APPLIED
+            and enforcement.may_be_in_force(action)
+        ):
+            unsettled.append((action_id, target))
+    lifting = []
+    for action_id, target in plan.lift_failing:
+        action = session.get(EnforcementAction, action_id, populate_existing=True)
+        if action is not None and enforcement.may_be_in_force(action):
+            lifting.append((action_id, target))
+    plan.stats["unverified_beyond_twice_the_interval"] = len(stale)
+    plan.stats["outcome_unknown_beyond_twice_the_interval"] = len(unsettled)
+    plan.stats["lift_failing_still_in_force"] = len(lifting)
+    if plan.paused or not (stale or unsettled or lifting):
+        return
+    _notify_unverified(
+        session,
+        stale=stale,
+        unsettled=unsettled,
+        lifting=lifting,
+        stale_after=plan.stale_after,
+        moment=moment,
+    )
 
 
 def _notify_unverified(
     session: Session,
-    stale: list,
     *,
+    stale: list[tuple[int, str]],
+    unsettled: list[tuple[int, str]],
+    lifting: list[tuple[int, str]],
     stale_after: timedelta,
-    moment: datetime,  # type: ignore[type-arg]
+    moment: datetime,
 ) -> None:
     """Say (once a day) that restrictions in force have gone unverified too long."""
     hours = stale_after.total_seconds() / 3600
-    examples = ", ".join(sorted({row.target_id for row in stale})[:5])
+
+    def examples(rows: list[tuple[int, str]]) -> str:
+        names = sorted({target for _id, target in rows})
+        return ", ".join(names[:5]) + ("..." if len(names) > 5 else "")
+
+    parts = []
+    if stale:
+        parts.append(
+            f"{len(stale):,} not read back for more than {hours:g} hours: {examples(stale)}. "
+            "Either they cannot be read back (the cycle record lists them: "
+            "evaluate.pacing.verification, unverified and failed; they are written again at "
+            "most once per interval to keep them in force), or the rotation does not reach "
+            "them within the interval at this size: raise the read-backs per cycle, or the "
+            "interval."
+        )
+    if unsettled:
+        parts.append(
+            f"{len(unsettled):,} whose last attempt's outcome has been unknown for more than "
+            f"{hours:g} hours: {examples(unsettled)}. They may be in force; the cycle keeps "
+            "trying to complete them (or to lift them, if nothing justifies them)."
+        )
+    if lifting:
+        parts.append(
+            f"{len(lifting):,} still in force because lifting them keeps failing: "
+            f"{examples(lifting)}. The cycle tries again every time; the Notification Center "
+            "has the error of each."
+        )
+    total = len(stale) + len(unsettled) + len(lifting)
     notifications.notify(
         session,
         category=notifications.CATEGORY_ENFORCEMENT,
         severity=Severity.WARNING,
         title=(
-            f"{len(stale):,} restriction(s) in force not read back from Checkmarx One for more "
-            f"than {hours:g} hours"
+            f"{total:,} restriction(s) in force not confirmed in Checkmarx One for more than "
+            f"{hours:g} hours (not read back)"
         ),
         body=(
             "Each restriction in force is read back regularly (Settings → Enforcement, verify "
             "each restriction every), so a change made in Checkmarx One that undoes it is "
-            f"found and re-asserted. These have not been for more than {hours:g} hours: "
-            f"{examples}{'...' if len(stale) > 5 else ''}.\n\nEither they cannot be read back "
-            "(the cycle record lists the failures: evaluate.pacing.verification), or the "
-            "rotation does not reach them within the interval at this size: raise the "
-            "read-backs per cycle, or the interval. They are still restricted as far as "
-            "CreditGuard knows; nothing was lifted."
+            "found and re-asserted.\n\n"
+            + "\n\n".join(parts)
+            + "\n\nThey are still restricted as far as CreditGuard knows."
         ),
         dedupe_key=f"unverified:{moment.strftime('%Y-%m-%d')}",
     )
@@ -816,9 +979,11 @@ def _notify_unverified(
 def _take_out_of_rotation(session: Session, action_ids: list[int], moment: datetime) -> None:
     """Restrictions that could not be read back go to the back of the rotation.
 
-    Their last verification is unchanged (they stay due, and count towards
-    the alert above); only their place in the queue moves, so one that keeps
-    failing never takes a slot from the others every cycle.
+    Their last verification is unchanged (they stay unverified, and count
+    towards the alert); they move behind the others and are not due again for
+    a verification interval, so one that keeps failing (an error, or no
+    readable answer) neither takes a slot from the others nor is written
+    again every cycle.
     """
     for start in range(0, len(action_ids), 1000):
         session.execute(
