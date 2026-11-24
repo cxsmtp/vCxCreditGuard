@@ -12,6 +12,7 @@ import {
   Modal,
   PageHeader,
 } from "../components/ui";
+import { AuthFrame } from "../components/AppShell";
 import { downloadText } from "../lib/export";
 import { useToast } from "../lib/ui-context";
 
@@ -131,8 +132,8 @@ export function PasswordChangeRequired({
   onSignOut: () => void;
 }) {
   return (
-    <div className="flex min-h-screen items-center justify-center px-4 py-10">
-      <div className="w-full max-w-md">
+    <AuthFrame title="Choose a new password" description="One step before you carry on">
+      <div className="w-full max-w-[560px]">
         <Card
           title="Choose a new password"
           description={`${username}, the password you signed in with was set by someone else. Choose your own before continuing. You will be asked to sign in again with it.`}
@@ -148,7 +149,7 @@ export function PasswordChangeRequired({
           </button>
         </Card>
       </div>
-    </div>
+    </AuthFrame>
   );
 }
 

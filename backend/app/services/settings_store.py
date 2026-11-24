@@ -56,7 +56,10 @@ KEY_NOTIFY_MIN_SEVERITY = "notify.min_severity"
 # Appearance: the organisation-wide accent theme an admin picks. Applied to
 # every signed-in browser; the chart series palette is never affected.
 KEY_UI_ACCENT = "ui.accent"
-ALLOWED_ACCENTS: tuple[str, ...] = ("default", "teal", "violet", "amber", "rose", "slate")
+# The Standard look's earth accents: default (Ink), teal (Lagoon), sage, violet
+# (Plum) and amber (Ochre). Rose and slate are kept so a saved choice stays valid;
+# the web UI shows them as Plum and Ink.
+ALLOWED_ACCENTS: tuple[str, ...] = ("default", "teal", "sage", "violet", "amber", "rose", "slate")
 
 # Credit requests: when on, a non-admin (viewer) may submit a request to raise an
 # entity's budget for an admin to approve. Off by default, so self-service is a

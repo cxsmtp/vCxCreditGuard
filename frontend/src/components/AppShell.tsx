@@ -5,7 +5,7 @@ import { LOOKS, PHOSPHORS, useTheme, useToast } from "../lib/ui-context";
 import { settingsDraft, useSettingsDraft } from "../lib/settingsDraft";
 import { BrandMark, Icon, type IconName } from "./Icon";
 import { PermissionBanner, PermissionPopup, permissionProblem } from "./KeyPermissions";
-import { Modal } from "./ui";
+import { Modal, PageTitleSlot } from "./ui";
 
 /* --------------------------------------------------------------- the map */
 
@@ -76,6 +76,19 @@ function inSettings(pathname: string): boolean {
     pathname === "/account" ||
     pathname === "/audit"
   );
+}
+
+/** The menu's name for the page open, shown in the top bar until the page puts its own title there. */
+function menuTitle(me: Me, pathname: string): string {
+  for (const item of mainNav(me)) {
+    const match = item.exact ? pathname === item.to : pathname === item.to || pathname.startsWith(`${item.to}/`);
+    if (match && item.to !== "/settings") return item.to === "/violations" ? "Policy violations" : item.label;
+  }
+  for (const [, links] of settingsNav(me)) {
+    const link = links.find((candidate) => candidate.to === pathname);
+    if (link) return link.label;
+  }
+  return inSettings(pathname) ? "Settings" : "";
 }
 
 /* ---------------------------------------------------------------- pieces */
@@ -451,6 +464,7 @@ export function AppShell({
   const [jumpOpen, setJumpOpen] = useState(false);
   const [lookOpen, setLookOpen] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
+  const [titleSlot, setTitleSlot] = useState<HTMLElement | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const nav = mainNav(me);
   const settings = inSettings(location.pathname);
@@ -502,7 +516,7 @@ export function AppShell({
 
   const main = (
     <main key={location.pathname} className="cg-main">
-      {children}
+      <PageTitleSlot.Provider value={titleSlot}>{children}</PageTitleSlot.Provider>
     </main>
   );
 
@@ -550,14 +564,14 @@ export function AppShell({
             ))}
           </nav>
           <div className="cg-side-foot">
-            <Link to="/settings/about" className="cg-ver" title="About this installation">
-              {me.version}
-            </Link>
             <span>
               {me.connection_configured
                 ? `Tenant: ${me.tenant_name ?? "connected"}`
                 : "No tenant connected"}
             </span>
+            <Link to="/settings/about" className="cg-ver" title="About this installation">
+              {me.version}
+            </Link>
           </div>
         </aside>
         {sideOpen && (
@@ -579,78 +593,91 @@ export function AppShell({
             >
               <Icon name="menu" />
             </button>
-            <button type="button" className="cg-jump" onClick={() => setJumpOpen(true)}>
-              <Icon name="search" size={16} />
-              <span>Jump to…</span>
-              <kbd className="cg-kbd">Ctrl K</kbd>
-            </button>
-            <span className="flex-1" />
-            <Lights me={me} />
-            <button
-              type="button"
-              className="cg-icon-btn"
-              onClick={toggle}
-              aria-label={theme === "dark" ? "Switch to light" : "Switch to dark"}
-              title={theme === "dark" ? "Switch to light" : "Switch to dark"}
-            >
-              <Icon name="theme" />
-            </button>
-            <div className="relative" ref={menuRef}>
+            <div className="cg-topbar-title">
+              <span className="cg-title cg-title-fallback" aria-hidden="true">
+                {menuTitle(me, location.pathname)}
+              </span>
+              <div className="cg-title-slot" ref={setTitleSlot} />
+            </div>
+            <div className="cg-topbar-tools">
+              <Lights me={me} />
               <button
                 type="button"
-                className="cg-who"
-                aria-haspopup="true"
-                aria-expanded={menuOpen}
-                onClick={() => setMenuOpen((open) => !open)}
+                className="cg-jump"
+                onClick={() => setJumpOpen(true)}
+                aria-label="Jump to a page (Ctrl K)"
+                title="Jump to a page or a setting (Ctrl K)"
               >
-                <span className="cg-avatar">{initials(me.username)}</span>
-                <span>
-                  <b>{me.username}</b>
-                  <small>{me.role === "admin" ? "Admin" : "Viewer"}</small>
-                </span>
+                <Icon name="search" size={16} />
+                <span>Jump to</span>
+                <kbd className="cg-kbd">Ctrl K</kbd>
               </button>
-              {menuOpen && (
-                <div className="cg-menu" role="menu">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      navigate("/account");
-                    }}
-                  >
-                    <Icon name="user" size={16} />
-                    Your account
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      setLookOpen(true);
-                    }}
-                  >
-                    <Icon name="theme" size={16} />
-                    Look…
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      navigate("/settings/about");
-                    }}
-                  >
-                    <Icon name="info" size={16} />
-                    About
-                  </button>
-                  <hr />
-                  <button type="button" role="menuitem" className="danger" onClick={onSignOut}>
-                    <Icon name="out" size={16} />
-                    Sign out
-                  </button>
-                </div>
-              )}
+              <button
+                type="button"
+                className="cg-icon-btn"
+                onClick={toggle}
+                aria-label={theme === "dark" ? "Switch to light" : "Switch to dark"}
+                title={theme === "dark" ? "Switch to light" : "Switch to dark"}
+              >
+                <Icon name="theme" />
+              </button>
+              <div className="relative" ref={menuRef}>
+                <button
+                  type="button"
+                  className="cg-who"
+                  aria-haspopup="true"
+                  aria-expanded={menuOpen}
+                  onClick={() => setMenuOpen((open) => !open)}
+                >
+                  <span className="cg-avatar">{initials(me.username)}</span>
+                  <span>
+                    <b>{me.username}</b>
+                    <small>{me.role === "admin" ? "Admin" : "Viewer"}</small>
+                  </span>
+                </button>
+                {menuOpen && (
+                  <div className="cg-menu" role="menu">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        navigate("/account");
+                      }}
+                    >
+                      <Icon name="user" size={16} />
+                      Your account
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        setLookOpen(true);
+                      }}
+                    >
+                      <Icon name="theme" size={16} />
+                      Look…
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        navigate("/settings/about");
+                      }}
+                    >
+                      <Icon name="info" size={16} />
+                      About
+                    </button>
+                    <hr />
+                    <button type="button" role="menuitem" className="danger" onClick={onSignOut}>
+                      <Icon name="out" size={16} />
+                      Sign out
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </header>
 
@@ -709,6 +736,77 @@ export function AppShell({
       <Modal open={lookOpen} title="Look" onClose={() => setLookOpen(false)} width="max-w-xl">
         <LookPicker />
       </Modal>
+      <Toasts />
+    </>
+  );
+}
+
+/* ------------------------------------------------------------ signed out */
+
+/**
+ * The frame without a session (sign in, a forced password change): the console
+ * with the brand on the left, the title in the top bar, the page's card below.
+ */
+export function AuthFrame({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description?: string;
+  children: ReactNode;
+}) {
+  const { theme, toggle } = useTheme();
+  return (
+    <>
+      <div className="cg-bg" aria-hidden="true">
+        <div className="cg-grid" />
+      </div>
+      <div className="cg-app bare">
+        <aside className="cg-side" aria-label="CxCreditGuard">
+          <div className="cg-brand">
+            <BrandMark />
+            <span>
+              <b>CxCreditGuard</b>
+              <small>Credit governance</small>
+            </span>
+          </div>
+          <p className="cg-auth-tagline">
+            Budgets, enforcement and an audit trail for Checkmarx One AI credits.
+          </p>
+        </aside>
+        <div className="cg-col">
+          <header className="cg-topbar">
+            <span className="cg-auth-topmark">
+              <BrandMark />
+            </span>
+            <div className="cg-topbar-title">
+              <h1 className="cg-title">{title}</h1>
+              {description && (
+                <p className="cg-subtitle" title={description}>
+                  {description}
+                </p>
+              )}
+            </div>
+            <div className="cg-topbar-tools">
+              <span className="cg-light off">
+                <i />
+                Signed out
+              </span>
+              <button
+                type="button"
+                className="cg-icon-btn"
+                onClick={toggle}
+                aria-label={theme === "dark" ? "Switch to light" : "Switch to dark"}
+                title={theme === "dark" ? "Switch to light" : "Switch to dark"}
+              >
+                <Icon name="theme" />
+              </button>
+            </div>
+          </header>
+          <main className="cg-auth-main">{children}</main>
+        </div>
+      </div>
       <Toasts />
     </>
   );

@@ -1116,16 +1116,19 @@ function isCounted(s: UnresolvedSubject): boolean {
 
 /* ------------------------------------------------------------- appearance */
 
-// Representative swatch colour per accent (the light-mode value). Purely for the
-// picker preview; the real tokens live in index.css under [data-accent].
-const ACCENT_SWATCH: Record<string, string> = {
-  default: "#0b6b86",
-  teal: "#0f766e",
-  violet: "#6d46c8",
-  amber: "#b45309",
-  rose: "#be123c",
-  slate: "#475569",
-};
+// The five earth accents of the Standard look, in the order the picker shows them,
+// with their light-mode colour for the swatch. The real tokens live in index.css
+// under [data-accent]. The keys are the stored values the API accepts.
+const ACCENTS: { key: string; name: string; swatch: string }[] = [
+  { key: "default", name: "Ink", swatch: "#34507a" },
+  { key: "teal", name: "Lagoon", swatch: "#1f6b68" },
+  { key: "sage", name: "Sage", swatch: "#3e6a46" },
+  { key: "violet", name: "Plum", swatch: "#6c4265" },
+  { key: "amber", name: "Ochre", swatch: "#8f5716" },
+];
+
+// Accents from before the earth colours, still accepted and shown as their nearest.
+const LEGACY_ACCENT: Record<string, string> = { rose: "violet", slate: "default" };
 
 function AppearanceCard({
   isAdmin,
@@ -1138,23 +1141,24 @@ function AppearanceCard({
   options: string[];
   onPick: (accent: string) => void;
 }) {
+  const shown = LEGACY_ACCENT[value] ?? value;
   return (
     <Card
       title="Organisation accent"
       description="The one accent colour of the Standard look, for everyone in this organisation. Command Center uses each person's phosphor colour instead."
     >
       <div className="flex flex-wrap gap-2.5">
-        {options.map((accent) => {
-          const selected = accent === value;
+        {ACCENTS.filter((accent) => options.includes(accent.key)).map((accent) => {
+          const selected = accent.key === shown;
           return (
             <button
-              key={accent}
+              key={accent.key}
               type="button"
               disabled={!isAdmin}
               aria-pressed={selected}
-              onClick={() => onPick(accent)}
-              title={accent}
-              className="flex items-center gap-2 rounded-lg border px-3 py-2 text-sm capitalize transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => onPick(accent.key)}
+              title={accent.name}
+              className="flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60"
               style={{
                 borderColor: selected ? "var(--accent)" : "var(--border)",
                 background: selected ? "var(--hover)" : "transparent",
@@ -1165,12 +1169,12 @@ function AppearanceCard({
               <span
                 className="inline-block size-4 rounded-full"
                 style={{
-                  background: ACCENT_SWATCH[accent] ?? "var(--accent)",
+                  background: accent.swatch,
                   outline: selected ? "2px solid var(--accent)" : "none",
                   outlineOffset: "1px",
                 }}
               />
-              {accent === "default" ? "standard" : accent}
+              {accent.name}
             </button>
           );
         })}

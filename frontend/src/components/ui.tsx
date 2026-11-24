@@ -1,6 +1,8 @@
 import {
   cloneElement,
+  createContext,
   isValidElement,
+  useContext,
   useEffect,
   useId,
   useRef,
@@ -72,6 +74,17 @@ export function HelpToggle({ open, onToggle }: { open: boolean; onToggle: () => 
   );
 }
 
+/**
+ * Where the app frame wants each page's title: the left of its top bar. The
+ * frame provides the element (null until it has mounted); outside the frame
+ * there is no provider, and a PageHeader renders where it stands.
+ */
+export const PageTitleSlot = createContext<HTMLElement | null | undefined>(undefined);
+
+/**
+ * The page's title and one-line description, which the frame shows left aligned
+ * in the top bar, and the page's actions, at the top right of the page itself.
+ */
 export function PageHeader({
   title,
   description,
@@ -81,14 +94,43 @@ export function PageHeader({
   description?: ReactNode;
   actions?: ReactNode;
 }) {
-  return (
-    <div className="cg-head">
-      <div className="min-w-0">
-        <h1 className="cg-title">{title}</h1>
-        {description && <p className="cg-subtitle">{description}</p>}
+  const slot = useContext(PageTitleSlot);
+  const descriptionRef = useRef<HTMLParagraphElement>(null);
+
+  // The description is cut to one line in the top bar: the whole of it stays
+  // a hover away.
+  useEffect(() => {
+    const element = descriptionRef.current;
+    if (element) element.title = element.textContent ?? "";
+  });
+
+  const heading = (
+    <>
+      <h1 className="cg-title" title={title}>
+        {title}
+      </h1>
+      {description && (
+        <p ref={descriptionRef} className="cg-subtitle">
+          {description}
+        </p>
+      )}
+    </>
+  );
+
+  if (slot === undefined) {
+    return (
+      <div className="cg-head">
+        <div className="min-w-0">{heading}</div>
+        {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
       </div>
-      {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
-    </div>
+    );
+  }
+
+  return (
+    <>
+      {slot && createPortal(heading, slot)}
+      {actions && <div className="cg-page-actions">{actions}</div>}
+    </>
   );
 }
 
@@ -325,14 +367,10 @@ export function EmptyState({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-2 px-6 py-12 text-center">
-      <p className="text-sm font-medium">{title}</p>
-      {description && (
-        <p className="max-w-md text-xs" style={{ color: "var(--text-secondary)" }}>
-          {description}
-        </p>
-      )}
-      {action && <div className="mt-2">{action}</div>}
+    <div className="cg-empty">
+      <p className="cg-empty-title">{title}</p>
+      {description && <p className="cg-empty-desc">{description}</p>}
+      {action && <div className="cg-empty-action">{action}</div>}
     </div>
   );
 }
