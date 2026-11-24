@@ -1292,3 +1292,77 @@ class TestReviewMinors:
 
 def now_text() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+class TestFollowUpReview:
+    """The follow-up security review: a malformed key is not "no key"; a release
+    whose SIGNED dependencies differ does not hide an older one that fits."""
+
+    QUIET = datetime(2026, 11, 24, 3, 10, tzinfo=UTC)
+
+    def test_app_malformed_env_key_is_not_no_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.updates import manifest
+
+        for value in ("not a pem", "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----"):
+            monkeypatch.setenv(manifest.PUBLIC_KEY_ENV, value)
+            assert manifest.configured_public_key() is manifest.UNUSABLE_KEY, value
+
+    def test_a_damaged_image_key_file_is_not_no_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.updates import manifest
+
+        image = tmp_path / "image"
+        key_file = image / "app" / "updates" / "release-signing-key.pub"
+        key_file.parent.mkdir(parents=True)
+        monkeypatch.delenv(manifest.PUBLIC_KEY_ENV, raising=False)
+        monkeypatch.setenv("CXCG_BUILTIN_DIR", str(image))
+        key_file.write_text("# the placeholder: comments only\n")
+        assert manifest.configured_public_key() is None
+        key_file.write_text("# a key pasted badly\nMCowBQYDK2VwAyEA\n")
+        assert manifest.configured_public_key() is manifest.UNUSABLE_KEY
+
+    def test_an_invalid_key_refuses_every_install_with_a_clear_status(
+        self, db: Session, tmp_path: Path, builtin_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.updates import manifest
+
+        monkeypatch.setenv(manifest.PUBLIC_KEY_ENV, "not a pem")
+        registry = FakeRegistry(releases=[Release(V_NEXT, private_key_pem=None)])
+        service = make_service(tmp_path, builtin_dir, registry, public_key="configured")
+        save_token(db)
+        assert service.key_invalid
+        for automatic, allow_unsigned in ((True, False), (False, False), (False, True)):
+            with pytest.raises(UpdateError) as refused:
+                service.install(
+                    db,
+                    V_NEXT,
+                    actor=ADMIN,
+                    automatic=automatic,
+                    allow_unsigned=allow_unsigned,
+                    background=False,
+                )
+            assert refused.value.code == "invalid_signing_key"
+            assert "configured release key is invalid" in str(refused.value)
+        result = service.auto_tick(self.QUIET)
+        assert result.startswith("The configured release key is invalid"), result
+        assert service.store.selection() is None
+        status = service.status(db)
+        assert status["signing"]["invalid"] is True and status["signing"]["auto_waits"]
+        assert "configured release key is invalid" in status["signing"]["message"]
+        assert "release key invalid" in status["notice"]["label"]
+
+    def test_a_signed_needs_image_release_does_not_hide_an_older_one_that_fits(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        registry = FakeRegistry(
+            releases=[Release(V_NEXT), Release(V_LATER, deps="deps-2", label_deps="deps-1")]
+        )
+        service = make_service(tmp_path, builtin_dir, registry)
+        save_token(db)
+        first = service.auto_tick(self.QUIET)  # tries V_LATER, learns its signed hash differs
+        assert "different image" in first, first
+        service.job = None
+        second = service.auto_tick(self.QUIET)
+        # README: "the newest one that fits this image is installed".
+        assert second == f"Installing {V_NEXT}.", (first, second)

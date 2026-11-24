@@ -1385,16 +1385,38 @@ Installing a release:
    the new version and asks the launcher to switch, a second and a half later
    so the page gets its answer first. The page reconnects in a few seconds;
    migrations run as the new version starts, as on any start;
-4. the launcher checks the installed files again before every start: exactly
-   the listed files, each matching, and, when the image has a signing key, the
-   signature against **the image's** key. Any difference (an extra file
-   included) and the version is not run: the image's own runs and the version is
-   marked *failed to start*. A version runs as
-   `python -I -B launcher.py serve --app-dir <version>`: an isolated interpreter
-   (no `PYTHONPATH`, no current or script folder on `sys.path`, no bytecode
-   written) in which the version's folder is *appended* to `sys.path`, after the
-   standard library and the image's packages, and serves the `app` package
-   only. Nothing in the data volume runs at interpreter start;
+4. the launcher checks the installed files again before **every** start - the
+   first, a switch, a restart after a crash, a rollback: exactly the listed
+   files, each matching; when the image has a signing key, the signature (over
+   the very manifest bytes whose file list, version and dependency hash it then
+   uses) against **the image's** key; a manifest, and an `app/__init__.py`, for
+   the version that was selected (an older signed release copied under a newer
+   name is refused); and this image's dependency hash. Any difference (an extra
+   file included) and the version is not run: the image's own runs and the
+   version is marked *failed to start*. The checked files are then **copied** to
+   a private folder outside the data volume (`/tmp/cxcreditguard-run`, mode
+   0700), each hashed again as it is copied, and made read-only (files 0400,
+   folders 0500); the version runs from that copy. A file written to the data
+   volume after the check, a module the app imports late included, is therefore
+   never run, and a file changed between the check and the copy refuses the
+   version. It runs as
+   `python -I -B -X pycache_prefix=/dev/null/... launcher.py serve --app-dir <copy>`:
+   an isolated interpreter (no `PYTHONPATH`, no current or script folder on
+   `sys.path`) that writes **and reads** no bytecode (the cache prefix cannot
+   exist, so a planted `__pycache__/*.pyc`, unchecked-hash ones included, is
+   never loaded), in which the version's folder is *appended* to `sys.path`,
+   after the standard library and the image's packages, and serves only the
+   `app` and `scripts` packages. Nothing is imported from the data volume
+   (`/app/data`, which sits inside the image's `/app`, is not importable), and
+   nothing in it runs at interpreter start. Migrations run in the same process
+   and leave `sys.path` alone. *What this does not cover:* the launcher and the
+   app run as the same user (uid 10001; the image never runs as root), so code
+   that already runs as the app - the app itself, compromised - could change its
+   own copy or the data volume; the read-only modes stop a bug that can only
+   write files, not code that can change modes. If the container's temporary
+   folder cannot be used (a read-only root file system without a writable
+   `/tmp`), the version runs from the data volume after the same check, and the
+   launcher logs it;
 5. the new version is **on trial** until `/healthz` answers with its version. If
    it exits first, or does not answer within 180 seconds
    (`CXCG_UPDATE_START_TIMEOUT`), the launcher stops it, puts the pre-update
@@ -1425,9 +1447,21 @@ version, so a release cannot bring its own key.
   release signing key* and admins get one notification. An admin can still
   install a release by hand after a warning that it cannot be verified and an
   explicit confirmation (`allow_unsigned`), which is audited
-  (`update.unsigned_install_confirmed`).
+  (`update.unsigned_install_confirmed`). **Until the image has a key, nothing
+  proves where a release came from:** the launcher's check before each start
+  then only proves that the installed files match the manifest stored next to
+  them, in the same writable folder - it catches damage and stray files, not a
+  deliberate replacement of both. Auto-update stays off until a key is in the
+  image.
 - **Image with a key:** automatic and manual installs both require a signature
   that verifies; an unsigned release is always refused.
+- **A key that is set but unusable** (`CXCG_UPDATE_PUBLIC_KEY` that is not an
+  ed25519 public key in PEM form, or a key file with anything but comments and
+  such a key) is never read as "no key", and never falls back to the image's
+  file: every install, manual ones included, is refused, the Updates page and
+  the top bar say *The configured release key is invalid*, and the launcher runs
+  only the image's own version (installed versions are not marked failed: they
+  run again once the key is fixed).
 
 **Automatic updates.** The registry is checked every 6 hours (and a minute after
 start); *Check now* is limited to once per 30 seconds. A newer release installs
@@ -1460,11 +1494,18 @@ failed to start (`failed.json`).
 
 **When the image itself must be replaced.** Each image carries a *dependency
 hash* (`io.cxcreditguard.deps`, also inside the signed file list): the base
-image **by digest** (`python:3.11-alpine@sha256:…`, resolved by the release
-workflow), the OS packages installed on it (`apk info -v`), the pinned Python
-packages, the launcher and the entrypoint. A release with a different signed
-hash cannot run as a layer on this image; the page says *needs a new image*,
-notifies admins once and shows the command:
+image **by digest** (`python:3.11-alpine@sha256:…`), the OS packages installed on
+it (`apk info -v`), the pinned Python packages, the launcher and the entrypoint.
+A release with a different signed hash cannot run as a layer on this image; the
+page says *needs a new image*, notifies admins once and shows the command. So
+the small in-place update applies to releases that change only the app and are
+built on the **same base**: the release workflow reuses the latest release's base
+digest unless the tag's message has a line `base: refresh`, which builds on the
+base tag's current digest (OS, Python, OpenSSL fixes) and makes that release a
+full image replacement. Even on the same base, a new revision of an OS package
+installed on it (libpq) changes the hash: such a release is a replacement too.
+When the newest release needs a new image, auto-update installs the newest one
+that does fit, if any, whether the label or the signed file list said so.
 
 ```sh
 podman login ghcr.io   # a GitHub user and the read:packages token
@@ -1521,13 +1562,17 @@ their own, and rolls such a release back only by restoring that backup.
    wheels (`.github/release-requirements.txt`) before the key is in any step's
    environment, **fails** if the public key is still the placeholder or the
    secret is missing, stamps the version into `backend/app/__init__.py` (the one
-   place it lives), resolves the base image's digest, builds the release
+   place it lives), chooses the base image's digest, builds the release
    manifest from `deploy/podman/Dockerfile`, signs it and verifies the signature
    against the committed public key, builds the image, checks that the image's
    `/app/release-manifest.json` and `.sig` are byte for byte the signed ones,
    that `/app` is not writable by the app's user and that the image comes up as
    that version, and pushes `:1.2.3` and `:latest` with the job's `GITHUB_TOKEN`
-   (`packages: write`). The release notes shown in the app are the `## 1.2.3`
+   (`packages: write`). The base image is the latest release's, unless the tag's
+   message has a line `base: refresh` (then the base tag's current digest; see
+   *When the image itself must be replaced*): refresh it at least every 90 days
+   and whenever a base-image advisory applies. The release notes shown in the
+   app are the `## 1.2.3`
    section of a `CHANGELOG.md`, if there is one, else the tag's message. New
    packages are private by default; check the package's visibility after the
    first release, and keep it private.

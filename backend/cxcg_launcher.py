@@ -9,19 +9,29 @@ outside the app layer, and uses the Python standard library only.
 
 What it does:
 
-* **Select.** At start (and on every switch) it runs the version chosen in
-  ``<data>/updates/selection.json`` from ``<data>/versions/<version>/`` when that
-  version is installed, intact (exactly the files its release manifest lists,
-  each matching: any other file, bytecode included, refuses it), signed with the
-  image's release signing key when the image has one, and built for this
-  image's dependencies (same deps hash). Otherwise it runs the image's own copy
-  in ``/app`` ("built-in"), and the refused version is never auto-installed again.
-* **Isolated interpreter.** The app runs as ``python -I -B -u launcher.py serve``:
-  no PYTHONPATH, no current or script folder on ``sys.path``, no bytecode
-  written. The selected version's folder is APPENDED to ``sys.path`` and only
-  serves the ``app`` package: the standard library and the image's packages
-  always come first, and nothing in the data volume runs at interpreter start
-  (no ``.pth`` file, no ``sitecustomize``).
+* **Select.** Before EVERY start (first start, switch, restart after a crash,
+  rollback) it runs the version chosen in ``<data>/updates/selection.json`` from
+  ``<data>/versions/<version>/`` when that version is installed, intact (exactly
+  the files its release manifest lists, each matching: any other file, bytecode
+  included, refuses it), signed with the image's release signing key when the
+  image has one, a manifest for that very version, and built for this image's
+  dependencies (same deps hash). Otherwise it runs the image's own copy in
+  ``/app`` ("built-in"), and the refused version is never auto-installed again.
+  A release key that is configured but unusable runs the image's own only.
+* **A verified copy runs, not the data volume.** The verified files are copied
+  (each hashed again as it is copied) to a private folder outside the data
+  volume (``$TMPDIR/cxcreditguard-run``), made read-only, and the app runs from
+  that copy: a file written to the data volume after the check is never
+  imported, however late the app imports a module.
+* **Isolated interpreter.** The app runs as
+  ``python -I -B -X pycache_prefix=<nowhere> -u launcher.py serve``: no
+  PYTHONPATH, no current or script folder on ``sys.path``, no bytecode written
+  and none read (the cache prefix is a path that cannot exist, so a planted
+  ``__pycache__`` file is never loaded). The selected version's folder is
+  APPENDED to ``sys.path`` and only serves the ``app`` and ``scripts`` packages:
+  the standard library and the image's packages always come first, nothing in
+  the data volume runs at interpreter start (no ``.pth`` file, no
+  ``sitecustomize``), and nothing is ever imported from the data volume.
 * **Trial and automatic rollback.** A version just switched to is on trial until
   ``/healthz`` answers with its version. If it exits first, or does not answer
   within ``CXCG_UPDATE_START_TIMEOUT`` seconds (180), the launcher stops it,
@@ -63,15 +73,18 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
 import urllib.request
 import uuid
+from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -98,6 +111,20 @@ CRASH_WINDOW = 600.0
 # A request's not_before further ahead than this is not believed (clock change).
 MAX_REQUEST_DELAY = 30.0
 _STARTUP_HOOKS = frozenset({"sitecustomize", "usercustomize"})
+# A configured release key that cannot be used. Nothing verifies against it, so
+# only the image's own version runs (never "no key, so unsigned is fine").
+INVALID_KEY = "invalid"
+# Where the app's interpreter looks for bytecode: a path below a file, which can
+# never exist, so no ``__pycache__`` (or planted ``.pyc``) is ever read.
+NO_BYTECODE_PREFIX = "/dev/null/cxcreditguard-no-bytecode"
+# The app's interpreter: isolated (-I), writes no bytecode (-B) and reads none
+# (pycache_prefix), unbuffered logs (-u).
+INTERPRETER_FLAGS = ("-I", "-B", "-X", f"pycache_prefix={NO_BYTECODE_PREFIX}", "-u")
+# The packages an app folder serves; any other module found there is refused.
+APP_PACKAGES = frozenset({"app", "scripts"})
+# Request ids acted on (kept in launcher.json): a request that cannot be removed
+# is acted on once, not at every tick.
+HANDLED_REQUESTS_KEEP = 50
 
 
 def say(message: str) -> None:
@@ -307,8 +334,24 @@ class ImageInfo:
     builtin_version: str
     deps_hash: str
     # The image's release signing key (PEM), or None: installed versions must be
-    # signed with it. Never read from the data volume.
+    # signed with it. Never read from the data volume. INVALID_KEY: a key is
+    # configured but cannot be used, so no installed version runs.
     public_key_pem: str | None = None
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """A release manifest as read ONCE: the signature is checked over ``raw``, and
+    the file list, version and deps hash are parsed from the same bytes."""
+
+    raw: bytes
+    signature: bytes | None
+    data: dict[str, Any]
+
+    @property
+    def files(self) -> dict[str, str]:
+        listed = self.data.get("files")
+        return listed if isinstance(listed, dict) else {}
 
 
 @dataclass(frozen=True)
@@ -322,6 +365,10 @@ class Target:
     # The selected version is installed but must not run (changed files, unsigned,
     # other dependencies): it is marked failed so it is never installed again.
     refused: bool = False
+    # The verified manifest of an installed version (what is copied to run).
+    manifest: Manifest | None = field(default=None, compare=False, repr=False)
+    # Where the code actually runs from: the verified, read-only copy (None: ``dir``).
+    run_dir: Path | None = None
 
 
 def sha256_file(path: Path) -> str:
@@ -373,16 +420,54 @@ def load_public_key_text(text: str | None) -> str | None:
     return pem + "\n" if "BEGIN PUBLIC KEY" in pem else None
 
 
-def signature_problem(root: Path, public_key_pem: str | None) -> str | None:
-    """Why ``root``'s manifest is not signed with the image's key (None: it is, or no key)."""
-    if public_key_pem is None:
+def usable_public_key(pem: str) -> bool:
+    """Whether ``pem`` is an ed25519 public key (True when it cannot be checked here)."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    except ImportError:
+        return True
+    try:
+        return isinstance(load_pem_public_key(pem.encode("ascii")), Ed25519PublicKey)
+    except (ValueError, TypeError, UnicodeEncodeError):
+        return False
+
+
+def read_manifest(root: Path) -> Manifest | None:
+    """The manifest's bytes and signature, read once, or None without a readable one."""
+    try:
+        raw = (root / MANIFEST_FILE).read_bytes()
+    except OSError:
         return None
     try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
+        return None
+    if not all(isinstance(k, str) and isinstance(v, str) for k, v in data["files"].items()):
+        return None
+    try:
+        signature: bytes | None = (root / SIGNATURE_FILE).read_bytes()
+    except OSError:
+        signature = None
+    return Manifest(raw, signature, data)
+
+
+def signature_problem(manifest: Manifest, public_key_pem: str | None) -> str | None:
+    """Why the manifest's bytes are not signed with the image's key (None: they are, or
+    the image has no key)."""
+    if public_key_pem is None:
+        return None
+    if public_key_pem == INVALID_KEY:
+        return "the configured release signing key is invalid"
+    try:
         signature = base64.b64decode(
-            (root / SIGNATURE_FILE).read_text(encoding="ascii").strip(), validate=True
+            (manifest.signature or b"").decode("ascii").strip(), validate=True
         )
-        data = (root / MANIFEST_FILE).read_bytes()
-    except (OSError, UnicodeDecodeError, binascii.Error, ValueError):
+    except (UnicodeDecodeError, binascii.Error, ValueError):
+        signature = b""
+    if not signature:
         return "it is not signed, and this image only runs signed releases"
     try:
         from cryptography.exceptions import InvalidSignature
@@ -394,7 +479,7 @@ def signature_problem(root: Path, public_key_pem: str | None) -> str | None:
         key = load_pem_public_key(public_key_pem.encode("ascii"))
         if not isinstance(key, Ed25519PublicKey):
             return "the image's release signing key is not an ed25519 key"
-        key.verify(signature, data)
+        key.verify(signature, manifest.raw)
     except InvalidSignature:
         return "its signature does not match the image's release signing key"
     except (ValueError, TypeError):
@@ -402,16 +487,17 @@ def signature_problem(root: Path, public_key_pem: str | None) -> str | None:
     return None
 
 
-def tree_problems(root: Path, public_key_pem: str | None = None) -> list[str]:
-    """Why the files under ``root`` are not exactly the ones its (signed) manifest lists."""
-    manifest = read_json(root / MANIFEST_FILE)
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
-        return ["no readable release manifest"]
+def check_tree(root: Path, public_key_pem: str | None = None) -> tuple[list[str], Manifest | None]:
+    """Why the files under ``root`` are not exactly the ones its (signed) manifest lists,
+    and that manifest (read once: what was verified is what is used)."""
+    manifest = read_manifest(root)
+    if manifest is None:
+        return ["no readable release manifest"], None
     problems: list[str] = []
-    signed = signature_problem(root, public_key_pem)
+    signed = signature_problem(manifest, public_key_pem)
     if signed:
         problems.append(signed)
-    listed: dict[str, str] = manifest["files"]
+    listed = manifest.files
     for rel, expected in listed.items():
         why = forbidden(rel) if rel not in UNCOVERED else "a file the store writes"
         if why:
@@ -426,7 +512,12 @@ def tree_problems(root: Path, public_key_pem: str | None = None) -> list[str]:
         if rel not in listed:
             why = forbidden(rel)
             problems.append(f"unexpected {rel}" + (f" ({why})" if why else ""))
-    return problems
+    return problems, manifest
+
+
+def tree_problems(root: Path, public_key_pem: str | None = None) -> list[str]:
+    """Why the files under ``root`` are not exactly the ones its (signed) manifest lists."""
+    return check_tree(root, public_key_pem)[0]
 
 
 def installed_info(paths: Paths, version: str) -> dict[str, Any] | None:
@@ -467,6 +558,12 @@ def choose_target(paths: Paths, image: ImageInfo, *, verify: bool = True) -> Tar
     def refuse(reason: str) -> Target:
         return Target(builtin.version, builtin.dir, BUILT_IN, reason, False, chosen, True)
 
+    if image.public_key_pem == INVALID_KEY:
+        # Not the version's fault: it is not marked failed, and runs once the key is fixed.
+        return fallback(
+            f"the configured release signing key is invalid ({PUBLIC_KEY_ENV} or the image's "
+            f"key file), so nothing can be verified and the image's own runs instead of {chosen}"
+        )
     info = installed_info(paths, chosen)
     if info is None:
         return fallback(f"{chosen} is not installed (or incomplete), so the image's own runs")
@@ -484,20 +581,118 @@ def choose_target(paths: Paths, image: ImageInfo, *, verify: bool = True) -> Tar
             "so the image's own runs"
         )
     root = paths.versions / chosen
+    manifest: Manifest | None = None
     if verify:
-        problems = tree_problems(root, image.public_key_pem)
-        if problems:
+        problems, manifest = check_tree(root, image.public_key_pem)
+        if problems or manifest is None:
+            shown = problems[0] if problems else "no readable release manifest"
             return refuse(
-                f"{chosen}'s files are not exactly its signed release ({problems[0]}), "
+                f"{chosen}'s files are not exactly its signed release ({shown}), "
                 "so the image's own runs"
             )
-        manifest = read_json(root / MANIFEST_FILE, {}) or {}
-        if image.deps_hash and manifest.get("deps_hash") != image.deps_hash:
+        signed_version = str(manifest.data.get("version") or "")
+        if signed_version != chosen:
+            return refuse(
+                f"{chosen}'s signed manifest is for {signed_version or 'no version'}, "
+                "so the image's own runs"
+            )
+        code_version = version_of_tree(root)
+        if code_version != chosen:
+            return refuse(
+                f"{chosen}'s code says it is {code_version or 'no version'}, "
+                "so the image's own runs"
+            )
+        if image.deps_hash and manifest.data.get("deps_hash") != image.deps_hash:
             return refuse(
                 f"{chosen}'s signed manifest names different dependencies than this image, "
                 "so the image's own runs"
             )
-    return Target(chosen, root, "installed", "selected on the Updates page", trial, chosen)
+    return Target(
+        chosen, root, "installed", "selected on the Updates page", trial, chosen, manifest=manifest
+    )
+
+
+# ------------------------------------------------------------- the verified copy
+
+
+class TreeChanged(Exception):
+    """An installed version's files changed between its check and its copy."""
+
+
+def _read_regular(path: Path) -> int:
+    """A read-only descriptor of a regular file, never following a final link and never
+    blocking on a FIFO or device."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise TreeChanged(f"{path.name} is not a regular file")
+    return fd
+
+
+def lock_tree(root: Path) -> None:
+    """Read-only for the owner (the app's user) and closed to anyone else: files
+    0400, folders 0500. The app cannot write to its own code without first
+    changing these modes."""
+    for dirpath, _dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames:
+            os.chmod(Path(dirpath) / name, 0o400)
+        os.chmod(dirpath, 0o500)
+
+
+def remove_tree(path: Path) -> None:
+    """Remove a (possibly read-only) folder of ours, or a file or link."""
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+        return
+    for dirpath, _dirnames, _filenames in os.walk(path):
+        os.chmod(dirpath, 0o700)
+    shutil.rmtree(path)
+
+
+def private_folder(path: Path) -> Path:
+    """``path`` as a folder only this user can use; refused when it is a link or not ours."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise OSError(f"{path} is not a folder of this user")
+    os.chmod(path, 0o700)
+    return path
+
+
+def copy_verified(src: Path, manifest: Manifest, parent: Path) -> Path:
+    """Copy exactly the files ``manifest`` lists from ``src`` into a new folder under
+    ``parent``, hashing each AS IT IS COPIED: the copy is the signed release whatever
+    happened to ``src`` since it was checked. The copy is made read-only."""
+    version = str(manifest.data.get("version") or "version")
+    dest = Path(tempfile.mkdtemp(prefix=f"{version}-", dir=parent))
+    try:
+        for rel, expected in sorted(manifest.files.items()):
+            why = forbidden(rel) if rel not in UNCOVERED else "a file the store writes"
+            if why:
+                raise TreeChanged(f"{why}: {rel!r}")
+            out = dest / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.sha256()
+            try:
+                fd = _read_regular(src / rel)
+            except OSError as exc:
+                raise TreeChanged(f"cannot read {rel} ({exc.strerror or exc})") from exc
+            with os.fdopen(fd, "rb") as source, out.open("xb") as target:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    target.write(chunk)
+            if digest.hexdigest() != expected:
+                raise TreeChanged(f"changed {rel}")
+        (dest / MANIFEST_FILE).write_bytes(manifest.raw)
+        if manifest.signature is not None:
+            (dest / SIGNATURE_FILE).write_bytes(manifest.signature)
+        lock_tree(dest)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            remove_tree(dest)
+        raise
+    return dest
 
 
 # ------------------------------------------------------------------- database
@@ -698,6 +893,9 @@ class Launcher:
     sleep: Callable[[float], None] = time.sleep
     wall: Callable[[], float] = time.time
     verify: bool = True
+    # Where verified copies of installed versions run from (outside the data
+    # volume); None runs them in place (tests, or no usable temporary folder).
+    run_root: Path | None = None
 
     child: Any = None
     current: Target | None = None
@@ -709,10 +907,16 @@ class Launcher:
     crashes: list[float] = field(default_factory=list)
     crash_version: str = ""
     restart_at: float | None = None
+    handled: deque[str] = field(default_factory=lambda: deque(maxlen=HANDLED_REQUESTS_KEEP))
 
     def __post_init__(self) -> None:
         if self.probe is http_probe:
             self.probe = functools.partial(http_probe, host=probe_host(self.host))
+        # Requests already acted on, from before a restart of the launcher (best effort).
+        state = read_json(self.paths.state, {})
+        known = state.get("handled_requests") if isinstance(state, dict) else None
+        if isinstance(known, list):
+            self.handled.extend(str(item) for item in known[-HANDLED_REQUESTS_KEEP:])
 
     @property
     def db_path(self) -> Path | None:
@@ -722,17 +926,16 @@ class Launcher:
 
     def command(self, target: Target) -> list[str]:
         # -I: no PYTHONPATH, no user site, neither the current nor the script's folder
-        # on sys.path; -B: no bytecode written; -u: logs as they happen. ``serve``
-        # appends the version's folder to sys.path and runs uvicorn in-process.
+        # on sys.path; -B: no bytecode written; pycache_prefix: none read either;
+        # -u: logs as they happen. ``serve`` appends the version's folder (its
+        # verified copy) to sys.path and runs uvicorn in-process.
         return [
             sys.executable,
-            "-I",
-            "-B",
-            "-u",
+            *INTERPRETER_FLAGS,
             str(Path(__file__).resolve()),
             "serve",
             "--app-dir",
-            str(target.dir),
+            str(target.run_dir or target.dir),
             "--host",
             self.host,
             "--port",
@@ -755,6 +958,7 @@ class Launcher:
                 "CXCG_DATA_DIR": str(self.paths.data),
                 # For any Python the app starts: no bytecode, no unsafe sys.path entry.
                 "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPYCACHEPREFIX": NO_BYTECODE_PREFIX,
                 "PYTHONSAFEPATH": "1",
                 "PYTHONNOUSERSITE": "1",
             }
@@ -762,6 +966,9 @@ class Launcher:
         return env
 
     def start(self, target: Target) -> None:
+        """Start ``target``: the image's own, or an installed version that ``choose()``
+        has just verified (every start goes through it: never an earlier check)."""
+        target = self.prepare(target)
         self.current = target
         self.healthy = False
         self.restart_at = None
@@ -778,6 +985,55 @@ class Launcher:
             self.crashes = []
             self.crash_version = target.version
         self.write_state()
+
+    def prepare(self, target: Target) -> Target:
+        """Run an installed version from a verified, read-only copy outside the data volume.
+
+        The copy hashes every file again as it copies it, so a file changed or added
+        in the data volume after the check never runs, however late it is imported.
+        """
+        if self.run_root is None:
+            return target
+        try:
+            parent = private_folder(self.run_root)
+            for old in parent.iterdir():  # no app runs now: earlier copies go
+                remove_tree(old)
+        except OSError as exc:
+            say(f"cannot use {self.run_root} ({exc}); verified versions run from the data volume")
+            return target
+        if target.source != "installed" or target.manifest is None:
+            return target
+        try:
+            copy = copy_verified(target.dir, target.manifest, parent)
+        except TreeChanged as exc:
+            reason = (
+                f"{target.version}'s files changed after they were checked ({exc}), "
+                "so the image's own runs"
+            )
+            say(reason)
+            mark_failed(self.paths, target.version, reason)
+            record_event(
+                self.paths,
+                {
+                    "type": "selection_ignored",
+                    "version": target.version,
+                    "reason": reason,
+                    "refused": True,
+                },
+            )
+            return Target(
+                self.image.builtin_version,
+                self.image.builtin_dir,
+                BUILT_IN,
+                reason,
+                False,
+                target.selected,
+                True,
+            )
+        except OSError as exc:
+            say(f"could not copy {target.version} ({exc}); it runs from the data volume")
+            return target
+        return replace(target, run_dir=copy)
 
     def write_state(self) -> None:
         if self.current is None:
@@ -796,6 +1052,8 @@ class Launcher:
                     "healthy": self.healthy,
                     "builtin_version": self.image.builtin_version,
                     "deps_hash": self.image.deps_hash,
+                    "run_dir": str(self.current.run_dir) if self.current.run_dir else None,
+                    "handled_requests": list(self.handled),
                     "at": now_iso(),
                 },
             )
@@ -918,11 +1176,8 @@ class Launcher:
             )
             selection["trial"] = False
             try_write_json(self.paths.selection, selection)
-            self.start(
-                Target(
-                    failed.version, failed.dir, failed.source, failed.reason, False, failed.selected
-                )
-            )
+            # Checked again, as before every start; no trial (nothing to go back to).
+            self.start(replace(self.choose(), trial=False))
             return
         say(
             f"{failed.version} failed ({why}); going back to {plan.to}"
@@ -1014,9 +1269,24 @@ class Launcher:
         selection["restore"] = None
         try_write_json(self.paths.selection, selection)
 
+    @staticmethod
+    def request_key(request: object) -> str:
+        """A request's id (the app gives each one), else a digest of its content."""
+        if isinstance(request, dict) and isinstance(request.get("id"), str) and request["id"]:
+            return "id:" + request["id"][:64]
+        encoded = json.dumps(request, sort_keys=True, default=str).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
     def take_request(self) -> dict[str, Any] | None:
         request = read_json(self.paths.request)
         if request is None and not self.nudged:
+            return None
+        key = self.request_key(request) if request is not None else ""
+        if key and key in self.handled:
+            # Acted on already; it could not be removed then. Never acted on again.
+            self.nudged = False
+            with contextlib.suppress(OSError):
+                self.paths.request.unlink()
             return None
         if isinstance(request, dict):
             try:
@@ -1027,6 +1297,8 @@ class Launcher:
                 # The app's answer to the browser goes out first; polled again soon.
                 return None
         self.nudged = False
+        if key:
+            self.handled.append(key)  # remembered (and saved with the state) before acting
         try:
             self.paths.request.unlink()
         except FileNotFoundError:
@@ -1059,8 +1331,9 @@ class Launcher:
             return
         if self.child is None:
             if self.restart_at is not None and self.clock() >= self.restart_at:
-                assert self.current is not None
-                self.start(self.current)
+                # Chosen and verified again: a crash (or a crash someone caused) never
+                # restarts files that were only checked before the previous start.
+                self.start(self.choose())
             return
         code = self.child.poll()
         target = self.current
@@ -1111,6 +1384,7 @@ class Launcher:
         stale = read_json(self.paths.request)
         if stale is not None:
             # Asked of the previous container: this start already applies it.
+            self.handled.append(self.request_key(stale))
             with contextlib.suppress(OSError):
                 self.paths.request.unlink()
         try:
@@ -1129,14 +1403,32 @@ class Launcher:
 
 def image_public_key(builtin_dir: Path) -> str | None:
     """The release signing key of the image: CXCG_UPDATE_PUBLIC_KEY, else the image's
-    own ``/app/app/updates/release-signing-key.pub``. Never the data volume's."""
+    own ``/app/app/updates/release-signing-key.pub``. Never the data volume's.
+
+    None only when no key is configured at all (the image's placeholder file). A
+    key that is set but unusable (a malformed variable, a damaged key file) is
+    INVALID_KEY: it never falls back to another key, or to "no key".
+    """
     from_env = os.environ.get(PUBLIC_KEY_ENV, "").strip()
     if from_env:
-        return load_public_key_text(from_env)
-    try:
-        return load_public_key_text((builtin_dir / PUBLIC_KEY_REL).read_text(encoding="utf-8"))
-    except OSError:
-        return None
+        pem = load_public_key_text(from_env)
+    else:
+        try:
+            text = (builtin_dir / PUBLIC_KEY_REL).read_text(encoding="utf-8")
+        except OSError:
+            return None
+        pem = load_public_key_text(text)
+        if pem is None:
+            # Comments only (the placeholder) is "no key"; anything else is a broken key.
+            meaningful = [
+                line
+                for line in text.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            return INVALID_KEY if meaningful else None
+    if pem is None or not usable_public_key(pem):
+        return INVALID_KEY
+    return pem
 
 
 def image_info_from_environment() -> ImageInfo:
@@ -1150,23 +1442,91 @@ def image_info_from_environment() -> ImageInfo:
     )
 
 
+def _within(path: str, folder: str) -> bool:
+    return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
+
+
+class ImportGuard:
+    """A path finder (in front of the standard one) that never imports from the data
+    volume, and imports only ``APP_PACKAGES`` from the app folder.
+
+    The app folder is appended to ``sys.path`` (after the standard library and the
+    image's packages), so a module missing from those - an optional import - would
+    be looked for there: a planted top-level module never runs, and neither does
+    anything else under the data volume (``/app/data`` is inside the image's own
+    folder, for instance).
+    """
+
+    def __init__(self, app_dir: Path, data_dir: Path | None) -> None:
+        self.app_dir = os.path.realpath(app_dir)
+        self.data_dir = os.path.realpath(data_dir) if data_dir else None
+
+    def refused(self, fullname: str, location: str) -> bool:
+        place = os.path.realpath(location)
+        if _within(place, self.app_dir):
+            return fullname.partition(".")[0] not in APP_PACKAGES
+        return self.data_dir is not None and _within(place, self.data_dir)
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        from importlib.machinery import PathFinder
+
+        spec = PathFinder.find_spec(fullname, path, target)
+        if spec is None:
+            return None
+        if spec.origin and spec.has_location:
+            refused = self.refused(fullname, spec.origin)
+        else:  # a namespace package: refused only when every part of it would be
+            places = list(spec.submodule_search_locations or [])
+            refused = bool(places) and all(self.refused(fullname, p) for p in places)
+        if refused:
+            raise ModuleNotFoundError(
+                f"{fullname} is not imported from {spec.origin or 'the data volume'}",
+                name=fullname,
+            )
+        return spec
+
+    def invalidate_caches(self) -> None:
+        pass
+
+
+def install_import_guard(app_dir: Path, data_dir: Path | None) -> ImportGuard:
+    from importlib.machinery import PathFinder
+
+    guard = ImportGuard(app_dir, data_dir)
+    at = sys.meta_path.index(PathFinder) if PathFinder in sys.meta_path else len(sys.meta_path)
+    sys.meta_path.insert(at, guard)
+    return guard
+
+
 def serve(app_dir: Path, host: str, port: int, *, dry_run: bool = False) -> int:
     """Run the app from ``app_dir`` in this (isolated, ``-I -B``) interpreter.
 
     The folder is appended to ``sys.path``, after the standard library and the
     image's packages, and must be where ``app`` is imported from: a module of
-    the same name as anything else can never shadow it.
+    the same name as anything else can never shadow it. Nothing is imported from
+    the data volume (``CXCG_DATA_DIR``) other than from ``app_dir`` itself.
     """
     root = app_dir.resolve()
     sys.path[:] = [p for p in sys.path if p not in ("", ".")]
     sys.path.append(str(root))
+    data = os.environ.get("CXCG_DATA_DIR", "").strip()
+    install_import_guard(root, Path(data) if data else None)
     spec = importlib.util.find_spec("app")
     origin = Path(spec.origin).resolve() if spec is not None and spec.origin else None
     if origin != root / "app" / "__init__.py":
         say(f"refusing to start: the app package resolves to {origin}, not {root}")
         return 3
     if dry_run:
-        print(json.dumps({"sys_path": sys.path, "app": str(origin)}))
+        print(
+            json.dumps(
+                {
+                    "sys_path": sys.path,
+                    "app": str(origin),
+                    "pycache_prefix": sys.pycache_prefix,
+                    "dont_write_bytecode": sys.dont_write_bytecode,
+                }
+            )
+        )
         return 0
     import uvicorn  # the image's own, from site-packages
 
@@ -1238,6 +1598,12 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(OSError):
             if folder.is_dir() and not folder.is_symlink():
                 folder.chmod(0o700)
+    # Verified copies run from here: the container's own temporary folder, never the
+    # data volume (in place, as a last resort, when it is not usable).
+    run_root: Path | None = Path(tempfile.gettempdir()).resolve() / "cxcreditguard-run"
+    with contextlib.suppress(OSError):
+        if _within(str(run_root), os.path.realpath(paths.data)):
+            run_root = None
     launcher = Launcher(
         paths=paths,
         image=image_info_from_environment(),
@@ -1245,11 +1611,17 @@ def main(argv: list[str] | None = None) -> int:
         host=os.environ.get("CXCG_HOST") or "0.0.0.0",  # noqa: S104
         start_timeout=float(os.environ.get("CXCG_UPDATE_START_TIMEOUT") or 180),
         database_url=os.environ.get("CXCG_DATABASE_URL") or DEFAULT_DATABASE_URL,
+        run_root=run_root,
     )
     say(
         f"image {launcher.image.builtin_version}, "
         f"deps {launcher.image.deps_hash[:12] or 'unknown'}, data {launcher.paths.data}"
     )
+    if launcher.image.public_key_pem == INVALID_KEY:
+        say(
+            f"the configured release signing key ({PUBLIC_KEY_ENV} or the image's key file) "
+            "is invalid: only the image's own version runs"
+        )
     return launcher.run()
 
 

@@ -133,12 +133,19 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
           </span>
         </div>
       )}
-      {data.signing.auto_waits && supervised && (
-        <div className="cg-banner" role="status">
-          <span>
-            <b>Auto-update waits for the release signing key.</b> {data.signing.message}
-          </span>
+      {data.signing.invalid ? (
+        <div className="cg-banner" role="alert">
+          <span>{data.signing.message}</span>
         </div>
+      ) : (
+        data.signing.auto_waits &&
+        supervised && (
+          <div className="cg-banner" role="status">
+            <span>
+              <b>Auto-update waits for the release signing key.</b> {data.signing.message}
+            </span>
+          </div>
+        )
       )}
       {data.image_age.stale && (
         <div className="cg-banner" role="status">
@@ -301,6 +308,8 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
               data.settings.auto_enabled
                 ? needsToken
                   ? "On, waiting for a registry token."
+                  : data.signing.invalid
+                    ? "On, but the configured release key is invalid: nothing is installed until it is fixed."
                   : unverifiable
                     ? "On, but waiting for the release signing key: nothing is installed automatically until the image has one."
                   : `On: newer releases install at ${hourLabel(data.settings.quiet_hour)} ${data.settings.timezone}.`

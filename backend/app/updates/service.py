@@ -56,7 +56,12 @@ from app.services import notifications, settings_store
 from app.services.audit import AuditActor, record_audit
 from app.updates import BUILT_IN, compare_versions, is_release_tag, parse_version
 from app.updates.backup import backup_database, current_revision
-from app.updates.manifest import ReleaseRejected, configured_public_key, verify_release
+from app.updates.manifest import (
+    UNUSABLE_KEY,
+    ReleaseRejected,
+    configured_public_key,
+    verify_release,
+)
 from app.updates.registry import (
     EGRESS_HOSTS,
     IMAGE,
@@ -104,6 +109,13 @@ NO_KEY_DETAIL = (
     "This image has no release signing key, so releases cannot be verified and are never "
     "installed automatically. An admin can install one by hand on Settings -> Updates after "
     "confirming that it cannot be verified; a newer image with the key restores auto-update."
+)
+INVALID_KEY = "The configured release key is invalid."
+INVALID_KEY_DETAIL = (
+    "CXCG_UPDATE_PUBLIC_KEY (or the image's release-signing-key.pub) is set but is not an "
+    "ed25519 public key in PEM form, so no release can be verified: none is installed, "
+    "automatically or by hand, and the launcher runs only the image's own version. Fix or "
+    "remove the variable and restart the container."
 )
 _REVISION_LINE = re.compile(r"""^revision(?:\s*:\s*str)?\s*=\s*["']([0-9A-Za-z_]+)["']""", re.M)
 _VERSION_LINE = re.compile(r"""^__version__\s*=\s*["']([^"']+)["']""", re.M)
@@ -278,9 +290,15 @@ class UpdateService:
             try:
                 self._public_key = configured_public_key()
             except ValueError:
+                self._public_key = UNUSABLE_KEY
+            if self._public_key is UNUSABLE_KEY:
                 logger.error("The configured release public key cannot be read; updates refused")
-                self._public_key = _UNUSABLE_KEY
         return self._public_key
+
+    @property
+    def key_invalid(self) -> bool:
+        """A release key is configured but cannot be used: every install is refused."""
+        return self.public_key is UNUSABLE_KEY
 
     def _session_scope(self) -> Any:
         if self._session_factory is not None:
@@ -391,10 +409,17 @@ class UpdateService:
                 return None
             if version in failed or version in skipped:
                 continue
-            if self.needs_image(str(releases[version].get("deps_hash") or "")):
+            if self._needs_image(releases[version]):
                 continue
             return releases[version]
         return None
+
+    def _needs_image(self, details: dict[str, Any]) -> bool:
+        """From its label, or because its SIGNED dependency hash turned out to differ when
+        it was downloaded (then an older release that fits can still be installed)."""
+        return bool(details.get("needs_image_signed")) or self.needs_image(
+            str(details.get("deps_hash") or "")
+        )
 
     def _sorted_versions(self) -> list[str]:
         return sorted(
@@ -513,7 +538,7 @@ class UpdateService:
                     "created": details.get("created"),
                     "revision": str(details.get("revision") or "")[:12],
                     "signed": bool(details.get("signed")),
-                    "needs_image": self.needs_image(str(details.get("deps_hash") or "")),
+                    "needs_image": self._needs_image(details),
                     "newer": compare_versions(version, self.rt.running_version) > 0,
                     "running": version == self.rt.running_version,
                     "installed": self.store.get(version) is not None,
@@ -570,8 +595,15 @@ class UpdateService:
             },
             "signing": {
                 "configured": self.public_key is not None,
-                "auto_waits": policy.auto_enabled and self.public_key is None,
-                "message": NO_KEY_DETAIL if self.public_key is None else "",
+                "invalid": self.key_invalid,
+                "auto_waits": policy.auto_enabled and (self.public_key is None or self.key_invalid),
+                "message": (
+                    f"{INVALID_KEY} {INVALID_KEY_DETAIL}"
+                    if self.key_invalid
+                    else NO_KEY_DETAIL
+                    if self.public_key is None
+                    else ""
+                ),
             },
             "image_age": {
                 "created": self.rt.image_created or None,
@@ -616,6 +648,13 @@ class UpdateService:
                 "label": "Updates: needs a registry token",
                 "detail": NEEDS_TOKEN,
             }
+        if self.key_invalid and self.rt.supervised:
+            return {
+                "kind": "needs_signing_key",
+                "tone": "bad",
+                "label": "Updates: release key invalid",
+                "detail": f"{INVALID_KEY} {INVALID_KEY_DETAIL}",
+            }
         if credential == TOKEN_INVALID:
             return {
                 "kind": "token_invalid",
@@ -627,7 +666,7 @@ class UpdateService:
         latest = self.latest()
         if latest and self.update_available():
             details = self.releases()[latest]
-            if self.needs_image(str(details.get("deps_hash") or "")) or not self.rt.supervised:
+            if self._needs_image(details) or not self.rt.supervised:
                 return {
                     "kind": "needs_image",
                     "tone": "warn",
@@ -767,7 +806,7 @@ class UpdateService:
         if not latest or compare_versions(latest, self.rt.running_version) <= 0:
             return
         details = self.releases()[latest]
-        if self.rt.supervised and self.needs_image(str(details.get("deps_hash") or "")):
+        if self.rt.supervised and self._needs_image(details):
             self._notify_needs_image(session, latest)
         elif self.rt.supervised and policy.auto_enabled and self.public_key is None:
             self._notify_waits_for_key(session, latest)
@@ -916,6 +955,8 @@ class UpdateService:
             raise UpdateError(f"{version} failed to start before; it is not retried automatically.")
         if automatic and version in self.store.skipped():
             raise UpdateError(f"{version} was rolled back by an admin; it is not reinstalled.")
+        if self.key_invalid:
+            raise UpdateError(f"{INVALID_KEY} {INVALID_KEY_DETAIL}", code="invalid_signing_key")
         unsigned = self.public_key is None
         if unsigned and automatic:
             raise UpdateError(f"{WAITS_FOR_KEY} {NO_KEY_DETAIL}", code="needs_signing_key")
@@ -1379,9 +1420,7 @@ class UpdateService:
             )
         latest = self.latest()
         latest_needs_image = bool(
-            latest
-            and self.update_available()
-            and self.needs_image(str(self.releases()[latest].get("deps_hash") or ""))
+            latest and self.update_available() and self._needs_image(self.releases()[latest])
         )
         if latest_needs_image and self.rt.supervised:
             self._notify_needs_image(session, str(latest))
@@ -1396,11 +1435,11 @@ class UpdateService:
         version = str(candidate["version"])
         if not self.rt.supervised:
             return f"{version} is available; this installation updates by replacing its image."
+        if self.key_invalid:
+            return f"{INVALID_KEY} Nothing is installed until it is fixed."
         if self.public_key is None:
             self._notify_waits_for_key(session, version)
             return f"{WAITS_FOR_KEY} {version} can be installed by hand."
-        if candidate.get("needs_image_signed"):
-            return f"{version} needs a new image; see Settings -> Updates for the command."
         if not self._db_backed_up() and self._schema_change_expected(candidate):
             self._notify_needs_backup(session, version)
             return (
@@ -1580,17 +1619,6 @@ class UpdateService:
 # Failures whose message is written for the admin; anything else is logged.
 _EXPLAINED = (UpdateError, RegistryError, ReleaseRejected, ValueError)
 
-
-class _Unusable:
-    """A configured key that cannot be read: nothing verifies against it."""
-
-    def verify(self, *_args: object) -> None:
-        from cryptography.exceptions import InvalidSignature
-
-        raise InvalidSignature
-
-
-_UNUSABLE_KEY = _Unusable()
 
 _EVENT_FIELDS = frozenset(
     {

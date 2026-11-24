@@ -20,9 +20,10 @@
 # The base image is part of the dependency hash (see below), named by its
 # DIGEST: a rebuilt python:3.11-alpine (OS, Python, OpenSSL fixes) is another
 # base, so its fixes arrive by replacing the image, never as an app layer. The
-# release workflow resolves the tag's current digest and passes it here; this
-# default is the digest last pinned by hand (keep the tag in step with
-# backend/Dockerfile).
+# release workflow passes the latest release's base (so app-only releases stay
+# installable as a layer), or the tag's current digest when the release tag's
+# message has a line "base: refresh"; this default is the digest last pinned by
+# hand (keep the tag in step with backend/Dockerfile).
 ARG PYTHON_IMAGE=python:3.11-alpine@sha256:7fbad8e4652eae0186429a6f26cf5b23e27e8c6fd7ac4d0cfd7a6988cdeea1e1
 
 # --- Stage 1: build the SPA ------------------------------------------------

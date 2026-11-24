@@ -6,6 +6,11 @@ name: Release
 #   git tag -a v1.2.3 -m "What changed, in a few lines"   # the notes shown in the app
 #   git push origin v1.2.3
 #
+# The base image of the latest release is reused, so an app-only release installs
+# as one small layer. Add a line "base: refresh" to the tag's message to build
+# on the base tag's current digest (OS, Python, OpenSSL fixes): that release is
+# then installed by replacing the image.
+#
 # Installations read it with a read-only token (read:packages) entered on
 # Settings -> Updates, and install the app layer in place (see README "Updates").
 #
@@ -102,7 +107,8 @@ jobs:
               found { print }' CHANGELOG.md)"
           fi
           if [ -z "$notes" ]; then
-            notes="$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' | sed '/-----BEGIN PGP SIGNATURE-----/,$d')"
+            notes="$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' \
+              | sed -e '/-----BEGIN PGP SIGNATURE-----/,$d' -e '/^[[:space:]]*base:[[:space:]]*refresh[[:space:]]*$/d')"
           fi
           printf '%s' "$notes" | head -c 3500 > "$RUNNER_TEMP/notes.txt"
 
@@ -126,12 +132,51 @@ jobs:
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Base image digest
-        # The tag's current digest: built FROM it and named in the dependency
-        # hash, so OS/Python/OpenSSL fixes in the base change the hash (and are
-        # installed by replacing the image).
+        # The base is named by digest in the dependency hash, so a new base makes
+        # the release "needs a new image" (installed by replacing the image, not as
+        # a layer). By default the LATEST RELEASE's base is reused, so a release
+        # that changes only the app stays installable in place. A new base (OS,
+        # Python, OpenSSL fixes) is taken when the tag's message has a line
+        # "base: refresh", when nothing was published yet, or when PYTHON_TAG
+        # changed. (The OS packages installed on the base are in the hash too: a
+        # new libpq revision also means a new image.)
         id: base
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
+          previous=""
+          if git for-each-ref "refs/tags/$TAG_NAME" --format='%(contents)' \
+              | grep -Eqx '[[:space:]]*base:[[:space:]]*refresh[[:space:]]*'; then
+            echo "The tag asks for a new base image."
+          else
+            previous="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Image}}' 2>/dev/null \
+              | python -c '
+          import json, os, re, sys
+          try:
+              data = json.load(sys.stdin)
+          except ValueError:
+              sys.exit(0)
+          if "config" not in data:  # an index: one config per platform
+              data = data.get("linux/amd64") or {}
+          labels = (data.get("config") or {}).get("Labels") or {}
+          name = str(labels.get("org.opencontainers.image.base.name") or "")
+          if re.fullmatch(re.escape(os.environ["PYTHON_TAG"]) + r"@sha256:[0-9a-f]{64}", name):
+              print(name)
+          ' || true)"
+          fi
+          if [ -n "$previous" ]; then
+            echo "image=$previous" >> "$GITHUB_OUTPUT"
+            echo "refreshed=no (the latest release's)" >> "$GITHUB_OUTPUT"
+            echo "Base image: $previous (the latest release's; a tag line 'base: refresh' takes a new one)"
+            exit 0
+          fi
           digest="$(docker buildx imagetools inspect "$PYTHON_TAG" --format '{{json .Manifest}}' \
             | python -c 'import json, sys; print(json.load(sys.stdin)["digest"])')"
           if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
@@ -139,13 +184,8 @@ jobs:
             exit 1
           fi
           echo "image=$PYTHON_TAG@$digest" >> "$GITHUB_OUTPUT"
-          echo "Base image: $PYTHON_TAG@$digest"
-
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          echo "refreshed=yes" >> "$GITHUB_OUTPUT"
+          echo "Base image: $PYTHON_TAG@$digest (new)"
 
       - name: Build the release manifest
         id: manifest
@@ -256,6 +296,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           DEPS: ${{ steps.manifest.outputs.deps }}
           PYTHON_IMAGE: ${{ steps.base.outputs.image }}
+          BASE_REFRESHED: ${{ steps.base.outputs.refreshed }}
         run: |
           docker tag cxcreditguard:release "$IMAGE:$VERSION"
           docker tag cxcreditguard:release "$IMAGE:latest"
@@ -265,6 +306,6 @@ jobs:
             echo "### Published $IMAGE:$VERSION"
             echo ""
             echo "- signed: yes (verified against the committed public key)"
-            echo "- base image: \`$PYTHON_IMAGE\`"
+            echo "- base image: \`$PYTHON_IMAGE\` (new: $BASE_REFRESHED)"
             echo "- dependency hash: \`$DEPS\`"
           } >> "$GITHUB_STEP_SUMMARY"

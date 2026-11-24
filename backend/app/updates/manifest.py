@@ -174,18 +174,51 @@ def public_key_path() -> Path | None:
     return path
 
 
+class UnusableKey:
+    """A release key that is configured but cannot be used: nothing verifies against it,
+    so every release is refused (it never reads as "no key")."""
+
+    def verify(self, *_args: object) -> None:
+        from cryptography.exceptions import InvalidSignature
+
+        raise InvalidSignature
+
+    def __repr__(self) -> str:
+        return "UnusableKey()"
+
+
+UNUSABLE_KEY = UnusableKey()
+
+
+def _has_content(text: str) -> bool:
+    return any(line.strip() and not line.lstrip().startswith("#") for line in text.splitlines())
+
+
 def configured_public_key() -> Any:
-    """The key releases must be signed with: the environment's, else the image's."""
+    """The key releases must be signed with: the environment's, else the image's.
+
+    None only when no key is configured (the image's placeholder file). A key that
+    is set but cannot be read - a malformed CXCG_UPDATE_PUBLIC_KEY, a damaged key
+    file - is UNUSABLE_KEY: it never falls back to the image's key or to "no key".
+    """
     from_env = os.environ.get(PUBLIC_KEY_ENV, "").strip()
     if from_env:
-        return load_public_key(from_env)
-    path = public_key_path()
-    if path is None:
-        return None
+        text = from_env
+    else:
+        path = public_key_path()
+        if path is None:
+            return None
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if not _has_content(text):
+            return None
     try:
-        return load_public_key(path.read_text(encoding="utf-8"))
-    except OSError:
-        return None
+        key = load_public_key(text)
+    except (ValueError, TypeError, UnicodeError):
+        return UNUSABLE_KEY
+    return UNUSABLE_KEY if key is None else key
 
 
 def verify_signature(data: bytes, signature_b64: str, public_key: Any) -> bool:

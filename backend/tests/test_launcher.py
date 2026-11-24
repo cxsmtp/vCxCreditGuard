@@ -7,6 +7,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import py_compile
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -451,7 +453,8 @@ class TestRequestsAndStop:
         assert env["PYTHONDONTWRITEBYTECODE"] == "1" and env["PYTHONSAFEPATH"] == "1"
         assert env["CXCG_IMAGE_DEPS_HASH"] == "deps-1"
         command = launcher.command(target)
-        assert command[1:4] == ["-I", "-B", "-u"] and "serve" in command
+        assert command[1:6] == ["-I", "-B", "-X", f"pycache_prefix={L.NO_BYTECODE_PREFIX}", "-u"]
+        assert "serve" in command and env["PYTHONPYCACHEPREFIX"] == L.NO_BYTECODE_PREFIX
         assert command[command.index("--app-dir") + 1] == str(paths.versions / NEW)
         assert command[-1] == "--no-proxy-headers"
 
@@ -708,3 +711,293 @@ def test_signature_helpers_round_trip() -> None:
     private, public = ed25519_keypair()
     assert base64.b64decode(sign(b"x", private))
     assert L.load_public_key_text("# c\n" + public) is not None
+
+
+# ------------------------------------------- follow-up security review findings
+
+BACKEND = Path(__file__).resolve().parents[1]
+
+
+class TestEveryStartIsVerified:
+    def test_crash_restart_reverifies_the_installed_tree(
+        self, setup: tuple[L.Paths, L.ImageInfo]
+    ) -> None:
+        paths, image = setup
+        root = install(paths, NEW)
+        select(paths, NEW)
+        launcher, processes, clock = make_launcher(paths, image, healthy={NEW, BUILTIN})
+        launcher.start(launcher.choose())
+        launcher.tick()
+        assert launcher.healthy and processes[-1].app_dir == str(root)
+        # A file planted in the data volume after the launcher verified the tree.
+        planted = root / "app" / "__pycache__" / f"main.{sys.implementation.cache_tag}.pyc"
+        planted.parent.mkdir()
+        planted.write_bytes(b"\0")
+        processes[-1].code = 1  # the app crashes (or is made to)
+        launcher.tick()
+        clock.now += 31
+        launcher.tick()
+        assert len(processes) == 2
+        # The restart checks the files again and refuses the tree.
+        assert processes[-1].app_dir == str(image.builtin_dir), "restarted an unverified tree"
+        assert NEW in L.read_json(paths.failed)
+
+    def test_planted_unchecked_hash_bytecode_is_never_read(self, tmp_path: Path) -> None:
+        """-I -B never WRITES bytecode but still reads it; the app's flags read none."""
+        pkg = tmp_path / "v" / "app"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        (pkg / "main.py").write_text("WHO = 'verified source'\n")
+        evil = tmp_path / "evil.py"
+        evil.write_text("WHO = 'planted bytecode'\n")
+        target = pkg / "__pycache__" / f"main.{sys.implementation.cache_tag}.pyc"
+        py_compile.compile(
+            str(evil),
+            cfile=str(target),
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        )
+        code = (
+            f"import sys; sys.path.append({str(tmp_path / 'v')!r}); "
+            "import app.main as m; print(m.WHO)"
+        )
+
+        def run(*flags: str) -> str:
+            return subprocess.run(  # noqa: S603 - this interpreter
+                [sys.executable, *flags, "-c", code], capture_output=True, text=True, check=True
+            ).stdout.strip()
+
+        assert run("-I", "-B") == "planted bytecode"  # what the pyc would do without the prefix
+        flags = [f for f in L.INTERPRETER_FLAGS if f != "-u"]
+        assert run(*flags) == "verified source"
+
+    def test_the_app_runs_from_a_verified_read_only_copy(
+        self, setup: tuple[L.Paths, L.ImageInfo], tmp_path: Path
+    ) -> None:
+        paths, image = setup
+        root = install(paths, NEW)
+        select(paths, NEW)
+        run_root = tmp_path / "run"
+        launcher, processes, clock = make_launcher(
+            paths, image, healthy={NEW, BUILTIN}, run_root=run_root
+        )
+        launcher.start(launcher.choose())
+        launcher.tick()
+        copy = Path(processes[-1].app_dir)
+        assert copy.parent == run_root and launcher.healthy
+        listed = json.loads((root / L.MANIFEST_FILE).read_text())["files"]
+        assert sorted(L.covered_files(copy)) == sorted(listed)
+        assert (copy / L.MANIFEST_FILE).read_bytes() == (root / L.MANIFEST_FILE).read_bytes()
+        assert (copy / "app" / "main.py").stat().st_mode & 0o777 == 0o400
+        assert (copy / "app").stat().st_mode & 0o777 == 0o500
+        assert run_root.stat().st_mode & 0o777 == 0o700
+        # Written to the data volume after the check: never in what runs.
+        (root / "app" / "late.py").write_text("raise SystemExit('planted')\n")
+        assert not (copy / "app" / "late.py").exists()
+        # ...and the next start (a crash here) checks again, refuses, removes the copy.
+        processes[-1].code = 1
+        launcher.tick()
+        clock.now += 31
+        launcher.tick()
+        assert processes[-1].app_dir == str(image.builtin_dir)
+        assert list(run_root.iterdir()) == []
+
+    def test_a_file_changed_between_the_check_and_the_copy_is_refused(
+        self, setup: tuple[L.Paths, L.ImageInfo], tmp_path: Path
+    ) -> None:
+        paths, image = setup
+        root = install(paths, NEW)
+        select(paths, NEW)
+        launcher, processes, _clock = make_launcher(paths, image, run_root=tmp_path / "run")
+        target = launcher.choose()
+        assert target.source == "installed"
+        (root / "app" / "main.py").write_text("app = 'swapped after the check'\n")
+        launcher.start(target)
+        assert processes[-1].app_dir == str(image.builtin_dir)
+        assert "changed after they were checked" in L.read_json(paths.failed)[NEW]["reason"]
+        assert list((tmp_path / "run").iterdir()) == []
+
+    def test_nothing_is_imported_from_the_data_volume(self, tmp_path: Path) -> None:
+        builtin = write_tree(tmp_path / "image-app", BUILTIN)
+        data = builtin / "data"  # the data volume lives inside the image's own folder
+        marker = tmp_path / "ran"
+        payload = f"open({str(marker)!r}, 'w')\n"
+        (data / "versions").mkdir(parents=True)
+        (data / "__init__.py").write_text(payload)
+        (data / "evil.py").write_text(payload)
+        (builtin / "planted.py").write_text(payload)  # an optional import's name
+        code = (
+            "import importlib.util, json, sys\n"
+            # The launcher loaded from its file: the backend folder is not on sys.path.
+            f"spec = importlib.util.spec_from_file_location('L', {str(L.__file__)!r})\n"
+            "L = sys.modules['L'] = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(L)\n"
+            "from pathlib import Path\n"
+            f"root = Path({str(builtin)!r})\n"
+            "sys.path.append(str(root))\n"
+            f"L.install_import_guard(root, Path({str(data)!r}))\n"
+            "out = {}\n"
+            "for name in ('data', 'data.evil', 'planted', 'app', 'app.main', 'json'):\n"
+            "    try:\n"
+            "        __import__(name)\n"
+            "        out[name] = 'imported'\n"
+            "    except ImportError:\n"
+            "        out[name] = 'refused'\n"
+            "print(json.dumps(out))\n"
+        )
+        result = subprocess.run(  # noqa: S603 - this interpreter
+            [sys.executable, "-I", "-B", "-c", code], capture_output=True, text=True, check=True
+        )
+        shown = json.loads(result.stdout.strip().splitlines()[-1])
+        assert shown == {
+            "data": "refused",
+            "data.evil": "refused",
+            "planted": "refused",
+            "app": "imported",
+            "app.main": "imported",
+            "json": "imported",
+        }, shown
+        assert not marker.exists()
+
+    def test_serve_reads_no_bytecode(self, tmp_path: Path) -> None:
+        root = write_tree(tmp_path / "version", NEW)
+        launcher = L.Launcher(paths=L.Paths(tmp_path / "data"), image=L.ImageInfo(root, NEW, ""))
+        command = launcher.command(L.Target(NEW, root, "installed", "test"))
+        result = subprocess.run(  # noqa: S603 - the launcher's own command
+            [*command[: command.index("--host")], "--dry-run"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        shown = json.loads(result.stdout.strip().splitlines()[-1])
+        assert shown["pycache_prefix"] == L.NO_BYTECODE_PREFIX and shown["dont_write_bytecode"]
+
+    def test_migrations_do_not_put_the_builtin_tree_before_the_version(
+        self, tmp_path: Path
+    ) -> None:
+        ignore = shutil.ignore_patterns("__pycache__", "static", "*.pyc")
+        trees = {}
+        for name in ("builtin", "version"):
+            root = tmp_path / name
+            root.mkdir()
+            for part in ("app", "alembic", "scripts"):
+                shutil.copytree(BACKEND / part, root / part, ignore=ignore)
+            shutil.copy(BACKEND / "alembic.ini", root / "alembic.ini")
+            (root / "scripts" / "which_tree.py").write_text(f"TREE = {name!r}\n")
+            trees[name] = root
+        code = (
+            "import sys, json\n"
+            f"sys.path.append({str(trees['version'])!r})\n"
+            "import app.db.migrate as m\n"
+            "from alembic.script import ScriptDirectory\n"
+            "ScriptDirectory.from_config(m.alembic_config('sqlite://'))\n"
+            "import scripts.which_tree as w\n"
+            "print(json.dumps({'path0': sys.path[0], 'tree': w.TREE}))\n"
+        )
+        result = subprocess.run(  # noqa: S603 - same flags and cwd as the launcher's child
+            # -E -P -B is -I without disabling the user site (this sandbox's packages
+            # may live there; the image's are in the system site-packages).
+            [sys.executable, "-E", "-P", "-B", "-c", code],
+            cwd=str(trees["builtin"]),
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "CXCG_MASTER_KEY": "A" * 44},
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        shown = json.loads(result.stdout.strip().splitlines()[-1])
+        # Nothing ahead of the standard library, and no import from the other tree.
+        assert shown["path0"] not in (".", ""), shown
+        assert shown["tree"] == "version", shown
+
+
+class TestTheReleaseKey:
+    def test_a_malformed_env_key_does_not_disable_the_images_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _private, public = ed25519_keypair()
+        image = tmp_path / "image"
+        (image / "app" / "updates").mkdir(parents=True)
+        (image / "app" / "updates" / "release-signing-key.pub").write_text(public)
+        monkeypatch.setenv(L.PUBLIC_KEY_ENV, "ssh-ed25519 AAAA... (pasted the wrong format)")
+        # A set-but-unusable key refuses everything (fail closed).
+        assert L.image_public_key(image) == L.INVALID_KEY
+        monkeypatch.setenv(L.PUBLIC_KEY_ENV, "-----BEGIN PUBLIC KEY-----\nnot a key\n")
+        assert L.image_public_key(image) == L.INVALID_KEY
+        monkeypatch.delenv(L.PUBLIC_KEY_ENV)
+        assert L.image_public_key(image) == L.load_public_key_text(public)
+        (image / "app" / "updates" / "release-signing-key.pub").write_text("# c\ngarbage\n")
+        assert L.image_public_key(image) == L.INVALID_KEY
+
+    def test_an_invalid_key_runs_only_the_image_and_marks_nothing_failed(
+        self, setup: tuple[L.Paths, L.ImageInfo]
+    ) -> None:
+        paths, image = setup
+        private, _public = ed25519_keypair()
+        install(paths, NEW, private_key=private)
+        select(paths, NEW)
+        broken = L.ImageInfo(image.builtin_dir, image.builtin_version, image.deps_hash, "invalid")
+        launcher, processes, _clock = make_launcher(paths, broken)
+        launcher.start(launcher.choose())
+        assert processes[-1].app_dir == str(image.builtin_dir)
+        assert launcher.current is not None and "key is invalid" in launcher.current.reason
+        # Not the version's fault: it runs again once the key is fixed.
+        assert not paths.failed.exists()
+
+    def test_an_old_signed_release_cannot_run_under_a_newer_name(
+        self, setup: tuple[L.Paths, L.ImageInfo]
+    ) -> None:
+        paths, image = setup
+        private, public = ed25519_keypair()
+        keyed = L.ImageInfo(image.builtin_dir, image.builtin_version, image.deps_hash, public)
+        root = write_tree(paths.versions / NEW, "1.0.5", private_key=private)
+        (root / L.VERSION_FILE).write_text(json.dumps({"version": NEW, "deps_hash": "deps-1"}))
+        select(paths, NEW)
+        target = L.choose_target(paths, keyed)
+        # The signed manifest says 1.0.5; the folder and the selection say 1.1.0.
+        assert target.source == "built-in" and target.refused, target.reason
+        assert "signed manifest is for 1.0.5" in target.reason
+
+    def test_the_code_must_be_the_selected_version(
+        self, setup: tuple[L.Paths, L.ImageInfo]
+    ) -> None:
+        paths, image = setup
+        root = install(paths, NEW)
+        (root / "app" / "__init__.py").write_text('__version__ = "1.0.5"\n')
+        manifest = json.loads((root / L.MANIFEST_FILE).read_text())
+        manifest["files"]["app/__init__.py"] = L.sha256_file(root / "app" / "__init__.py")
+        (root / L.MANIFEST_FILE).write_bytes(manifest_bytes(manifest))
+        select(paths, NEW)
+        target = L.choose_target(paths, image)
+        assert target.source == "built-in" and "code says it is 1.0.5" in target.reason
+
+
+class TestRequestsOnce:
+    def test_an_unremovable_request_is_acted_on_once(
+        self, setup: tuple[L.Paths, L.ImageInfo], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        paths, image = setup
+        launcher, processes, _clock = make_launcher(paths, image, healthy={BUILTIN})
+        launcher.start(launcher.choose())
+        launcher.tick()
+        L.write_json_atomic(paths.request, {"kind": "restart", "by": "admin"})
+        real_unlink = Path.unlink
+
+        def unlink(self: Path, *a: Any, **kw: Any) -> None:
+            if self == paths.request:
+                raise PermissionError(13, "Read-only file system")
+            real_unlink(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "unlink", unlink)
+        for _ in range(5):
+            launcher.tick()
+        assert len(processes) == 2, f"{len(processes) - 1} restarts for one request"
+        # Remembered in launcher.json: a new launcher does not act on it either.
+        again, more, _clock = make_launcher(paths, image, healthy={BUILTIN})
+        again.start(again.choose())
+        for _ in range(3):
+            again.tick()
+        assert len(more) == 1
+        # A new request (another id) is acted on.
+        L.write_json_atomic(paths.request, {"id": "n2", "kind": "restart", "by": "admin"})
+        again.tick()
+        assert len(more) == 2

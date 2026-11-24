@@ -124,7 +124,8 @@ export interface UpdatesStatus {
   selection: { version: string | null; previous: string | null; at: string | null; by: string | null };
   settings: { auto_enabled: boolean; quiet_hour: number; timezone: string };
   token: { configured: boolean; status: "ok" | "invalid" | "missing" | "unknown" };
-  signing: { configured: boolean; auto_waits: boolean; message: string };
+  /** invalid: a key is configured but unusable, so every install is refused. */
+  signing: { configured: boolean; invalid?: boolean; auto_waits: boolean; message: string };
   image_age: { created: string | null; days: number | null; stale: boolean; max_days: number };
   skipped: Record<string, { at: string; by: string; reason: string }>;
   database: { kind: string; backups: boolean };
