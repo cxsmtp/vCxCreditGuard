@@ -192,6 +192,8 @@ KEY_ACTION_RATES = "credits.action_rates"
 # application: {"project": {"<reported name, lowercased>": "<project id>"},
 # "application": {...}}. Set under Settings → Attribution.
 KEY_ENTITY_MAPPINGS = "attribution.entity_mappings"
+# The last enforcement coverage report (app/services/coverage.py), cached.
+KEY_ENFORCEMENT_COVERAGE = "enforcement.coverage"
 # The group names last found not to be unique, kept for Diagnostics.
 KEY_DUPLICATE_GROUP_NAMES = "org_sync.duplicate_group_names"
 # Newest scan the policy violation check has looked at, per restricted project.

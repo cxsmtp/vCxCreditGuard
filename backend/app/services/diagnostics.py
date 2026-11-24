@@ -68,6 +68,12 @@ _REMEDIATION: dict[tuple[str, str], str] = {
         "application) it belongs to. A name that is no project at all (an SCM repository "
         "scanned outside a project) can be left: it is counted tenant wide."
     ),
+    ("enforcement_coverage", WARN): (
+        "Open Simulation (or Settings → Enforcement) to see who a user restriction cannot "
+        "reach and why. Consider restricting through dedicated AI roles, keeping AI roles "
+        "out of broad composite roles and groups, and relying on project, group and "
+        "application limits, which turn AI features off on projects."
+    ),
     ("group_names", WARN): (
         "Rename the groups in Checkmarx One so each name is unique, or set group limits only "
         "on groups whose name is unique."
@@ -134,6 +140,9 @@ def run_diagnostics(
     group_names = _group_names_check(session)
     if group_names is not None:
         checks.append(group_names)
+    coverage_check = _coverage_check(session)
+    if coverage_check is not None:
+        checks.append(coverage_check)
     if settings_store.auto_triage_to_initiator(session):
         # Only while charging auto triage to scan initiators is on, so the
         # report is unchanged for everyone who has not turned it on.
@@ -314,6 +323,34 @@ def _unmatched_entities_check(session: Session) -> Check:
         "Checkmarx reports usage under a repository name that matches no project in "
         f"/api/projects: {'; '.join(parts)}. That usage counts towards no project, group or "
         "application limit. Map each name under Settings → Attribution.",
+    )
+
+
+def _coverage_check(session: Session) -> Check | None:
+    """Whether user budgets can bite, from the last coverage report (cached;
+    Diagnostics never reads the tenant). Shown once user limits exist."""
+    from app.models.enums import EntityType
+    from app.models.limits import CreditLimit
+    from app.services import coverage
+
+    report = coverage.cached(session)
+    has_user_limits = session.scalar(
+        select(CreditLimit.id)
+        .where(CreditLimit.entity_type == EntityType.USER, CreditLimit.is_active.is_(True))
+        .limit(1)
+    )
+    if report is None or (has_user_limits is None and not report.get("low")):
+        return None
+    label = "Enforcement coverage"
+    holders = report.get("ai_holders") or 0
+    if report.get("low"):
+        return Check("enforcement_coverage", label, WARN, str(report.get("warning")))
+    return Check(
+        "enforcement_coverage",
+        label,
+        OK,
+        f"A user restriction can take AI access from {report.get('restrictable', 0)} of the "
+        f"{holders} users who hold an AI role.",
     )
 
 
