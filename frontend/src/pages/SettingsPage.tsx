@@ -43,6 +43,8 @@ import { applyAccent, useToast } from "../lib/ui-context";
 import { LookPicker } from "../components/AppShell";
 import { StatTile } from "../components/StatTile";
 import { UpdatesPanel } from "../components/UpdatesPanel";
+import { CoveragePanel } from "../components/CoveragePanel";
+import { EntityMappingCard } from "../components/EntityMappingCard";
 import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
 /** Unsaved edits. The last three are write only: the server never sends the
@@ -717,6 +719,7 @@ export function SettingsPage({
             />
           </Card>
           )}
+          {section === "enforcement" && <CoveragePanel isAdmin={isAdmin} />}
           {section === "enforcement" && (
           <div id="enforcement-safety">
             <Card
@@ -956,6 +959,7 @@ export function SettingsPage({
               onChanged={() => unresolved.reload()}
             />
           )}
+          {section === "attribution" && <EntityMappingCard isAdmin={isAdmin} />}
           {isAdmin && section === "operations" && <OperationsCard />}
           {isAdmin && section === "updates" && <UpdatesPanel onChanged={onSettingsSaved} />}
           {isAdmin && section === "accounts" && <AccountsCard />}
@@ -1254,7 +1258,7 @@ const TAB_BLURB: Record<AttributionTab, string> = {
   matched:
     "Counted towards a user's limits — either matched automatically at high confidence, or mapped by you. Change any that look wrong.",
   unmatched:
-    "No user resembled the reported handle closely enough to suggest. Map these by hand. Automation accounts (bots) are listed here too and are never counted.",
+    "No user resembled the reported handle closely enough to suggest. Map these by hand. Automation (bots, and integration identities with no email) is listed here too, marked as such: it counts towards no user limit and raises no alert.",
 };
 
 const SUBJECT_VIEW: ViewColumn<UnresolvedSubject>[] = [
@@ -1521,8 +1525,11 @@ function AttributionCard({
                 <Td>
                   <span className="text-sm">{subject.subject_name ?? subject.subject_key}</span>
                   {subject.is_bot && (
-                    <span className="ml-1.5">
-                      <Badge tone="neutral">Bot</Badge>
+                    <span
+                      className="ml-1.5"
+                      title="A bot or an integration identity (one handle, no email): automation, not a person. Map it if it is a person after all."
+                    >
+                      <Badge tone="info">Automation</Badge>
                     </span>
                   )}
                   {subject.source === "scan_initiator" && (

@@ -18,6 +18,7 @@ import {
   type BadgeTone,
 } from "../components/ui";
 import { FilterNote, Pager, usePaged, useTableView, type ViewColumn } from "../components/tableView";
+import { CoveragePanel } from "../components/CoveragePanel";
 import { useResource } from "../hooks/useResource";
 import { entityLabel, formatCredits, formatDateTime, formatPercent } from "../lib/format";
 
@@ -37,7 +38,7 @@ const DRY_RUN_VIEW: ViewColumn<DryRunRow>[] = [
   { key: "enforce", value: (r) => (r.would_enforce ? "Yes" : "No") },
 ];
 
-export function PreviewPage() {
+export function PreviewPage({ isAdmin = false }: { isAdmin?: boolean }) {
   const dryRun = useResource<DryRunResult>(
     (signal) => api.get("/api/preview/dry-run", undefined, signal),
     [],
@@ -109,6 +110,8 @@ export function PreviewPage() {
           {data.user_roles_truncated && data.user_roles_note && (
             <InfoNote tone="warning">{data.user_roles_note}</InfoNote>
           )}
+
+          <CoveragePanel isAdmin={isAdmin} />
 
           <Card
             title="Per-limit projection"

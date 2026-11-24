@@ -274,10 +274,21 @@ export interface ConnectionTestResult {
 }
 
 export interface ActionBreakdownItem {
+  /** As Checkmarx reports it ("Fusion Scan - Opus 5.5"); a normalised type when
+   * the breakdown is derived from per-user counts. */
   action_type: string;
   credits: string;
   transactions: number | null;
   percent_of_total: number | null;
+  /** The normalised type ("fusion"), for a stable colour. */
+  action_bucket?: string | null;
+  /** Credits / transactions as the feed reports them. */
+  credits_per_transaction?: string | null;
+  /** The listed rate (credits per action), when Checkmarx lists one. */
+  listed_rate?: string | null;
+  /** What CreditGuard prices one transaction at: the listed rate, or the feed's
+   * average where the rate does not match it. */
+  price_source?: "rate" | "observed" | null;
 }
 
 export interface TrendPoint {
@@ -299,6 +310,8 @@ export interface TopConsumer {
   resolved: boolean;
   /** Auto-triage credits charged to this person from scans they started (setting on). */
   auto_triage_attributed?: string | null;
+  /** Users only: automation (Auto Triage, a bot, an integration identity), not a person. */
+  automation?: boolean;
 }
 
 export interface StatusTiles {
@@ -332,6 +345,58 @@ export interface Dashboard {
   tiles: StatusTiles;
   unavailable_dimensions: string[];
   credit_pool: CreditPoolInfo | null;
+  attribution?: AttributionSummary | null;
+}
+
+export interface UnmatchedEntities {
+  count: number;
+  credits: string;
+  total_credits: string;
+  top: { name: string; credits: string }[];
+}
+
+/** Usage that counts towards no limit, and why (latest readings). */
+export interface AttributionSummary {
+  unmatched_people: number;
+  unmatched_people_credits: string;
+  automation: number;
+  automation_credits: string;
+  user_total_credits: string;
+  projects: UnmatchedEntities;
+  applications: UnmatchedEntities;
+}
+
+export interface UnmatchedEntity {
+  view: "project" | "application";
+  subject_key: string;
+  name: string;
+  credits: string;
+  mapped_entity_id: string | null;
+  mapped_label: string | null;
+}
+
+/** Whether a user restriction can bite (GET /api/preview/coverage). */
+export interface EnforcementCoverage {
+  computed_at: string;
+  ai_roles: string[];
+  protected_roles: string[];
+  users: number;
+  ai_holders: number;
+  restrictable: number;
+  share: number | null;
+  via_composite: number;
+  via_group: number;
+  via_composite_or_group: number;
+  protected: number;
+  unknown: number;
+  composites: Record<string, string[]>;
+  composite_holders: Record<string, number>;
+  groups_granting: string[];
+  dedicated_roles: string[];
+  notes: string[];
+  available: boolean;
+  low: boolean;
+  warning: string | null;
 }
 
 export interface CreditPoolInfo {
@@ -341,6 +406,13 @@ export interface CreditPoolInfo {
   collected_at: string | null;
   assigned: string;
   over_allocation: string | null;
+  /** Checkmarx's own credit enforcement, as /credits/info reports it (read only). */
+  checkmarx_enforcement?: {
+    state?: string;
+    consumptionPct?: number;
+    warningThresholdPct?: number;
+    cutoffThresholdPct?: number;
+  } | null;
 }
 
 export interface LimitPeriodState {
