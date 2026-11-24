@@ -100,10 +100,12 @@ class TestMappingsCountForwardOnly:
         assert _state(db, group).credits_used == 20
 
         body = _map(admin_client, None)
-        assert body["confirmation"] == (
+        assert body["confirmation"].startswith(
             "Credits reported under example-org/payments-api no longer count towards "
-            "anything. The 20 credits it had added to payments/api no longer count there."
-        )
+            "anything. It no longer adds to payments/api: of the 20 credits it had added "
+            "there, each of payments/api's budgets takes off only what it added within the "
+            "budget's current period."
+        ), body["confirmation"]
         cycle.run_cycle(trigger="manual")
         assert _state(db, project).credits_used == 0
         _map(admin_client, "proj-api")
@@ -159,10 +161,7 @@ class TestMappingsCountForwardOnly:
         cycle.run_cycle(trigger="manual")
         web_before = _state(db, counted).credits_used
         body = _map(admin_client, "proj-web")
-        assert (
-            "The 10 credits it had added to payments/api no longer count there."
-            in (body["confirmation"])
-        )
+        assert "of the 10 credits it had added there" in body["confirmation"]
         cycle.run_cycle(trigger="manual")
         assert _state(db, project).credits_used == 0
         assert _state(db, counted).credits_used == web_before
@@ -201,7 +200,7 @@ class TestMappingsCountForwardOnly:
             f"/api/usage/unresolved/{subject.id}/map", json={"user_id": None}
         )
         assert response.status_code == httpx.codes.OK, response.text
-        assert "The 12 credits it had added to " in response.json()["confirmation"]
+        assert "of the 12 credits it had added there" in response.json()["confirmation"]
 
 
 class TestMappingEndpoint:

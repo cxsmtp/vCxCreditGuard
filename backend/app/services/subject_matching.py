@@ -213,6 +213,29 @@ _PRODUCT_TOKENS = frozenset(
 )
 
 
+# Build and CI words. In a handle of several parts these mark automation
+# whatever the case ("GitHub-Actions", "sonar-scanner", "Build-Agent"); a
+# handle of one part only when it is written in lowercase, digits allowed
+# ("buildserver01").
+_BUILD_TOKENS = frozenset(
+    {
+        "actions",
+        "sonar",
+        "sonarqube",
+        "scanner",
+        "build",
+        "buildserver",
+        "buildagent",
+        "pipeline",
+        "deploy",
+    }
+)
+# Words that are also surnames ("Runner", "Builder"): automation only in a
+# handle written in lowercase ("gitlab-runner", "builder").
+_LOWERCASE_BUILD_TOKENS = frozenset({"runner", "builder", "deployer"})
+_PHRASES = frozenset({"github-actions", "gitlab-ci", "azure-pipelines", "bitbucket-pipelines"})
+
+
 def is_integration_identity(name: str | None, email: str | None) -> bool:
     """True for a consumption subject that looks like an integration, not a person.
 
@@ -238,12 +261,23 @@ def is_integration_identity(name: str | None, email: str | None) -> bool:
         return True
     if not text.isascii():
         return False
-    tokens = [token for token in re.split(r"[-_.]+", low) if token]
-    if len(tokens) > 1 and any(token in _AUTOMATION_TOKENS for token in tokens):
+    if any(phrase in low for phrase in _PHRASES):
         return True
-    # A product's own name, as a whole token, only in a handle written in
-    # lowercase (an identity, not a person's display name).
-    return text == low and any(token in _PRODUCT_TOKENS for token in tokens)
+    tokens = [token for token in re.split(r"[-_.]+", low) if token]
+    # "buildserver01" is "buildserver": trailing digits number instances.
+    stems = [token.rstrip("0123456789") for token in tokens]
+    if len(tokens) > 1 and any(
+        token in _AUTOMATION_TOKENS or stem in _BUILD_TOKENS
+        for token, stem in zip(tokens, stems, strict=True)
+    ):
+        return True
+    # A product's own name (or a build word), as a whole token, only in a
+    # handle written in lowercase: an identity, not a person's display name.
+    lowercase_words = _PRODUCT_TOKENS | _BUILD_TOKENS | _LOWERCASE_BUILD_TOKENS
+    return text == low and any(
+        token in lowercase_words or stem in lowercase_words
+        for token, stem in zip(tokens, stems, strict=True)
+    )
 
 
 def similarity(a: frozenset[str], b: frozenset[str]) -> float:

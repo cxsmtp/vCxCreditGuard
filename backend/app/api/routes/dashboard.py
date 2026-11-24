@@ -592,8 +592,10 @@ def _move_words(move: ingestion.SubjectMove, *, target: str | None, previous: st
     if move.previous_entity is not None and previous and previous != target:
         if move.removed > 0:
             parts.append(
-                f"The {format_credits(move.removed)} credits it had added to {previous} "
-                "no longer count there."
+                f"It no longer adds to {previous}: of the {format_credits(move.removed)} "
+                f"credits it had added there, each of {previous}'s budgets takes off only "
+                "what it added within the budget's current period. What it added before "
+                "stays counted where it was, and the budget's own usage is never touched."
             )
         else:
             parts.append(f"It had added nothing to {previous} since it started counting there.")

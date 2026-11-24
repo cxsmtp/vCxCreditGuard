@@ -110,6 +110,14 @@ class UsageRecord(Base):
     # counts only what it reported since (``credits_used`` minus the anchor's
     # offset, see UsageAnchor). Null means all of it.
     attributed_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    # Null for a row as the feed reported it. "kept": the name no longer
+    # matches the entity it counted towards (a rename the sync learnt first,
+    # or the entity just disappeared), so it keeps counting there. "carried":
+    # the name is missing from this reading altogether, and its previous row
+    # is carried for a few readings (a rename the feed reported first, or a
+    # one-off gap). ``held_readings`` counts the readings in a row it was held.
+    held_reason: Mapped[str | None] = mapped_column(String(16))
+    held_readings: Mapped[int | None] = mapped_column(Integer)
     # The row as the feed sent it. Kept for a week (RAW_KEEP_DAYS in
     # app/services/retention.py), and for as long as the snapshot is one a
     # reader needs it on (the latest, the readings a period's usage breakdown
@@ -200,18 +208,20 @@ class UsageAnchor(Base):
     """Where a reported name's usage starts counting towards an entity.
 
     The consumption feed reports cumulative totals over its lookback window,
-    so a name that starts counting towards an entity (an admin's mapping, or a
-    project renamed to it or a user synced or auto-matched later) would bring
-    its whole history into that entity's current period. An anchor records the
-    name's reported total when that happened (``offset_credits``), and only
-    what it reports beyond that counts (``UsageRecord.attributed_credits``).
+    so a name that is mapped to an entity by an admin, or that moves from one
+    entity to another by itself, would bring its whole history into the new
+    entity's current period. An anchor records the name's reported total then
+    (``offset_credits``), and only what it reports beyond that counts there
+    (``UsageRecord.attributed_credits``). A name that counted nowhere before
+    (a new project or user, or one the sync had not brought yet) is never
+    anchored: its usage is the entity's own.
 
     One per reported name. Written in the mapping's own transaction, from the
-    latest live reading and under the attribution lock (or by ingestion, for a
-    name that starts to match by itself), and never rewritten otherwise,
-    except to re-anchor when the lookback window rolls the total below the
-    offset. Unmapping notes the release (``released_at``, the name's total
-    then); mapping again takes a fresh anchor. No period baseline is ever
+    latest live reading and under the attribution lock (or by ingestion, for
+    a move), and otherwise rewritten only to re-anchor when the lookback
+    window rolls the total below the offset. Unmapping, or a confirmed
+    deletion of its entity, releases it; mapping again takes a fresh anchor,
+    while the entity coming back re-uses it. No period baseline is ever
     changed by a mapping.
     """
 
@@ -225,11 +235,23 @@ class UsageAnchor(Base):
     # The reading the offset was taken from (None: no reading had the name).
     snapshot_id: Mapped[int | None] = mapped_column(Integer)
     anchored_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
-    # "mapping" (an admin) or "first_match" (it started to match by itself).
+    # "mapping" (an admin) or "moved" (it matched another entity by itself).
     reason: Mapped[str] = mapped_column(String(16), nullable=False)
-    # Set when the mapping was removed: the name's total then.
+    # The name's per action transaction counts when it was anchored: what
+    # violations, the action mix and Auto Triage attribution measure its rise
+    # from (kept here, so thinning the reading it came from loses nothing).
+    reference_actions: Mapped[dict | None] = mapped_column(JSONColumn)
+    # Set when the anchor stopped counting: the name's total then, and why
+    # ("unmap" by an admin, "deleted" when its entity's deletion was confirmed).
     released_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     released_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    release_reason: Mapped[str | None] = mapped_column(String(16))
+    # The entity the name last stopped counting towards by an explicit move
+    # (unmapped, mapped elsewhere, or a match that moved), and when. A budget
+    # whose period figures included the name discounts what it had counted
+    # then, so the move takes away only the name's usage within the period.
+    removed_from: Mapped[str | None] = mapped_column(String(64))
+    removed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     __table_args__ = (UniqueConstraint("view_by", "subject_key", name="usage_anchor_subject"),)
 

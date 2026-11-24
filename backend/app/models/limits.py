@@ -196,6 +196,12 @@ class LimitPeriodState(Base):
     # Null on periods opened before this column existed: the period start is
     # used instead.
     baseline_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # What each reported name counted towards this budget when the baseline
+    # was taken ({"names": {"<view>|<name>": "<credits>"}, "at": <iso>}), so
+    # that a name later unmapped or moved elsewhere takes away only its usage
+    # within the period, never the budget's own. Null on periods opened before
+    # this existed (they behave as before).
+    baseline_names: Mapped[dict | None] = mapped_column(JSONColumn)
     # The auto-triage credits charged from scans that are included in
     # credits_used. Null while that setting is off (credits_used is then
     # reported_total - baseline_credits, exactly as before).

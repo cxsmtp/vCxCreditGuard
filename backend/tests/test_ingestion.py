@@ -190,12 +190,10 @@ class TestAttribution:
 
         ingestion.ingest_usage(db, client)
         db.commit()
-        # Forward only: what it had reported before the pin does not count.
-        assert ingestion.latest_totals(db, UsageView.USER)["user-carol"] == Decimal("0")
-        tenant.set_user_credits(name="departed.person@example.com", credits=10)
-        ingestion.ingest_usage(db, client)
-        db.commit()
-        assert ingestion.latest_totals(db, UsageView.USER)["user-carol"] == Decimal("3")
+        # A pin written straight to the database (not through the mapping
+        # endpoint, which anchors it) is a name that counted nowhere starting
+        # to count: in full.
+        assert ingestion.latest_totals(db, UsageView.USER)["user-carol"] == Decimal("7")
 
     def test_applications_and_projects_match_by_id_then_name(self, db: Session) -> None:
         tenant = populated_tenant()
@@ -375,13 +373,8 @@ class TestFuzzyAttribution:
         ingestion.ingest_usage(db, client)
         db.commit()
         assert db.scalar(select(UnresolvedSubject)) is None
-        # It counts towards Dave from the reading it first matched in: the 4
-        # credits reported before he synced are not this period's usage.
-        assert ingestion.latest_totals(db, UsageView.USER)["user-dave"] == Decimal("0")
-        tenant.set_user_credits(name="Dave Dawson", email="dave.dawson@example.com", credits=6)
-        ingestion.ingest_usage(db, client)
-        db.commit()
-        assert ingestion.latest_totals(db, UsageView.USER)["user-dave"] == Decimal("2")
+        # A user synced after their first usage was reported: it is theirs.
+        assert ingestion.latest_totals(db, UsageView.USER)["user-dave"] == Decimal("4")
 
 
 def test_latest_totals_is_empty_before_any_ingestion(db: Session) -> None:

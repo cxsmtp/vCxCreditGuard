@@ -311,12 +311,20 @@ def _actions(session: Session, snapshot: UsageSnapshot | None, ids: list[str]) -
     totals: dict[str, int] = {}
     if snapshot is None or not ids:
         return totals
-    for actions in session.scalars(
-        select(UsageRecord.actions).where(
-            UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.in_(ids)
+    records = list(
+        session.scalars(
+            select(UsageRecord).where(
+                UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.in_(ids)
+            )
         )
-    ):
-        for action, count in (actions or {}).items():
+    )
+    anchors = ingestion.anchors_for(
+        session,
+        snapshot.view_by,
+        [r.subject_key for r in records if r.attributed_credits is not None],
+    )
+    for record in records:
+        for action, count in ingestion.forward_actions(record, anchors).items():
             if isinstance(count, int | float):
                 key = bucket(action)
                 totals[key] = totals.get(key, 0) + int(count)

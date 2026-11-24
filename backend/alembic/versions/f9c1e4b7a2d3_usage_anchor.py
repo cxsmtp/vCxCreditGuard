@@ -10,6 +10,10 @@ Create Date: 2026-11-24
   brings history into a budget period, whenever it is made.
 * ``usage_record.attributed_credits`` - what of a row's credits counts towards
   its entity (null: all of it).
+* ``usage_record.held_reason``/``held_readings`` - a name kept on the entity
+  it counted towards while it briefly does not match it (or is missing).
+* ``limit_period_state.baseline_names`` - what each name counted towards a
+  budget when its baseline was taken.
 * ``unresolved_subject.automation_noticed_at`` - the "new automation identity"
   notice is raised once per subject ever. Subjects already known to be
   automation are marked here, silently, so the first cycle after the upgrade
@@ -40,10 +44,24 @@ branch_labels = None
 depends_on = None
 
 DEMO_PERIOD_PARAM = "__demo__"
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _columns(bind, table: str) -> set[str]:  # type: ignore[no-untyped-def]
     return {column["name"] for column in sa.inspect(bind).get_columns(table)}
+
+
+def _when(value: object) -> datetime:
+    """A stored timestamp as a datetime (SQLite hands back text), or the epoch."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return EPOCH
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return EPOCH
 
 
 def upgrade() -> None:
@@ -61,13 +79,25 @@ def upgrade() -> None:
         sa.Column("snapshot_id", sa.Integer(), nullable=True),
         sa.Column("anchored_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("reason", sa.String(16), nullable=False),
+        sa.Column("reference_actions", sa.JSON(), nullable=True),
         sa.Column("released_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("released_credits", sa.Numeric(18, 4), nullable=True),
+        sa.Column("release_reason", sa.String(16), nullable=True),
+        sa.Column("removed_from", sa.String(64), nullable=True),
+        sa.Column("removed_at", sa.DateTime(timezone=True), nullable=True),
         sa.UniqueConstraint("view_by", "subject_key", name="usage_anchor_subject"),
     )
-    if "attributed_credits" not in _columns(bind, "usage_record"):
-        with op.batch_alter_table("usage_record") as batch:
+    record_columns = _columns(bind, "usage_record")
+    with op.batch_alter_table("usage_record") as batch:
+        if "attributed_credits" not in record_columns:
             batch.add_column(sa.Column("attributed_credits", sa.Numeric(18, 4), nullable=True))
+        if "held_reason" not in record_columns:
+            batch.add_column(sa.Column("held_reason", sa.String(16), nullable=True))
+        if "held_readings" not in record_columns:
+            batch.add_column(sa.Column("held_readings", sa.Integer(), nullable=True))
+    if "baseline_names" not in _columns(bind, "limit_period_state"):
+        with op.batch_alter_table("limit_period_state") as batch:
+            batch.add_column(sa.Column("baseline_names", sa.JSON(), nullable=True))
     if "automation_noticed_at" not in _columns(bind, "unresolved_subject"):
         with op.batch_alter_table("unresolved_subject") as batch:
             batch.add_column(
@@ -82,14 +112,14 @@ def upgrade() -> None:
         ),
         {"now": now, "yes": True},
     )
-    mappings: list[tuple[str, str, str]] = [
-        (view, key, entity_id)
-        for view, key, entity_id in bind.execute(
-            sa.text("SELECT view_by, subject_key, entity_id FROM entity_mapping")
+    mappings: list[tuple[str, str, str, object]] = [
+        (view, key, entity_id, mapped_at)
+        for view, key, entity_id, mapped_at in bind.execute(
+            sa.text("SELECT view_by, subject_key, entity_id, mapped_at FROM entity_mapping")
         )
     ]
     mappings += [
-        ("user", key, user_id)
+        ("user", key, user_id, EPOCH)
         for key, user_id in bind.execute(
             sa.text(
                 "SELECT subject_key, mapped_user_id FROM unresolved_subject "
@@ -98,7 +128,7 @@ def upgrade() -> None:
         )
     ]
     latest: dict[str, int | None] = {}
-    for view, key, entity_id in mappings:
+    for view, key, entity_id, mapped_at in mappings:
         if view not in latest:
             row = bind.execute(
                 sa.text(
@@ -113,15 +143,31 @@ def upgrade() -> None:
             sa.text(
                 "INSERT INTO usage_anchor (view_by, subject_key, entity_id, offset_credits, "
                 "snapshot_id, anchored_at, reason) VALUES (:view, :key, :entity, 0, "
-                ":sid, :now, 'mapping')"
+                ":sid, :at, 'mapping')"
             ),
-            {"view": view, "key": key, "entity": entity_id, "sid": latest[view], "now": now},
+            # Anchored when the mapping was made (a user pin has no date: the
+            # epoch), never at the upgrade: a restriction applied before the
+            # upgrade keeps measuring the name from its own pinned reading.
+            {
+                "view": view,
+                "key": key,
+                "entity": entity_id,
+                "sid": latest[view],
+                "at": _when(mapped_at),
+            },
         )
 
 
 def downgrade() -> None:
+    # Drops every anchor and the forward-only figures with them: after a
+    # downgrade, mapped names count in full again (as before this revision),
+    # and an upgrade after that anchors existing mappings at 0.
+    with op.batch_alter_table("limit_period_state") as batch:
+        batch.drop_column("baseline_names")
     with op.batch_alter_table("unresolved_subject") as batch:
         batch.drop_column("automation_noticed_at")
     with op.batch_alter_table("usage_record") as batch:
+        batch.drop_column("held_readings")
+        batch.drop_column("held_reason")
         batch.drop_column("attributed_credits")
     op.drop_table("usage_anchor")

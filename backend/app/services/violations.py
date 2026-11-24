@@ -50,6 +50,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import func, select
@@ -1286,14 +1287,12 @@ class _UsageReader:
             }
         return self._anchors[view]
 
-    def reference(self, view: str, record: UsageRecord, before: UsageSnapshot) -> int | None:
-        """The reading a name's rise towards its entity is measured from.
-
-        ``before`` (the reading pinned at the restriction), unless the name
-        only started to count towards the entity after it: then the reading it
-        was anchored at, so usage it reported before counting there (and
-        before the restriction, or under someone else) is never read as new.
-        """
+    def anchored_after(
+        self, view: str, record: UsageRecord, before: UsageSnapshot
+    ) -> UsageAnchor | None:
+        """The name's anchor, when it started to count towards the record's
+        entity only after ``before`` (mapped or moved since): its rise there is
+        measured from what it had reported then, kept on the anchor itself."""
         anchor = self.anchors(view).get(record.subject_key)
         if (
             anchor is not None
@@ -1301,30 +1300,37 @@ class _UsageReader:
             and anchor.entity_id == record.entity_id
             and anchor.anchored_at > before.collected_at
         ):
-            return anchor.snapshot_id
-        return before.id
+            return anchor
+        return None
 
     def pairs(
         self, view: str, now: list[UsageRecord], before: UsageSnapshot
-    ) -> tuple[list[UsageRecord], list[UsageRecord | None]]:
-        """Each name's row now, and the same name's row in the reading its rise
-        is measured from (None: it had none, all of it is new). A name whose
-        reference reading has since been pruned is left out of both sides:
-        nothing is claimed about it."""
+    ) -> tuple[list[UsageRecord], list]:
+        """Each name's row now, and what the same name had reported where its
+        rise is measured from: the reading pinned at the restriction, or, for
+        a name that started to count towards the target later, its anchor
+        (None: it had nothing, all of it is new). A name anchored with no
+        record of its actions is left out of both sides: nothing is claimed
+        about it."""
         kept: list[UsageRecord] = []
-        then: list[UsageRecord | None] = []
+        then: list = []
         for record in now:
-            snapshot_id = self.reference(view, record, before)
-            if snapshot_id is None:
+            anchor = self.anchored_after(view, record, before)
+            if anchor is not None:
+                if anchor.reference_actions is None and Decimal(anchor.offset_credits or 0) > 0:
+                    continue
                 kept.append(record)
-                then.append(None)
+                then.append(
+                    SimpleNamespace(
+                        actions=anchor.reference_actions or {},
+                        credits_used=Decimal(anchor.offset_credits or 0),
+                    )
+                )
                 continue
-            if snapshot_id != before.id and self.session.get(UsageSnapshot, snapshot_id) is None:
-                continue
-            if (snapshot_id, record.subject_key) not in self._by_key:
-                self.preload_keys(snapshot_id, {record.subject_key})
+            if (before.id, record.subject_key) not in self._by_key:
+                self.preload_keys(before.id, {record.subject_key})
             kept.append(record)
-            then.append(self._by_key[(snapshot_id, record.subject_key)])
+            then.append(self._by_key[(before.id, record.subject_key)])
         return kept, then
 
 

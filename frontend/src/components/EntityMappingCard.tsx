@@ -28,15 +28,34 @@ const PAGE = 200;
 
 export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
   const toast = useToast();
-  // One page from the server at a time; "Show more" asks for a longer one.
-  const [shown, setShown] = useState(PAGE);
+  // One page from the server at a time: "Show more" asks for the next one
+  // (by offset), so the list is never asked for more than a page at once.
   const rows = useResource<UnmatchedEntity[]>(
     (signal) =>
       isAdmin
-        ? api.get("/api/usage/unmatched-entities", { limit: shown }, signal)
+        ? api.get("/api/usage/unmatched-entities", { limit: PAGE, offset: 0 }, signal)
         : Promise.resolve([]),
-    [isAdmin, shown],
+    [isAdmin],
   );
+  const [more, setMore] = useState<UnmatchedEntity[]>([]);
+  const [lastPageFull, setLastPageFull] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  async function showMore() {
+    setLoadingMore(true);
+    try {
+      const page = await api.get<UnmatchedEntity[]>("/api/usage/unmatched-entities", {
+        limit: PAGE,
+        offset: (rows.data?.length ?? 0) + more.length,
+      });
+      setMore((current) => [...current, ...page]);
+      setLastPageFull(page.length >= PAGE);
+    } catch (caught) {
+      toast.error(caught instanceof ApiError ? caught.message : "Could not load more names.");
+    } finally {
+      setLoadingMore(false);
+    }
+  }
   const [mapping, setMapping] = useState<UnmatchedEntity | null>(null);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<OrgEntity[]>([]);
@@ -82,6 +101,8 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
           : "Mapping cleared.",
       );
       setMapping(null);
+      setMore([]);
+      setLastPageFull(true);
       await rows.reload();
     } catch (caught) {
       toast.error(caught instanceof ApiError ? caught.message : "Could not save the mapping.");
@@ -91,7 +112,8 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
   }
 
   if (!isAdmin) return null;
-  const data = rows.data ?? [];
+  const data = [...(rows.data ?? []), ...more];
+  const canShowMore = (rows.data?.length ?? 0) >= PAGE && (more.length === 0 || lastPageFull);
 
   return (
     <Card
@@ -164,9 +186,9 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
           </tbody>
         </Table>
       )}
-      {data.length >= shown && (
+      {canShowMore && (
         <div className="mt-3">
-          <Button variant="secondary" onClick={() => setShown(shown + PAGE)}>
+          <Button variant="secondary" onClick={showMore} loading={loadingMore}>
             Show more
           </Button>
         </div>

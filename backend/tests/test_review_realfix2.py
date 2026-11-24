@@ -70,9 +70,7 @@ def test_map_unmap_remap_counts_each_credit_once(
     assert _state(db, project).credits_used == 600
 
     body = _map(admin_client, None)
-    assert (
-        "600 credits it had added to payments/api no longer count there" in (body["confirmation"])
-    ), body["confirmation"]
+    assert "of the 600 credits it had added there" in body["confirmation"], body["confirmation"]
     cycle.run_cycle(trigger="manual")
     assert _state(db, project).credits_used == 0
 
@@ -437,12 +435,16 @@ def test_user_mapping_after_demo_mode_anchors_on_the_live_reading(
     assert _state(db, limit).credits_used == 0
 
 
-def test_a_name_that_starts_to_match_by_itself_is_not_this_periods_usage(
+def test_a_name_that_starts_to_match_by_itself_counts_in_full(
     db: Session,
     connected,  # noqa: F811
 ) -> None:
-    """Same movement as a mapping, but automatic: a project renamed in
-    Checkmarx One to the name the feed already reported."""
+    """A project renamed in Checkmarx One to a name the feed already reported
+    separately, while unmatched. The third review settled this: a name that
+    counted nowhere and starts to match counts in full (as before realfix), so
+    that a project created and scanned before the next sync is never robbed of
+    its first usage; the two cannot be told apart without ids in the feed.
+    Its old name stays counted where it was (kept, see test_review_realfix3)."""
     tenant = live_tenant()
     tenant.set_entity_credits(view="project", name=NAME, credits=870)
     connected(tenant)
@@ -452,16 +454,11 @@ def test_a_name_that_starts_to_match_by_itself_is_not_this_periods_usage(
     for p in tenant.projects:
         if p["id"] == "proj-api":
             p["name"] = NAME  # renamed in Checkmarx One to the reported name
-    tenant.set_entity_credits(view="project", name="payments/api", credits=0)
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     cycle.run_cycle(trigger="manual")
     state = _state(db, project)
-    assert state.credits_used < 100, (state.credits_used, state.baseline_credits)
-    anchor = _anchor(db, NAME)
-    assert anchor.reason == ingestion.ANCHOR_FIRST_MATCH and anchor.offset_credits == 870
-    tenant.set_entity_credits(view="project", name=NAME, credits=880)
-    cycle.run_cycle(trigger="manual")
-    assert _state(db, project).credits_used == 10
+    assert state.credits_used == 870, (state.credits_used, state.baseline_credits)
+    assert _anchor(db, NAME) is None
 
 
 def test_a_new_name_counts_in_full_and_a_rolled_window_re_anchors(

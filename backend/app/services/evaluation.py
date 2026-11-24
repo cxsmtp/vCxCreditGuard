@@ -160,10 +160,23 @@ class UsageIndex:
 
     def __init__(self, session: Session) -> None:
         self._session = session
-        self.users = ingestion.latest_totals(session, UsageView.USER)
-        self.applications = ingestion.latest_totals(session, UsageView.APPLICATION)
-        self.projects = ingestion.latest_totals(session, UsageView.PROJECT)
-        self.groups = ingestion.latest_totals(session, UsageView.GROUP)
+        # Each view's names and their anchors, in one statement per view: the
+        # totals and what a budget's period discounts (``effective_baseline``)
+        # come from the same reading.
+        self.names = {
+            str(view): ingestion.latest_names(session, view)
+            for view in (
+                UsageView.USER,
+                UsageView.APPLICATION,
+                UsageView.PROJECT,
+                UsageView.GROUP,
+            )
+        }
+        self.users = ingestion.totals_of(self.names[str(UsageView.USER)])
+        self.applications = ingestion.totals_of(self.names[str(UsageView.APPLICATION)])
+        self.projects = ingestion.totals_of(self.names[str(UsageView.PROJECT)])
+        self.groups = ingestion.totals_of(self.names[str(UsageView.GROUP)])
+        self._ids: dict[tuple[str, str], list[str]] = {}
         self.project_dimension = ingestion.dimension_supported(session, UsageView.PROJECT)
         self.group_dimension = ingestion.dimension_supported(session, UsageView.GROUP)
         self.application_dimension = ingestion.dimension_supported(session, UsageView.APPLICATION)
@@ -279,13 +292,7 @@ class UsageIndex:
         if self.application_dimension and application_id in self.applications:
             return self.applications[application_id], True
         # Fall back to the sum of the application's projects.
-        project_ids = list(
-            self._session.scalars(
-                select(CxApplicationProject.project_id).where(
-                    CxApplicationProject.application_id == application_id
-                )
-            )
-        )
+        project_ids = self._linked("application_projects", application_id)
         if not project_ids or not self.project_dimension:
             if self.application_dimension:
                 # The dimension works, this application simply spent nothing.
@@ -304,11 +311,7 @@ class UsageIndex:
         if not include_members and self.group_dimension and group_id in self.groups:
             return self.groups[group_id], True
 
-        project_ids = list(
-            self._session.scalars(
-                select(CxProjectGroup.project_id).where(CxProjectGroup.group_id == group_id)
-            )
-        )
+        project_ids = self._linked("group_projects", group_id)
         total = Decimal("0")
         available = False
         if project_ids and self.project_dimension:
@@ -317,17 +320,116 @@ class UsageIndex:
             )
             available = True
         if include_members:
-            member_ids = list(
-                self._session.scalars(
-                    select(CxGroupMembership.user_id).where(CxGroupMembership.group_id == group_id)
-                )
-            )
+            member_ids = self._linked("group_members", group_id)
             if member_ids and self.user_dimension:
                 total += sum(
                     (self.users.get(uid, Decimal("0")) for uid in member_ids), Decimal("0")
                 )
                 available = True
         return total, available
+
+    def _linked(self, kind: str, entity_id: str) -> list[str]:
+        """Projects of an application or group, or a group's members (cached)."""
+        cache_key = (kind, entity_id)
+        if cache_key not in self._ids:
+            if kind == "application_projects":
+                query = select(CxApplicationProject.project_id).where(
+                    CxApplicationProject.application_id == entity_id
+                )
+            elif kind == "group_projects":
+                query = select(CxProjectGroup.project_id).where(
+                    CxProjectGroup.group_id == entity_id
+                )
+            else:
+                query = select(CxGroupMembership.user_id).where(
+                    CxGroupMembership.group_id == entity_id
+                )
+            self._ids[cache_key] = list(self._session.scalars(query))
+        return self._ids[cache_key]
+
+    def feeding(self, limit: CreditLimit) -> set[tuple[str, str]]:
+        """The (view, entity id) pairs whose names make up ``reported_total``."""
+        user, project = str(UsageView.USER), str(UsageView.PROJECT)
+        if limit.entity_type == EntityType.USER:
+            return {(user, limit.entity_id)} if self.user_dimension else set()
+        if limit.entity_type == EntityType.PROJECT:
+            return {(project, limit.entity_id)} if self.project_dimension else set()
+        if limit.entity_type == EntityType.APPLICATION:
+            if self.application_dimension and limit.entity_id in self.applications:
+                return {(str(UsageView.APPLICATION), limit.entity_id)}
+            if not self.project_dimension:
+                return set()
+            return {(project, pid) for pid in self._linked("application_projects", limit.entity_id)}
+        if limit.entity_type == EntityType.GROUP:
+            members = limit.include_member_usage
+            if not members and self.group_dimension and limit.entity_id in self.groups:
+                return {(str(UsageView.GROUP), limit.entity_id)}
+            found: set[tuple[str, str]] = set()
+            if self.project_dimension:
+                found |= {(project, pid) for pid in self._linked("group_projects", limit.entity_id)}
+            if members and self.user_dimension:
+                found |= {(user, uid) for uid in self._linked("group_members", limit.entity_id)}
+            return found
+        return set()
+
+    def name_figures(self, limit: CreditLimit) -> dict[str, object]:
+        """What each name counts towards this budget now, for a new baseline:
+        ``{"names": {"<view>|<name>": [credits, anchored_at, removed_at]}}``."""
+        feeding = self.feeding(limit)
+        names: dict[str, list] = {}
+        for view, rows in self.names.items():
+            for row in rows.values():
+                if row.entity_id is None or (view, row.entity_id) not in feeding:
+                    continue
+                if row.counted <= 0:
+                    continue
+                names[f"{view}|{row.key}"] = [
+                    str(row.counted),
+                    row.anchored_at.isoformat() if row.anchored_at else None,
+                    row.removed_at.isoformat() if row.removed_at else None,
+                ]
+        return {"names": names}
+
+    def effective_baseline(self, limit: CreditLimit, state: LimitPeriodState) -> Decimal:
+        """The period's baseline, less what names since moved away had in it.
+
+        A name unmapped, mapped elsewhere, or whose anchor was taken afresh
+        after the baseline was taken no longer brings into the total what it
+        had brought into the baseline. Discounting exactly that keeps the
+        budget's own usage, and the name's usage within the period is all
+        that the move takes away. Names that simply stop being reported are
+        left to the usual re-baselining.
+        """
+        baseline = Decimal(state.baseline_credits or 0)
+        captured = (state.baseline_names or {}).get("names") if state.baseline_names else None
+        if not captured or baseline <= 0:
+            return baseline
+        feeding = self.feeding(limit)
+        discount = Decimal("0")
+        for name, figures in captured.items():
+            view, _, key = name.partition("|")
+            row = self.names.get(view, {}).get(key)
+            if row is None:
+                continue
+            credits, anchored_at, removed_at = (list(figures) + [None, None, None])[:3]
+            now_anchored = row.anchored_at.isoformat() if row.anchored_at else None
+            now_removed = row.removed_at.isoformat() if row.removed_at else None
+            feeds = row.entity_id is not None and (view, row.entity_id) in feeding
+            if feeds:
+                moved = (
+                    row.anchor_live
+                    and row.anchor_entity == row.entity_id
+                    and now_anchored != anchored_at
+                )
+            else:
+                moved = (
+                    now_removed is not None
+                    and now_removed != removed_at
+                    and (view, row.removed_from) in feeding
+                )
+            if moved:
+                discount += Decimal(str(credits))
+        return max(Decimal("0"), baseline - discount)
 
     def reported_total(self, limit: CreditLimit) -> tuple[Decimal, bool]:
         if limit.entity_type == EntityType.USER:
@@ -1513,23 +1615,25 @@ def _evaluate_one(
         reported_total=reported_total,
         available=available,
         moment=moment,
+        index=index,
     )
 
+    baseline = index.effective_baseline(limit, state)
     # A sliding lookback window can drop old consumption, which would otherwise
-    # produce negative usage. Re-baseline instead.
-    if reported_total < state.baseline_credits:
+    # produce negative usage. Re-baseline instead (and take the names afresh).
+    if reported_total < baseline:
         logger.info(
             "Reported total for %s %s fell below the period baseline, re-baselining",
             limit.entity_type,
             limit.entity_id,
         )
         state.baseline_credits = reported_total
+        state.baseline_names = index.name_figures(limit) if reported_total > 0 else None
+        baseline = reported_total
 
     state.reported_total = reported_total
     state.usage_available = available
-    state.credits_used = (
-        max(Decimal("0"), reported_total - state.baseline_credits) if available else Decimal("0")
-    )
+    state.credits_used = max(Decimal("0"), reported_total - baseline) if available else Decimal("0")
     attributed = (
         index.attributed_usage(limit, window=window, state=state, moment=moment)
         if available
@@ -1772,7 +1876,7 @@ def period_usage(
     reported_total, available = index.reported_total(limit)
     state = index.period_state(limit.id, window.key)
     baseline = (
-        state.baseline_credits
+        index.effective_baseline(limit, state)
         if state is not None
         else baseline_for(limit, window=window, reported_total=reported_total, available=available)
     )
@@ -1793,6 +1897,7 @@ def _get_or_create_state(
     reported_total: Decimal,
     available: bool,
     moment: datetime | None = None,
+    index: UsageIndex | None = None,
 ) -> LimitPeriodState:
     state = session.scalar(
         select(LimitPeriodState).where(
@@ -1802,14 +1907,17 @@ def _get_or_create_state(
     )
     if state is not None:
         return state
+    baseline = baseline_for(
+        limit, window=window, reported_total=reported_total, available=available
+    )
     state = LimitPeriodState(
         limit_id=limit.id,
         period_key=window.key,
         period_start=window.start,
         period_end=window.end,
-        baseline_credits=baseline_for(
-            limit, window=window, reported_total=reported_total, available=available
-        ),
+        baseline_credits=baseline,
+        # What each name brought into the baseline (see effective_baseline).
+        baseline_names=index.name_figures(limit) if index is not None and baseline > 0 else None,
         baseline_at=moment or utcnow(),
         reported_total=reported_total,
         credits_used=Decimal("0"),
