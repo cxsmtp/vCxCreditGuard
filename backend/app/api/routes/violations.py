@@ -7,7 +7,7 @@ does not offer the page to them.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, or_, select
@@ -24,6 +24,13 @@ from app.services import violations as violations_service
 
 router = APIRouter(prefix="/violations", tags=["violations"])
 MAX_ROWS = 500
+
+
+def _utc(moment: datetime) -> datetime:
+    """A query time as aware UTC; one given without a zone is taken as UTC."""
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC)
 
 
 def _to_response(row: PolicyViolation, db=None) -> ViolationResponse:  # type: ignore[no-untyped-def]
@@ -92,9 +99,9 @@ def list_violations(
             )
         )
     if since is not None:
-        query = query.where(PolicyViolation.detected_at >= since)
+        query = query.where(PolicyViolation.detected_at >= _utc(since))
     if until is not None:
-        query = query.where(PolicyViolation.detected_at < until)
+        query = query.where(PolicyViolation.detected_at < _utc(until))
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     rows = db.scalars(
         query.order_by(PolicyViolation.detected_at.desc(), PolicyViolation.id.desc()).limit(limit)

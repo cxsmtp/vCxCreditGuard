@@ -280,11 +280,13 @@ def rate_table(session: Session) -> dict[str, tuple[Decimal, str | None]]:
 
     Indexed by the rate's ``action_type`` and by its ``display_name``, both as
     :func:`usage_api.action_key`, so either spelling the feed uses matches.
+    A rate marked inactive (``is_active`` false) is not a current price and is
+    left out, so it can never shadow the active one for the same action.
     """
     stored = settings_store.action_rates(session)
     table: dict[str, tuple[Decimal, str | None]] = {}
     for entry in (stored or {}).get("rates") or []:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or entry.get("is_active") is False:
             continue
         try:
             price = Decimal(str(entry.get("credits_per_action")))

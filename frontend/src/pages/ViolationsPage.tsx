@@ -34,7 +34,7 @@ const KINDS = [
   { value: "", label: "Everything" },
   { value: "setting_reenabled", label: "Setting switched back on" },
   { value: "fusion_scan_during_restriction", label: "Fusion scan during a restriction" },
-  { value: "ai_scan_during_restriction", label: "AI scan without Fusion" },
+  { value: "ai_scan_during_restriction", label: "AI scans without Fusion (information)" },
   { value: "usage_after_restriction", label: "Usage kept rising" },
 ];
 

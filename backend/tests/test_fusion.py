@@ -10,13 +10,13 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, func, inspect, select
 from sqlalchemy.orm import Session
 
 from app.checkmarx import credits as credits_api
 from app.checkmarx import usage as usage_api
 from app.db.migrate import alembic_config
-from app.models import EnforcementAction, Notification
+from app.models import AuditLogEntry, EnforcementAction, Notification, PolicyViolation
 from app.models.enums import (
     ActionType,
     EnforcementKind,
@@ -450,17 +450,53 @@ class TestTurnOffFusion:
         )
 
     def test_repo_half_absent_is_skipped_quietly(self, db: Session) -> None:
+        """No fusionScanConfig: nothing to turn off. Recorded as left alone (so
+        the safety ceiling does not count it as new every cycle), never as a
+        failure of the cycle, without a notification, and audited once per
+        project whatever the period."""
         tenant, client = setup_tenant(db)
         limit = make_limit(db, actions=["fusion"])
-        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        outcome = enforcement.apply_enforcement(
+            db, client, limit=limit, period_key=PERIOD, actor=ACTOR
+        )
         db.commit()
+        assert outcome.failed == []
+        assert any("nothing to turn off there" in line for line in outcome.skipped)
         repo = actions_by_kind(db)["disable_repo_fusion"]
-        assert repo.status == EnforcementStatus.FAILED
         assert "do not include a Fusion setting" in repo.error
+        assert not enforcement.may_be_in_force(repo)
+        for period in (PERIOD, "2026-09", "2026-10"):
+            again = enforcement.apply_enforcement(
+                db, client, limit=limit, period_key=period, actor=ACTOR
+            )
+            db.commit()
+            assert again.failed == []
+        audits = list(
+            db.scalars(
+                select(AuditLogEntry).where(
+                    AuditLogEntry.action.in_(
+                        ["enforcement.not_applicable", "enforcement.not_restricted"]
+                    )
+                )
+            )
+        )
+        assert [entry.action for entry in audits] == ["enforcement.not_applicable"]
         assert not db.scalar(
-            select(Notification).where(Notification.title.like("%no repository Fusion setting"))
+            select(Notification).where(Notification.title.like("%repository Fusion setting%"))
         )
         assert "repo-1" not in tenant.repo_fusion  # nothing invented
+
+        # A repository that gains the setting is restricted from then on.
+        tenant.repo_fusion["repo-1"] = {"enabled": True, "llmModel": "opus-5.5"}
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        repo = next(
+            action
+            for action in db.scalars(select(EnforcementAction))
+            if action.kind == "disable_repo_fusion" and action.period_key == PERIOD
+        )
+        assert repo.status == EnforcementStatus.APPLIED
+        assert tenant.repo_fusion["repo-1"]["enabled"] is False
 
     def test_repo_half_present_is_turned_off_and_restored(self, db: Session) -> None:
         tenant = populated_tenant()
@@ -828,3 +864,349 @@ def test_a_config_read_refused_on_one_project_is_cleared_only_by_that_project(
     )
     check = next(c for c in report["checks"] if c["id"] == "project_config_read")
     assert not check["runtime_denied_at"]
+
+
+# ------------------------------------- retries, sibling limits and read-backs
+
+
+def _count(db: Session, model, *conditions) -> int:  # type: ignore[no-untyped-def]
+    db.expire_all()
+    return int(db.scalar(select(func.count()).select_from(model).where(*conditions)) or 0)
+
+
+class TestWhatWasTakenIsGivenBack:
+    def test_retry_after_unknown_outcome_with_lock_rejected_restores_fusion(
+        self, db: Session, monkeypatch
+    ) -> None:
+        """Attempt 1: the lock is refused (400), the value-only fallback lands but
+        its answer is lost. Attempt 2 reads Fusion already off, and the lock is
+        refused again. What attempt 1 took (Fusion on) must still be given back."""
+        from app.checkmarx import platform
+        from app.checkmarx.errors import CheckmarxError
+
+        tenant = populated_tenant()
+        tenant.reject_config_lock = True
+        tenant, client = setup_tenant(db, tenant)
+        limit = make_limit(db, actions=["fusion"])
+
+        real = platform.set_project_setting
+        calls = {"n": 0}
+
+        def flaky(client_, *, project_id, entry):  # type: ignore[no-untyped-def]
+            calls["n"] += 1
+            real(client_, project_id=project_id, entry=entry)  # 400 for the lock
+            if calls["n"] == 2:  # the value-only fallback landed; the answer was lost
+                raise CheckmarxError("connection reset")
+
+        monkeypatch.setattr(platform, "set_project_setting", flaky)
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        action = actions_by_kind(db)["disable_fusion"]
+        assert action.status == EnforcementStatus.FAILED
+        assert tenant.fusion_setting("proj-api")["value"] == "false"
+        monkeypatch.setattr(platform, "set_project_setting", real)
+
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        action = actions_by_kind(db)["disable_fusion"]
+        assert action.status == EnforcementStatus.APPLIED
+        snapshot = action.undo_snapshot
+        assert snapshot["fusion_write"] is True
+        assert snapshot["value_before"] == "true"
+        assert snapshot["lock_applied"] is False
+        enforcement.restore_action(db, client, action=action, actor=ACTOR)
+        db.commit()
+        entry = tenant.fusion_setting("proj-api")
+        assert entry["value"] == "true" and entry["allowOverride"] is True
+
+    def test_sibling_limits_last_release_restores_original(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        project_limit = make_limit(db, actions=["fusion"])
+        group_limit = make_limit(
+            db, entity_type=EntityType.GROUP, entity_id="grp-payments", actions=["fusion"]
+        )
+        enforcement.apply_enforcement(
+            db, client, limit=project_limit, period_key=PERIOD, actor=ACTOR
+        )
+        enforcement.apply_enforcement(db, client, limit=group_limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        limits_service.update_limit(
+            db,
+            limit=project_limit,
+            changes={"project_actions": ["auto_triage"]},
+            actor=ACTOR,
+            client=client,
+        )
+        db.commit()
+        assert tenant.fusion_setting("proj-api")["value"] == "false"
+        limits_service.update_limit(
+            db, limit=group_limit, changes={"enforce": False}, actor=ACTOR, client=client
+        )
+        db.commit()
+        entry = tenant.fusion_setting("proj-api")
+        assert entry["value"] == "true" and entry["allowOverride"] is True
+
+    def test_the_lock_is_still_checked_after_the_first_limit_lets_go(self, db: Session) -> None:
+        """The second limit found the lock in place (the first one's): it carries
+        the first one's word on the lock, so a lock removed later is re-applied."""
+        tenant, client = setup_tenant(db)
+        project_limit = make_limit(db, actions=["fusion"])
+        group_limit = make_limit(
+            db, entity_type=EntityType.GROUP, entity_id="grp-payments", actions=["fusion"]
+        )
+        enforcement.apply_enforcement(
+            db, client, limit=project_limit, period_key=PERIOD, actor=ACTOR
+        )
+        enforcement.apply_enforcement(db, client, limit=group_limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        limits_service.update_limit(
+            db,
+            limit=project_limit,
+            changes={"project_actions": ["auto_triage"]},
+            actor=ACTOR,
+            client=client,
+        )
+        db.commit()
+        group_action = next(
+            action
+            for action in db.scalars(select(EnforcementAction))
+            if action.kind == "disable_fusion"
+            and action.limit_id == group_limit.id
+            and action.target_id == "proj-api"
+        )
+        assert group_action.undo_snapshot["lock_applied"] is True
+        tenant.fusion_setting("proj-api")["allowOverride"] = True
+        outcome = enforcement.apply_enforcement(
+            db, client, limit=group_limit, period_key=PERIOD, actor=ACTOR
+        )
+        db.commit()
+        assert [a.target_id for a in outcome.reconciled] == ["proj-api"]
+        assert tenant.fusion_setting("proj-api")["allowOverride"] is False
+
+    def test_unreadable_setting_never_unlocks_a_locked_one(self, db: Session) -> None:
+        """The setting cannot be read and the locked write is refused: the
+        restriction is reported unverifiable, never rewritten unlocked."""
+        tenant, client = setup_tenant(db)
+        limit = make_limit(db, actions=["fusion"])
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        assert tenant.fusion_setting("proj-api")["allowOverride"] is False
+        tenant.fail_requests[("GET", "/configuration/project")] = 500
+        tenant.reject_config_lock = True
+        outcome = enforcement.apply_enforcement(
+            db, client, limit=limit, period_key=PERIOD, actor=ACTOR
+        )
+        db.commit()
+        entry = tenant.fusion_setting("proj-api")
+        assert entry["value"] == "false" and entry["allowOverride"] is False
+        assert any("could not be verified" in line for line in outcome.skipped)
+
+    def test_project_actions_none_is_stored_as_sql_null(self, db: Session) -> None:
+        from sqlalchemy import text
+
+        legacy = make_limit(db, actions=None)
+        chosen = make_limit(db, entity_id="proj-web", actions=["fusion"])
+        limits_service.update_limit(
+            db, limit=chosen, changes={"project_actions": None}, actor=ACTOR
+        )
+        db.commit()
+        nulls = dict(db.execute(text("SELECT id, project_actions IS NULL FROM credit_limit")).all())
+        assert bool(nulls[legacy.id]) is True
+        assert bool(nulls[chosen.id]) is True
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(CreditLimit)
+                .where(CreditLimit.project_actions.is_(None))
+            )
+            == 2
+        )
+
+
+class TestReadBack:
+    def test_a_lock_the_tenant_does_not_keep_is_recorded_once_and_is_not_drift(
+        self, db: Session
+    ) -> None:
+        tenant = populated_tenant()
+        tenant.drop_config_lock = True
+        tenant, client = setup_tenant(db, tenant)
+        limit = make_limit(db, actions=["fusion"])
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        action = actions_by_kind(db)["disable_fusion"]
+        assert action.status == EnforcementStatus.APPLIED
+        assert action.undo_snapshot["lock_applied"] is False
+        assert action.undo_snapshot["lock_not_kept"] is True
+        entry = tenant.fusion_setting("proj-api")
+        assert entry["value"] == "false" and entry["allowOverride"] is True
+        body = db.scalar(
+            select(Notification.body).where(Notification.title.like("%: Fusion turned off"))
+        )
+        assert "did not keep it" in body
+        for _ in range(3):
+            outcome = enforcement.apply_enforcement(
+                db, client, limit=limit, period_key=PERIOD, actor=ACTOR
+            )
+            db.commit()
+            assert outcome.reconciled == []
+        assert _count(db, PolicyViolation) == 0
+        assert _count(db, Notification, Notification.category == "policy") == 0
+        # The value part is still enforced.
+        tenant.fusion_setting("proj-api")["value"] = "true"
+        outcome = enforcement.apply_enforcement(
+            db, client, limit=limit, period_key=PERIOD, actor=ACTOR
+        )
+        db.commit()
+        assert [a.kind for a in outcome.reconciled] == [EnforcementKind.DISABLE_FUSION]
+        assert tenant.fusion_setting("proj-api")["value"] == "false"
+
+    def test_a_lock_removed_every_cycle_is_one_violation_and_one_alert_a_day(
+        self, db: Session
+    ) -> None:
+        tenant, client = setup_tenant(db)
+        limit = make_limit(db, actions=["fusion"])
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        for _ in range(3):
+            tenant.fusion_setting("proj-api")["allowOverride"] = True
+            enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+            db.commit()
+            assert tenant.fusion_setting("proj-api")["allowOverride"] is False
+        from app.models.violations import KIND_SETTING_REENABLED
+
+        assert _count(db, PolicyViolation, PolicyViolation.kind == KIND_SETTING_REENABLED) == 1
+        assert _count(db, Notification, Notification.category == "policy") == 1
+        # The policy notification is the one alert: no separate "turned off again".
+        assert (
+            _count(
+                db,
+                Notification,
+                Notification.category == "enforcement",
+                Notification.title.like("%turned off again%"),
+            )
+            == 0
+        )
+        # Each re-assert is still audited.
+        assert _count(db, AuditLogEntry, AuditLogEntry.action == "enforcement.reconciled") == 3
+
+    def test_a_value_the_tenant_does_not_keep_is_not_counted_as_turned_off(
+        self, db: Session
+    ) -> None:
+        tenant = populated_tenant()
+        tenant.drop_config_writes = True
+        tenant, client = setup_tenant(db, tenant)
+        limit = make_limit(db, actions=["fusion"])
+        outcome = enforcement.apply_enforcement(
+            db, client, limit=limit, period_key=PERIOD, actor=ACTOR
+        )
+        db.commit()
+        action = actions_by_kind(db)["disable_fusion"]
+        assert action.status == EnforcementStatus.FAILED
+        assert "still reads as on" in action.error
+        assert outcome.failed
+        # In doubt (part of it may have landed), so Restore still considers it.
+        assert enforcement.may_be_in_force(action)
+
+    def test_a_repo_setting_the_tenant_does_not_keep_is_recorded_once(self, db: Session) -> None:
+        tenant = populated_tenant()
+        tenant.repo_fusion["repo-1"] = {"enabled": True, "llmModel": "opus-5.5"}
+        tenant.drop_repo_fusion_writes = True
+        tenant, client = setup_tenant(db, tenant)
+        limit = make_limit(db, actions=["fusion"])
+        for _ in range(3):
+            outcome = enforcement.apply_enforcement(
+                db, client, limit=limit, period_key=PERIOD, actor=ACTOR
+            )
+            db.commit()
+            assert outcome.failed == []
+        repo = actions_by_kind(db)["disable_repo_fusion"]
+        assert repo.status == EnforcementStatus.FAILED
+        assert "did not keep it" in repo.error
+        assert not enforcement.may_be_in_force(repo)
+        assert (
+            _count(db, Notification, Notification.title.like("%repository Fusion setting not%"))
+            == 1
+        )
+        assert (
+            _count(
+                db,
+                AuditLogEntry,
+                AuditLogEntry.action == "enforcement.not_restricted",
+                AuditLogEntry.target_id == "proj-api",
+            )
+            == 1
+        )
+        assert _count(db, PolicyViolation) == 0
+
+
+class TestPricesAndNames:
+    def test_inactive_rate_does_not_shadow_the_active_one(self, db: Session) -> None:
+        settings_store.set_value(
+            db,
+            settings_store.KEY_ACTION_RATES,
+            {
+                "rates": [
+                    {
+                        "action_type": "fusion_scan_-_opus_5.5",
+                        "credits_per_action": "1",
+                        "display_name": "Fusion Scan - Opus 5.5",
+                        "is_active": False,
+                    },
+                    {
+                        "action_type": "fusion_scan_-_opus_5.5",
+                        "credits_per_action": "2",
+                        "display_name": "Fusion Scan - Opus 5.5",
+                        "is_active": True,
+                    },
+                ]
+            },
+        )
+        db.commit()
+        table = usage_mix.rate_table(db)
+        assert table["fusion_scan___opus_5.5"][0] == 2
+
+    def test_a_scan_model_is_priced_by_an_exact_match_only(self) -> None:
+        from app.services import violations
+
+        rates = {
+            "fusion_scan___claude_opus_5.5": (Decimal("9"), "Fusion Scan - Claude Opus 5.5"),
+            "fusion_scan___haiku_4.5": (Decimal("1.5"), "Fusion Scan - Haiku 4.5"),
+        }
+        assert violations._fusion_price("opus-5.5", rates) is None
+        assert violations._fusion_price("5.5", rates) is None
+        assert violations._fusion_price("claude-opus-5.5", rates) == Decimal("9")
+        assert violations._fusion_price("Haiku 4.5", rates) == Decimal("1.5")
+
+    @pytest.mark.parametrize("raw", ["fusion_sast", "fusionsomething", "Fusion Report"])
+    def test_other_fusion_types_stay_visible(self, raw: str) -> None:
+        assert usage_api.normalise_action_type(raw) != ActionType.FUSION
+        assert usage_api.normalise_action_type(raw) == usage_api.action_key(raw)
+
+
+class TestNeededPermissions:
+    def test_turning_fusion_off_needs_the_repository_read_and_the_scans(
+        self, db: Session, monkeypatch
+    ) -> None:
+        tenant = _connected(db, monkeypatch)
+        org_sync.sync_org_model(db, tenant.client())
+        db.commit()
+        make_limit(db, entity_id="proj-api", actions=["fusion"])
+        assessed = key_permissions.current_report(db) or key_permissions.run_check(
+            db, trigger=key_permissions.TRIGGER_MANUAL, actor=ACTOR
+        )
+        checks = {check["id"]: check for check in assessed["checks"]}
+        assert checks["repo_read"]["required"] is True
+        assert checks["repo_fusion_write"]["required"] is True
+        assert checks["scans"]["required"] is True
+
+    def test_without_a_fusion_limit_they_are_not_needed_for_it(
+        self, db: Session, monkeypatch
+    ) -> None:
+        tenant = _connected(db, monkeypatch)
+        org_sync.sync_org_model(db, tenant.client())
+        db.commit()
+        make_limit(db, entity_id="proj-api", actions=["auto_triage"])
+        report = key_permissions.run_check(db, trigger=key_permissions.TRIGGER_MANUAL, actor=ACTOR)
+        checks = {check["id"]: check for check in report["checks"]}
+        assert checks["repo_fusion_write"]["required"] is False
+        assert checks["scans"]["required"] is False

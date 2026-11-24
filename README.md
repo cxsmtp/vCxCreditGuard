@@ -405,29 +405,57 @@ repository's), each restored and verified on its own.
   turn Fusion back on for itself. **That Checkmarx One honours this lock for ad
   hoc scans is not verified.** If Checkmarx rejects the locked entry (400 or
   422) the value is written without the lock, and the record and the
-  restriction notification say the lock was not accepted. The lock attempt can
+  restriction notification say the lock was not accepted. After the write the
+  setting is read back once: a value that still reads `"true"` is not counted as
+  turned off (the action fails and is retried next cycle), and a lock the tenant
+  answered 2xx to but did not keep is recorded once as *not kept by this
+  tenant*. Only a lock that was seen to hold is checked as drift afterwards, so a
+  tenant that does not keep the lock never produces a violation every cycle;
+  the value is still enforced. The lock attempt can
   be switched off (Settings → Enforcement, *Lock Fusion against per-scan
   override*, on by default). CreditGuard does not rely on the lock: see
   [Policy violations](#policy-violations).
 * A project whose scan settings have no Fusion entry is left alone, with a
   notification saying why; the project's other restrictions still apply.
-* A setting inherited from the tenant (`originLevel` `Tenant`) is set on the
-  project when it is turned off. Restore writes the previous value and
-  `allowOverride` back, which also sets it on the project: there is no known
-  endpoint to remove a project's own value, so a later tenant-level change no
-  longer reaches that project. The restore notification says so.
+* A setting inherited from the tenant (`originLevel` `Tenant` or `Environment`)
+  is set on the project when it is turned off. Restore writes the previous
+  value and `allowOverride` back, which also sets it on the project: there is no
+  known endpoint to remove a project's own value, so a later tenant-level change
+  no longer reaches that project. The restore notification says so. Removing
+  the project's own value is deliberately **not** attempted with a guessed
+  `DELETE`: a wrong one could remove the project's other overrides too. See
+  [Remaining unknowns](#remaining-unknowns) (item 6).
 * The repository half is **not verified**: that the repos-manager read returns
   `fusionScanConfig`, and that a `PATCH` of `{"fusionScanConfig": {...,
-  "enabled": false}}` changes it. When the read does not include it, that half
-  is skipped and recorded as such (no notification, nothing invented); when the
-  read fails, it is left unchanged and the admin is told.
+  "enabled": false}}` changes it. When the read does not include it, there is
+  nothing to turn off there: the action is recorded as left alone (not
+  applicable; never a failure of the cycle, no notification, not counted by the
+  safety ceilings), the audit log says so once per project whatever the period
+  (`enforcement.not_applicable`), and it is looked at again every cycle. When the
+  read fails, it is left unchanged and the admin is told. After the `PATCH` the
+  setting is read back once; a tenant that answers 2xx and still reports it on
+  does not support it, which is recorded once (*repository Fusion setting not
+  supported*), never as a failure of the cycle and never later as drift.
 * Drift: a value read back as `"true"` (or the lock read back removed, or the
   repository's `enabled` read back `true`) is drift and is re-asserted; a
   setting that cannot be read is re-applied quietly and counted as *could not
   verify*, the same rule as for the other actions.
+* A restriction whose outcome is in doubt (a write that timed out) and is then
+  retried keeps the evidence of what the first attempt took, whatever the
+  retry finds: the retry's own result is merged with it, never laid over it.
+  The same holds for the lock's state when a second limit restricts the same
+  project and the first one lets go.
+* When the setting cannot be read during the drift check and it is meant to be
+  locked, it is written locked only; it is never rewritten unlocked from the
+  value it had before the restriction.
 * What it does not stop: a scan started with its own settings where the lock is
   not honoured; the AI engine running without Fusion (LLM-based scanning, whose
   cost is not known); people's own AI Triage and AI Remediation.
+* **Downgrading.** Restore Fusion restrictions (or let them lift) before
+  downgrading below the version that added them (migration `f4c2a7d1e9b3`): an
+  earlier version does not know the `disable_fusion` and `disable_repo_fusion`
+  actions, so it can neither verify nor restore them, and its downgrade drops
+  `credit_limit.project_actions` and the `policy_violation` table.
 
 ## Deploy
 
@@ -764,7 +792,10 @@ the normal cycle. Five safeguards are worth knowing:
    it carries the Restore access button.
 4. **Auto-triage charges inside the lookback window are kept**, however short the
    retention setting, because they are part of someone's current figure. Older
-   ones are pruned with everything else.
+   ones are pruned with everything else. Policy violations follow the same
+   window once resolved; open and acknowledged ones are kept (an admin's
+   to-do), and the AI-scan information rows go with the window whatever their
+   status.
 5. **The prune of audit rows is itself audited.** `app/services/retention.py` is
    the only code anywhere that deletes audit rows, and it writes an entry stating
    the counts, so the log always explains its own gaps.
@@ -929,8 +960,8 @@ CreditGuard checks what the key may do instead of finding out at the first breac
   at the start of a cycle, and whenever an admin presses **Check again**
   (Settings → Connection → *Key permissions*, or the pop-up).
 - **What it can test:** one small read per call in the table above (`limit=1`
-  style; `GET /api/scans/` only when auto-triage charging is on or someone presses
-  Check again), on one synced project and one synced user where a call needs one.
+  style; `GET /api/scans/` only when auto-triage charging is on, a limit turns
+  Fusion off or a Fusion restriction is in force, or someone presses Check again), on one synced project and one synced user where a call needs one.
   Each is reported as allowed, refused (403), not found, error, or skipped with the
   reason (for example when no project is linked to a repository yet).
 - **What it cannot test:** the writes (role mapping `POST`/`DELETE`, the Auto Triage
@@ -940,7 +971,10 @@ CreditGuard checks what the key may do instead of finding out at the first breac
   and remediation one, so a refusal of that call at run time counts for both.
   The project configuration read (`GET /api/configuration/project`) is checked on
   one project and is needed once an enforcing limit turns Fusion off; the
-  action-rates read is optional.
+  repository read (and the repository Fusion change) is needed as well once
+  such a limit exists and at least one project has a repository; the scans read
+  is needed once a limit turns Fusion off or a Fusion restriction is in force
+  (policy violations); the action-rates read is optional.
   They are shown as *not tested*, and as *will fail* when the read on the same
   service was refused. The role and group names in the key's access token are
   shown too (never the token), and a token that lists `realm-management` roles
@@ -1044,26 +1078,38 @@ menu, admins only; *Policy violations* in Jump to), for an admin to follow up:
 
 | Kind | What is detected | When |
 | ---- | ---------------- | ---- |
-| `setting_reenabled` | A restriction read back undone: Auto Triage back on, PR triage and remediation severities back, Fusion back on (or its lock removed), the repository's Fusion back on, a user's AI roles back. It is re-applied. | During evaluation, for every restriction in force |
+| `setting_reenabled` | A restriction read back undone: Auto Triage back on, PR triage and remediation severities back, Fusion back on (or its lock removed, once the lock was seen to hold), the repository's Fusion back on, a user's AI roles back. It is re-applied. One record per restriction per day, however many cycles find it undone that day. | During evaluation, for every restriction in force |
 | `fusion_scan_during_restriction` | A scan on a project whose Fusion restriction is in force, created after it was applied, whose engines include `ai` and whose `metadata.configs[type=ai].value.fusionEnabled` is true: Fusion ran anyway (a scan started with its own settings). Records the initiator, `sourceOrigin`/`sourceType`, branch, scan id, model and the price from action-rates when known. | Cycle step `violations`, after evaluation |
-| `ai_scan_during_restriction` | The same scan with `fusionEnabled` false (the AI engine ran without Fusion, LLM-based scanning), or not saying. Information only: whether it costs credits is not known. | Same |
-| `usage_after_restriction` | What the restriction is meant to stop (a user's `triage`/`remediation`; a project's `auto_triage` when Auto Triage is turned off, `fusion` when Fusion is) kept rising in the consumption feed after the restriction, compared with the reading at the time it was applied. One record per restriction, brought up to date while it keeps rising; credits only when Fusion is priced. | Same |
+| `ai_scan_during_restriction` | The same scan with `fusionEnabled` false (the AI engine ran without Fusion, LLM-based scanning), or not saying. That is the restriction working, so it is recorded silently: one information row per restriction per day with the count (no notification, no audit entry). Whether it costs credits is not known. | Same |
+| `usage_after_restriction` | What the restriction is meant to stop (a user's `triage`/`remediation`; a project's `auto_triage` when Auto Triage is turned off, `fusion` when Fusion is) kept rising in the consumption feed after the restriction. Each action type is compared with the reading taken when *its own* restriction was applied (Fusion restricted after Auto Triage is measured from the Fusion restriction). One record per restriction, brought up to date while it keeps rising; credits only when Fusion is priced. | Same |
 
 Scans are listed newest first from the later of the restriction's
 `applied_at` and the newest scan already looked at (a per-project cursor),
 bounded like the auto-triage reads: 50 projects, 2 pages per project and 50
 single-scan reads (for a listing that leaves the scan's settings out) per
 cycle. A truncated listing leaves its cursor where it was; each scan is reported
-once whatever happens (a unique key per finding). No database write lock is
+once whatever happens (a unique key per finding), with its final
+classification: a scan still queued or running (for up to a day), or one whose
+settings could not be read this cycle, is not recorded yet and the cursor stops
+before it, so the next cycle looks at it again. Failed and cancelled scans are
+never recorded, and only a completed scan is priced. No database write lock is
 held while Checkmarx is called, and one project's failure never stops the
 others or the cycle.
 
-Each new violation raises one notification (category *Policy violations*,
-`policy`) and an audit entry (`violation.detected`); acknowledging and
+Each new violation (except the AI-scan information rows) raises one
+notification (category *Policy violations*, `policy`) and an audit entry
+(`violation.detected`). A setting found switched back on raises that policy
+notification instead of the enforcement "turned off again" one (the
+`enforcement.reconciled` audit entry is still written), and Fusion found back on
+in both the project's scan settings and its repository is one notification.
+Notifications and the audit log are visible to viewers, so they name the
+project and what happened, never the person: who started a scan is only on the
+violation itself (admins only). Acknowledging and
 resolving (with an optional note) are audited too (`violation.acknowledged`,
 `violation.resolved`). The open count is on `/api/me` (`open_violations`,
 admins only) for the top-bar light and the menu badge. API (admins only):
-`GET /api/violations` (filters `status`, `kind`, `target`, `since`, `until`),
+`GET /api/violations` (filters `status`, `kind`, `target`, `since`, `until`;
+a time without a zone is taken as UTC),
 `GET /api/violations/{id}`, `POST /api/violations/{id}/acknowledge` and
 `POST /api/violations/{id}/resolve` (body `{"note": "..."}`, optional).
 
@@ -1400,13 +1446,26 @@ They are listed because each has a cost worth knowing about.
    refused lock falls back to the value alone, an absent repository setting is
    skipped, and any scan that ran Fusion during a restriction is recorded as a
    policy violation. Whether the AI engine without Fusion (LLM-based scanning)
-   costs credits is not known either.
+   costs credits is not known either. A lock or a repository setting that a
+   tenant answers 2xx to and does not keep is detected by reading it back.
 5. **`scan.config.ai.allowAiUsage`.** The project configuration API exposes an
    `ai` category entry named "Allow AI Usage", overridable per project. It is not
    used: the mechanisms implemented are Auto Triage, PR triage and remediation and
    Fusion. If that flag
    is the authoritative master switch, adding it is one function in
    `app/checkmarx/platform.py`.
+6. **Removing a project's own Fusion value.** Turning Fusion off writes the
+   setting at the project level, also when it was inherited (`originLevel`
+   `Tenant` or `Environment`), and Restore can only write the previous value back
+   at the project level, which pins it there. Whether Checkmarx One has a
+   per-key delete for a project's configuration entry (so that Restore could make
+   it inherit again) is not known. It is deliberately not guessed: a wrong
+   `DELETE` on `/api/configuration/project` could remove the project's other
+   overrides. To verify on a tenant: take a project with an inherited
+   `scan.config.ai.fusionEnabled`, set it on the project in the UI, and look for
+   the request the UI sends when the project value is reset to the inherited
+   one; if it is a per-key call, Restore can use it for an entry whose
+   `origin_level_before` is not `Project`.
 
 Settled since the first draft: the `period` parameter accepts exactly
 `last_month`, `last_30_days`, `last_90_days`, `last_180_days` and `last_year`, all

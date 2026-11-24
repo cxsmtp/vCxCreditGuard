@@ -126,9 +126,18 @@ def normalise_action_type(raw: str | None) -> str:
     if not raw:
         return ActionType.UNKNOWN
     key = action_key(raw)
-    if key.startswith("fusion"):
+    if _is_fusion_scan(key):
         return ActionType.FUSION
     return _ACTION_ALIASES.get(key, _ACTION_ALIASES.get(key.replace("_", ""), key))
+
+
+def _is_fusion_scan(key: str) -> bool:
+    """A Fusion scan, with or without its model: ``fusion``, ``fusion_scan``,
+    ``fusionscan`` and ``fusion_scan_<model>``. Any other type that merely starts
+    with "fusion" is not assumed to be one and stays visible as it is."""
+    if key in ("fusion", "fusion_scan", "fusionscan"):
+        return True
+    return key.startswith(("fusion_scan_", "fusionscan_"))
 
 
 def fusion_model(raw: str | None) -> str | None:

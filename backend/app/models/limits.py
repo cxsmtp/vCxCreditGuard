@@ -97,7 +97,9 @@ class CreditLimit(Base, TimestampMixin):
     # "fusion"). Null means the limit predates the choice: it keeps turning off
     # Auto Triage and PR triage and remediation only, so an upgrade changes
     # nothing. Always null for user limits.
-    project_actions: Mapped[list[str] | None] = mapped_column(JSONColumn)
+    # none_as_null: None is stored as SQL NULL, not as the JSON value null, so
+    # "IS NULL" finds every limit that keeps the legacy behaviour.
+    project_actions: Mapped[list[str] | None] = mapped_column(JSONColumn(none_as_null=True))
 
     period_states: Mapped[list[LimitPeriodState]] = relationship(
         back_populates="limit", cascade="all, delete-orphan"

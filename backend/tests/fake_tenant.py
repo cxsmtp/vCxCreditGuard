@@ -72,6 +72,13 @@ class FakeTenant:
     # Answer a PATCH that locks an entry (allowOverride false) with 400, like a
     # tenant that does not accept the lock.
     reject_config_lock: bool = False
+    # Answer 2xx to a lock (allowOverride false) but keep allowOverride as it
+    # was, like a tenant that does not support the lock.
+    drop_config_lock: bool = False
+    # Answer 2xx to a project configuration PATCH but keep nothing.
+    drop_config_writes: bool = False
+    # Answer 2xx to a fusionScanConfig PATCH but keep nothing.
+    drop_repo_fusion_writes: bool = False
     # repo id -> fusionScanConfig. A repo absent here has no fusionScanConfig
     # in its settings (the read does not include it).
     repo_fusion: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -576,11 +583,16 @@ class FakeTenant:
         ):
             return httpx.Response(400, json={"message": "allowOverride cannot be changed"})
         self.config_patches.append((project_id, body))
+        if self.drop_config_writes:
+            return httpx.Response(204)
         entries = self.project_config.setdefault(project_id, [])
         for update in body:
             for index, entry in enumerate(entries):
                 if entry["key"] == update.get("key"):
-                    entries[index] = {**entry, **update}
+                    kept = dict(update)
+                    if self.drop_config_lock and kept.get("allowOverride") is False:
+                        kept["allowOverride"] = entry.get("allowOverride")
+                    entries[index] = {**entry, **kept}
                     break
             else:
                 entries.append(dict(update))
@@ -656,7 +668,7 @@ class FakeTenant:
         body = json.loads(request.content or b"{}")
         if "remediationSeverities" in body:
             self.repo_severities[repo_id] = list(body.get("remediationSeverities", []))
-        if isinstance(body.get("fusionScanConfig"), dict):
+        if isinstance(body.get("fusionScanConfig"), dict) and not self.drop_repo_fusion_writes:
             self.repo_fusion[repo_id] = dict(body["fusionScanConfig"])
         return httpx.Response(200, json={"status": "ok"})
 
