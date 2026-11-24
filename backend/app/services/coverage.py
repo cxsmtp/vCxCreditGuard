@@ -26,6 +26,7 @@ never changed here, only suggestions are made.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -35,13 +36,21 @@ from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
 from app.db.base import utcnow
-from app.models.org import CxGroup, CxUser
+from app.models.org import CxGroup, CxGroupMembership, CxUser
 from app.services import role_sources, settings_store
 
 logger = logging.getLogger(__name__)
 
 # How long a computed report is shown before it is computed again on request.
 MAX_AGE = timedelta(hours=6)
+# ...and one that could not read the tenant (not connected, demo mode, IAM
+# refused or not answering): tried again soon, not in six hours.
+SHORT_AGE = timedelta(minutes=5)
+# "Check again" computes at most this often.
+REFRESH_EVERY = timedelta(minutes=1)
+# One computation at a time in this process; a second request is served the
+# cached report meanwhile.
+_computing = threading.Lock()
 # Optional reads for one computation (each read once, short timeout).
 READ_SECONDS = 20.0
 READ_TIMEOUT_SECONDS = 5.0
@@ -89,15 +98,42 @@ class Coverage:
     dedicated_roles: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     available: bool = True
+    # True when reads stopped (refused, not answering, out of time).
+    read_failed: bool = False
+    # The API key the report was computed with: another key makes it stale.
+    key_fingerprint: str | None = None
+
+    @property
+    def known(self) -> int:
+        """AI holders whose role sources could all be read."""
+        return self.ai_holders - self.unknown
 
     @property
     def share(self) -> float | None:
-        return self.restrictable / self.ai_holders if self.ai_holders else None
+        """Of the holders whose sources are known, the share a restriction can
+        reach. Holders that could not be read are left out: an unread source is
+        not evidence that a restriction would not bite."""
+        return self.restrictable / self.known if self.known > 0 else None
+
+    @property
+    def determined(self) -> bool:
+        return self.ai_holders == 0 or self.known > 0
 
     @property
     def low(self) -> bool:
         share = self.share
         return share is not None and share < LOW_COVERAGE
+
+    def undetermined_note(self) -> str | None:
+        """Said instead of a verdict when no holder's sources could be read."""
+        if self.determined:
+            return None
+        return (
+            f"Whether user budgets can bite could not be determined: the role sources of the "
+            f"{self.ai_holders} users who hold an AI role could not be read "
+            f"({'; '.join(self.notes) or 'the tenant could not be read'}). It is checked "
+            "again shortly."
+        )
 
     def warning(self) -> str | None:
         """What the admin is told when budgets will not bite, or None."""
@@ -125,10 +161,12 @@ class Coverage:
         share = round((self.share or 0) * 100)
         text = (
             f"User budgets will not bite on this tenant: a user restriction can take AI access "
-            f"from only {self.restrictable} of the {self.ai_holders} users who have it "
-            f"({share}%). Of those it cannot reach, "
+            f"from only {self.restrictable} of the {self.known} users who have it and whose "
+            f"roles could be read ({share}%). Of those it cannot reach, "
             f"{'; '.join(reasons) or 'the reason is unknown'}."
         )
+        if self.unknown:
+            text += f" The roles of {self.unknown} more could not be read."
         if self.dedicated_roles:
             text += (
                 " This tenant has roles dedicated to AI features "
@@ -161,7 +199,14 @@ class Coverage:
             "notes": self.notes,
             "available": self.available,
             "low": self.low,
+            "determined": self.determined,
             "warning": self.warning(),
+            "undetermined": self.undetermined_note(),
+            # Read again soon when the tenant could not be read.
+            "max_age_seconds": int(
+                (MAX_AGE if self.available and not self.read_failed else SHORT_AGE).total_seconds()
+            ),
+            "key_fingerprint": self.key_fingerprint,
         }
 
 
@@ -169,7 +214,10 @@ class Coverage:
 class _User:
     id: str
     roles: frozenset[str]
+    # Group ids: the user's groups and all their parents.
     groups: tuple[str, ...]
+    # A group the user is in could not be resolved to one group.
+    unresolved: bool = False
 
 
 def cached(session: Session) -> dict[str, Any] | None:
@@ -178,14 +226,31 @@ def cached(session: Session) -> dict[str, Any] | None:
     return value if isinstance(value, dict) and value.get("computed_at") else None
 
 
-def _fresh(report: dict[str, Any] | None, now: datetime) -> bool:
+def _age(report: dict[str, Any] | None, now: datetime) -> timedelta | None:
     if report is None:
-        return False
+        return None
     try:
-        at = datetime.fromisoformat(str(report["computed_at"]))
+        return now - datetime.fromisoformat(str(report["computed_at"]))
     except (KeyError, ValueError):
+        return None
+
+
+def _fresh(report: dict[str, Any] | None, now: datetime, fingerprint: str | None) -> bool:
+    age = _age(report, now)
+    if age is None or report is None:
         return False
-    return now - at < MAX_AGE
+    if report.get("key_fingerprint") != fingerprint:
+        return False  # computed with another key (or before one was saved)
+    max_age = report.get("max_age_seconds")
+    limit = timedelta(seconds=max_age) if isinstance(max_age, int) else MAX_AGE
+    return age < limit
+
+
+def _fingerprint(session: Session) -> str | None:
+    from app.services import connection as connection_service
+
+    connection = connection_service.get_connection(session)
+    return str(connection.api_key_fingerprint or "") if connection is not None else None
 
 
 def current(
@@ -194,15 +259,31 @@ def current(
     """The cached report, computed again when it is older than MAX_AGE (or
     ``refresh``) and a client is given. Without a client only the cache is used."""
     report = cached(session)
-    if client is None or (not refresh and _fresh(report, utcnow())):
+    now = utcnow()
+    fingerprint = _fingerprint(session)
+    if client is None:
         return report
+    fresh = _fresh(report, now, fingerprint)
+    if fresh and not refresh:
+        return report
+    age = _age(report, now)
+    if refresh and fresh and age is not None and age < REFRESH_EVERY:
+        return report  # "Check again" pressed twice in a row
+    if not _computing.acquire(blocking=False):
+        return report  # another request is computing it right now
     try:
         computed = compute(session, client)
+        computed.key_fingerprint = fingerprint
+        settings_store.set_value(
+            session, settings_store.KEY_ENFORCEMENT_COVERAGE, computed.as_dict()
+        )
+        session.commit()
     except Exception:  # noqa: BLE001 - a coverage figure must never break a page
+        session.rollback()
         logger.warning("Could not compute the enforcement coverage", exc_info=True)
         return report
-    settings_store.set_value(session, settings_store.KEY_ENFORCEMENT_COVERAGE, computed.as_dict())
-    session.commit()
+    finally:
+        _computing.release()
     return cached(session)
 
 
@@ -215,22 +296,49 @@ def compute(session: Session, client: CheckmarxClient | None) -> Coverage:
     ai_roles = list(settings_store.ai_role_names(session))
     protected_roles = sorted(settings_store.enforcement_guard(session).protected_roles)
     owners = enforcement.protected_user_ids(session)
-    users = [
-        _User(
-            id=row.id,
-            roles=frozenset(str(name) for name in (row.role_names or []) if name),
-            groups=tuple(str(name) for name in (row.group_names or []) if name),
+    # Groups by id, each with its parents (a Keycloak subgroup inherits its
+    # parent's role mappings), and each user's resolved memberships. A group
+    # name reported for a user that the sync could not resolve to one group
+    # (a repeated name) leaves that user's sources unknown, never guessed.
+    group_rows = list(session.scalars(select(CxGroup).where(CxGroup.is_deleted.is_(False))))
+    by_path = {row.path: row.id for row in group_rows if row.path}
+
+    def parent_of(row: CxGroup) -> str | None:
+        # The synced parent, or the group whose path is this one's minus its
+        # last part ("/Engineering/Team A" -> "/Engineering").
+        if row.parent_id:
+            return row.parent_id
+        if row.path and row.path.count("/") > 1:
+            return by_path.get(row.path.rsplit("/", 1)[0])
+        return None
+
+    parents = {row.id: parent_of(row) for row in group_rows}
+    group_names = {row.id: row.name for row in group_rows}
+    memberships: dict[str, set[str]] = {}
+    for user_id, group_id in session.execute(
+        select(CxGroupMembership.user_id, CxGroupMembership.group_id)
+    ):
+        memberships.setdefault(user_id, set()).add(group_id)
+    users = []
+    for row in session.scalars(
+        select(CxUser).where(CxUser.is_deleted.is_(False), CxUser.enabled.is_(True))
+    ):
+        names = {str(name) for name in (row.group_names or []) if name}
+        direct = memberships.get(row.id, set())
+        chain: set[str] = set()
+        for group_id in direct:
+            current_id: str | None = group_id
+            while current_id is not None and current_id not in chain:
+                chain.add(current_id)
+                current_id = parents.get(current_id)
+        users.append(
+            _User(
+                id=row.id,
+                roles=frozenset(str(name) for name in (row.role_names or []) if name),
+                groups=tuple(sorted(chain)),
+                unresolved=len(names) > len(direct),
+            )
         )
-        for row in session.scalars(
-            select(CxUser).where(CxUser.is_deleted.is_(False), CxUser.enabled.is_(True))
-        )
-    ]
-    groups = {
-        key: row.id
-        for row in session.scalars(select(CxGroup).where(CxGroup.is_deleted.is_(False)))
-        for key in {row.name, row.path or ""}
-        if key
-    }
     session.commit()  # nothing open while Checkmarx is read
 
     report = Coverage(computed_at=utcnow(), ai_roles=ai_roles, protected_roles=protected_roles)
@@ -285,18 +393,15 @@ def compute(session: Session, client: CheckmarxClient | None) -> Coverage:
     group_grants: dict[str, set[str] | None] = {}
     group_reads = 0
     if reader is not None:
-        for name in sorted({group for user in holders for group in user.groups}):
-            group_id = groups.get(name) or groups.get(f"/{name}")
-            if group_id is None:
-                group_grants[name] = None
-                continue
+        for group_id in sorted({group for user in holders for group in user.groups}):
+            name = group_names.get(group_id, group_id)
             if group_reads >= MAX_GROUP_READS:
-                group_grants[name] = None
+                group_grants[group_id] = None
                 continue
             group_reads += 1
             mapped = reader.group_roles(group_id)
             if mapped is None:
-                group_grants[name] = None
+                group_grants[group_id] = None
                 continue
             granted: set[str] = set()
             for role in mapped:
@@ -305,17 +410,18 @@ def compute(session: Session, client: CheckmarxClient | None) -> Coverage:
                 elif role.composite:
                     inner = reader.contained(role.name)
                     granted |= (inner or set()) & wanted
-            group_grants[name] = granted
+            group_grants[group_id] = granted
             if granted:
                 report.groups_granting.append(name)
     if reader is not None and reader.stopped:
+        report.read_failed = True
         report.notes.append(f"Some roles were not read: {reader.stopped}.")
 
     for user in holders:
         held_ai = user.roles & wanted
         protected = user.id in owners or bool({r.lower() for r in user.roles} & protected_lower)
         kept: set[str] = set()
-        unknown = reader is None
+        unknown = reader is None or user.unresolved
         for name in user.roles:
             if name not in contains:
                 continue

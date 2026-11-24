@@ -60,8 +60,18 @@ export function CoveragePanel({ isAdmin }: { isAdmin: boolean }) {
           <div className="mb-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
             <Figure
               label="A user restriction can reach"
-              value={`${formatNumber(data.restrictable)} of ${formatNumber(data.ai_holders)}`}
-              detail={percent === null ? "No one holds an AI role" : `${percent}% of AI-role holders`}
+              value={
+                data.determined === false
+                  ? "Not determined"
+                  : `${formatNumber(data.restrictable)} of ${formatNumber(data.ai_holders - data.unknown)}`
+              }
+              detail={
+                data.determined === false
+                  ? "Their roles could not be read"
+                  : percent === null
+                    ? "No one holds an AI role"
+                    : `${percent}% of AI-role holders whose roles were read`
+              }
               tone={data.low ? "critical" : "neutral"}
             />
             <Figure
@@ -81,7 +91,11 @@ export function CoveragePanel({ isAdmin }: { isAdmin: boolean }) {
             />
           </div>
 
-          {data.warning ? (
+          {data.determined === false ? (
+            <InfoNote tone="info">
+              {data.undetermined ?? "Whether user budgets can bite could not be determined."}
+            </InfoNote>
+          ) : data.warning ? (
             <InfoNote tone="warning">{data.warning}</InfoNote>
           ) : (
             <InfoNote tone="info">
