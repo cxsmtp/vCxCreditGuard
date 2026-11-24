@@ -577,7 +577,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
         <tbody>
           <tr><td><span class="chip good">≥ 85%</span> one clear winner</td><td>Matched automatically and written to the audit log. Counted from the next poll — and still overridable.</td></tr>
           <tr><td><span class="chip warn">≥ 60%</span> or a near-tie</td><td>Left <strong>uncounted</strong> and raised as a <strong>dispute</strong> with ranked suggestions to confirm.</td></tr>
-          <tr><td><span class="chip">below 60%</span></td><td>Unmatched — map it by hand. Automation (handles like <code>dependabot[bot]</code>, and integration identities with no email that match nobody) is flagged, shown as automation and kept out of the queue and the alerts.</td></tr>
+          <tr><td><span class="chip">below 60%</span></td><td>Unmatched — map it by hand. Automation (handles with <code>[bot]</code>, and integration identities: no email, matching nobody, and a handle that looks like one, such as <code>example-ci-bot</code>) stays listed in the Unmatched tab, marked Automation and mappable, but is not chased as a person: one "new automation identity" notice instead of a "could not be matched" one.</td></tr>
         </tbody>
       </table></div>
       <h3>The attribution queue</h3>
@@ -585,7 +585,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
       <div class="grid2">
         <div class="fcard"><h4><span class="chip warn">Disputes</span></h4><p>A likely user was found but not with certainty. Click a suggestion chip to confirm, or map to any user. Nothing counts until you do.</p></div>
         <div class="fcard"><h4><span class="chip good">Auto-matched</span></h4><p>Matched automatically at high confidence and counted. Review, and override any that look wrong.</p></div>
-        <div class="fcard"><h4><span class="chip">Unmatched</span></h4><p>No user resembled the handle. Map by hand. Automation appears here, marked as such, and is never counted. Project and application names that match no project are mapped in their own card below.</p></div>
+        <div class="fcard"><h4><span class="chip">Unmatched</span></h4><p>No user resembled the handle. Map by hand. Automation is listed here too, marked Automation; it counts towards no user limit until you map it to a person. Project and application names that match no project are mapped in their own card below. A mapping moves usage that was already reported: a monthly or quarterly budget does not count those credits against its current period (its starting figure moves with them), only what is spent afterwards; the confirmation after the mapping says which budgets this applies to.</p></div>
       </div>
       <p>A manual mapping always wins over the automatic decision, and takes effect from the next poll onward.</p>
     </section>

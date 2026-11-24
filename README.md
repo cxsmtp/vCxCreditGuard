@@ -72,7 +72,9 @@ point links to the section below that explains it.
   released).
 - Simulation: a dry run of the next cycle showing who would be warned and
   restricted, before anything happens.
-- Enforcement coverage (Simulation and Settings → Enforcement): how many of the
+- Enforcement coverage (Simulation and Settings → Enforcement; opening it reads
+  the tenant's composite roles and the AI holders' groups from IAM, bounded and
+  cached for six hours, five minutes when the tenant could not be read): how many of the
   people holding an AI role a user restriction could actually take it from,
   how many keep it through a composite role or a group, and how many are
   protected; it warns when user budgets will not bite and names the tenant's
@@ -498,7 +500,7 @@ bills the wrong person, decides:
 | ---------- | ------- |
 | **≥ 85%**, one clear winner | Attributed automatically and written to the audit log. Still overridable. |
 | **≥ 60%**, or an auto-worthy near-tie between two people | Left **uncounted** and raised as a *dispute* with ranked suggestions to confirm on the Settings page. |
-| below 60% | Unmatched, mapped by hand. Automation (handles like `dependabot[bot]`, and integration identities: one handle, no email, matching nobody) is flagged, shown as automation and kept out of the queue and the alerts. |
+| below 60% | Unmatched, mapped by hand. Automation is told apart: handles with `[bot]`, and integration identities (no email, matching nobody, and a handle that looks like one: a `-`, `_` or digit, or a word such as github, jenkins, svc or integration; "Priya" or "张伟" stay people). It stays listed in the *Unmatched* tab, marked *Automation* and mappable, but is not chased as a person: no "could not be matched" notice, one "new automation identity" notice instead. |
 
 Nothing is ever dropped: every subject lands in `unresolved_subject` with its
 status, and the Settings page groups them into **Disputes**, **Auto-matched** and
@@ -511,7 +513,21 @@ name that is no synced project or application (on a live tenant, 87% of project
 credits were under `org/repo` names absent from `/api/projects`) are counted in
 the cycle record, on the Overview and in Diagnostics, and an admin can map a
 name to a project or application under Settings → Attribution
-(`/api/usage/unmatched-entities`); a real name match always wins over a mapping.
+(`/api/usage/unmatched-entities`, one row per name in `entity_mapping`); a real
+name match always wins over a mapping, and a mapping to a project that is gone is
+shown as broken and ignored.
+
+**A mapping moves usage that was already reported.** Mapping a name (or a user
+subject) moves the credits the latest reading has under it to the target, and
+unmapping moves them back. Those credits were spent somewhere in the lookback
+window before the mapping, so a monthly or quarterly budget that does not count
+usage already reported when its period opened shifts its period's baseline by
+exactly the credits moved: they are not counted against the current period,
+and what is spent from then on is. Mapping, unmapping and mapping again leave the
+baseline where it was. A budget that counts existing usage (lifetime, custom, or
+*count existing usage*) counts them. Every budget, group and application
+fallback included, is covered; the shift is in the audit entry and in the
+confirmation shown after the mapping.
 
 ## What the enforcement actions actually are
 
@@ -1297,7 +1313,8 @@ CreditGuard checks what the key may do instead of finding out at the first breac
   at the start of a cycle, and whenever an admin presses **Check again**
   (Settings → Connection → *Key permissions*, or the pop-up).
 - **What it can test:** one small read per call in the table above (`limit=1`
-  style; `GET /api/scans/` only when auto-triage charging is on, a limit turns
+  style, except the projects read, which reads one page of 50 projects to find
+  one linked to a repository; `GET /api/scans/` only when auto-triage charging is on, a limit turns
   Fusion off or a Fusion restriction is in force, or someone presses Check again), on one synced project and one synced user where a call needs one.
   Each is reported as allowed, refused (403), not found, error, or skipped with the
   reason (for example when no project is linked to a repository yet). The
@@ -2280,9 +2297,16 @@ They are listed because each has a cost worth knowing about.
    "scannerTypes": true, "riskStatuses": true, "severityLevels": true}` on a
    live tenant, where the same read also lists an `auto_remediation` feature
    with its own `allowOverride`, and `allowAiUsage` at the top level). The
-   `PUT` sends that whole configuration back as read with only the
+   `PUT` sends only `configurations`, every entry as read with only the
    `auto_triage` entry's `enabled` and `config` changed, so the other feature
-   and every `allowOverride` are kept; Restore reads it again first. What each
+   and every `allowOverride` are kept; `scope` and `projectId` are named by the
+   path, and `allowAiUsage` (the tenant's inherited AI switch) is never echoed,
+   so it cannot be pinned on the project. Restore reads the configuration again
+   first. After the write the configuration is read back: if `auto_remediation`
+   or `allowAiUsage` changed, the outcome is kept in doubt and an alert says so.
+   **Not yet verified:** that this is the body the Checkmarx One UI sends.
+   Capture one HAR of toggling Auto Triage on a project in the UI and compare
+   it before enabling project enforcement on a real tenant. What each
    `allowOverride` key means is not documented: it is
    recorded verbatim and only used, best effort, for the Simulation's *may not
    hold* warning. That a project cannot override an account-wide ("select
@@ -2295,9 +2319,11 @@ reported 31,024 credits for 285 Opus 5.5 Fusion transactions (about 108.9 each,
 rate 2), about 7.65 per Opus 4.7 transaction (rate 2.5), about 5.4 per Haiku 4.5
 (rate 1.5) and 1,568 credits for 10 DAST correlations (about 156.8, rate 14).
 So a price is the listed rate only when the feed's own credits / transactions
-(action dimension) agree with it within 10%, or the feed has no figure;
-otherwise the feed's average is used, and every message and the Overview's
-table say which.
+(action dimension) agree with it within 10%; otherwise the feed's average is
+used, and every message and the Overview's table say which. With no feed figure
+triage and remediation are priced at their rate, but Fusion and DAST correlation
+are not priced at all: the breach and violation messages and the Overview say
+their cost per scan is not known from this tenant's data.
 
 **Other live-tenant observations.** `creditsUsed` arrives as a string
 (`"31024"`, `"252.5"`); no consumption row carries an id (matching is by name,
