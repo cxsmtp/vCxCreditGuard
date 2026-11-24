@@ -199,12 +199,13 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
         <Card
           title="Credits consumed over time"
           description="Difference between consecutive polls"
-          className="lg:col-span-2"
+          className="min-w-0 lg:col-span-2"
         >
           <TrendChart points={data.trend} />
         </Card>
 
-        <Card title="By action type" description="What the credits were spent on">
+        {/* min-w-0: a grid item may otherwise grow to its table's width on a phone. */}
+        <Card title="By action type" description="What the credits were spent on" className="min-w-0">
           <BreakdownChart items={data.breakdown} />
         </Card>
       </div>
