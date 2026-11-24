@@ -215,6 +215,8 @@
   .fcard { border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.1rem; background: var(--surface); }
   .fcard h4 { margin: 0 0 0.3rem; font-size: 1rem; font-weight: 600; }
   .fcard p { margin: 0; font-size: 0.88rem; color: var(--ink-2); }
+  .fcard ul { margin: 0; padding-left: 1.1rem; font-size: 0.88rem; color: var(--ink-2); }
+  .fcard li { margin: 0.25rem 0; }
 
   .footer { max-width: var(--maxread); margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--ink-3); font-size: 0.85rem; }
 
@@ -253,6 +255,7 @@
   <nav class="toc" id="toc" aria-label="Contents">
     <div class="group">Start here</div>
     <a href="#overview">What it is</a>
+    <a href="#features">Features &amp; limitations</a>
     <a href="#how-it-works">How it works</a>
     <a href="#deploy">Deploy</a>
     <a href="#setup">First-time setup</a>
@@ -310,9 +313,89 @@
       </div>
     </section>
 
+    <!-- FEATURES AND LIMITATIONS -->
+    <section id="features">
+      <p class="section-kicker">02 — Start here</p>
+      <h2>Features and limitations</h2>
+      <p>What CxCreditGuard does today, and what it cannot do (or has not been verified to do) yet, with what each limitation means for you. The same list is on the app's <strong>About</strong> page (Settings → About, or <em>About</em> in the user menu) and in the README.</p>
+
+      <h3>What it does</h3>
+      <div class="grid2">
+        <div class="fcard"><h4>Measure and attribute</h4><ul>
+          <li>Reads AI credit use from Checkmarx One on a schedule (every 15 minutes by default) for every user, group, project and application.</li>
+          <li>Matches each usage row to a Checkmarx user: exactly where it can, by name similarity where not. Unsure matches wait for an admin to confirm.</li>
+          <li>Can also charge a project's Auto Triage credits to the person whose scan set it off (off by default).</li>
+          <li>Overview of spend over time, by action type and by top consumers, with each budget marked.</li>
+          <li>Explains a figure: each budget shows what Checkmarx reported and what the period's starting point discounted.</li>
+        </ul></div>
+        <div class="fcard"><h4>Budgets and requests</h4><ul>
+          <li>Budgets per user, group, project or application: monthly, quarterly, a custom range or lifetime.</li>
+          <li>A warning when usage reaches a set share of the budget (80% by default).</li>
+          <li>Every new budget only monitors until you switch it to enforce.</li>
+          <li>Exemptions, permanent or until a date, for people and projects that must never be restricted.</li>
+          <li>Bulk edit, and import and export as CSV.</li>
+          <li>Credit requests: when an admin allows it, viewers ask for more budget; an admin approves in full or in part, optionally until a date, or refuses with a reason.</li>
+          <li>Optional automatic approval of small increases, up to a cap you set (off by default).</li>
+          <li>Reports: where each budget is heading this period, chargeback by business unit (with a cost per credit if you set one), and a weekly summary by email (off by default).</li>
+        </ul></div>
+        <div class="fcard"><h4>Enforcement and safety</h4><ul>
+          <li>At the limit, an enforcing budget removes a person's AI roles, or turns off Auto Triage, PR triage and remediation and Fusion (your choice) on the projects it covers.</li>
+          <li>Records what was there before every change; <strong>Restore access</strong> puts it back in one click.</li>
+          <li>Gives access back by itself when usage drops under budget, the budget is raised or a new period starts (unless the budget is set to hold until released).</li>
+          <li>Simulation: a dry run of the next cycle showing who would be warned and restricted, before anything happens.</li>
+          <li>Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users and projects restricts nobody and pauses itself.</li>
+          <li>A pause switch stops new restrictions at once; warnings and giving access back carry on.</li>
+          <li>Protected roles (<code>ast-admin</code> and <code>iam-admin</code> by default) are never restricted.</li>
+          <li>A sudden fall in reported usage is held, not believed, until later readings confirm it.</li>
+        </ul></div>
+        <div class="fcard"><h4>Watch and alert</h4><ul>
+          <li>Reads each restriction back and puts it back if someone undid it in Checkmarx One.</li>
+          <li><a href="#violations">Policy violations</a> (admins only): settings switched back on, Fusion scans during a restriction, usage still rising after one.</li>
+          <li>A Notification Center, with copies by email and webhook (optionally signed), filtered by severity.</li>
+          <li>Checks the API key's permissions and says what is missing before it matters.</li>
+          <li>An audit log of every action and change, chained so that an edited or deleted entry can be detected.</li>
+        </ul></div>
+        <div class="fcard"><h4>Operate</h4><ul>
+          <li>Runs on your own server: one container with SQLite, or Compose with PostgreSQL behind an HTTPS proxy.</li>
+          <li>Admin and viewer accounts, two-factor sign-in with recovery codes, password reset by email.</li>
+          <li>In-app updates for the single container: signed releases, installed in a quiet hour, rolled back if the new version does not start.</li>
+          <li>Configuration backup (settings, budgets, exemptions) to download, email or restore. Compose also dumps the database daily.</li>
+          <li>Demo mode with made-up data that never touches a tenant.</li>
+          <li>Two looks, Standard and Command Center, each in light and dark.</li>
+        </ul></div>
+      </div>
+      <div class="callout tip">
+        <span class="ico">◆</span>
+        <div><span class="h">What it connects to.</span><p style="margin-top:0.2rem;">Your Checkmarx One tenant; your mail server and your webhook, only if you set them up; and, only with a registry token entered under Settings → Updates, GitHub's container registry (<code>ghcr.io</code> and <code>pkg-containers.githubusercontent.com</code>) to check for and download releases. No telemetry, no analytics, and nothing else is contacted.</p></div>
+      </div>
+
+      <h3>Limitations</h3>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Limitation</th><th>What it means for you</th></tr></thead>
+        <tbody>
+          <tr><td><strong>It acts once a cycle</strong>, not the moment credits are spent.</td><td>Usage is read and budgets judged once a cycle (every 15 minutes by default), and Checkmarx can report credits a little after they are spent. Usage in between can take a budget past its limit before the restriction lands, so leave some headroom. A large group or application is restricted over several cycles (at most 1,000 changes a cycle by default).</td></tr>
+          <tr><td><strong>It restricts access, it does not meter credits.</strong></td><td>It removes roles and turns settings off; it cannot stop an action already running or cap a budget to the exact credit.</td></tr>
+          <tr><td><strong>Only roles held directly are removed.</strong></td><td>An AI role a person holds through a group or a composite role stays in effect. CreditGuard says so once and never changes the group or role, because that would affect everyone in it. Remove it there in Checkmarx One, or exempt the person (see <a href="#enforcement">Enforcement</a>).</td></tr>
+          <tr><td><strong>A project budget does not stop people's own AI Triage and AI Remediation.</strong></td><td>Turning project features off leaves what people start themselves working; only a user budget stops that.</td></tr>
+          <tr><td><strong>Account-wide Auto Triage may override a project.</strong></td><td>If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project.</td></tr>
+          <tr><td><strong>Turning Fusion off is not airtight.</strong></td><td>A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as <a href="#violations">policy violations</a>.</td></tr>
+          <tr><td><strong>The general Risk Management roles are used for now.</strong></td><td>AI Triage and AI Remediation are reached through them today, so a restricted person also loses the Risk Management pages and dashboard. When Checkmarx One's dedicated AI permissions reach your tenant, swap them in under Settings → Enforcement, <em>Roles a user restriction removes</em>.</td></tr>
+          <tr><td><strong>Figures only cover Checkmarx's lookback window.</strong></td><td>Checkmarx reports totals over a window (at most the last year), not individual events. "Lifetime" means everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened, unless the budget is set to (see <a href="#measurement">How usage is measured</a>).</td></tr>
+          <tr><td><strong>Unmatched usage counts against nobody.</strong></td><td>Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (see <a href="#attribution">Attribution</a>).</td></tr>
+          <tr><td><strong>It cannot say who undid a restriction.</strong></td><td>Checkmarx One does not report who switched a setting back on. By default each restriction is read back once an hour, so a setting switched back on can stay on for up to about that long, and one undone and redone between two read-backs is not seen.</td></tr>
+          <tr><td><strong>Some Checkmarx behaviour is not yet verified on a real tenant.</strong></td><td>Where a person's roles come from (groups, composite roles); the Fusion lock and the repository's Fusion setting; usage rows per group (only ever seen empty; the sum of its projects is used instead); paging of a very long user list; finding a project's repository (without it, PR triage and remediation is skipped there); the names of the default protected roles (check them against your tenant); whether a Fusion setting the project inherited can inherit again after Restore (for now it is restored on the project itself). Each degrades safely and says so rather than guessing.</td></tr>
+          <tr><td><strong>Tested to 2,000 projects on a synthetic tenant.</strong></td><td>Load tested with 2,000 projects and 1,000 users made up for the test, not on a real tenant of that size. Use PostgreSQL above about 500 projects or 300 users.</td></tr>
+          <tr><td><strong>One instance only.</strong></td><td>A second copy against the same database refuses to start. Availability comes from restarting the one copy, not from running several.</td></tr>
+          <tr><td><strong>The database is the only record of how to undo a restriction.</strong></td><td>The in-app backup holds configuration only. Back the database up; after restoring an older one, restrictions made since it was taken have to be given back by hand in Checkmarx One.</td></tr>
+          <tr><td><strong>Updates are only as trustworthy as the release signing key.</strong></td><td>Until the image carries the release signing key, auto-update installs nothing and a manual install cannot be verified. Updates need a registry token, and only the single container updates itself: Compose shows the steps instead. Operating system, Python and OpenSSL fixes need a new image.</td></tr>
+          <tr><td><strong>The audit log is tamper-evident, not tamper-proof.</strong></td><td>An edited or deleted entry is detected, but someone with full write access to the database could rewrite the whole chain.</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
     <!-- HOW IT WORKS -->
     <section id="how-it-works">
-      <p class="section-kicker">02 — Start here</p>
+      <p class="section-kicker">03 — Start here</p>
       <h2>How it works</h2>
       <p>
         CxCreditGuard is <strong>one deployable unit</strong>: a backend that also serves the web UI
@@ -341,7 +424,7 @@
 
     <!-- DEPLOY -->
     <section id="deploy">
-      <p class="section-kicker">03 — Start here</p>
+      <p class="section-kicker">04 — Start here</p>
       <h2>Deploy</h2>
       <p>Two supported paths, both on Podman. Start with the single container to try it; use Compose to run it for real.</p>
 
@@ -387,7 +470,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- SETUP -->
     <section id="setup">
-      <p class="section-kicker">04 — Start here</p>
+      <p class="section-kicker">05 — Start here</p>
       <h2>First-time setup</h2>
       <ol>
         <li><strong>Sign in and change the password.</strong> Use the credentials from the startup log (single container) or the ones you set in <code>.env</code> (Compose). You will be asked to change the password on first login.</li>
@@ -404,7 +487,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- DASHBOARD -->
     <section id="dashboard">
-      <p class="section-kicker">05 — Daily use</p>
+      <p class="section-kicker">06 — Daily use</p>
       <h2>The dashboard</h2>
       <p>The dashboard answers "what is being spent, by whom, and is anything at risk" at a glance.</p>
       <ul>
@@ -421,7 +504,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- LIMITS -->
     <section id="limits">
-      <p class="section-kicker">06 — Daily use</p>
+      <p class="section-kicker">07 — Daily use</p>
       <h2>Setting limits</h2>
       <p>A limit is a credit budget on one entity, for one period. Create and manage them on the <strong>Limits</strong> page — one tab per level (user, group, project, application), each with a live usage bar.</p>
       <div class="tablewrap"><table>
@@ -443,7 +526,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- MEASUREMENT -->
     <section id="measurement">
-      <p class="section-kicker">07 — Daily use</p>
+      <p class="section-kicker">08 — Daily use</p>
       <h2>How usage is measured</h2>
       <p>This is the one idea worth understanding. Checkmarx's consumption endpoint returns <strong>aggregate totals over a lookback window</strong> — not a stream of timestamped events. There are no event IDs or timestamps, so per-period usage cannot be summed from events. Instead:</p>
       <ol>
@@ -468,7 +551,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- ATTRIBUTION -->
     <section id="attribution">
-      <p class="section-kicker">08 — Daily use</p>
+      <p class="section-kicker">09 — Daily use</p>
       <h2>Attribution &amp; disputes</h2>
       <p>
         The consumption feed identifies users inconsistently: some rows carry a clean email, some a
@@ -505,7 +588,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- ENFORCEMENT -->
     <section id="enforcement">
-      <p class="section-kicker">09 — Daily use</p>
+      <p class="section-kicker">10 — Daily use</p>
       <h2>Enforcement</h2>
       <p>When an <em>enforcing</em> limit is breached, CxCreditGuard turns off the AI features that spend credits for that entity. What changes depends on the level:</p>
       <div class="tablewrap"><table>
@@ -524,7 +607,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
       <p><strong>Simulation</strong> shows, for each person who would be restricted, the roles they would lose (with what each grants), the roles they would keep and through which group or role, and, for projects, where turning Auto Triage off <em>may not hold</em>. It reads at most 50 people's roles per run and says when it stopped there, spends at most about 10 seconds reading, stops reading once Checkmarx One's IAM does not answer, and does not read again someone already restricted. Only admins see what a person holds; viewers see which roles a restriction would remove.</p>
       <div class="callout warn">
         <span class="ico">!</span>
-        <div><span class="h">What turning Fusion off does not stop.</span><p style="margin-top:0.2rem;">A scan started with its own settings can turn Fusion on for that one scan. CreditGuard also tries to lock the project's setting against that (Settings → Enforcement, <em>Lock Fusion against per-scan override</em>, on by default); whether Checkmarx One honours the lock is <strong>not verified</strong>, and a tenant that refuses the lock gets Fusion turned off without it. The AI engine can still run without Fusion (LLM-based scanning); whether that costs credits is not known. Turning Fusion off in a repository's settings is <strong>not verified</strong> either: it is skipped when Checkmarx does not report the setting, and a setting (or lock) that Checkmarx accepts but does not keep is noticed by reading it back on two consecutive checks (one read straight after a write can be behind it) and said once; a repository setting not kept is then not sent again that period. What was there before is always kept, so Restore puts it back. CreditGuard re-applies every restriction each cycle and records anything done against it under <a href="#violations">Policy violations</a>.</p></div>
+        <div><span class="h">What turning Fusion off does not stop.</span><p style="margin-top:0.2rem;">A scan started with its own settings can turn Fusion on for that one scan. CreditGuard also tries to lock the project's setting against that (Settings → Enforcement, <em>Lock Fusion against per-scan override</em>, on by default); whether Checkmarx One honours the lock is <strong>not verified</strong>, and a tenant that refuses the lock gets Fusion turned off without it. The AI engine can still run without Fusion (LLM-based scanning); whether that costs credits is not known. Turning Fusion off in a repository's settings is <strong>not verified</strong> either: it is skipped when Checkmarx does not report the setting, and a setting (or lock) that Checkmarx accepts but does not keep is noticed by reading it back on two consecutive checks (one read straight after a write can be behind it) and said once; a repository setting not kept is then not sent again that period. What was there before is always kept, so Restore puts it back. CreditGuard reads every restriction back (at least once an hour by default), re-applies it if it was undone, and records anything done against it under <a href="#violations">Policy violations</a>.</p></div>
       </div>
       <div class="callout tip">
         <span class="ico">↺</span>
@@ -534,9 +617,9 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- VIOLATIONS -->
     <section id="violations">
-      <p class="section-kicker">09b — Daily use</p>
+      <p class="section-kicker">11 — Daily use</p>
       <h2>Policy violations</h2>
-      <p>CreditGuard does not rely on Checkmarx One keeping a restricted setting off: every cycle it reads each restriction back and applies it again if it was undone. The <strong>Violations</strong> page (admins only; <em>Policy violations</em> in Jump to) is the record of what it found, so someone can follow it up:</p>
+      <p>CreditGuard does not rely on Checkmarx One keeping a restricted setting off: it reads each restriction back (each at least once an hour by default, spread over the cycles) and applies it again if it was undone. The <strong>Violations</strong> page (admins only; <em>Policy violations</em> in Jump to) is the record of what it found, so someone can follow it up:</p>
       <div class="tablewrap"><table>
         <thead><tr><th>What happened</th><th>What is recorded</th></tr></thead>
         <tbody>
@@ -552,7 +635,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- NOTIFICATIONS -->
     <section id="notifications">
-      <p class="section-kicker">10 — Daily use</p>
+      <p class="section-kicker">12 — Daily use</p>
       <h2>Notifications</h2>
       <p>The <strong>Notification Center</strong> is always the record of truth — a filterable feed with an unread badge, an active-restrictions table, and one-click <strong>Restore access</strong>. Email and webhook are optional copies, so a broken SMTP server can never lose a warning.</p>
       <ul>
@@ -565,7 +648,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- SETTINGS -->
     <section id="settings">
-      <p class="section-kicker">11 — Daily use</p>
+      <p class="section-kicker">13 — Daily use</p>
       <h2>Settings</h2>
       <div class="tablewrap"><table>
         <thead><tr><th>Area</th><th>Controls</th></tr></thead>
@@ -581,7 +664,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- PERMISSIONS -->
     <section id="permissions">
-      <p class="section-kicker">12 — Operating it</p>
+      <p class="section-kicker">14 — Operating it</p>
       <h2>Checkmarx permissions the key needs</h2>
       <p>The service-account API key needs to reach these endpoints. The last two rows are <strong>only</strong> needed for enforce mode — a read-only key runs the whole tool in monitor-only mode.</p>
       <div class="tablewrap"><table>
@@ -605,7 +688,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- SECURITY -->
     <section id="security">
-      <p class="section-kicker">13 — Operating it</p>
+      <p class="section-kicker">15 — Operating it</p>
       <h2>Security posture</h2>
       <p>A condensed view; the repository README carries the full detail and threat model.</p>
       <ul>
@@ -619,7 +702,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
 
     <!-- RUNBOOKS -->
     <section id="runbooks">
-      <p class="section-kicker">14 — Operating it</p>
+      <p class="section-kicker">16 — Operating it</p>
       <h2>Runbooks</h2>
 
       <h3>Turning enforcement on for the first time</h3>
@@ -652,7 +735,7 @@ python -m scripts.diagnose_usage --user "someone@example.com"</code></pre>
 
     <!-- TROUBLESHOOTING -->
     <section id="troubleshooting">
-      <p class="section-kicker">15 — Operating it</p>
+      <p class="section-kicker">17 — Operating it</p>
       <h2>Troubleshooting</h2>
 
       <h3>I didn't see the admin password</h3>

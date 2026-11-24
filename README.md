@@ -14,13 +14,129 @@ reversible from the GUI with one click.
 > the operator runbooks — written for administrators. Open it in any browser.
 > This README is the deeper architecture, security and configuration reference.
 
+## Features and limitations
+
+The same list is on the app's **About** page (Settings → About, or *About* in
+the user menu) and in the [User Guide](docs/user-guide.html#features). Each
+point links to the section below that explains it.
+
+### What it does
+
+**Measure and attribute**
+
+- Reads AI credit use from Checkmarx One on a schedule (every 15 minutes by
+  default) for every user, group, project and application
+  ([How usage is measured](#how-usage-is-measured)).
+- Matches each usage row to a Checkmarx user: exactly where it can, by name
+  similarity where not. Unsure matches wait for an admin to confirm
+  ([Attribution](#attribution)).
+- Can also charge a project's Auto Triage credits to the person whose scan set
+  it off, off by default ([Charging auto triage](#charging-auto-triage-to-the-person-who-started-the-scan)).
+- Overview of spend over time, by action type and by top consumers, with each
+  budget marked ([The GUI](#the-gui)).
+- Explains a figure: each budget shows what Checkmarx reported and what the
+  period's starting point discounted; `scripts/diagnose_usage.py` walks the
+  whole chain ([Runbook](#runbook-a-figure-on-screen-does-not-match-checkmarx)).
+
+**Budgets and requests**
+
+- Budgets per user, group, project or application: monthly, quarterly, a custom
+  range or lifetime.
+- A warning when usage reaches a set share of the budget (80% by default).
+- Every new budget only monitors until you switch it to enforce.
+- Exemptions, permanent or until a date, for people and projects that must
+  never be restricted.
+- Bulk edit, and import and export as CSV.
+- Credit requests: when an admin allows it, viewers ask for more budget; an
+  admin approves in full or in part, optionally until a date, or refuses with a
+  reason.
+- Optional automatic approval of small increases, up to a cap you set (off by
+  default).
+- Reports: where each budget is heading this period, chargeback by business
+  unit (with a cost per credit if you set one), and a weekly summary by email
+  (off by default).
+
+**Enforcement and safety**
+
+- At the limit, an enforcing budget removes a person's AI roles, or turns off
+  Auto Triage, PR triage and remediation and Fusion (your choice) on the
+  projects it covers ([What the enforcement actions actually are](#what-the-enforcement-actions-actually-are)).
+- Records what was there before every change; *Restore access* puts it back in
+  one click.
+- Gives access back by itself when usage drops under budget, the budget is
+  raised or a new period starts (unless the budget is set to hold until
+  released).
+- Simulation: a dry run of the next cycle showing who would be warned and
+  restricted, before anything happens.
+- Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users
+  and projects restricts nobody and pauses itself; a pause switch stops new
+  restrictions at once; protected roles (`ast-admin`, `iam-admin` by default)
+  are never restricted; a sudden fall in reported usage is held until later
+  readings confirm it ([Enforcement safety](#enforcement-safety)).
+
+**Watch and alert**
+
+- Reads each restriction back and puts it back if someone undid it in
+  Checkmarx One ([Policy violations](#policy-violations)).
+- Policy violations (admins only): settings switched back on, Fusion scans
+  during a restriction, usage still rising after one.
+- A Notification Center, with copies by email and webhook (optionally signed),
+  filtered by severity ([Notification delivery](#notification-delivery)).
+- Checks the API key's permissions and says what is missing before it matters
+  ([The key permission check](#the-key-permission-check)).
+- An audit log of every action and change, hash-chained so that an edited or
+  deleted entry can be detected.
+
+**Operate**
+
+- Runs on your own server: one container with SQLite, or Compose with
+  PostgreSQL behind an HTTPS proxy ([Deploy](#deploy)).
+- Admin and viewer accounts, two-factor sign-in with recovery codes, password
+  reset by email ([Accounts](#accounts)).
+- In-app updates for the single container: signed releases, installed in a
+  quiet hour, rolled back if the new version does not start ([Updates](#updates)).
+- Configuration backup (settings, budgets, exemptions) to download, email or
+  restore; Compose also dumps the database daily ([Backup and restore](#backup-and-restore)).
+- Demo mode with made-up data that never touches a tenant
+  ([Trying it without a tenant](#trying-it-without-a-tenant)).
+- Two looks, Standard and Command Center, each in light and dark.
+
+**What it connects to.** Your Checkmarx One tenant; your mail server and your
+webhook, only if you set them up; and, only with a registry token entered under
+Settings → Updates, GitHub's container registry (`ghcr.io` and
+`pkg-containers.githubusercontent.com`) to check for and download releases. No
+telemetry, no analytics, and nothing else is contacted.
+
+### Limitations
+
+| Limitation | What it means for you |
+| ---------- | --------------------- |
+| **It acts once a cycle**, not the moment credits are spent. | Usage is read and budgets judged once a cycle (every 15 minutes by default), and Checkmarx can report credits a little after they are spent. Usage in between can take a budget past its limit before the restriction lands, so leave some headroom. A large group or application is restricted over several cycles (at most 1,000 changes a cycle by default; [Sizing and scale](#sizing-and-scale)). |
+| **It restricts access, it does not meter credits.** | It removes roles and turns settings off; it cannot stop an action already running or cap a budget to the exact credit. |
+| **Only roles held directly are removed.** | An AI role a person holds through a group or a composite role stays in effect. CreditGuard says so once and never changes the group or role, because that would affect everyone in it. Remove it there in Checkmarx One, or exempt the person ([Restricting a user, in detail](#what-the-enforcement-actions-actually-are)). |
+| **A project budget does not stop people's own AI Triage and AI Remediation.** | Turning project features off leaves what people start themselves working; only a user budget stops that ([What the breach and restriction messages say](#what-the-breach-and-restriction-messages-say)). |
+| **Account-wide Auto Triage may override a project.** | If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project. |
+| **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
+| **The general Risk Management roles are used for now.** | AI Triage and AI Remediation are reached through them today, so a restricted person also loses the Risk Management pages and dashboard. When Checkmarx One's dedicated AI permissions reach your tenant, swap them in under Settings → Enforcement, *Roles a user restriction removes*. |
+| **Figures only cover Checkmarx's lookback window.** | Checkmarx reports totals over a window (at most the last year), not individual events. "Lifetime" means everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened, unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
+| **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution). |
+| **It cannot say who undid a restriction.** | Checkmarx One does not report who switched a setting back on. By default each restriction is read back once an hour (`verify_interval_minutes`), so a setting switched back on can stay on for up to about that long, and one undone and redone between two read-backs is not seen. |
+| **Some Checkmarx behaviour is not yet verified on a real tenant.** | Where a person's roles come from (groups, composite roles); the Fusion lock and the repository's Fusion setting; usage rows per group (only ever seen empty; the sum of its projects is used instead); paging of a very long user list; finding a project's repository (without it, PR triage and remediation is skipped there); the names of the default protected roles (check them against your tenant); whether a Fusion setting the project inherited can inherit again after Restore (for now it is restored on the project itself). Each degrades safely and says so rather than guessing ([Remaining unknowns](#remaining-unknowns)). |
+| **Tested to 2,000 projects on a synthetic tenant.** | Load tested with 2,000 projects and 1,000 users made up for the test, not on a real tenant of that size. Use PostgreSQL above about 500 projects or 300 users ([Sizing and scale](#sizing-and-scale)). |
+| **One instance only.** | A second copy against the same database refuses to start. Availability comes from restarting the one copy, not from running several ([One instance only](#one-instance-only)). |
+| **The database is the only record of how to undo a restriction.** | The in-app backup holds configuration only. Back the database up; after restoring an older one, restrictions made since it was taken have to be given back by hand in Checkmarx One ([Backup and restore](#backup-and-restore)). |
+| **Updates are only as trustworthy as the release signing key.** | Until the image carries the release signing key, auto-update installs nothing and a manual install cannot be verified. Updates need a registry token, and only the single container updates itself: Compose shows the steps instead. Operating system, Python and OpenSSL fixes need a new image ([Updates](#updates)). |
+| **The audit log is tamper-evident, not tamper-proof.** | An edited or deleted entry is detected, but someone with full write access to the database could rewrite the whole chain. |
+
 ## High-level architecture
 
 CxCreditGuard is **one deployable unit**: a FastAPI backend that also serves the
 React single-page app from the same origin, a background scheduler running in the
 same process, and a database (SQLite by default, PostgreSQL for the hardened
-deployment). It talks to exactly one external system — the Checkmarx One APIs —
-and it does so only through a single hardened HTTP client.
+deployment). The external system it works with is Checkmarx One, reached only
+through a single hardened HTTP client; beyond that it sends mail and webhooks
+only when they are set up, and the in-app updater reads GitHub's container
+registry only once a registry token is entered (see [Updates](#updates)).
 
 Everything of consequence happens in one loop, `services/cycle.py`, run on a
 schedule or on demand via `POST /api/ops/run-cycle`:
@@ -1268,10 +1384,10 @@ sync reports that as a warning rather than undercounting quietly.
 
 CreditGuard does not rely on Checkmarx One keeping a restricted setting off.
 It reads each restriction in force back and applies it again if it was undone
-(the drift check above): every cycle on a small tenant, and in rotation on a
-large one (each at least every `verify_interval_minutes`, 60 by default; see
-[Sizing and scale](#sizing-and-scale)), so a setting switched back on holds for
-about that long at most. What it finds is recorded on the **Violations** page (main
+(the drift check above), in rotation: each at least every
+`verify_interval_minutes` (60 by default; 0 reads every restriction every
+cycle; see [Sizing and scale](#sizing-and-scale)), so a setting switched back
+on holds for about that long at most. What it finds is recorded on the **Violations** page (main
 menu, admins only; *Policy violations* in Jump to), for an admin to follow up:
 
 | Kind | What is detected | When |
