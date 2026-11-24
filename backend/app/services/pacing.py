@@ -9,14 +9,20 @@ number of cycles and the cycle itself finishes well within its interval:
 
 * **Verification** of restrictions in force: each is read back at most every
   ``verify_interval_minutes`` (default 60), spread evenly over the cycles,
-  oldest-verified first, at most ``max_verifications_per_cycle`` per cycle. A
-  restriction is read back straight after it is applied, so a new one is
-  always verified at once.
-* **Restriction writes** (applying or lifting a restriction): at most
-  ``max_writes_per_cycle`` per cycle. A limit with more targets than that is
-  restricted over several cycles, resuming where it stopped, with its progress
-  on the limit ("Restricting 1,240 of 2,000 projects"). Small limits go first,
-  so one large rollout never holds up a single user's restriction.
+  oldest-verified first, at most ``max_verifications_per_cycle`` per cycle.
+  Every restriction the cycle keeps in force is in the rotation, whether or
+  not a limit's current plan still includes its target; ones being lifted are
+  not (``evaluation._plan_verification``). A restriction is read back straight
+  after it is applied, so a new one is always verified at once.
+* **Tenant writes** (lifting, re-asserting drift, applying): at most
+  ``max_writes_per_cycle`` per cycle, spent in that order - every lift first,
+  then the verification pass's re-asserts, then new restrictions - so giving
+  access back and keeping a restriction in force never wait behind a rollout.
+  A limit with more targets than that is restricted (or lifted) over several
+  cycles, resuming where it stopped, with its progress on the limit
+  ("Restricting 1,240 of 2,000 projects", "Lifting: 760 still in force").
+  Small limits go first, so one large rollout never holds up a single user's
+  restriction.
 * **Policy violation scan checks** and **auto-triage attribution**: a number of
   projects per cycle, the longest-waiting first.
 * **A time budget** for the whole cycle (``time_budget_pct`` of the interval):
@@ -26,7 +32,14 @@ number of cycles and the cycle itself finishes well within its interval:
   other (verification read-backs, scan listings) are made ``read_concurrency``
   at a time. Writes are never parallel.
 
-Each budget set to 0 means "no budget": the behaviour before pacing existed.
+Each budget set to 0 means "no budget": everything, every cycle. For the
+verification interval, the write budget and the time budget that is the
+behaviour before pacing existed; the policy violation check and auto-triage
+attribution had fixed caps before pacing (50 projects; 50 projects and 300
+scan listings), and 0 now means no cap at all.
+
+The time budget belongs to the cycle (a context variable, shared with the read
+workers it starts), never to an API request served meanwhile.
 """
 
 from __future__ import annotations

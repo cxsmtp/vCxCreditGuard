@@ -154,7 +154,8 @@ timestamps and no project ids in the user view. So per-period usage cannot be
 summed from events. Instead:
 
 1. Each cycle polls the endpoint per dimension and stores the reported totals
-   (`usage_snapshot` and `usage_record`, with the raw payload kept for audit).
+   (`usage_snapshot` and `usage_record`, with each row's raw payload kept for a
+   week for audit; see [Data retention](#data-retention)).
 2. When a budget period opens, the total reported at that moment becomes the
    period's **baseline**.
 3. Usage for the period is `latest reported total - baseline`.
@@ -963,6 +964,33 @@ the normal cycle. Five safeguards are worth knowing:
 5. **The prune of audit rows is itself audited.** `app/services/retention.py` is
    the only code anywhere that deletes audit rows, and it writes an entry stating
    the counts, so the log always explains its own gaps.
+
+Consumption readings are most of the database (one row per user, project,
+application and group per cycle), so two more things keep them in check, both
+summarised in the prune's audit entry (`thinned_snapshots`, `raw_cleared_records`,
+`pinned_snapshots`):
+
+* **Raw rows are kept for a week.** Each reading stores every row as Checkmarx
+  sent it (`usage_record.raw`) next to the parsed figures. After 7 days the raw
+  copy is cleared, except where something still reads it: the latest reading of
+  each dimension, the readings an open budget period's usage breakdown starts
+  from (the Fusion model of each scan is only in the raw row), the baseline of a
+  restriction in force, and rows that matched no user, project or application.
+  The response pages of a reading (`usage_snapshot.raw`) are no longer stored at
+  all, except for a held reading (the evidence of a collapsed answer, which has
+  no rows). Cleared in batches, at most 20,000 readings a run, oldest first.
+* **Old readings are thinned** (*Thin old consumption readings*, Settings →
+  General, on by default): every reading of the last 3 days is kept, then one an
+  hour per dimension up to 40 days (longer than the longest monthly period plus
+  the week raw rows are kept), then one a day. Whole readings only, never single
+  rows. A reading anything refers to is never removed: the latest of each
+  dimension and lookback window, each restriction's baseline (the reading a rise
+  in usage since it was applied is measured from, see
+  [Policy violations](#policy-violations)), the readings open periods' usage
+  breakdowns start from, each project's auto-triage cursor and the readings
+  auto-triage charges were observed on. Held and demo readings are never thinned.
+  Deleted in batches of 100 readings, a transaction each, at most 20,000 a run.
+  Off: every reading is kept for the whole retention window, as before.
 
 ## Configuration
 
@@ -1803,47 +1831,63 @@ limits: 200 user, 50 project, 10 group (one covering 1,000 projects with all
 three project actions, about 3,500 restrictions) and 5 application limits, all
 enforcing. The cycle interval is the default 15 minutes.
 
-Measured (`scripts/loadtest.py`, 10 cycles; before = the version without
-pacing, 6 cycles):
+Measured (`scripts/loadtest.py`; before = the version without pacing, 6
+cycles; after on PostgreSQL = this version, 7 cycles, re-measured after the
+review fixes below; after on SQLite = the first pacing version, 10 cycles):
 
 | | Before, PostgreSQL | After, PostgreSQL | Before, SQLite | After, SQLite |
 | --- | --- | --- | --- | --- |
-| First enforcement of 3,545 restrictions | 1 cycle of 874 s | 5 cycles of 79–196 s | 1 cycle of 744 s | 5 cycles of 69–183 s |
-| Steady-state cycle | 313 s | **74 s** | 281 s | 65 s |
-| Checkmarx calls per steady cycle | 3,796 | 1,658 | 3,796 | 1,658 |
-| Database statements per steady cycle | 43,230 | 13,106 | 49,469 | 19,364 |
+| First enforcement of 3,545 restrictions | 1 cycle of 874 s | 5 cycles of 180–196 s | 1 cycle of 744 s | 5 cycles of 69–183 s |
+| Steady-state cycle | 313 s | **68–72 s** | 281 s | 65 s |
+| Checkmarx calls per steady cycle | 3,796 | 1,642–1,720 | 3,796 | 1,658 |
+| Database statements per steady cycle | 43,230 | 12,416–13,004 | 49,469 | 19,364 |
 | Restrictions in force read back | all, every cycle | each every 60 min (806 a cycle) | all, every cycle | each every 60 min |
 | Restricted projects checked for policy violations | the same 50 of 1,070, never the rest | 150 a cycle: each every 8 cycles (2 h) | the same 50 | each every 8 cycles |
-| Peak memory (RSS) | 226 MB | 263 MB | 216 MB | 258 MB |
-| Slowest GUI endpoint | dry run 1,967 ms | dry run 721 ms | dry run 1,049 ms | dry run 686 ms |
+| Consumption readings on disk after a month (15 min) | 5.5 GB | **≈ 1.0 GB** | 9 GB | (not measured) |
+| Peak memory (RSS) | 226 MB | 240 MB | 216 MB | 258 MB |
+| Slowest GUI endpoint | dry run 1,967 ms | dashboard 670 ms, dry run 643 ms | dry run 1,049 ms | dry run 686 ms |
 
 Every endpoint the GUI uses answers in under a second at this size (the
-Simulation dry run 0.7 s, the Budgets list 0.7 s, the report 0.45 s, the blast
-radius of the 1,000-project group 0.1 s and 22 KB instead of 0.9 s and 344 KB).
+Simulation dry run 0.65 s, the Budgets list 0.5 s, the report 0.25 s, the blast
+radius of the 1,000-project group 0.1 s and 22 KB instead of 0.9 s and 344 KB,
+a page of restrictions in force 26 ms).
 Auto-triage attribution, with 1,000 projects showing new Auto Triage every
 cycle, works through 150 a cycle: each is traced within 7 cycles (the oldest
 waited 2.5 hours; until then its credits count on the project).
 
-**What a cycle costs.** In steady state about 830 Checkmarx calls per
+**What a cycle costs.** In steady state about 820 Checkmarx calls per
 1,000 projects per cycle (verification read-backs spread over the hour, scan
 listings for policy violations and auto-triage attribution, consumption pages,
-and the organisation sync every 30 minutes; about 320 of them re-read
-repository Fusion settings that the tenant does not have, which are looked at
-again every cycle), about 74 s on PostgreSQL
-and 65 s on SQLite with 50 ms calls: well inside a 15 minute
+and the organisation sync every 30 minutes; about 575 of them read repository
+settings back: PR triage and remediation, repository Fusion), about 70 s on
+PostgreSQL and 65 s on SQLite with 50 ms calls: well inside a 15 minute
 interval. The first enforcement of the 1,000-project group (3,545
 restrictions) is spread over 5 cycles of about 3 minutes each, with
 the progress on the Budgets page.
 
 **Database growth.** Each cycle stores one consumption reading per dimension:
-about 3,000 `usage_record` rows (≈ 1.9 MB on PostgreSQL, 3 MB on SQLite) for
-this tenant, so about **5.5 GB a month at a 15 minute interval** on PostgreSQL
-(≈ 2.8 GB at 30 minutes; ≈ 9 GB on SQLite),
-kept for `retention.days` (365 by default). Restrictions, notifications and
+3,033 `usage_record` rows for this tenant. Measured on PostgreSQL:
+
+| | Before | Now |
+| --- | --- | --- |
+| A reading, as stored | ≈ 1.9 MB (rows with their raw copy, plus every response page again on `usage_snapshot.raw`) | ≈ 1.7 MB (rows with their raw copy; no response pages) |
+| A reading older than a week | the same | ≈ 0.7 MB (raw copy cleared: 64% of the rows' bytes) |
+| Readings kept, per dimension, 30 days at 15 minutes | 2,880 | 936 (all of 3 days, then one an hour) |
+| Readings kept, per dimension, 365 days | 35,040 | 1,501 (… then one a day after 40 days) |
+| On disk after a month | ≈ 5.5 GB | **≈ 1.0 GB** |
+| On disk after a year (`retention.days` 365) | ≈ 66 GB | **≈ 1.4 GB** |
+| Growth after the first 40 days | ≈ 5.5 GB a month | ≈ 21 MB a month (one reading a day) |
+
+The simulation in the load test (`--simulate-thinning-days 45`: 45 days of
+readings at 15 minutes, 25 rows each, then one retention run) kept 1,188
+readings per dimension of 4,327, and the two tables went from 177 MB to 44 MB
+after `VACUUM FULL` (the run took 3 s); the figures above scale its per-row
+sizes to the real 3,033 rows. With thinning switched off, readings are kept
+whole for the whole window (raw copies are still cleared after a week:
+≈ 2.7 GB a month, ≈ 25 GB a year). Restrictions, notifications and
 audit entries add a few MB per thousand restrictions, once. At this size use
-PostgreSQL, plan the disk for the retention you keep, and consider a 90 day
-retention (`retention.days`) if a year of 15 minute readings is more than you
-need.
+PostgreSQL. PostgreSQL reuses the space freed by thinning for new rows; it does
+not give it back to the file system without a `VACUUM FULL`.
 
 **Recommendations.**
 
@@ -1859,14 +1903,20 @@ need.
   work, so coverage (below) takes more cycles.
 
 **Pacing settings** (Settings → Enforcement, *Pacing for large tenants*; API
-fields in brackets). Each is a per-cycle budget; **0 means no budget**, which is
-exactly the behaviour before pacing existed.
+fields in brackets). Each is a per-cycle budget; **0 means no budget**:
+everything, every cycle. For the verification interval and cap, the
+restriction changes and the time budget that is the behaviour before pacing
+existed. It is not for the two rotations: before pacing the policy violation
+check had a fixed cap of 50 restricted projects a cycle (always the same 50)
+and auto-triage attribution one of 50 projects and 300 scan listings; set to 0
+they now have **no cap at all**, every restricted project and every waiting
+project each cycle.
 
 | Setting | Default | What it means |
 | ------- | ------- | ------------- |
-| Verify each restriction every (`verify_interval_minutes`) | 60 | Each restriction in force is read back at most this often, spread evenly over the cycles, the oldest-verified first. A new restriction is read back as it is applied, and an edited limit's restrictions are read back first on the next cycle. 0: every restriction, every cycle. |
-| Read-backs per cycle (`max_verifications_per_cycle`) | 2000 | At most this many read-backs in one cycle. With more in force than this covers within the interval, each is verified less often; the cycle record says how often (`each_verified_within_minutes`). |
-| Restriction changes per cycle (`max_writes_per_cycle`) | 1000 | Restrictions applied or lifted in one cycle. A larger group or application is restricted over several cycles, resuming where it stopped ("Restricting 1,240 of 2,000 projects" on the Budgets page, one notification when it starts). Small limits go first: a limit needing more than 50 changes waits until every other limit has had its turn in the cycle. Restores (and lifting a large limit switched off in the GUI: 200 at once, the rest by the cycles) are batched the same way. The safety ceilings judge a rollout once, when it starts. |
+| Verify each restriction every (`verify_interval_minutes`) | 60 | Each restriction in force is read back at most this often, spread evenly over the cycles, the oldest-verified first. That is every restriction the cycle keeps in force, including those no limit's current plan still includes (a project that left the group or application, which stays restricted until its period ends; a hold-until-released limit's earlier periods), but not those being lifted. A new restriction is read back as it is applied; a limit whose enforcement, active state or project actions change has its restrictions read back first on the next cycle. One that cannot be read back moves behind the others (it stays due). A notification (once a day) says when any restriction in force has gone unread for more than twice the interval. 0: every restriction, every cycle. |
+| Read-backs per cycle (`max_verifications_per_cycle`) | 2000 | At most this many read-backs in one cycle. With more in force than this covers within the interval, each is verified less often; the cycle record says how often (`each_verified_within_minutes`). At the defaults and a 15 minute interval every restriction is read back within the hour up to 8,000 in force, if the cycle has the time. |
+| Restriction changes per cycle (`max_writes_per_cycle`) | 1000 | Every change a cycle makes to the tenant, spent in this order: **lifts** first (a limit switched off or within budget again, an exemption, the period rollover), then **drift re-asserted** by the verification (and restrictions that could not be read back, written again), then **new restrictions**, small limits first. Giving access back therefore never waits behind a rollout, and a re-assert the budget does not reach is done first on the next cycle (the restriction stays due); at worst a drift found waits as many cycles as lifts and re-asserts fill. A larger group or application is restricted over several cycles, resuming where it stopped ("Restricting 1,240 of 2,000 projects" on the Budgets page, one notification when it starts); a large lift likewise ("Lifting: 760 still in force"; the period shows *restored* only once the last is lifted). A limit needing more than 50 changes waits until every other limit has had its turn in the cycle. A limit switched off in the GUI lifts at most 200 at once (whatever the cycle is doing meanwhile), the rest by the cycles. The safety ceilings judge each user or project of a rollout once: the ones it has still to restrict are remembered by id, and anything else (a project added to the group since, a new breach after the period was lifted) is judged again. |
 | Projects checked for violations per cycle (`violation_projects_per_cycle`) | 150 | Restricted projects whose scans are listed, least recently checked first: each at least every ceil(restricted / 150) cycles. |
 | Auto-triage projects per cycle (`attribution_projects_per_cycle`) | 150 | Projects whose new Auto Triage is traced to scans, longest waiting first. |
 | Auto-triage scan requests per cycle (`attribution_requests_per_cycle`) | 600 | Scan listings attribution may make in one cycle. |
@@ -1875,9 +1925,12 @@ exactly the behaviour before pacing existed.
 
 **Coverage is on every cycle's record** (`scheduler_run.stats`, also
 returned by `POST /api/ops/run-cycle`): `evaluate.pacing.verification` (restrictions in
-force, due, read back, `each_verified_within_minutes`,
-`oldest_verified_minutes_ago`), `evaluate.pacing.writes` (budget, used,
-deferred, `stopped_for_time`), `evaluate.rollouts` (limit, done, total),
+force, `rotation` = `in_a_plan` + `outside_a_plan`, `being_lifted`,
+`target_deleted`, due, read back, `reasserted`, `unverified`,
+`reasserts_deferred`, `failed`, `each_verified_within_minutes`,
+`oldest_verified_minutes_ago`, `unverified_beyond_twice_the_interval`),
+`evaluate.pacing.writes` (budget, used, deferred, `lifts`, `reasserts`,
+`stopped_for_time`), `evaluate.rollouts` (limit, done, total),
 `violations` (`watched`, `per_cycle`, `each_checked_every_cycles`,
 `oldest_check_minutes`), `auto_triage_attribution` (`backlog`,
 `oldest_waiting_minutes`, `each_within_cycles`) and `http` (requests, 429s,
@@ -1905,7 +1958,11 @@ python -m scripts.loadtest \
 
 Options set the tenant size (`--projects`, `--users`, `--groups`,
 `--applications`), latency and rate limiting, and `--profile-cycle N` profiles
-one cycle (functions and the most frequent SQL). The simulated clock moves on
+one cycle (functions and the most frequent SQL). Each cycle's record has the
+size of the consumption readings (`usage`); on PostgreSQL
+`--simulate-thinning-days N` (with `--simulate-rows R`) then writes N days of
+readings at the interval and runs the retention job once, reporting the
+readings kept per dimension and the size before and after. The simulated clock moves on
 by the interval before every cycle, so time-based work behaves as on a real
 schedule. The synthetic tenant is `backend/tests/scale_tenant.py`; small
 regression tests of the pacing are in `backend/tests/test_scale_pacing.py`.
@@ -1925,7 +1982,8 @@ regression tests of the pacing are in `backend/tests/test_scale_pacing.py`.
    by a group, project or application limit they had no idea applied to them.
 4. **Check the attribution.** The Audit Log holds the before and after state of
    every action. If usage was attributed to the wrong user, the raw consumption
-   payload is stored on each event for exactly this comparison.
+   row is stored on each reading of the last week (and on the latest reading,
+   whatever its age) for exactly this comparison.
 5. **If the GUI is unavailable**, restoring access in Checkmarx One directly is
    always safe: re-add the role, or re-enable the project setting. Then mark the
    enforcement record as reversed in the utility, or clear the limit, before the
