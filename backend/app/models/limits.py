@@ -20,7 +20,14 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
 from app.db.types import JSONColumn, UTCDateTime
-from app.models.enums import EnforcementStatus, LimitStatus, PeriodType
+from app.models.enums import (
+    LEGACY_PROJECT_ACTIONS,
+    PROJECT_ACTION_ORDER,
+    EnforcementStatus,
+    EntityType,
+    LimitStatus,
+    PeriodType,
+)
 
 DEFAULT_WARNING_THRESHOLD_PCT = 80
 
@@ -85,6 +92,13 @@ class CreditLimit(Base, TimestampMixin):
     # request row can be pruned without nulling it out from under this check.
     granted_by_request_id: Mapped[int | None] = mapped_column(Integer)
 
+    # What a project, group or application limit turns off on its projects, as
+    # a list of ProjectAction values ("auto_triage", "pr_remediation",
+    # "fusion"). Null means the limit predates the choice: it keeps turning off
+    # Auto Triage and PR triage and remediation only, so an upgrade changes
+    # nothing. Always null for user limits.
+    project_actions: Mapped[list[str] | None] = mapped_column(JSONColumn)
+
     period_states: Mapped[list[LimitPeriodState]] = relationship(
         back_populates="limit", cascade="all, delete-orphan"
     )
@@ -97,6 +111,22 @@ class CreditLimit(Base, TimestampMixin):
             name="warning_threshold_range",
         ),
     )
+
+
+def effective_project_actions(limit: CreditLimit) -> tuple[str, ...]:
+    """What this limit turns off on its projects, in the order it is applied.
+
+    Empty for a user limit. A stored list that holds nothing recognisable falls
+    back to the legacy pair rather than to nothing: a limit that enforces must
+    never silently stop restricting because of a bad value.
+    """
+    if limit.entity_type == EntityType.USER:
+        return ()
+    stored = limit.project_actions
+    if stored is None or not isinstance(stored, list):
+        return LEGACY_PROJECT_ACTIONS
+    chosen = tuple(action for action in PROJECT_ACTION_ORDER if action in stored)
+    return chosen or LEGACY_PROJECT_ACTIONS
 
 
 class Exemption(Base, TimestampMixin):

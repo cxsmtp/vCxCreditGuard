@@ -28,6 +28,8 @@ CATEGORY_AUTH_FAILURE = "auth_failure"
 CATEGORY_ATTRIBUTION = "attribution"
 # The stored Checkmarx API key lacks a permission CreditGuard needs.
 CATEGORY_PERMISSIONS = "permissions"
+# Someone acted against a restriction in force ("Policy violations").
+CATEGORY_POLICY = "policy"
 
 
 def notify(

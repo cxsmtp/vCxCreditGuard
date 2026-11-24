@@ -104,11 +104,49 @@ _ACTION_ALIASES: dict[str, str] = {
 }
 
 
+def action_key(raw: str) -> str:
+    """A raw action type (or a rate's display name) as one comparable key.
+
+    ``fusion_scan_-_opus_5.5`` and ``Fusion Scan - Opus 5.5`` both become
+    ``fusion_scan___opus_5.5``, which is how a consumption row's action type is
+    matched to its price in ``GET /api/v1/credits/action-rates``.
+    """
+    return raw.strip().lower().replace("-", "_").replace(" ", "_")
+
+
 def normalise_action_type(raw: str | None) -> str:
+    """The action type a raw ``actionType`` belongs to.
+
+    Fusion is billed per model, so the feed names it with the model in it
+    (``fusion_scan_-_opus_5.5``, the action-rates endpoint's ``action_type``).
+    Every such variant is Fusion here; the model stays in the raw row
+    (``UsageRecord.raw``) and in the action dimension's subject, and
+    :func:`fusion_model` reads it back where a price needs it.
+    """
     if not raw:
         return ActionType.UNKNOWN
-    key = raw.strip().lower().replace("-", "_").replace(" ", "_")
+    key = action_key(raw)
+    if key.startswith("fusion"):
+        return ActionType.FUSION
     return _ACTION_ALIASES.get(key, _ACTION_ALIASES.get(key.replace("_", ""), key))
+
+
+def fusion_model(raw: str | None) -> str | None:
+    """The model in a Fusion action type, for people to read, or None.
+
+    ``fusion_scan_-_opus_5.5`` gives ``Opus 5.5``; a plain ``fusion`` gives None.
+    """
+    if not raw or normalise_action_type(raw) != ActionType.FUSION:
+        return None
+    key = action_key(raw)
+    for prefix in ("fusion_scan", "fusionscan", "fusion"):
+        if key.startswith(prefix):
+            key = key[len(prefix) :]
+            break
+    words = [word for word in key.split("_") if word]
+    if not words:
+        return None
+    return " ".join(word[:1].upper() + word[1:] for word in words)
 
 
 def _to_decimal(value: Any) -> Decimal:

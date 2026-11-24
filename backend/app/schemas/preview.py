@@ -27,8 +27,13 @@ class BlastRadiusResponse(BaseModel):
     remove_user_roles: int
     disable_auto_triage: int
     disable_pr_remediation: int
+    # Fusion off in the project's scan settings / in its repository's settings.
+    disable_fusion: int = 0
+    disable_repo_fusion: int = 0
     total_actions: int
     targets: list[TargetPreviewResponse]
+    # What the limit turns off on its projects ([] for a user limit).
+    project_actions: list[str] = []
 
 
 class DryRunRowResponse(BaseModel):

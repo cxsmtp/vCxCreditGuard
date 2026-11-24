@@ -23,8 +23,10 @@ function mainNav(me: Me): NavItem[] {
   items.push(
     { to: "/reports", label: "Reports", icon: "reports" },
     { to: "/notifications", label: "Notifications", icon: "bell" },
-    { to: "/settings", label: "Settings", icon: "settings" },
   );
+  // Admins only: a violation names people, and following it up is an admin's call.
+  if (me.role === "admin") items.push({ to: "/violations", label: "Violations", icon: "shield" });
+  items.push({ to: "/settings", label: "Settings", icon: "settings" });
   return items;
 }
 
@@ -182,6 +184,15 @@ function Lights({ me }: { me: Me }) {
       title: me.key_permissions.summary,
     });
   }
+  if ((me.open_violations ?? 0) > 0) {
+    lights.push({
+      key: "violations",
+      tone: "warn",
+      label: `${me.open_violations} policy violation${me.open_violations === 1 ? "" : "s"}`,
+      to: "/violations",
+      title: "Someone acted against a restriction in force. Open Policy violations to follow up.",
+    });
+  }
   if (me.enforcement_paused) {
     lights.push({
       key: "paused",
@@ -313,7 +324,7 @@ function JumpPalette({ me, open, onClose }: { me: Me; open: boolean; onClose: ()
 
   const targets = useMemo<JumpTarget[]>(() => {
     const pages: JumpTarget[] = mainNav(me).map((item) => ({
-      label: item.label,
+      label: item.to === "/violations" ? "Policy violations" : item.label,
       where: "Page",
       to: item.to,
       icon: item.icon,
@@ -525,6 +536,14 @@ export function AppShell({
                 {item.to === "/notifications" && unreadCount > 0 && (
                   <span className="cg-count tabular" aria-label={`${unreadCount} unread`}>
                     {unreadCount > 99 ? "99+" : unreadCount}
+                  </span>
+                )}
+                {item.to === "/violations" && (me.open_violations ?? 0) > 0 && (
+                  <span
+                    className="cg-count tabular"
+                    aria-label={`${me.open_violations} open violations`}
+                  >
+                    {(me.open_violations ?? 0) > 99 ? "99+" : me.open_violations}
                   </span>
                 )}
               </NavLink>

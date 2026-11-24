@@ -60,7 +60,12 @@ from app.models.enums import (
     Severity,
     UsageView,
 )
-from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
+from app.models.limits import (
+    CreditLimit,
+    EnforcementAction,
+    LimitPeriodState,
+    effective_project_actions,
+)
 from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
 from app.services import (
     auto_triage_attribution,
@@ -512,7 +517,10 @@ def _would_start_restricting(session: Session, limit: CreditLimit, period_key: s
     targets = [
         (str(target.kind), target.target_id)
         for target in enforcement.plan_targets(
-            session, entity_type=limit.entity_type, entity_id=limit.entity_id
+            session,
+            entity_type=limit.entity_type,
+            entity_id=limit.entity_id,
+            project_actions=effective_project_actions(limit),
         )
     ]
     return bool(_starting_targets(session, limit.id, period_key, targets))
@@ -583,6 +591,9 @@ def _lift_unjustified_restrictions(
             session, entity_type=action.entity_type, entity_id=action.entity_id
         ):
             reason = enforcement.EXEMPTED_REASON
+        elif enforcement.deselected(action, limit):
+            # The limit no longer turns this off (its choice was changed).
+            reason = enforcement.DESELECTED_REASON
         else:
             # The target itself has become exempt or protected (rather than the
             # limit's own entity): a project exempted while its application's
@@ -1105,16 +1116,19 @@ def _notify_breach(
     lines = [headline, tail]
     if limit.enforce and not exempt:
         kind = usage_mix.restriction_kind_for(limit.entity_type)
+        actions = effective_project_actions(limit)
         lines.append(
             "What the restriction does: "
             + (
                 "the AI roles are removed from the user."
                 if kind == EnforcementKind.REMOVE_USER_ROLES
-                else "Auto Triage and PR triage and remediation are turned off on "
+                else f"{usage_mix.actions_phrase(actions)} "
+                + ("is" if len(actions) == 1 else "are")
+                + " turned off on "
                 + ("the project." if limit.entity_type == EntityType.PROJECT else "its projects.")
             )
             + " "
-            + usage_mix.does_not_stop(kind, mix)
+            + usage_mix.does_not_stop(kind, mix, actions=actions)
         )
     notifications.notify(
         session,

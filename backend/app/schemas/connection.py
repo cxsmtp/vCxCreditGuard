@@ -162,6 +162,7 @@ class KeyPermissionReport(KeyPermissionSummary):
     key_fingerprint: str | None = None
     enforce_users: bool = False
     enforce_projects: bool = False
+    enforce_fusion: bool = False
     auto_triage_charging: bool = False
     checks: list[KeyPermissionCheck] = Field(default_factory=list)
     runtime_denials: list[KeyPermissionRuntimeDenial] = Field(default_factory=list)

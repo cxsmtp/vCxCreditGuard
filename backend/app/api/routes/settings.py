@@ -48,6 +48,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "max_new_enforcements_per_cycle": settings_store.KEY_MAX_NEW_ENFORCEMENTS,
     "max_new_targets_per_cycle": settings_store.KEY_MAX_NEW_TARGETS,
     "protected_roles": settings_store.KEY_PROTECTED_ROLES,
+    "fusion_lock_override": settings_store.KEY_FUSION_LOCK,
     "charge_auto_triage_to_scan_initiator": settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR,
 }
 
@@ -117,6 +118,7 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         max_new_enforcements_per_cycle=guard.max_new_per_cycle,
         max_new_targets_per_cycle=guard.max_new_targets_per_cycle,
         protected_roles=", ".join(sorted(guard.protected_roles)),
+        fusion_lock_override=settings_store.fusion_lock_enabled(db),
         charge_auto_triage_to_scan_initiator=bool(
             values.get(settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR) is True
         ),

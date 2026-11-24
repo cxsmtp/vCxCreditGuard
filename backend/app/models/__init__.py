@@ -36,6 +36,7 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
+from app.models.violations import PolicyViolation
 
 # Once every model is known: see app/db/length_guard.py.
 install_length_guards(Base)
@@ -63,6 +64,7 @@ __all__ = [
     "LimitPeriodState",
     "LoginAttempt",
     "PasswordResetToken",
+    "PolicyViolation",
     "Notification",
     "SchedulerLock",
     "SchedulerRun",

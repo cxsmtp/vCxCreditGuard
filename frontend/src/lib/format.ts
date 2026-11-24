@@ -114,7 +114,34 @@ const ENFORCEMENT_LABELS: Record<string, string> = {
   remove_user_roles: "AI roles removed",
   disable_auto_triage: "Auto Triage disabled",
   disable_pr_remediation: "PR triage and remediation disabled",
+  disable_fusion: "Fusion turned off",
+  disable_repo_fusion: "Repository Fusion setting turned off",
 };
+
+/** What a project, group or application limit can turn off, in order. */
+export const PROJECT_ACTIONS: { id: "auto_triage" | "pr_remediation" | "fusion"; label: string; help: string }[] = [
+  {
+    id: "auto_triage",
+    label: "Auto Triage",
+    help: "Turned off in the project's AI agent configuration.",
+  },
+  {
+    id: "pr_remediation",
+    label: "PR triage and remediation",
+    help: "Severities cleared in the repository settings (projects with a repository only).",
+  },
+  {
+    id: "fusion",
+    label: "Fusion",
+    help: "Turned off in the project's scan settings, and in its repository's where Checkmarx reports it. A scan started with its own settings may still turn it on; CreditGuard records any such scan under Policy violations.",
+  },
+];
+
+export function projectActionsLabel(actions: string[]): string {
+  const names = PROJECT_ACTIONS.filter((action) => actions.includes(action.id)).map((a) => a.label);
+  if (names.length <= 1) return names.join("") || "Nothing";
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
 
 export function enforcementLabel(kind: string): string {
   return ENFORCEMENT_LABELS[kind] ?? humanise(kind);

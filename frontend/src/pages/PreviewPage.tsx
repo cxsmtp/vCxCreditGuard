@@ -199,6 +199,9 @@ export function BlastSummary({ blast }: { blast: BlastRadius }) {
   if (blast.remove_user_roles > 0) parts.push(`${blast.remove_user_roles} user`);
   if (blast.disable_auto_triage > 0) parts.push(`${blast.disable_auto_triage} Auto Triage`);
   if (blast.disable_pr_remediation > 0) parts.push(`${blast.disable_pr_remediation} PR remediation`);
+  if ((blast.disable_fusion ?? 0) > 0) parts.push(`${blast.disable_fusion} Fusion`);
+  if ((blast.disable_repo_fusion ?? 0) > 0)
+    parts.push(`${blast.disable_repo_fusion} repository Fusion`);
   return (
     <span className="text-xs" style={{ color: "var(--text-primary)" }}>
       {parts.join(", ")}

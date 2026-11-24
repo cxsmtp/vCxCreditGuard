@@ -221,6 +221,9 @@ class SettingsResponse(BaseModel):
     max_new_enforcements_per_cycle: int = 25
     max_new_targets_per_cycle: int = 100
     protected_roles: str = ""
+    # Turning Fusion off also tries to lock it against per-scan override
+    # (allowOverride false). Unverified that Checkmarx One honours the lock.
+    fusion_lock_override: bool = True
     # Charge each project's auto-triage credits also to the person whose scan
     # triggered it. Off by default.
     charge_auto_triage_to_scan_initiator: bool = False
@@ -259,6 +262,7 @@ class SettingsUpdateRequest(StrictModel):
     max_new_enforcements_per_cycle: int | None = Field(default=None, ge=0, le=100_000)
     max_new_targets_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
     protected_roles: str | None = Field(default=None, max_length=1024)
+    fusion_lock_override: bool | None = None
     charge_auto_triage_to_scan_initiator: bool | None = None
 
     @field_validator("schedule_mode")
@@ -329,6 +333,9 @@ class MeResponse(BaseModel):
     # The last API key permission check, compact, so every page can show the
     # "missing permissions" banner without another request. None until checked.
     key_permissions: KeyPermissionSummary | None = None
+    # Open policy violations, for the top-bar light and the nav badge. Admins
+    # only (viewers do not see violations); None for a viewer.
+    open_violations: int | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
 

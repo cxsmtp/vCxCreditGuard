@@ -675,6 +675,15 @@ export function SettingsPage({
                   />
                 </Field>
               </div>
+              <div className="mt-4 border-t border-hairline pt-4">
+                <Toggle
+                  checked={value("fusion_lock_override") ?? true}
+                  disabled={!isAdmin}
+                  onChange={(next) => set({ fusion_lock_override: next })}
+                  label="Lock Fusion against per-scan override"
+                  description="When a limit turns Fusion off, also try to stop a scan started with its own settings from turning it back on (allowOverride off). Not verified that Checkmarx One honours this; a tenant that refuses the lock still gets Fusion turned off without it. CreditGuard re-applies its restrictions every cycle and records any scan that ran Fusion anyway under Policy violations, so this is optional."
+                />
+              </div>
             </Card>
           </div>
           )}

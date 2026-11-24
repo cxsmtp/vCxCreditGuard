@@ -35,6 +35,7 @@ EXPECTED_TABLES = {
     "login_attempt",
     "notification",
     "password_reset_token",
+    "policy_violation",
     "scheduler_lock",
     "scheduler_run",
     "unresolved_subject",

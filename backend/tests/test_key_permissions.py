@@ -600,7 +600,9 @@ class TestBreachMessages:
         assert breach.body.startswith(f"4 of 3 credits used in {month}: Fusion scan 4.\n")
         assert "4.0000" not in breach.body
         assert breach.body.count("credits used") == 1
-        assert "does not stop Fusion scans; CreditGuard cannot switch Fusion off yet" in breach.body
+        # This limit predates the choice (legacy pair), so it says Fusion is not turned off.
+        assert "does not stop Fusion scans: this limit does not turn Fusion off" in breach.body
+        assert "cannot switch Fusion off yet" not in breach.body
 
         restricted = db.scalar(
             select(Notification).where(Notification.title.like("%Auto Triage disabled"))
@@ -638,7 +640,8 @@ class TestBreachMessages:
         assert "The AI roles were removed: " in body
         assert all(role in body for role in AI_ROLE_NAMES)
         assert "Most of the actions behind them were Fusion scans." in body
-        assert "does not stop Fusion scans" in body
+        assert "Fusion scans keep running on projects" in body
+        assert "cannot switch Fusion off yet" not in body
         action = db.scalar(select(EnforcementAction))
         assert action is not None
 

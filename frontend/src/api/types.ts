@@ -35,6 +35,8 @@ export interface Me {
   enforcement_paused: string | null;
   /** The last API key permission check, compact. Null until one has run. */
   key_permissions?: KeyPermissionSummary | null;
+  /** Open policy violations (admins only; null for a viewer). */
+  open_violations?: number | null;
 }
 
 export type KeyPermissionVerdict = "ok" | "limited" | "insufficient" | "unknown";
@@ -78,6 +80,7 @@ export interface KeyPermissionReport extends KeyPermissionSummary {
   key_fingerprint: string | null;
   enforce_users: boolean;
   enforce_projects: boolean;
+  enforce_fusion?: boolean;
   auto_triage_charging: boolean;
   checks: KeyPermissionCheck[];
   runtime_denials: {
@@ -341,11 +344,17 @@ export interface Limit {
   exempt: boolean;
   notes: string | null;
   business_unit: string | null;
+  /** As stored: null for a limit that predates the choice (and for users). */
+  project_actions: ProjectAction[] | null;
+  /** What the limit turns off on its projects ([] for a user limit). */
+  effective_project_actions: ProjectAction[];
   created_at: string;
   updated_at: string;
   current_period: LimitPeriodState | null;
   active_restrictions: number;
 }
+
+export type ProjectAction = "auto_triage" | "pr_remediation" | "fusion";
 
 export interface Exemption {
   id: number;
@@ -493,6 +502,8 @@ export interface AppSettings {
   max_new_targets_per_cycle: number;
   /** Comma separated tenant role names whose holders are never restricted. */
   protected_roles: string;
+  /** Turning Fusion off also tries to lock it against per-scan override (unverified). */
+  fusion_lock_override: boolean;
   current_schedule_description: string;
 }
 
@@ -673,8 +684,11 @@ export interface BlastRadius {
   remove_user_roles: number;
   disable_auto_triage: number;
   disable_pr_remediation: number;
+  disable_fusion?: number;
+  disable_repo_fusion?: number;
   total_actions: number;
   targets: TargetPreview[];
+  project_actions?: ProjectAction[];
 }
 
 export interface DryRunRow {
@@ -717,4 +731,40 @@ export interface BulkResult {
   updated: number;
   restrictions_lifted: number;
   errors: string[];
+}
+
+export type ViolationStatus = "open" | "acknowledged" | "resolved";
+
+export interface PolicyViolation {
+  id: number;
+  kind: string;
+  kind_label: string;
+  detected_at: string;
+  updated_at: string | null;
+  limit_id: number | null;
+  limit_label: string | null;
+  limit_entity_type: string | null;
+  limit_entity_id: string | null;
+  enforcement_action_id: number | null;
+  target_type: string;
+  target_id: string;
+  target_label: string | null;
+  actor: string | null;
+  source: string | null;
+  detail: string;
+  evidence: Record<string, unknown> | null;
+  credits: string | null;
+  severity: string;
+  status: ViolationStatus;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  resolved_by: string | null;
+  resolved_at: string | null;
+  note: string | null;
+}
+
+export interface ViolationList {
+  items: PolicyViolation[];
+  total: number;
+  open: number;
 }

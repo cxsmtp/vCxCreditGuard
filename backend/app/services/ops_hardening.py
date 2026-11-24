@@ -237,6 +237,7 @@ _LIMIT_FIELDS = (
     "count_existing_usage",
     "notes",
     "business_unit",
+    "project_actions",
 )
 
 
@@ -322,6 +323,7 @@ def _limit_input(row: dict[str, Any]) -> limits_service.LimitInput:
             custom_period_end=_parse_dt(row.get("custom_period_end")),
             notes=row.get("notes"),
             business_unit=row.get("business_unit"),
+            project_actions=limits_service.normalise_project_actions(row.get("project_actions")),
         )
     except (KeyError, ValueError, TypeError) as exc:
         raise BackupError(f"Invalid limit entry in backup: {exc}") from exc

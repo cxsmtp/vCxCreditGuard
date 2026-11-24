@@ -11,6 +11,7 @@ from app.models.enums import (
     EntityType,
     LimitStatus,
     PeriodType,
+    ProjectAction,
     Severity,
 )
 from app.schemas.auth import StrictModel
@@ -33,11 +34,23 @@ class LimitCreateRequest(StrictModel):
     custom_period_end: datetime | None = None
     notes: str | None = Field(default=None, max_length=1024)
     business_unit: str | None = Field(default=None, max_length=128)
+    # What a project, group or application limit turns off on its projects.
+    # Omitted or null: Auto Triage and PR triage and remediation (what every
+    # limit did before the choice existed). Not allowed on user limits.
+    project_actions: list[ProjectAction] | None = Field(default=None, max_length=3)
 
     @model_validator(mode="after")
     def _check_custom_period(self) -> LimitCreateRequest:
         if self.period_type == PeriodType.CUSTOM and self.custom_period_start is None:
             raise ValueError("A custom period needs a start date.")
+        if self.project_actions is not None:
+            if self.entity_type == EntityType.USER:
+                raise ValueError(
+                    "What to turn off for projects can only be chosen for project, group and "
+                    "application limits."
+                )
+            if not self.project_actions:
+                raise ValueError("Choose at least one thing to turn off for projects.")
         if (
             self.custom_period_start is not None
             and self.custom_period_end is not None
@@ -60,6 +73,8 @@ class LimitUpdateRequest(StrictModel):
     custom_period_end: datetime | None = None
     notes: str | None = Field(default=None, max_length=1024)
     business_unit: str | None = Field(default=None, max_length=128)
+    # null puts the limit back on the legacy pair; an empty list is refused.
+    project_actions: list[ProjectAction] | None = Field(default=None, max_length=3)
 
 
 class AutoTriagePartResponse(BaseModel):
@@ -145,6 +160,10 @@ class LimitResponse(BaseModel):
     exempt: bool
     notes: str | None
     business_unit: str | None = None
+    # As stored: null for a limit that predates the choice (and for users).
+    project_actions: list[str] | None = None
+    # What the limit actually turns off on its projects ([] for user limits).
+    effective_project_actions: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
     current_period: LimitPeriodStateResponse | None = None

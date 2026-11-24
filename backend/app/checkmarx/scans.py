@@ -61,10 +61,41 @@ class ScanSummary:
     completed_at: datetime | None
     initiator: str | None
     source_origin: str | None
+    # The engines the scan ran ("sast", "sca", "ai", ...).
+    engines: tuple[str, ...] = ()
+    source_type: str | None = None
+    # ``metadata.configs[type=ai].value`` (fusionEnabled, llmModel), when the
+    # payload carries it. None: the scan does not say.
+    ai_config: dict[str, Any] | None = None
+    # Whether the payload had a metadata.configs list at all (the listing may
+    # leave it out; the scan's own read has it).
+    has_configs: bool = False
 
     @property
     def completed(self) -> bool:
         return self.status.strip().lower() in COMPLETED_STATUSES
+
+    @property
+    def ran_ai(self) -> bool:
+        return "ai" in self.engines
+
+    @property
+    def fusion(self) -> bool | None:
+        """True when the AI engine ran with Fusion on, False when it ran without
+        (LLM-based scanning only), None when the scan does not say."""
+        if not self.ran_ai or self.ai_config is None:
+            return None
+        value = self.ai_config.get("fusionEnabled")
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() == "true"
+
+    @property
+    def llm_model(self) -> str | None:
+        model = (self.ai_config or {}).get("llmModel")
+        return model.strip()[:64] if isinstance(model, str) and model.strip() else None
 
 
 @dataclass
@@ -128,6 +159,16 @@ def parse_scan(item: Any) -> ScanSummary | None:
     initiator = item.get("initiator")
     branch = item.get("branch")
     origin = item.get("sourceOrigin")
+    source_type = item.get("sourceType")
+    engines = item.get("engines")
+    metadata = item.get("metadata")
+    configs = metadata.get("configs") if isinstance(metadata, dict) else None
+    ai_config: dict[str, Any] | None = None
+    for config in configs if isinstance(configs, list) else []:
+        if isinstance(config, dict) and str(config.get("type") or "").lower() == "ai":
+            value = config.get("value")
+            ai_config = dict(value) if isinstance(value, dict) else {}
+            break
     return ScanSummary(
         id=scan_id,
         status=status,
@@ -136,7 +177,20 @@ def parse_scan(item: Any) -> ScanSummary | None:
         completed_at=updated or created,
         initiator=initiator.strip() if isinstance(initiator, str) and initiator.strip() else None,
         source_origin=origin if isinstance(origin, str) and origin else None,
+        engines=tuple(
+            engine.strip().lower()
+            for engine in (engines if isinstance(engines, list) else [])
+            if isinstance(engine, str) and engine.strip()
+        ),
+        source_type=source_type if isinstance(source_type, str) and source_type else None,
+        ai_config=ai_config,
+        has_configs=isinstance(configs, list),
     )
+
+
+def get_scan(client: CheckmarxClient, *, scan_id: str) -> ScanSummary | None:
+    """One scan, with its metadata (``GET /api/scans/{id}``)."""
+    return parse_scan(client.get_json(f"{SCANS_PATH}{scan_id}"))
 
 
 def parse_scan_page(payload: Any) -> ScanPage:
