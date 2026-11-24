@@ -500,7 +500,10 @@ def _plan_verification(
         stats["interval_minutes"] = 0
         return stats
     never = datetime.min.replace(tzinfo=UTC)
-    cutoff = moment - timedelta(minutes=config.verify_interval_minutes)
+    # Due a little early (a tenth of the interval), so the time the cycles
+    # themselves take never pushes a read-back past the interval.
+    interval = config.verify_interval_minutes
+    cutoff = moment - timedelta(minutes=interval - max(1, interval // 10))
     ordered = sorted(rows, key=lambda row: (row.last_verified_at or never, row.id))
     due = sum(1 for row in rows if row.last_verified_at is None or row.last_verified_at <= cutoff)
     wanted = config.verifications_per_cycle(len(rows), due) or 0
