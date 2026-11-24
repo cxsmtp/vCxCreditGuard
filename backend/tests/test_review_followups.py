@@ -286,6 +286,29 @@ class TestCoverageThatCouldNotRead:
         report = coverage.compute(db, tenant.client())
         assert report.unknown == 1 and report.restrictable == 0
 
+    def test_the_page_is_told_it_was_not_determined(
+        self,
+        db: Session,
+        connected,  # noqa: F811
+        admin_client: TestClient,
+    ) -> None:
+        from app.checkmarx.iam import DEFAULT_AI_ROLE_NAMES
+
+        tenant = FakeTenant()
+        for index in range(3):
+            tenant.add_user(
+                user_id=f"u{index}",
+                username=f"u{index}@example.com",
+                roles=[*DEFAULT_AI_ROLE_NAMES, "ast-scanner"],
+            )
+        connected(tenant)
+        org_sync.sync_org_model(db, tenant.client())
+        db.commit()
+        tenant.fail_paths["/protocol/openid-connect/token"] = 401
+        body = admin_client.get("/api/preview/coverage?refresh=true").json()
+        assert body["determined"] is False and body["low"] is False
+        assert "could not be determined" in body["undetermined"]
+
     def test_check_again_is_throttled_and_a_new_key_recomputes(
         self, db: Session, monkeypatch
     ) -> None:

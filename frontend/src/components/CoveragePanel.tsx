@@ -87,7 +87,7 @@ export function CoveragePanel({ isAdmin }: { isAdmin: boolean }) {
             <Figure
               label="Could not be read"
               value={formatNumber(data.unknown)}
-              detail="Sources unknown; counted as not reachable"
+              detail="Sources unknown; left out of the share"
             />
           </div>
 

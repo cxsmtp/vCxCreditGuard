@@ -138,3 +138,6 @@ class EnforcementCoverageResponse(BaseModel):
     available: bool = True
     low: bool = False
     warning: str | None = None
+    # False when no AI holder's role sources could be read: no verdict.
+    determined: bool = True
+    undetermined: str | None = None

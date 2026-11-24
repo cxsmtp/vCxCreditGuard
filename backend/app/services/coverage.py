@@ -128,10 +128,12 @@ class Coverage:
         """Said instead of a verdict when no holder's sources could be read."""
         if self.determined:
             return None
+        why = "; ".join(note.rstrip(".") for note in self.notes) or "the tenant could not be read"
         return (
             f"Whether user budgets can bite could not be determined: the role sources of the "
             f"{self.ai_holders} users who hold an AI role could not be read "
-            f"({'; '.join(self.notes) or 'the tenant could not be read'}). It is checked "
+            f"({why}). "
+            "It is checked "
             "again shortly."
         )
 
