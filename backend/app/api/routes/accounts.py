@@ -215,11 +215,12 @@ def unlock_account(user_id: int, ctx: AdminUser, db: DbSession) -> MessageRespon
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such account.")
     before = {"locked_until": user.locked_until, "failed_login_count": user.failed_login_count}
-    user.locked_until = None
-    user.failed_login_count = 0
     # Also forget the per-address lockouts, or the account would look unlocked
     # while its owner still could not sign in from the address that failed.
+    # The counters before the account row: the sign-in's lock order.
     auth_service.clear_login_throttle(db, username=user.username)
+    user.locked_until = None
+    user.failed_login_count = 0
     db.flush()
     record_audit(
         db,

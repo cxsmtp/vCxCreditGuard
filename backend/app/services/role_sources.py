@@ -574,7 +574,10 @@ def tenant_client_roles(session: Session, *, fresh: bool = False) -> ClientRoleL
         logger.info("Could not list the tenant's client roles: %s", exc)
         return ClientRoleListing(
             available=False,
-            message=f"The tenant's roles could not be read from Checkmarx One: {exc}",
+            message=(
+                "The tenant's roles could not be read from Checkmarx One: "
+                f"{error_text.public_error(exc)}"
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - listing roles must never break a page
         logger.warning("Could not list the tenant's client roles", exc_info=True)

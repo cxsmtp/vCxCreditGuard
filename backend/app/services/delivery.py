@@ -72,12 +72,24 @@ TIMESTAMP_HEADER = "X-CxCreditGuard-Timestamp"
 
 # Cloud instance metadata. Never a legitimate webhook target.
 BLOCKED_HOSTS = frozenset({"169.254.169.254", "metadata.google.internal", "fd00:ec2::254"})
-# The same, as addresses, so that any spelling of them is caught.
+# Cloud metadata and platform endpoints, as addresses, so that any spelling of
+# them is caught: AWS (IPv4 and IPv6), GCP's IPv6 one, Alibaba Cloud, and
+# Azure's WireServer. (169.254.169.254 serves AWS, GCP, Azure and others.)
 BLOCKED_ADDRESSES = frozenset(
-    {ipaddress.ip_address("169.254.169.254"), ipaddress.ip_address("fd00:ec2::254")}
+    ipaddress.ip_address(address)
+    for address in (
+        "169.254.169.254",
+        "fd00:ec2::254",
+        "fd20:ce::254",
+        "100.100.100.200",
+        "168.63.129.16",
+    )
 )
-# NAT64's well-known prefix: an IPv4 address embedded in an IPv6 one.
-_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+# NAT64 prefixes, well-known (RFC 6052) and local-use (RFC 8215): the IPv4
+# address is carried in the last 32 bits.
+_NAT64_PREFIXES = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
+# IPv4-compatible IPv6 (deprecated, ::a.b.c.d).
+_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
 
 SmtpFactory = Callable[[str, int, float], smtplib.SMTP]
 
@@ -229,8 +241,16 @@ def deliver_pending(
         session.flush()
         return result
 
-    owns_client = http_client is None
-    client = http_client or webhook_client()
+    # Built only when there is a webhook to post to, so an email-only setup
+    # never depends on the webhook client.
+    client = http_client
+    client_error: DeliveryError | None = None
+    if client is None and config.webhook_enabled:
+        try:
+            client = webhook_client()
+        except DeliveryError as exc:
+            client_error = exc
+    owns_client = http_client is None and client is not None
     try:
         for notification in candidates:
             outcome: dict[str, Any] = {"attempts": 1}
@@ -246,6 +266,8 @@ def deliver_pending(
 
             if config.webhook_enabled:
                 try:
+                    if client is None:
+                        raise client_error or DeliveryError("no webhook client")
                     post_webhook(notification, config=config, client=client)
                     outcome["webhook"] = "sent"
                 except DeliveryError as exc:
@@ -275,7 +297,7 @@ def deliver_pending(
             # part way through.
             session.commit()
     finally:
-        if owns_client:
+        if owns_client and client is not None:
             client.close()
 
     return result
@@ -482,7 +504,8 @@ class _GuardedSMTP(smtplib.SMTP):
 
     def _get_socket(self, host, port, timeout):  # type: ignore[no-untyped-def]
         try:
-            addresses = guarded_addresses(host, port)
+            # A relay on this host (loopback) is a common mail setup.
+            addresses = guarded_addresses(host, port, allow_loopback=True)
         except TargetRefused as exc:
             raise DeliveryError(str(exc)) from exc
         except httpcore.ConnectError as exc:
@@ -560,25 +583,46 @@ def sign_payload(body: bytes, *, secret: str, timestamp: str) -> str:
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
-def forbidden_address(address: IPAddress) -> str | None:
+def _embedded_ipv4(address: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """The IPv4 address an IPv6 one carries and reaches, if any: IPv4-mapped,
+    IPv4-compatible, 6to4, Teredo (the client) and NAT64."""
+    if address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    if address.sixtofour is not None:
+        return address.sixtofour
+    if address.teredo is not None:
+        return address.teredo[1]
+    low = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    if any(address in prefix for prefix in _NAT64_PREFIXES):
+        return low
+    if address in _IPV4_COMPATIBLE and int(address) > 1:  # not :: or ::1
+        return low
+    return None
+
+
+def forbidden_address(address: IPAddress, *, allow_loopback: bool = False) -> str | None:
     """Why ``address`` may never be connected to (None: it may).
 
-    The cloud metadata endpoints and link-local addresses, including an IPv4
-    one carried inside an IPv6 address (IPv4-mapped, NAT64), which reaches the
-    same place. Private ranges are allowed: an internal relay is a supported
-    deployment.
+    Cloud metadata and platform endpoints, link-local addresses, the
+    unspecified address (0.0.0.0 and :: reach this host) and, unless
+    ``allow_loopback`` (a mail relay on this host), loopback; also any of them
+    carried inside an IPv6 address. Private ranges are allowed: an internal
+    relay is a supported deployment.
     """
     if isinstance(address, ipaddress.IPv6Address):
-        embedded = address.ipv4_mapped
-        if embedded is None and address in _NAT64_PREFIX:
-            embedded = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
-        reason = forbidden_address(embedded) if embedded is not None else None
-        if reason:
-            return reason
+        embedded = _embedded_ipv4(address)
+        if embedded is not None:
+            reason = forbidden_address(embedded, allow_loopback=allow_loopback)
+            if reason:
+                return reason
     if address in BLOCKED_ADDRESSES:
         return "a cloud metadata address"
     if address.is_link_local:
         return "a link-local address"
+    if address.is_unspecified:
+        return "the unspecified address"
+    if address.is_loopback and not allow_loopback:
+        return "a loopback address"
     return None
 
 
@@ -623,7 +667,7 @@ class TargetRefused(httpcore.ConnectError):
     """A connection was refused because of where it would have gone."""
 
 
-def guarded_addresses(host: str, port: int) -> list[str]:
+def guarded_addresses(host: str, port: int, *, allow_loopback: bool = False) -> list[str]:
     """The addresses ``host`` resolves to now, if none of them is forbidden.
 
     Called at the moment of connecting, and the connection is then made to one
@@ -642,7 +686,7 @@ def guarded_addresses(host: str, port: int) -> list[str]:
     addresses: list[str] = []
     for _family, _type, _proto, _canonical, sockaddr in infos:
         text = str(sockaddr[0]).split("%", 1)[0]
-        reason = forbidden_address(ipaddress.ip_address(text))
+        reason = forbidden_address(ipaddress.ip_address(text), allow_loopback=allow_loopback)
         if reason:
             raise TargetRefused(f"refusing to connect: the host name resolves to {reason}")
         if text not in addresses:
@@ -694,20 +738,67 @@ class _GuardedBackend(httpcore.NetworkBackend):
         self._inner.sleep(seconds)
 
 
-def webhook_client() -> httpx.Client:
-    """The HTTP client webhooks are posted with: connections are guarded
-    (``guarded_addresses``) and redirects are not followed.
+def _check_target_before_sending(request: httpx.Request) -> None:
+    """Every request: resolve the target and refuse a forbidden address.
 
-    Through an HTTP proxy from the environment (``HTTPS_PROXY``) the proxy makes
-    the connection, so it is the proxy's own egress rules that apply to the
-    name; the URL check (``assert_webhook_target_allowed``) still runs.
+    This is what guards a request sent through an HTTP proxy from the
+    environment (``HTTPS_PROXY``), which resolves the name itself, where the
+    connection guard below never sees the target. A name this host cannot
+    resolve is left to the proxy (or fails to connect without one).
     """
-    client = httpx.Client(timeout=WEBHOOK_TIMEOUT_SECONDS, follow_redirects=False)
-    pool = getattr(client._transport, "_pool", None)  # noqa: SLF001 - see the test
-    if pool is None or not hasattr(pool, "_network_backend"):
+    port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    try:
+        guarded_addresses(request.url.host, port)
+    except TargetRefused as exc:
+        raise DeliveryError(str(exc)) from exc
+    except httpcore.ConnectError:
+        return
+
+
+class _SelfTestReached(Exception):
+    """Raised by the self-test backend: the pool connects through it."""
+
+
+class _SelfTestBackend(httpcore.NetworkBackend):
+    def connect_tcp(self, *_args: Any, **_kwargs: Any) -> httpcore.NetworkStream:
+        raise _SelfTestReached
+
+    def connect_unix_socket(self, *_args: Any, **_kwargs: Any) -> httpcore.NetworkStream:
+        raise _SelfTestReached
+
+
+def webhook_client() -> httpx.Client:
+    """The HTTP client webhooks are posted with: every target is checked before
+    the request is sent, direct connections go only to checked addresses, and
+    redirects are not followed.
+
+    The connection guard sits in httpx's private connection pool (httpx and
+    httpcore are pinned for that). It is proven to be in the request path each
+    time a client is built: a request through a backend that only raises must
+    end in that backend, with no network involved. If not, no client is built
+    and the webhook is reported as failed, never sent unguarded.
+    """
+    client = httpx.Client(
+        timeout=WEBHOOK_TIMEOUT_SECONDS,
+        follow_redirects=False,
+        event_hooks={"request": [_check_target_before_sending]},
+    )
+    pool = getattr(client._transport, "_pool", None)  # noqa: SLF001
+    reached = False
+    if pool is not None and hasattr(pool, "_network_backend"):
+        pool._network_backend = _SelfTestBackend()  # noqa: SLF001
+        try:
+            client._transport.handle_request(  # noqa: SLF001
+                httpx.Request("GET", "http://guard-self-test.invalid/")
+            )
+        except _SelfTestReached:
+            reached = True
+        except Exception:  # noqa: BLE001 - anything else means the guard is not in the path
+            reached = False
+        pool._network_backend = _GuardedBackend()  # noqa: SLF001
+    if not reached:
         client.close()
         raise DeliveryError("the webhook connection cannot be guarded with this httpx version")
-    pool._network_backend = _GuardedBackend()  # noqa: SLF001
     return client
 
 
@@ -790,14 +881,16 @@ def send_test_notification(
 
     if config.webhook_enabled:
         owns_client = http_client is None
-        client = http_client or webhook_client()
+        client: httpx.Client | None = http_client
         try:
+            if client is None:
+                client = webhook_client()
             post_webhook(sample, config=config, client=client)
             outcome["webhook"] = "sent"
         except DeliveryError as exc:
             outcome["webhook"] = f"failed: {exc}"
         finally:
-            if owns_client:
+            if owns_client and client is not None:
                 client.close()
 
     return outcome

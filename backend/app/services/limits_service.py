@@ -26,7 +26,7 @@ from app.db.base import utcnow
 from app.models.enums import PROJECT_ACTION_ORDER, EntityType
 from app.models.limits import CreditLimit, Exemption, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
-from app.services import evaluation
+from app.services import error_text, evaluation
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -439,7 +439,7 @@ def delete_limit(
     except CheckmarxError as exc:
         raise LimitRestoreError(
             "The limit was not deleted because the restrictions it applied could not be "
-            f"lifted in Checkmarx One: {exc}"
+            f"lifted in Checkmarx One: {error_text.public_error(exc)}"
         ) from exc
     record_audit(
         session,
