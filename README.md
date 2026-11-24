@@ -298,8 +298,14 @@ counted and the per project parts all from the same rebuild); the period's
 `credits_used` is from its last evaluation and catches up at the next cycle, for
 example after an initiator is mapped (`evaluated_counted` shows what it included).
 
-**Bounded and crash safe.** Listing is paged and capped (50 projects and 300
-requests per cycle, 500 scans per project interval). Scans are listed newest
+**Bounded and crash safe.** Listing is paged and capped
+(`attribution.max_projects_per_cycle` projects and
+`attribution.max_requests_per_cycle` requests per cycle, 150 and 600 by default;
+500 scans per project interval). The work waiting longest goes first, new
+increases and history estimates alike, so a capped cycle leaves the newest
+work and nothing waits for ever; the step's record says how much is left
+(`backlog`), how long the oldest has waited (`oldest_waiting_minutes`) and
+within how many cycles each is reached at this backlog (`each_within_cycles`). Scans are listed newest
 first by when they were created, so an interval is listed back to four hours before
 it opened, enough for a long SAST scan of a large repository to finish inside it. The
 listing does not ask the server to filter by date (the pages read are the same), so
@@ -816,14 +822,17 @@ backend/app/
   services/      connection, auth, audit, org_sync, ingestion, periods,
                  evaluation, enforcement, role_sources (where a user's
                  roles come from), violations, usage_mix, limits_service,
-                 notifications, settings_store, cycle
+                 notifications, settings_store, pacing (per-cycle budgets and
+                 rotation for large tenants), cycle
   scheduler.py   APScheduler wiring, reconfigurable at runtime
   api/           dependencies (auth, CSRF, RBAC), middleware, routes
   schemas/       request and response models with strict validation
   static/        the built SPA (produced by the frontend build, not in git)
 alembic/         migrations
-scripts/         seed_demo.py, for a tenant-free demo database
+scripts/         seed_demo.py, for a tenant-free demo database; loadtest.py,
+                 the load test (see Sizing and scale)
 tests/           unit, service and API tests, plus the in-memory fake tenant
+                 and its 2,000-project synthetic variant (scale_tenant.py)
 
 frontend/src/
   api/           typed fetch client with CSRF handling, response types
@@ -847,7 +856,10 @@ Two design decisions worth knowing before reading the code:
 **Sync I/O throughout.** This is a single tenant admin tool whose busiest hour
 involves a handful of admins and one scheduler thread. Sync SQLAlchemy and
 `httpx.Client` remove a whole class of async footguns (accidental blocking
-calls, session sharing across tasks) at no practical cost.
+calls, session sharing across tasks) at no practical cost. The one exception is
+bounded: independent read-only Checkmarx calls of a cycle (verification
+read-backs, scan listings) are made a few at a time on worker threads that
+never touch the database (`pacing.parallel_map`).
 
 **One HTTP client for all Checkmarx traffic.** `app/checkmarx/client.py` owns
 base URL selection, token injection, re-authentication on 401, retry with
@@ -1203,9 +1215,11 @@ sync reports that as a warning rather than undercounting quietly.
 ## Policy violations
 
 CreditGuard does not rely on Checkmarx One keeping a restricted setting off.
-Every cycle it reads each restriction in force back and applies it again if it
-was undone (the drift check above), so a setting switched back on holds for one
-interval at most. What it finds is recorded on the **Violations** page (main
+It reads each restriction in force back and applies it again if it was undone
+(the drift check above): every cycle on a small tenant, and in rotation on a
+large one (each at least every `verify_interval_minutes`, 60 by default; see
+[Sizing and scale](#sizing-and-scale)), so a setting switched back on holds for
+about that long at most. What it finds is recorded on the **Violations** page (main
 menu, admins only; *Policy violations* in Jump to), for an admin to follow up:
 
 | Kind | What is detected | When |
@@ -1218,9 +1232,12 @@ menu, admins only; *Policy violations* in Jump to), for an admin to follow up:
 
 Scans are listed newest first from the later of the restriction's
 `applied_at` and the newest scan already looked at (a per-project cursor),
-bounded like the auto-triage reads: 50 projects, 2 pages per project and 50
-single-scan reads (for a listing that leaves the scan's settings out) per
-cycle. Each scan is reported once whatever happens (a unique key per finding),
+bounded: `violations.max_projects_per_cycle` projects (150 by default; the
+ones checked least recently first, so each restricted project is listed at
+least every ceil(restricted / 150) cycles, and the cycle record says how often:
+`each_checked_every_cycles`, `oldest_check_minutes`), 2 pages per project and
+50 single-scan reads (for a listing that leaves the scan's settings out) per
+cycle. The listings are made `cycle.read_concurrency` at a time. Each scan is reported once whatever happens (a unique key per finding),
 with its final classification, and a scan already recorded is never read
 again. A scan still queued or running (for up to a day), or one whose settings
 could not be read this cycle, is not recorded yet: it is kept by id as pending
@@ -1463,7 +1480,10 @@ failure of this tool is restricting many people at once for a wrong reason.
   pauses itself, and alerts the admins with the counts. Both numbers are
   configurable; the defaults suit a tenant of a few hundred engineers. Resuming
   after such a pause lets the next cycle through once without the ceiling, on
-  the understanding that an admin has looked.
+  the understanding that an admin has looked. A first enforcement too large
+  for one cycle's write budget (see [Sizing and scale](#sizing-and-scale)) is
+  judged once, when it starts: its continuation on the next cycles is not
+  counted as new, but users or projects added to the limit since are.
 - **Protected roles.** A user holding one of the listed Checkmarx roles
   (default `ast-admin`, `iam-admin`) is never restricted, and is released if
   the role is granted later. They still get the warning. **Check these names
@@ -1507,6 +1527,124 @@ It prints a temporary password that must be changed at the next sign-in,
 switches two factor off for that account, and records the reset in the audit
 log. The bootstrap variables do not help here: they only create an account when
 there are none.
+
+## Sizing and scale
+
+CxCreditGuard has been load tested against a synthetic tenant of **2,000
+projects** (60% with a repository, half with Auto Triage on), **1,000 users**,
+**100 groups** (nested, one holding 1,000 projects), **30 applications**,
+consumption for every dimension and scans on 400 projects, with **50 ms per
+Checkmarx call** and a **429 every 500 calls** (`Retry-After: 1`). Seeded
+limits: 200 user, 50 project, 10 group (one covering 1,000 projects with all
+three project actions, about 3,500 restrictions) and 5 application limits, all
+enforcing. The cycle interval is the default 15 minutes.
+
+Measured (`scripts/loadtest.py`, 10 cycles; before = the version without
+pacing, 6 cycles):
+
+| | Before, PostgreSQL | After, PostgreSQL | Before, SQLite | After, SQLite |
+| --- | --- | --- | --- | --- |
+| First enforcement of 3,545 restrictions | 1 cycle of 874 s | 5 cycles of 79–196 s | 1 cycle of 744 s | 5 cycles of 69–183 s |
+| Steady-state cycle | 313 s | **74 s** | 281 s | 65 s |
+| Checkmarx calls per steady cycle | 3,796 | 1,658 | 3,796 | 1,658 |
+| Database statements per steady cycle | 43,230 | 13,106 | 49,469 | 19,364 |
+| Restrictions in force read back | all, every cycle | each every 60 min (806 a cycle) | all, every cycle | each every 60 min |
+| Restricted projects checked for policy violations | the same 50 of 1,070, never the rest | 150 a cycle: each every 8 cycles (2 h) | the same 50 | each every 8 cycles |
+| Peak memory (RSS) | 226 MB | 263 MB | 216 MB | 258 MB |
+| Slowest GUI endpoint | dry run 1,967 ms | dry run 721 ms | dry run 1,049 ms | dry run 686 ms |
+
+Every endpoint the GUI uses answers in under a second at this size (the
+Simulation dry run 0.7 s, the Budgets list 0.7 s, the report 0.45 s, the blast
+radius of the 1,000-project group 0.1 s and 22 KB instead of 0.9 s and 344 KB).
+Auto-triage attribution, with 1,000 projects showing new Auto Triage every
+cycle, works through 150 a cycle: each is traced within 7 cycles (the oldest
+waited 2.5 hours; until then its credits count on the project).
+
+**What a cycle costs.** In steady state about 830 Checkmarx calls per
+1,000 projects per cycle (verification read-backs spread over the hour, scan
+listings for policy violations and auto-triage attribution, consumption pages,
+and the organisation sync every 30 minutes; about 320 of them re-read
+repository Fusion settings that the tenant does not have, which are looked at
+again every cycle), about 74 s on PostgreSQL
+and 65 s on SQLite with 50 ms calls: well inside a 15 minute
+interval. The first enforcement of the 1,000-project group (3,545
+restrictions) is spread over 5 cycles of about 3 minutes each, with
+the progress on the Budgets page.
+
+**Database growth.** Each cycle stores one consumption reading per dimension:
+about 3,000 `usage_record` rows (≈ 1.9 MB on PostgreSQL, 3 MB on SQLite) for
+this tenant, so about **5.5 GB a month at a 15 minute interval** on PostgreSQL
+(≈ 2.8 GB at 30 minutes; ≈ 9 GB on SQLite),
+kept for `retention.days` (365 by default). Restrictions, notifications and
+audit entries add a few MB per thousand restrictions, once. At this size use
+PostgreSQL, plan the disk for the retention you keep, and consider a 90 day
+retention (`retention.days`) if a year of 15 minute readings is more than you
+need.
+
+**Recommendations.**
+
+* **PostgreSQL above about 500 projects** (or 300 users). SQLite has a single
+  writer: a cycle's writes and the GUI's sign-ins and edits queue behind each
+  other. It works at 2,000 projects (measured above) but PostgreSQL is
+  faster and does not stall the GUI.
+* **A 15 minute interval** up to about 3,000 projects with the default budgets;
+  30 minutes above that, or raise the budgets below only as far as the cycle
+  record shows time to spare (`http.time_budget_left_seconds`).
+* Do not lower the interval to 2 or 5 minutes at this size: the time budget
+  keeps a cycle from overrunning, but each cycle then does less of the rotating
+  work, so coverage (below) takes more cycles.
+
+**Pacing settings** (Settings → Enforcement, *Pacing for large tenants*; API
+fields in brackets). Each is a per-cycle budget; **0 means no budget**, which is
+exactly the behaviour before pacing existed.
+
+| Setting | Default | What it means |
+| ------- | ------- | ------------- |
+| Verify each restriction every (`verify_interval_minutes`) | 60 | Each restriction in force is read back at most this often, spread evenly over the cycles, the oldest-verified first. A new restriction is read back as it is applied, and an edited limit's restrictions are read back first on the next cycle. 0: every restriction, every cycle. |
+| Read-backs per cycle (`max_verifications_per_cycle`) | 2000 | At most this many read-backs in one cycle. With more in force than this covers within the interval, each is verified less often; the cycle record says how often (`each_verified_within_minutes`). |
+| Restriction changes per cycle (`max_writes_per_cycle`) | 1000 | Restrictions applied or lifted in one cycle. A larger group or application is restricted over several cycles, resuming where it stopped ("Restricting 1,240 of 2,000 projects" on the Budgets page, one notification when it starts). Small limits go first: a limit needing more than 50 changes waits until every other limit has had its turn in the cycle. Restores (and lifting a large limit switched off in the GUI: 200 at once, the rest by the cycles) are batched the same way. The safety ceilings judge a rollout once, when it starts. |
+| Projects checked for violations per cycle (`violation_projects_per_cycle`) | 150 | Restricted projects whose scans are listed, least recently checked first: each at least every ceil(restricted / 150) cycles. |
+| Auto-triage projects per cycle (`attribution_projects_per_cycle`) | 150 | Projects whose new Auto Triage is traced to scans, longest waiting first. |
+| Auto-triage scan requests per cycle (`attribution_requests_per_cycle`) | 600 | Scan listings attribution may make in one cycle. |
+| Parallel reads (`read_concurrency`) | 4 | Independent read-only calls (read-backs, scan listings) made at the same time; writes are always one at a time. 1: one call after another. 429 and `Retry-After` are honoured per call as before. |
+| Cycle time budget (`cycle_time_budget_pct`) | 80 | Once a cycle has run this share of its interval (at least a minute), it stops starting new per-target work and leaves the rest to the next cycle instead of overrunning. The hung-cycle watchdog (2 hours) is unchanged. |
+
+**Coverage is on every cycle's record** (`scheduler_run.stats`, also
+returned by `POST /api/ops/run-cycle`): `evaluate.pacing.verification` (restrictions in
+force, due, read back, `each_verified_within_minutes`,
+`oldest_verified_minutes_ago`), `evaluate.pacing.writes` (budget, used,
+deferred, `stopped_for_time`), `evaluate.rollouts` (limit, done, total),
+`violations` (`watched`, `per_cycle`, `each_checked_every_cycles`,
+`oldest_check_minutes`), `auto_triage_attribution` (`backlog`,
+`oldest_waiting_minutes`, `each_within_cycles`) and `http` (requests, 429s,
+retries, seconds waited, per step, and the time budget left). The API client
+keeps its connections open between calls and cycles.
+
+**Large lists in the GUI.** Budgets, Simulation, Reports and Policy violations
+show 100 rows a page (sorting and the column filters still apply to every row);
+the Notification Center's active restrictions are searched and paged on the
+server (`GET /api/notifications/enforcements/page?q=&offset=&limit=`); the
+entity pickers search the server. A blast radius lists its first 200 targets
+(20 per Simulation row) with the complete counts (`targets_total`).
+
+**Running the load test.** Not part of `pytest`:
+
+```sh
+cd backend
+# SQLite (a file in a temporary directory)
+python -m scripts.loadtest --database sqlite --cycles 10 --out /tmp/lt-sqlite.md
+# PostgreSQL: a fresh database is created on this server and dropped afterwards
+python -m scripts.loadtest \
+  --database "postgresql+psycopg://postgres@/postgres?host=/tmp&port=5433" \
+  --cycles 10 --latency-ms 50 --rate-limit-every 500 --out /tmp/lt-pg.md
+```
+
+Options set the tenant size (`--projects`, `--users`, `--groups`,
+`--applications`), latency and rate limiting, and `--profile-cycle N` profiles
+one cycle (functions and the most frequent SQL). The simulated clock moves on
+by the interval before every cycle, so time-based work behaves as on a real
+schedule. The synthetic tenant is `backend/tests/scale_tenant.py`; small
+regression tests of the pacing are in `backend/tests/test_scale_pacing.py`.
 
 ## Runbook: the utility restricted someone it should not have
 
