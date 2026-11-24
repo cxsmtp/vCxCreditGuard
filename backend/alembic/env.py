@@ -7,14 +7,22 @@ SQLite cannot ALTER most things in place and needs table rebuilds.
 
 from __future__ import annotations
 
+import sys
 from logging.config import fileConfig
+from pathlib import Path
 
-from sqlalchemy import engine_from_config, pool
+if "app" not in sys.modules:
+    # The `alembic` command line, run from backend/ (alembic.ini has no
+    # prepend_sys_path). In the app's own process `app` is already imported and
+    # sys.path is left alone.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from alembic import context
-from app.core.config import get_settings
-from app.db.types import UTCDateTime
-from app.models import Base  # noqa: F401 - imported for metadata side effects
+from sqlalchemy import engine_from_config, pool  # noqa: E402
+
+from alembic import context  # noqa: E402
+from app.core.config import get_settings  # noqa: E402
+from app.db.types import UTCDateTime  # noqa: E402
+from app.models import Base  # noqa: E402,F401 - imported for metadata side effects
 
 config = context.config
 

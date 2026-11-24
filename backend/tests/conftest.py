@@ -36,6 +36,7 @@ from app.models.enums import UtilityRole  # noqa: E402
 from app.services import auth as auth_service  # noqa: E402
 from app.services import connection as connection_service  # noqa: E402
 from app.services.audit import AuditActor  # noqa: E402
+from app.updates import service as update_service  # noqa: E402
 
 ADMIN_PASSWORD = "Str0ng!Adm1n#Pass"
 VIEWER_PASSWORD = "Str0ng!V1ewer#Pass"
@@ -64,6 +65,9 @@ def isolated_environment(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Iter
         monkeypatch.setenv("CXCG_DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
     else:
         monkeypatch.setenv("CXCG_DATABASE_URL", TEST_DATABASE_URL)
+    # The updater's files (versions, launcher state) in a folder of this test's own.
+    monkeypatch.setenv("CXCG_DATA_DIR", str(tmp_path / "app-data"))
+    update_service.set_service(None)
     reset_settings_cache()
     crypto.reset_secret_box()
     db_session.reset_engine()
@@ -76,6 +80,7 @@ def isolated_environment(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Iter
             connection.exec_driver_sql("CREATE SCHEMA public")
     Base.metadata.create_all(engine)
     yield
+    update_service.set_service(None)
     db_session.reset_engine()
     connection_service.reset_client_cache()
     crypto.reset_secret_box()

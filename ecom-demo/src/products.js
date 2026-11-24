@@ -2,32 +2,37 @@
 
 const express = require('express');
 const db = require('./db');
+const validate = require('./validate');
 
 const router = express.Router();
 
+const listAll = db.prepare('SELECT * FROM products ORDER BY name');
+const listByCategory = db.prepare('SELECT * FROM products WHERE category = ? ORDER BY name');
+const getById = db.prepare('SELECT * FROM products WHERE id = ?');
+
 // List products, optionally filtered by category.
 router.get('/', (req, res) => {
-  const { category } = req.query;
+  const raw = req.query.category;
 
-  if (category) {
-    const rows = db
-      .prepare('SELECT * FROM products WHERE category = ? ORDER BY name')
-      .all(category);
-    return res.json(rows);
+  if (raw !== undefined) {
+    const category = validate.category(raw);
+    if (category === null) {
+      return res.status(400).json({ error: 'invalid category' });
+    }
+    return res.json(listByCategory.all(category));
   }
 
-  const rows = db.prepare('SELECT * FROM products ORDER BY name').all();
-  res.json(rows);
+  res.json(listAll.all());
 });
 
 // Fetch a single product by id.
 router.get('/:id', (req, res) => {
-  const id = Number.parseInt(req.params.id, 10);
-  if (!Number.isInteger(id)) {
+  const id = validate.productId(req.params.id);
+  if (id === null) {
     return res.status(400).json({ error: 'invalid product id' });
   }
 
-  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(id);
+  const product = getById.get(id);
   if (!product) {
     return res.status(404).json({ error: 'product not found' });
   }

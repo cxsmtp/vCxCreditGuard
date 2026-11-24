@@ -159,6 +159,55 @@ class TestCsvFormulaInjection:
         assert "'=1+1" in body
 
 
+class TestCsvImportEchoIsNotRenderable:
+    """The import reports bad rows by quoting the offending cell back. That echo is
+    a JSON body the SPA renders as text, never HTML: these headers are what keeps a
+    hostile cell from being interpreted by a browser that opens the response."""
+
+    def test_a_script_in_a_cell_comes_back_as_inert_json(self, admin_client: TestClient) -> None:
+        payload = "<script>alert(document.domain)</script>"
+        response = admin_client.post(
+            "/api/limits/import?dry_run=true",
+            files={"file": ("limits.csv", f"entity_type,entity_id,credit_limit\n{payload},x,1\n")},
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert "script-src 'self'" in response.headers["content-security-policy"]
+        assert any(payload in error for error in response.json()["errors"])
+
+    def test_the_export_is_a_csv_download(self, admin_client: TestClient, db: Session) -> None:
+        db.add(
+            CreditLimit(
+                entity_type=EntityType.PROJECT,
+                entity_id="proj-1",
+                entity_label="<img src=x onerror=alert(1)>",
+                credit_limit=10,
+                period_type="monthly",
+            )
+        )
+        db.commit()
+        response = admin_client.get("/api/limits/export")
+        assert response.headers["content-type"].startswith("text/csv")
+        assert response.headers["content-disposition"].startswith("attachment;")
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+
+class TestRequestIdHeader:
+    """X-Request-ID is echoed in the response, in error bodies and in the log."""
+
+    def test_a_well_formed_id_is_kept(self, client: TestClient) -> None:
+        response = client.get("/healthz", headers={"X-Request-ID": "abc-123_DEF.4"})
+        assert response.headers["x-request-id"] == "abc-123_DEF.4"
+
+    @pytest.mark.parametrize("value", ["<script>", "a" * 65, "id with spaces", "a;b"])
+    def test_anything_else_is_replaced(self, client: TestClient, value: str) -> None:
+        response = client.get("/healthz", headers={"X-Request-ID": value})
+        echoed = response.headers["x-request-id"]
+        assert echoed != value
+        assert len(echoed) == 12 and echoed.isalnum()
+
+
 class TestEmailHeaderInjection:
     """A notification title is built from tenant data, so it cannot be trusted in a
     mail header."""

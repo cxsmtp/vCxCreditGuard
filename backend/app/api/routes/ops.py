@@ -21,7 +21,6 @@ from app.schemas.limits import (
     DiagnosticsResponse,
     RestoreResultResponse,
     SchedulerStatusResponse,
-    SetLatestVersionRequest,
     UpdateStatusResponse,
     WatchdogResponse,
 )
@@ -217,7 +216,7 @@ def verify_audit_chain(ctx: AdminUser, db: DbSession) -> AuditChainResponse:
 @router.get("/attestation", response_model=AttestationResponse)
 def attestation(ctx: AdminUser, db: DbSession) -> AttestationResponse:
     """Report what is running: version, applied migration head, a config digest,
-    and whether a newer version has been recorded."""
+    and whether the updater has seen a newer release."""
     att = ops_hardening.attestation(db)
     update = ops_hardening.update_status(db)
     return AttestationResponse(
@@ -227,16 +226,6 @@ def attestation(ctx: AdminUser, db: DbSession) -> AttestationResponse:
         generated_at=att.generated_at,
         update=UpdateStatusResponse(**update),
     )
-
-
-@router.post("/version/latest", response_model=UpdateStatusResponse)
-def set_latest_version(
-    payload: SetLatestVersionRequest, ctx: AdminUser, db: DbSession
-) -> UpdateStatusResponse:
-    """Record the latest available version (e.g. from a deploy pipeline)."""
-    ops_hardening.set_latest_version(db, version=payload.version, actor=ctx.actor)
-    db.commit()
-    return UpdateStatusResponse(**ops_hardening.update_status(db))
 
 
 @router.get("/watchdog", response_model=WatchdogResponse)

@@ -33,6 +33,7 @@ const SECTIONS: SettingsSection[] = [
   "accounts",
   "appearance",
   "operations",
+  "updates",
 ];
 
 /** /settings itself, and the old single-page anchors, open the right page. */
@@ -56,8 +57,8 @@ function SettingsRoute({
 }) {
   const { section } = useParams();
   if (!SECTIONS.includes(section as SettingsSection)) return <Navigate to="/settings/general" replace />;
-  // Accounts, and backups and health, are an admin's only.
-  if (!isAdmin && (section === "accounts" || section === "operations")) {
+  // Accounts, backups and health, and updates are an admin's only.
+  if (!isAdmin && (section === "accounts" || section === "operations" || section === "updates")) {
     return <Navigate to="/settings/general" replace />;
   }
   return (

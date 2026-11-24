@@ -44,6 +44,7 @@ const CATEGORIES = [
   { value: "auth_failure", label: "Authentication" },
   { value: "permissions", label: "API key permissions" },
   { value: "policy", label: "Policy violations" },
+  { value: "updates", label: "Updates" },
 ];
 
 const RESTRICTION_VIEW: ViewColumn<EnforcementActionItem>[] = [

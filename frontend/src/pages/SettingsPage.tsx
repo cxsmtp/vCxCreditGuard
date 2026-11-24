@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useLocation } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { ApiError, api } from "../api/client";
 import type {
   AdminResetResult,
@@ -42,6 +42,7 @@ import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 import { LookPicker } from "../components/AppShell";
 import { StatTile } from "../components/StatTile";
+import { UpdatesPanel } from "../components/UpdatesPanel";
 import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
 /** Unsaved edits. The last three are write only: the server never sends the
@@ -60,7 +61,8 @@ export type SettingsSection =
   | "attribution"
   | "accounts"
   | "appearance"
-  | "operations";
+  | "operations"
+  | "updates";
 
 const SECTION_HEAD: Record<SettingsSection, { title: string; description: string }> = {
   general: {
@@ -95,6 +97,11 @@ const SECTION_HEAD: Record<SettingsSection, { title: string; description: string
   operations: {
     title: "Backups & health",
     description: "Configuration backup and restore, the scheduler watchdog and the release attestation.",
+  },
+  updates: {
+    title: "Updates",
+    description:
+      "New releases, installed in place from the private registry. Automatic by default, with a rollback.",
   },
 };
 
@@ -940,6 +947,7 @@ export function SettingsPage({
             />
           )}
           {isAdmin && section === "operations" && <OperationsCard />}
+          {isAdmin && section === "updates" && <UpdatesPanel onChanged={onSettingsSaved} />}
           {isAdmin && section === "accounts" && <AccountsCard />}
         </>
       </div>
@@ -1714,9 +1722,9 @@ function OperationsCard() {
                 <div>
                   v{att.version}
                   {att.update.update_available && (
-                    <span className="ml-2">
+                    <Link to="/settings/updates" className="ml-2">
                       <Badge tone="warning">Update to {att.update.latest}</Badge>
-                    </span>
+                    </Link>
                   )}
                 </div>
                 <code className="text-xs break-all" style={{ color: "var(--text-muted)" }}>

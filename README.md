@@ -109,6 +109,11 @@ total from **416 to 237**:
   coreutils, tar) was the source of ~175 OS-package CVEs; Alpine carries a small
   fraction. psycopg runs in its pure-Python mode against the system `libpq`, since
   `psycopg[binary]` ships glibc-only wheels.
+  Since then the runtime base is `python:3.13-alpine3.24` (the 3.11 images still
+  carry pip 24.0, setuptools and wheel with known CVEs), the build runs
+  `apk upgrade` so the base's OS packages take Alpine's later fixes, and every
+  base image (Python, Node, `postgres:16.16-alpine3.24`, the proxy's
+  `nginx:1.30.8-alpine3.24-slim`) is pinned by tag and digest.
 - **IaC (KICS).** `HEALTHCHECK` on both images; the unpinned `apt-get install curl`
   layer removed (the health check uses the bundled interpreter); `cap_drop: ALL`
   plus a minimal `cap_add` and `no-new-privileges` on the `db` and `proxy`
@@ -625,6 +630,17 @@ podman run -d --name cxcreditguard --restart unless-stopped \
   -p 8000:8000 -v cxcreditguard-data:/app/data cxcreditguard:podman
 ```
 
+Or run a published release instead of building one (the package is private: log
+in with a GitHub token that has `read:packages`, see [Updates](#updates)):
+
+```sh
+podman login ghcr.io
+podman run -d --name cxcreditguard --restart unless-stopped \
+  -p 8000:8000 -v cxcreditguard-data:/app/data ghcr.io/cxsmtp/vcxcreditguard:latest
+```
+
+From then on it updates itself (Settings → Updates).
+
 | Action | `make` | `run.bat` | `run-podman.ps1` |
 | ------ | ------ | --------- | ---------------- |
 | Build and run | `make podman-run` | `run.bat` | `.\run-podman.ps1` |
@@ -824,13 +840,18 @@ backend/app/
                  roles come from), violations, usage_mix, limits_service,
                  notifications, settings_store, pacing (per-cycle budgets and
                  rotation for large tenants), cycle
+  updates/       in-app updates: GHCR client, release manifest and signature,
+                 installed versions, check / install / rollback / auto-update
   scheduler.py   APScheduler wiring, reconfigurable at runtime
   api/           dependencies (auth, CSRF, RBAC), middleware, routes
   schemas/       request and response models with strict validation
   static/        the built SPA (produced by the frontend build, not in git)
 alembic/         migrations
 scripts/         seed_demo.py, for a tenant-free demo database; loadtest.py,
-                 the load test (see Sizing and scale)
+                 the load test (see Sizing and scale); release_manifest.py
+                 and release_keygen.py, for signed releases
+cxcg_launcher.py the single image's main process: runs the selected version,
+                 rolls back one that does not come up (standard library only)
 tests/           unit, service and API tests, plus the in-memory fake tenant
                  and its 2,000-project synthetic variant (scale_tenant.py)
 
@@ -961,6 +982,9 @@ change behaviour most:
 | `CXCG_CX_ALLOWED_HOSTS` | none | Extra Checkmarx One hostnames to accept. Tenant URLs must be `https` and end in `checkmarx.net`; a dedicated or private host has to be listed here or the connection is refused. |
 | `CXCG_SMTP_CA_FILE` | system CAs | CA bundle used to verify the mail server's certificate, for a server with a private CA. |
 | `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP_DAYS` | 24 / 14 | Compose only: how often the database is dumped and how long dumps are kept. |
+| `CXCG_DATA_DIR` | `./data` (`/app/data` in the image) | Where installed versions, the launcher's state and pre-update backups are kept. |
+| `CXCG_UPDATE_START_TIMEOUT` | 180 | Seconds a newly installed version has to answer its health check before the launcher rolls it back. |
+| `CXCG_UPDATE_PUBLIC_KEY` | the image's key | Release signing public key (PEM), instead of the image's own `/app/app/updates/release-signing-key.pub` (never one from the data volume). Without either, nothing is installed automatically. |
 
 ## Security posture
 
@@ -1413,7 +1437,8 @@ restart.
 
 ### Upgrading
 
-Take a backup, pull the new source, `podman compose up -d --build`. Migrations
+The single container updates itself (see [Updates](#updates)). Compose: take a
+backup, check out the release tag, `podman compose up -d --build`. Migrations
 run at start. Coming from a version before the production hardening, check
 these, because each one can stop something that used to work:
 
@@ -1465,6 +1490,245 @@ these, because each one can stop something that used to work:
   the upgrade is charged as observed. A third (`c8e1f5a3d6b2`) adds
   `history_ceiling`; a row from before it (null) bounds the estimate by the current
   reading until the next fall sets it, and a restart sets it at once.
+
+### Updates
+
+Releases are published as a **private** container image,
+`ghcr.io/cxsmtp/vcxcreditguard:<version>` (and `:latest`), and the single
+container installs them itself from **Settings → Updates** (admins only).
+**Auto-update is on by default, but installs nothing until the image has a
+release signing key** (see *Signing* below).
+
+**How it works.** The image's main process is a small launcher
+(`backend/cxcg_launcher.py`, standard library only). It runs the version selected
+on the Updates page from the data volume (`/app/data/versions/<version>/`), or the
+image's own copy in `/app` (owned by root and read-only for the app's user).
+Installing a release:
+
+1. reads the release's image from the registry and downloads **only its app
+   layer** (the last layer of the image, a few MB). Every answer is read as sent
+   (`Accept-Encoding: identity`; an encoded answer is refused) and reading stops
+   at a size limit; every blob is checked against its sha256 digest; the layer
+   is read once, front to back, refusing paths outside the app folder, links and
+   special files, and stopping at size limits (decompressed size included).
+   Unpacking happens in memory: nothing is written yet;
+2. verifies the release's file list (`release-manifest.json`: **every** file the
+   release ships and its sha256, nothing excluded) and its ed25519 signature
+   (see *Signing*). Only the files the verified list names are written to the
+   data volume, each matching its sha256: a release holding any other file, or
+   any compiled bytecode (`*.pyc`, `__pycache__`), `.pth` file or
+   `sitecustomize`/`usercustomize` module (listed or not), is refused as a whole
+   and nothing of it is written. Its *signed* dependency hash must be this
+   image's (see below);
+3. waits for any running enforcement cycle, backs the database up
+   (`/app/data/backups/pre-update-*.sqlite3`, the last three are kept), selects
+   the new version and asks the launcher to switch, a second and a half later
+   so the page gets its answer first. The page reconnects in a few seconds;
+   migrations run as the new version starts, as on any start;
+4. the launcher checks the installed files again before **every** start - the
+   first, a switch, a restart after a crash, a rollback: exactly the listed
+   files, each matching; when the image has a signing key, the signature (over
+   the very manifest bytes whose file list, version and dependency hash it then
+   uses) against **the image's** key; a manifest, and an `app/__init__.py`, for
+   the version that was selected (an older signed release copied under a newer
+   name is refused); and this image's dependency hash. Any difference (an extra
+   file included) and the version is not run: the image's own runs and the
+   version is marked *failed to start*. The checked files are then **copied** to
+   a private folder outside the data volume (`/tmp/cxcreditguard-run`, mode
+   0700), each hashed again as it is copied, and made read-only (files 0400,
+   folders 0500); the version runs from that copy. A file written to the data
+   volume after the check, a module the app imports late included, is therefore
+   never run, and a file changed between the check and the copy refuses the
+   version. It runs as
+   `python -I -B -X pycache_prefix=/dev/null/... launcher.py serve --app-dir <copy>`:
+   an isolated interpreter (no `PYTHONPATH`, no current or script folder on
+   `sys.path`) that writes **and reads** no bytecode (the cache prefix cannot
+   exist, so a planted `__pycache__/*.pyc`, unchecked-hash ones included, is
+   never loaded), in which the version's folder is *appended* to `sys.path`,
+   after the standard library and the image's packages, and serves only the
+   `app` and `scripts` packages. Nothing is imported from the data volume
+   (`/app/data`, which sits inside the image's `/app`, is not importable), and
+   nothing in it runs at interpreter start. Migrations run in the same process
+   and leave `sys.path` alone. *What this does not cover:* the launcher and the
+   app run as the same user (uid 10001; the image never runs as root), so code
+   that already runs as the app - the app itself, compromised - could change its
+   own copy or the data volume; the read-only modes stop a bug that can only
+   write files, not code that can change modes. If the container's temporary
+   folder cannot be used (a read-only root file system without a writable
+   `/tmp`), the version runs from the data volume after the same check, and the
+   launcher logs it;
+5. the new version is **on trial** until `/healthz` answers with its version. If
+   it exits first, or does not answer within 180 seconds
+   (`CXCG_UPDATE_START_TIMEOUT`), the launcher stops it, puts the pre-update
+   database backup back **if the new version changed the schema**, runs the
+   previous version again and marks the new one *failed to start*: auto-update
+   never installs it again. A version that passed its health check and then
+   stops 3 times within 10 minutes is rolled back the same way, except that the
+   launcher never restores a backup by itself then (it reports it instead). The
+   rollback is audited and notified, saying whether data written since the
+   update was lost. When the launcher puts a backup back it first keeps a copy of
+   the replaced database (taken through SQLite, so what was only in its
+   write-ahead log is kept too) and removes the old `-wal`/`-shm` files before
+   the backup is moved in.
+
+The data volume keeps the running version, the one before it and the image's
+own; older installed versions are removed. A full or read-only data volume does
+not stop the launcher: it logs, and runs the image's own version when it cannot
+read or record a selection.
+
+**Signing.** Each release's file list is signed in the release workflow with an
+ed25519 key; installations check it against the public key **of the image they
+run on** (`/app/app/updates/release-signing-key.pub`, or
+`CXCG_UPDATE_PUBLIC_KEY`), never a key from the data volume or a downloaded
+version, so a release cannot bring its own key.
+
+- **Image without a key** (the placeholder file): auto-update installs
+  nothing; the Updates page and the top bar say *Auto-update waits for the
+  release signing key* and admins get one notification. An admin can still
+  install a release by hand after a warning that it cannot be verified and an
+  explicit confirmation (`allow_unsigned`), which is audited
+  (`update.unsigned_install_confirmed`). **Until the image has a key, nothing
+  proves where a release came from:** the launcher's check before each start
+  then only proves that the installed files match the manifest stored next to
+  them, in the same writable folder - it catches damage and stray files, not a
+  deliberate replacement of both. Auto-update stays off until a key is in the
+  image.
+- **Image with a key:** automatic and manual installs both require a signature
+  that verifies; an unsigned release is always refused.
+- **A key that is set but unusable** (`CXCG_UPDATE_PUBLIC_KEY` that is not an
+  ed25519 public key in PEM form, or a key file with anything but comments and
+  such a key) is never read as "no key", and never falls back to the image's
+  file: every install, manual ones included, is refused, the Updates page and
+  the top bar say *The configured release key is invalid*, and the launcher runs
+  only the image's own version (installed versions are not marked failed: they
+  run again once the key is fixed).
+
+**Automatic updates.** The registry is checked every 6 hours (and a minute after
+start); *Check now* is limited to once per 30 seconds. A newer release installs
+only in the **quiet hour** (default 03:00 UTC), never while an enforcement cycle
+runs, never a version that failed to start here or that an admin rolled back
+(below), and never an older one. When the newest release needs a new image, the
+newest one that fits this image is installed, if there is one (and admins are
+told about the newer one). On PostgreSQL a release that changes the schema is
+recognised from its `io.cxcreditguard.migrations` label before anything is
+downloaded: it is not installed automatically, admins are notified once, and it
+installs by hand after confirming a backup of their own. Turn auto-update off,
+or move the hour, on Settings → Updates; when off, admins are notified once when
+a release is published and install it from the page. Every action (check,
+install, switch, rollback, token and setting changes) is in the audit log;
+installed, rolled back, *needs a new image*, *waits for the signing key* and
+*token refused* are also notifications.
+
+**Rolling back.** *Roll back* on the Updates page returns to the version that ran
+before the last update. If the database schema changed since that update, the
+backup taken before it is restored: **everything written since the update is
+lost** (usage readings, budget changes, requests, audit entries), and the page
+says so and asks for confirmation. The replaced database is kept in
+`/app/data/backups/` for manual recovery. Without a schema change the database
+is kept as it is. If the backup cannot be put back, the version the rollback
+started from keeps running. The version rolled back from is **skipped**:
+auto-update does not install it again (the page shows *Skipped after rollback*)
+until an admin installs it by hand or a newer release supersedes it. The list
+is kept in `/app/data/updates/skipped.json`, apart from the versions that
+failed to start (`failed.json`).
+
+**When the image itself must be replaced.** Each image carries a *dependency
+hash* (`io.cxcreditguard.deps`, also inside the signed file list): the base
+image **by digest** (`python:3.13-alpine3.24@sha256:…`), the OS packages installed on
+it (`apk info -v`), the pinned Python packages, the launcher and the entrypoint.
+A release with a different signed hash cannot run as a layer on this image; the
+page says *needs a new image*, notifies admins once and shows the command. So
+the small in-place update applies to releases that change only the app and are
+built on the **same base**: the release workflow reuses the latest release's base
+digest unless the tag's message has a line `base: refresh`, which builds on the
+base tag's current digest (OS, Python, OpenSSL fixes) and makes that release a
+full image replacement. Even on the same base, a new revision of an OS package
+installed on it (libpq, or a fix the build's `apk upgrade` takes) changes the hash: such a release is a replacement too.
+When the newest release needs a new image, auto-update installs the newest one
+that does fit, if any, whether the label or the signed file list said so.
+
+```sh
+podman login ghcr.io   # a GitHub user and the read:packages token
+podman pull ghcr.io/cxsmtp/vcxcreditguard:1.2.3
+podman rm -f cxcreditguard
+podman run -d --name cxcreditguard --restart unless-stopped \
+  -p 8000:8000 -v cxcreditguard-data:/app/data ghcr.io/cxsmtp/vcxcreditguard:1.2.3
+```
+
+The data volume carries over; a replaced image runs its own version unless an
+installed one is newer and built for the same dependencies.
+
+**OS, Python and OpenSSL fixes arrive only by replacing the image.** In-app
+updates replace the app's own files, never the operating system, Python or
+OpenSSL beneath them. Because the base image's digest and the OS packages are in
+the dependency hash, a release built on a patched base says *needs a new
+image*. Independently, when the running image's OS packages are **more than 90
+days old** (recorded at build time in
+`/usr/local/share/cxcreditguard/image.json`), the Updates page and the top bar
+say *Image is N days old* and show the command to replace it. Replace the image
+at least that often, and whenever a base-image security advisory applies.
+
+**Compose and source installations** are not updated in place: there is no
+launcher and the database is PostgreSQL, which the app cannot back up itself.
+The Updates page still checks (with a token) and notifies, and shows the steps:
+`git fetch --tags && git checkout v<version>`, then
+`podman compose up -d --build`, after a dump (see [Backup and
+restore](#backup-and-restore)). Rebuilding also picks up base-image fixes. The
+single container pointed at PostgreSQL with `CXCG_DATABASE_URL` installs a
+release that changes the schema only after an admin confirms having a backup of
+their own, and rolls such a release back only by restoring that backup.
+
+#### One-time setup (repository owner)
+
+1. **Signing key.** On a trusted machine:
+   `python backend/scripts/release_keygen.py` writes the private key to
+   `cxcg-release-signing-key.pem` and prints the public key. Paste the public key
+   into `backend/app/updates/release-signing-key.pub` and commit it; images built
+   from that commit on verify every release against it. Keep an offline copy of
+   the private key and delete the file after step 2.
+2. **The `release` environment.** On GitHub: Settings → Environments → *New
+   environment* `release`. Add **required reviewers** (the release managers;
+   prevent self-review), limit *Deployment branches and tags* to tags matching
+   `v*.*.*`, and store the private key file's whole contents there as the
+   environment secret **`CXCG_RELEASE_SIGNING_KEY`** (not as a repository
+   secret): the release job runs in this environment, so the key is handed to it
+   only after a reviewer approved that run.
+3. **Tag ruleset.** Settings → Rules → Rulesets → *New tag ruleset*, target
+   `v*`: restrict creations, updates and deletions (bypass list: the release
+   managers) and block force pushes, so only they can start a release.
+4. **Publishing.** Push a version tag: `git tag -a v1.2.3 -m "notes"` then
+   `git push origin v1.2.3`. `.github/workflows/release.yml` (third-party
+   actions pinned by commit SHA) installs its signing tools from hash-pinned
+   wheels (`.github/release-requirements.txt`) before the key is in any step's
+   environment, **fails** if the public key is still the placeholder or the
+   secret is missing, stamps the version into `backend/app/__init__.py` (the one
+   place it lives), chooses the base image's digest, builds the release
+   manifest from `deploy/podman/Dockerfile`, signs it and verifies the signature
+   against the committed public key, builds the image, checks that the image's
+   `/app/release-manifest.json` and `.sig` are byte for byte the signed ones,
+   that `/app` is not writable by the app's user and that the image comes up as
+   that version, and pushes `:1.2.3` and `:latest` with the job's `GITHUB_TOKEN`
+   (`packages: write`). The base image is the latest release's, unless the tag's
+   message has a line `base: refresh` (then the base tag's current digest; see
+   *When the image itself must be replaced*): refresh it at least every 90 days
+   and whenever a base-image advisory applies. The release notes shown in the
+   app are the `## 1.2.3`
+   section of a `CHANGELOG.md`, if there is one, else the tag's message. New
+   packages are private by default; check the package's visibility after the
+   first release, and keep it private.
+5. **A read-only token per installation.** On GitHub: Settings → Developer
+   settings → Personal access tokens → Tokens (classic) → *Generate new token*,
+   scope **`read:packages` only**, from an account that can see the package (give
+   it access under the package's settings, *Manage Actions access* / *Manage
+   access*). Enter it on Settings → Updates → *Registry token*. It is encrypted
+   with the master key like the Checkmarx API key, never shown again, never logged,
+   and is tried at once. Until one is entered, auto-update stays on and the page
+   and the top bar say *needs a registry token*; nothing fails in a loop.
+
+**Network.** Outbound HTTPS (443) to `ghcr.io` (token exchange, tags, manifests)
+and `pkg-containers.githubusercontent.com` (where GHCR serves the layer). Both are
+fixed in code: no address an admin types or a registry answers is ever called,
+and the registry token is only ever sent to `ghcr.io`.
 
 ### Enforcement safety
 
