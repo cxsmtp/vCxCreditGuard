@@ -174,6 +174,12 @@ def reconcile_key(action_id: int, period_key: str) -> str:
     return f"reconciled:{action_id}:{period_key}"
 
 
+def lock_not_kept_key(project_id: str, period_key: str) -> str:
+    """One "Fusion lock not kept" notice per project and period, however many
+    limits restrict it."""
+    return f"locknotkept:{project_id}:{period_key}"
+
+
 def restoration_key(action_id: int) -> str:
     return f"restored:{action_id}"
 

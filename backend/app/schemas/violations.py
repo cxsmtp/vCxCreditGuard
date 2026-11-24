@@ -15,6 +15,8 @@ class ViolationResponse(BaseModel):
     id: int
     kind: str
     kind_label: str
+    # Information, not a violation: nothing to follow up, never counted as open.
+    information: bool = False
     detected_at: datetime
     updated_at: datetime | None = None
     limit_id: int | None

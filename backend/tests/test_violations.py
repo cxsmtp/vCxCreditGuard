@@ -102,8 +102,13 @@ class TestSettingReenabled:
         assert fusion.actor is None  # Checkmarx does not say who
         assert fusion.limit_id == limit.id
         assert tenant.fusion_setting("proj-api")["value"] == "false"
-        policy = db.scalars(select(Notification).where(Notification.category == "policy")).all()
-        assert len(policy) == 2
+        # Announced in the enforcement category, as a re-applied restriction
+        # always was (e-mail and webhook consumers that follow it still get it).
+        drift = db.scalars(
+            select(Notification).where(Notification.body.like("%Policy violations page%"))
+        ).all()
+        assert sorted(n.category for n in drift) == ["enforcement", "enforcement"]
+        assert _count(db, Notification, Notification.category == "policy") == 0
         assert (
             db.scalar(
                 select(func.count())
@@ -391,8 +396,9 @@ class TestOneEventOneAlert:
             "disable_fusion",
             "disable_repo_fusion",
         ]
-        # Fusion back on is one event: one notification, the policy one.
-        assert _count(db, Notification, Notification.category == "policy") == 1
+        # Fusion back on is one event: one notification, in the enforcement
+        # category, pointing at the violation.
+        assert _count(db, Notification, Notification.category == "policy") == 0
         assert (
             _count(
                 db,
@@ -400,7 +406,7 @@ class TestOneEventOneAlert:
                 Notification.category == "enforcement",
                 Notification.title.like("%turned off again%"),
             )
-            == 0
+            == 1
         )
         # Every re-assert is still in the audit log.
         assert _count(db, AuditLogEntry, AuditLogEntry.action == "enforcement.reconciled") == 6
@@ -677,3 +683,183 @@ class TestApiAndRetention:
         db.commit()
         assert result.policy_violations == 2
         assert [v.dedupe_key for v in rows(db)] == ["open"]
+
+
+class TestInformationIsNotAViolation:
+    def test_ai_scan_info_rows_do_not_count_as_open_violations(
+        self, admin_client: TestClient, db: Session, tenant: FakeTenant
+    ) -> None:
+        restrict(db, tenant)
+        for index in range(3):
+            tenant.add_scan(
+                project_id="proj-api",
+                scan_id=f"llm-{index}",
+                initiator="dev@example.com",
+                completed_at=later(30 + index),
+                engines=["ai"],
+                ai={"fusionEnabled": "false"},
+            )
+        violations.detect(db, tenant.client())
+        assert len(rows(db, KIND_AI_SCAN)) == 1
+        assert _count(db, Notification, Notification.category == "policy") == 0
+        # Information only: not an open violation to follow up.
+        assert violations.open_count(db) == 0
+        assert admin_client.get("/api/me").json()["open_violations"] == 0
+        listed = admin_client.get("/api/violations", params={"kind": "violations"}).json()
+        assert listed["items"] == [] and listed["open"] == 0
+        info = admin_client.get("/api/violations", params={"kind": "information"}).json()
+        assert [item["kind"] for item in info["items"]] == [KIND_AI_SCAN]
+        assert info["items"][0]["information"] is True
+        # A real violation is still counted.
+        tenant.add_scan(
+            project_id="proj-api",
+            scan_id="fusion-1",
+            initiator="dev@example.com",
+            completed_at=later(40),
+            engines=["ai"],
+            ai={"fusionEnabled": "true"},
+        )
+        violations.detect(db, tenant.client())
+        assert violations.open_count(db) == 1
+        assert admin_client.get("/api/me").json()["open_violations"] == 1
+        bad = admin_client.get("/api/violations", params={"kind": "nonsense"})
+        assert bad.status_code == 400
+
+
+def _detail_reads(tenant: FakeTenant) -> list[str]:
+    return [
+        path
+        for method, path in tenant.requests
+        if method == "GET" and "/api/scans/" in path and not path.rstrip("/").endswith("/api/scans")
+    ]
+
+
+class TestScanReadsAreNotWasted:
+    def test_a_running_scan_does_not_make_reads_be_spent_again_or_starve_other_projects(
+        self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        restrict(db, tenant, entity_id="proj-api")
+        restrict(db, tenant, entity_id="proj-web")
+        tenant.add_scan(
+            project_id="proj-api",
+            scan_id="running",
+            status="Running",
+            initiator="a@example.com",
+            completed_at=later(20),
+            created_at=later(5),
+            engines=["ai"],
+            ai={"fusionEnabled": "false"},
+        )
+        for i in range(3):
+            tenant.add_scan(
+                project_id="proj-api",
+                scan_id=f"api-{i}",
+                initiator="a@example.com",
+                completed_at=later(40 + i),
+                engines=["ai"],
+                ai={"fusionEnabled": "false"},
+                metadata_in_listing=False,
+            )
+        tenant.add_scan(
+            project_id="proj-web",
+            scan_id="web-fusion",
+            initiator="b@example.com",
+            completed_at=later(50),
+            engines=["ai"],
+            ai={"fusionEnabled": "true", "llmModel": "opus-5.5"},
+            metadata_in_listing=False,
+        )
+        monkeypatch.setattr(violations, "MAX_SCAN_READS_PER_CYCLE", 3)
+        per_cycle = []
+        for cycle_number in range(5):
+            tenant.requests.clear()
+            violations.detect(db, tenant.client())
+            per_cycle.append(len(_detail_reads(tenant)))
+            if cycle_number == 0:
+                # proj-api cannot spend the read kept for proj-web.
+                assert [v.evidence["scan_id"] for v in rows(db, KIND_FUSION_SCAN)] == ["web-fusion"]
+        # Each scan is read once, ever; the running one holds nobody back.
+        assert per_cycle == [3, 1, 0, 0, 0]
+        assert [v.evidence["scan_id"] for v in rows(db, KIND_FUSION_SCAN)] == ["web-fusion"]
+        ai = rows(db, KIND_AI_SCAN)
+        assert sum(v.evidence["scans"] for v in ai) == 3
+
+    def test_a_busy_project_is_not_held_back_by_idle_ones(
+        self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        restrict(db, tenant, entity_id="proj-api")
+        restrict(db, tenant, entity_id="proj-web")
+        for i in range(4):
+            tenant.add_scan(
+                project_id="proj-api",
+                scan_id=f"busy-{i}",
+                initiator="a@example.com",
+                completed_at=later(40 + i),
+                engines=["ai"],
+                ai={"fusionEnabled": "true"},
+                metadata_in_listing=False,
+            )
+        monkeypatch.setattr(violations, "MAX_SCAN_READS_PER_CYCLE", 4)
+        tenant.requests.clear()
+        violations.detect(db, tenant.client())
+        assert len(_detail_reads(tenant)) == 4
+        assert len(rows(db, KIND_FUSION_SCAN)) == 4
+
+    def test_a_cursor_held_by_a_running_scan_moves_on_when_scans_pile_up(
+        self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """More scans pile up after a running one than one listing reaches: the
+        cursor moves on, the running scan is still classified once it finishes,
+        and the scans that could not be reached are said once (information)."""
+        from app.checkmarx import scans as scans_api
+
+        not_checked = "scans_not_checked"
+        monkeypatch.setattr(violations, "SCAN_PAGE_SIZE", 2, raising=False)
+        monkeypatch.setattr(violations, "MAX_PAGES_PER_PROJECT", 2)
+        real_list = scans_api.list_project_scans
+
+        def small_pages(client, **kwargs):  # type: ignore[no-untyped-def]
+            kwargs["page_size"] = 2  # two pages of two: four scans a listing
+            return real_list(client, **kwargs)
+
+        monkeypatch.setattr(scans_api, "list_project_scans", small_pages)
+        restrict(db, tenant)
+        tenant.add_scan(
+            project_id="proj-api",
+            scan_id="long-run",
+            status="Running",
+            initiator="dev@example.com",
+            completed_at=later(200),
+            created_at=later(5),
+            engines=["ai"],
+            ai={"fusionEnabled": "true", "llmModel": "opus-5.5"},
+        )
+        violations.detect(db, tenant.client())
+        assert rows(db) == []
+        for i in range(6):
+            tenant.add_scan(
+                project_id="proj-api",
+                scan_id=f"pile-{i}",
+                initiator="dev@example.com",
+                completed_at=later(20 + i),
+                created_at=later(10 + i),
+                engines=["ai"],
+                ai={"fusionEnabled": "false"},
+            )
+        violations.detect(db, tenant.client())
+        # The four newest were looked at.
+        assert rows(db, KIND_AI_SCAN)[0].evidence["scans"] == 4
+        # The long scan finishes; it is no longer in the listing's reach.
+        next(s for s in tenant.scans["proj-api"] if s["id"] == "long-run")["status"] = "Completed"
+        for _ in range(3):
+            violations.detect(db, tenant.client())
+        assert [v.evidence["scan_id"] for v in rows(db, KIND_FUSION_SCAN)] == ["long-run"]
+        # The two it could not reach are said once, as information.
+        notes = rows(db, not_checked)
+        assert len(notes) == 1 and notes[0].severity == "info"
+        assert notes[0].evidence["occurrences"] == 1
+        assert violations.open_count(db) == 1  # the Fusion scan, not the note
+        # Nothing left pending, and no scan is read again.
+        tenant.requests.clear()
+        violations.detect(db, tenant.client())
+        assert _detail_reads(tenant) == []

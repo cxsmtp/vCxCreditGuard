@@ -110,16 +110,19 @@ def list_enforcements(
     only_active: bool = True,
     limit: int = Query(default=200, ge=1, le=1000),
 ) -> list[EnforcementActionResponse]:
-    query = select(EnforcementAction)
     if only_active:
-        query = query.where(EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES))
-    rows = [
-        row
-        for row in db.scalars(query.order_by(EnforcementAction.created_at.desc()).limit(limit))
         # "Active" includes a restriction whose outcome was never confirmed: it
         # may be in place in Checkmarx, and this is where an admin can undo it.
-        if not only_active or enforcement.may_be_in_force(row)
-    ]
+        # Only those count towards ``limit``.
+        rows = enforcement.active_actions(db, limit=limit)
+    else:
+        rows = list(
+            db.scalars(
+                select(EnforcementAction)
+                .order_by(EnforcementAction.created_at.desc(), EnforcementAction.id.desc())
+                .limit(limit)
+            )
+        )
     return [
         EnforcementActionResponse(
             id=row.id,

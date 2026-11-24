@@ -406,12 +406,21 @@ repository's), each restored and verified on its own.
   hoc scans is not verified.** If Checkmarx rejects the locked entry (400 or
   422) the value is written without the lock, and the record and the
   restriction notification say the lock was not accepted. After the write the
-  setting is read back once: a value that still reads `"true"` is not counted as
-  turned off (the action fails and is retried next cycle), and a lock the tenant
-  answered 2xx to but did not keep is recorded once as *not kept by this
-  tenant*. Only a lock that was seen to hold is checked as drift afterwards, so a
-  tenant that does not keep the lock never produces a violation every cycle;
-  the value is still enforced. The lock attempt can
+  setting is read back once. One read straight after a write can be behind it
+  (a propagation delay, a cache), so nothing is concluded from it alone, and
+  what was there before always stays on the record for Restore. A value that
+  still reads `"true"` is not counted as turned off: the outcome stays in doubt
+  (Restore still puts back what was there), it is retried next cycle, and only
+  if that retry reads it on again is the admin told (*Could not restrict*, then
+  once a day). A lock that does not read back is kept as sent but marked
+  unconfirmed; its absence is re-applied without an alarm, and the next check
+  decides: seen holding, it is confirmed and from then on its removal is drift;
+  absent again, the tenant is taken not to keep it, which is said once per
+  project and period (*Fusion lock not kept*, audit `enforcement.lock_not_kept`)
+  and the lock is no longer sent or checked. A tenant that does not keep the
+  lock therefore never produces a violation every cycle; the value is still
+  enforced. A second limit on the same project inherits the first one's word on
+  the lock, doubt included. The lock attempt can
   be switched off (Settings → Enforcement, *Lock Fusion against per-scan
   override*, on by default). CreditGuard does not rely on the lock: see
   [Policy violations](#policy-violations).
@@ -433,9 +442,14 @@ repository's), each restored and verified on its own.
   safety ceilings), the audit log says so once per project whatever the period
   (`enforcement.not_applicable`), and it is looked at again every cycle. When the
   read fails, it is left unchanged and the admin is told. After the `PATCH` the
-  setting is read back once; a tenant that answers 2xx and still reports it on
-  does not support it, which is recorded once (*repository Fusion setting not
-  supported*), never as a failure of the cycle and never later as drift.
+  setting is read back once. Still on, the outcome stays in doubt (what was
+  there before is kept) and the next cycle tries again, quietly; still on after
+  that attempt too, the tenant is taken not to support it: recorded once
+  (*repository Fusion setting not supported*), never as a failure of the cycle
+  and never later as drift, and the `PATCH` is not sent again for the rest of
+  the period. What was there before stays on the record even then, so Restore
+  (or the end of the restriction) writes it back, which changes nothing if it
+  was never taken.
 * Drift: a value read back as `"true"` (or the lock read back removed, or the
   repository's `enabled` read back `true`) is drift and is re-asserted; a
   setting that cannot be read is re-applied quietly and counted as *could not
@@ -1078,38 +1092,58 @@ menu, admins only; *Policy violations* in Jump to), for an admin to follow up:
 
 | Kind | What is detected | When |
 | ---- | ---------------- | ---- |
-| `setting_reenabled` | A restriction read back undone: Auto Triage back on, PR triage and remediation severities back, Fusion back on (or its lock removed, once the lock was seen to hold), the repository's Fusion back on, a user's AI roles back. It is re-applied. One record per restriction per day, however many cycles find it undone that day. | During evaluation, for every restriction in force |
+| `setting_reenabled` | A restriction read back undone: Auto Triage back on, PR triage and remediation severities back, Fusion back on (or its lock removed, once the lock was seen to hold), the repository's Fusion back on, a user's AI roles back. It is re-applied. One record per restriction per budget period, with `occurrences`, `first_seen` and `last_seen` in its evidence, however many cycles find it undone. | During evaluation, for every restriction in force |
 | `fusion_scan_during_restriction` | A scan on a project whose Fusion restriction is in force, created after it was applied, whose engines include `ai` and whose `metadata.configs[type=ai].value.fusionEnabled` is true: Fusion ran anyway (a scan started with its own settings). Records the initiator, `sourceOrigin`/`sourceType`, branch, scan id, model and the price from action-rates when known. | Cycle step `violations`, after evaluation |
 | `ai_scan_during_restriction` | The same scan with `fusionEnabled` false (the AI engine ran without Fusion, LLM-based scanning), or not saying. That is the restriction working, so it is recorded silently: one information row per restriction per day with the count (no notification, no audit entry). Whether it costs credits is not known. | Same |
+| `scans_not_checked` | More scans were made on a restricted project since the last look than one cycle's listing reaches (2 pages of 100), so the older ones in between were not checked. Information, once per restriction (its evidence lists the windows and how often). | Same |
 | `usage_after_restriction` | What the restriction is meant to stop (a user's `triage`/`remediation`; a project's `auto_triage` when Auto Triage is turned off, `fusion` when Fusion is) kept rising in the consumption feed after the restriction. Each action type is compared with the reading taken when *its own* restriction was applied (Fusion restricted after Auto Triage is measured from the Fusion restriction). One record per restriction, brought up to date while it keeps rising; credits only when Fusion is priced. | Same |
 
 Scans are listed newest first from the later of the restriction's
 `applied_at` and the newest scan already looked at (a per-project cursor),
 bounded like the auto-triage reads: 50 projects, 2 pages per project and 50
 single-scan reads (for a listing that leaves the scan's settings out) per
-cycle. A truncated listing leaves its cursor where it was; each scan is reported
-once whatever happens (a unique key per finding), with its final
-classification: a scan still queued or running (for up to a day), or one whose
-settings could not be read this cycle, is not recorded yet and the cursor stops
-before it, so the next cycle looks at it again. Failed and cancelled scans are
-never recorded, and only a completed scan is priced. No database write lock is
-held while Checkmarx is called, and one project's failure never stops the
-others or the cycle.
+cycle. Each scan is reported once whatever happens (a unique key per finding),
+with its final classification, and a scan already recorded is never read
+again. A scan still queued or running (for up to a day), or one whose settings
+could not be read this cycle, is not recorded yet: it is kept by id as pending
+and the cursor stops before it, so the next cycle looks at it again (from the
+listing, or by its own read once the cursor has moved on). A listing cut off by
+the page cap moves the cursor past what it listed, and the older scans it could
+not reach are recorded once as information (`scans_not_checked`) rather than
+holding detection still. Every project is listed first and the cycle's
+single-scan reads are then handed out one at a time to each project that needs
+one in turn, so one busy project can neither starve the others nor be held back
+by idle ones; a single scan whose read fails is looked at again next cycle
+without stopping the rest. Failed and cancelled scans are never
+recorded, and only a completed scan is priced. No database write lock is held
+while Checkmarx is called, and one project's failure never stops the others or
+the cycle.
 
-Each new violation (except the AI-scan information rows) raises one
-notification (category *Policy violations*, `policy`) and an audit entry
-(`violation.detected`). A setting found switched back on raises that policy
-notification instead of the enforcement "turned off again" one (the
-`enforcement.reconciled` audit entry is still written), and Fusion found back on
-in both the project's scan settings and its repository is one notification.
+The AI-scan counts and scans not checked are information, not violations:
+no notification, no audit entry, never counted as open (the top-bar light, the
+menu badge, `open_violations`), shown as *Information* and listed under the
+page's *Information* filter (the page opens on *All violations*). Every other
+new violation raises one notification and an audit entry
+(`violation.detected`). A setting found switched back on raises the
+notification a re-applied restriction always raised, in the `enforcement`
+category (so e-mail and webhook consumers that follow it still get it; delivery
+itself is by severity, whatever the category), instead of a separate "turned
+off again" one (the `enforcement.reconciled` audit entry is still written): for
+a user's AI roles, Auto Triage and PR triage and remediation once per
+restriction per budget period, as before (an IdP or SCIM sync that puts roles
+back every day is one notification a period); for Fusion once a day, and Fusion
+found back on in both the project's scan settings and its repository is one
+notification. The scan and usage findings are notified in the `policy`
+category (*Policy violations*).
 Notifications and the audit log are visible to viewers, so they name the
 project and what happened, never the person: who started a scan is only on the
 violation itself (admins only). Acknowledging and
 resolving (with an optional note) are audited too (`violation.acknowledged`,
 `violation.resolved`). The open count is on `/api/me` (`open_violations`,
 admins only) for the top-bar light and the menu badge. API (admins only):
-`GET /api/violations` (filters `status`, `kind`, `target`, `since`, `until`;
-a time without a zone is taken as UTC),
+`GET /api/violations` (filters `status`, `kind` - a kind, `violations` for
+everything but the information rows, or `information` - `target`, `since`,
+`until`; a time without a zone is taken as UTC),
 `GET /api/violations/{id}`, `POST /api/violations/{id}/acknowledge` and
 `POST /api/violations/{id}/resolve` (body `{"note": "..."}`, optional).
 
@@ -1447,7 +1481,8 @@ They are listed because each has a cost worth knowing about.
    skipped, and any scan that ran Fusion during a restriction is recorded as a
    policy violation. Whether the AI engine without Fusion (LLM-based scanning)
    costs credits is not known either. A lock or a repository setting that a
-   tenant answers 2xx to and does not keep is detected by reading it back.
+   tenant answers 2xx to and does not keep is detected by reading it back, on
+   two consecutive checks (one read straight after a write may be behind it).
 5. **`scan.config.ai.allowAiUsage`.** The project configuration API exposes an
    `ai` category entry named "Allow AI Usage", overridable per project. It is not
    used: the mechanisms implemented are Auto Triage, PR triage and remediation and

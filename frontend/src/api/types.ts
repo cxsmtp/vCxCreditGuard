@@ -739,6 +739,8 @@ export interface PolicyViolation {
   id: number;
   kind: string;
   kind_label: string;
+  /** Information, not a violation: nothing to follow up, never counted as open. */
+  information?: boolean;
   detected_at: string;
   updated_at: string | null;
   limit_id: number | null;
@@ -766,5 +768,6 @@ export interface PolicyViolation {
 export interface ViolationList {
   items: PolicyViolation[];
   total: number;
+  /** Open violations to follow up (information rows are never counted). */
   open: number;
 }

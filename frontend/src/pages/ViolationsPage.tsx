@@ -30,13 +30,21 @@ const STATUS_TONES: Record<ViolationStatus, BadgeTone> = {
   resolved: "good",
 };
 
+// "violations" and "information" are filters the API understands: everything to
+// follow up, and the information rows (nothing to act on, never counted as open).
 const KINDS = [
-  { value: "", label: "Everything" },
+  { value: "violations", label: "All violations" },
   { value: "setting_reenabled", label: "Setting switched back on" },
   { value: "fusion_scan_during_restriction", label: "Fusion scan during a restriction" },
-  { value: "ai_scan_during_restriction", label: "AI scans without Fusion (information)" },
   { value: "usage_after_restriction", label: "Usage kept rising" },
+  { value: "information", label: "Information (AI scans, scans not checked)" },
+  { value: "", label: "Everything" },
 ];
+
+function StatusBadge({ violation }: { violation: PolicyViolation }) {
+  if (violation.information) return <Badge tone="info">Information</Badge>;
+  return <Badge tone={STATUS_TONES[violation.status]}>{humanise(violation.status)}</Badge>;
+}
 
 function targetName(v: PolicyViolation): string {
   const kind = v.target_type === "cx_user" ? "User" : "Project";
@@ -51,12 +59,16 @@ const VIEW: ViewColumn<PolicyViolation>[] = [
   { key: "who", value: (v) => v.actor },
   { key: "source", value: (v) => v.source },
   { key: "credits", value: (v) => (v.credits === null ? null : Number(v.credits)), filter: false },
-  { key: "status", value: (v) => v.status, label: (value) => humanise(String(value ?? "")) },
+  {
+    key: "status",
+    value: (v) => (v.information ? "information" : v.status),
+    label: (value) => humanise(String(value ?? "")),
+  },
 ];
 
 export function ViolationsPage({ onChanged }: { onChanged?: () => void }) {
   const [status, setStatus] = useState<string>("");
-  const [kind, setKind] = useState("");
+  const [kind, setKind] = useState("violations");
   const [target, setTarget] = useState("");
   const [open, setOpen] = useState<PolicyViolation | null>(null);
 
@@ -199,7 +211,7 @@ export function ViolationsPage({ onChanged }: { onChanged?: () => void }) {
                     </span>
                   </Td>
                   <Td>
-                    <Badge tone={STATUS_TONES[v.status]}>{humanise(v.status)}</Badge>
+                    <StatusBadge violation={v} />
                   </Td>
                 </tr>
               ))}
@@ -254,6 +266,8 @@ function ViolationDialog({
       ? `/limits?entity_type=${encodeURIComponent(violation.limit_entity_type)}&entity_id=${encodeURIComponent(violation.limit_entity_id)}`
       : null;
   const resolved = violation.status === "resolved";
+  // Information rows have nothing to follow up: no acknowledge or resolve.
+  const actionable = !resolved && !violation.information;
 
   return (
     <Modal
@@ -267,12 +281,12 @@ function ViolationDialog({
           <Button variant="secondary" onClick={onClose}>
             Close
           </Button>
-          {!resolved && violation.status === "open" && (
+          {actionable && violation.status === "open" && (
             <Button onClick={() => act("acknowledge")} loading={busy === "acknowledge"}>
               Acknowledge
             </Button>
           )}
-          {!resolved && (
+          {actionable && (
             <Button variant="primary" onClick={() => act("resolve")} loading={busy === "resolve"}>
               Resolve
             </Button>
@@ -283,10 +297,12 @@ function ViolationDialog({
       <div className="flex flex-col gap-4">
         {error && <ErrorNote>{error}</ErrorNote>}
         <div className="flex flex-wrap items-center gap-2">
-          <Badge tone={STATUS_TONES[violation.status]}>{humanise(violation.status)}</Badge>
-          <Badge tone={violation.severity === "info" ? "info" : "warning"}>
-            {humanise(violation.severity)}
-          </Badge>
+          <StatusBadge violation={violation} />
+          {!violation.information && (
+            <Badge tone={violation.severity === "info" ? "info" : "warning"}>
+              {humanise(violation.severity)}
+            </Badge>
+          )}
           {violation.credits !== null && (
             <Badge tone="neutral">{formatCredits(violation.credits)} credits</Badge>
           )}
@@ -347,7 +363,12 @@ function ViolationDialog({
           )}
         </div>
 
-        {!resolved ? (
+        {violation.information && (
+          <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+            Information only: nothing to follow up, and not counted as an open violation.
+          </p>
+        )}
+        {actionable ? (
           <Field label="Note" hint="Optional. Saved with the status change and in the audit log.">
             <Textarea
               rows={2}

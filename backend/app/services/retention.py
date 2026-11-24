@@ -32,7 +32,7 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
-from app.models.violations import KIND_AI_SCAN, STATUS_RESOLVED, PolicyViolation
+from app.models.violations import INFO_KINDS, STATUS_RESOLVED, PolicyViolation
 from app.services import audit_chain, settings_store
 from app.services import auth as auth_service
 from app.services.audit import AuditActor, record_audit
@@ -247,15 +247,16 @@ def _prune_policy_violations(session: Session, cutoff) -> int:
     An open or acknowledged violation is still an admin's to-do and is kept,
     however old, just as an applied restriction is. A resolved one goes once
     both its last finding and its resolution are older than the window. The
-    AI-scan information rows (a daily count, nothing to act on) go once their
-    day is older than the window, whatever their status, like notifications.
+    information rows (the AI-scan daily count, scans not checked: nothing to
+    act on) go once they are older than the window, whatever their status,
+    like notifications.
     """
     old = func.coalesce(PolicyViolation.updated_at, PolicyViolation.detected_at) < cutoff
     resolved = (PolicyViolation.status == STATUS_RESOLVED) & (PolicyViolation.resolved_at < cutoff)
     return _delete_where(
         session,
         PolicyViolation,
-        old & (resolved | (PolicyViolation.kind == KIND_AI_SCAN)),
+        old & (resolved | PolicyViolation.kind.in_(INFO_KINDS)),
     )
 
 

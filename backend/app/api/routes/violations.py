@@ -14,7 +14,14 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import AdminUser, DbSession
 from app.models.limits import CreditLimit
-from app.models.violations import KINDS, STATUSES, PolicyViolation
+from app.models.violations import (
+    FILTER_INFORMATION,
+    FILTER_VIOLATIONS,
+    INFO_KINDS,
+    KINDS,
+    STATUSES,
+    PolicyViolation,
+)
 from app.schemas.violations import (
     ViolationListResponse,
     ViolationResponse,
@@ -41,6 +48,7 @@ def _to_response(row: PolicyViolation, db=None) -> ViolationResponse:  # type: i
         id=row.id,
         kind=row.kind,
         kind_label=violations_service.KIND_LABELS.get(row.kind, row.kind),
+        information=row.kind in INFO_KINDS,
         detected_at=row.detected_at,
         updated_at=row.updated_at,
         limit_id=row.limit_id,
@@ -80,15 +88,21 @@ def list_violations(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_status", "message": f"status must be one of {STATUSES}."},
         )
-    if kind is not None and kind not in KINDS:
+    filters = (*KINDS, FILTER_VIOLATIONS, FILTER_INFORMATION)
+    if kind is not None and kind not in filters:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "invalid_kind", "message": f"kind must be one of {KINDS}."},
+            detail={"code": "invalid_kind", "message": f"kind must be one of {filters}."},
         )
     query = select(PolicyViolation)
     if status_filter:
         query = query.where(PolicyViolation.status == status_filter)
-    if kind:
+    if kind == FILTER_VIOLATIONS:
+        # Everything to follow up: not the information rows.
+        query = query.where(PolicyViolation.kind.not_in(INFO_KINDS))
+    elif kind == FILTER_INFORMATION:
+        query = query.where(PolicyViolation.kind.in_(INFO_KINDS))
+    elif kind:
         query = query.where(PolicyViolation.kind == kind)
     if target:
         pattern = f"%{target.strip()}%"

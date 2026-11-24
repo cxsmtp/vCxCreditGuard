@@ -27,7 +27,23 @@ KIND_SETTING_REENABLED = "setting_reenabled"
 KIND_FUSION_SCAN = "fusion_scan_during_restriction"
 KIND_AI_SCAN = "ai_scan_during_restriction"
 KIND_USAGE_AFTER = "usage_after_restriction"
-KINDS = (KIND_SETTING_REENABLED, KIND_FUSION_SCAN, KIND_AI_SCAN, KIND_USAGE_AFTER)
+# Scans on a restricted project that could not be looked at (more than the
+# listing reaches in one cycle): said once per restriction, for information.
+KIND_SCANS_NOT_CHECKED = "scans_not_checked"
+KINDS = (
+    KIND_SETTING_REENABLED,
+    KIND_FUSION_SCAN,
+    KIND_AI_SCAN,
+    KIND_USAGE_AFTER,
+    KIND_SCANS_NOT_CHECKED,
+)
+# Information, not violations: nothing to follow up. Never counted as open
+# violations (the top-bar light, the menu badge, /api/me), and listed under the
+# Violations page's "Information" filter.
+INFO_KINDS = (KIND_AI_SCAN, KIND_SCANS_NOT_CHECKED)
+# Pseudo-kinds the list accepts as a filter.
+FILTER_VIOLATIONS = "violations"
+FILTER_INFORMATION = "information"
 
 
 class PolicyViolation(Base):
