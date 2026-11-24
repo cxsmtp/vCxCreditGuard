@@ -3,6 +3,7 @@
 const express = require('express');
 const db = require('./db');
 const validate = require('./validate');
+const { internalError } = require('./security');
 
 const router = express.Router();
 
@@ -80,7 +81,9 @@ router.post('/', (req, res) => {
     if (err instanceof CheckoutError) {
       return res.status(err.status).json({ error: err.message });
     }
-    throw err;
+    // Anything else (a database failure) is answered here with a generic body;
+    // its details stay in the server log.
+    return internalError(res, err);
   }
 });
 

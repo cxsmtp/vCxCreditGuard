@@ -38,14 +38,17 @@ decremented inside a single transaction.
 
 ## Hardening
 
-- Every response carries `Strict-Transport-Security`, a deny-all
-  `Content-Security-Policy` (the API returns only JSON), `X-Content-Type-Options:
-  nosniff`, `X-Frame-Options`, `Referrer-Policy` and `Cache-Control: no-store`
-  (`src/security.js`); `X-Powered-By` is off.
+- Every response carries the [helmet](https://helmetjs.github.io/) headers,
+  tightened for a JSON-only API: `Strict-Transport-Security` (one year,
+  subdomains), a deny-all `Content-Security-Policy`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, plus
+  `Permissions-Policy` and `Cache-Control: no-store` (`src/security.js`);
+  `X-Powered-By` is off.
 - Input is validated strictly (`src/validate.js`): whole-number ids and
   quantities, at most 50 cart lines and 100 of one product, a single short
   category name. Repeated products in one cart are combined before the stock
   check, and the stock guard is part of the `UPDATE`, so an order can never
   oversell.
-- Bodies over 16 KB and malformed JSON get a short JSON error, never a stack trace.
+- Bodies over 16 KB, malformed JSON and unexpected failures get a short JSON
+  error, never the error's message or a stack trace (those go to the server log).
 - All SQL is parameterised. Dependencies are locked in `package-lock.json`.

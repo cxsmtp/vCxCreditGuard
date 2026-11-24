@@ -6,7 +6,7 @@ const checkout = require('./checkout');
 const { securityHeaders, errorHandler } = require('./security');
 
 const app = express();
-// Do not advertise the framework and version.
+// Do not advertise the framework and version (helmet removes the header too).
 app.disable('x-powered-by');
 app.use(securityHeaders);
 // A cart is a few hundred bytes; refuse anything much larger.
