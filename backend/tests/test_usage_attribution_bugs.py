@@ -32,7 +32,7 @@ NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 # The exact payload the tenant returned for viewBy=project. Note: no id field, and
 # the project is identified by name alone.
 REAL_PROJECT_ROW = {
-    "name": "singakash/CxHybrid",
+    "name": "carolorg/CxHybrid",
     "creditsUsed": 13,
     "percentOfTotal": 100,
     "actionsPerformed": {
@@ -48,21 +48,21 @@ REAL_PROJECT_ROW = {
 def tenant_like_production() -> FakeTenant:
     """A tenant shaped like the one in the bug report."""
     tenant = FakeTenant()
-    tenant.add_project(project_id="proj-hybrid", name="singakash/CxHybrid")
+    tenant.add_project(project_id="proj-hybrid", name="carolorg/CxHybrid")
     tenant.add_user(
-        user_id="user-akash",
-        username="akash.singh@checkmarx.com",
-        email="akash.singh@checkmarx.com",
-        first_name="Akash",
-        last_name="Singh",
+        user_id="user-carol",
+        username="carol.chen@example.com",
+        email="carol.chen@example.com",
+        first_name="Carol",
+        last_name="Chen",
     )
     tenant.consumption["project"] = [dict(REAL_PROJECT_ROW)]
     # The user view reports Auto Triage as a synthetic person.
     tenant.consumption["user"] = [
         {
-            "name": "Akash Singh",
-            "email": "akash.singh@checkmarx.com",
-            "userEmail": "akash.singh@checkmarx.com",
+            "name": "Carol Chen",
+            "email": "carol.chen@example.com",
+            "userEmail": "carol.chen@example.com",
             "creditsUsed": 3,
             "percentOfTotal": 23.08,
             "actionsPerformed": {
@@ -122,7 +122,7 @@ def add_limit(
     limit = CreditLimit(
         entity_type=EntityType.PROJECT,
         entity_id="proj-hybrid",
-        entity_label="singakash/CxHybrid",
+        entity_label="carolorg/CxHybrid",
         credit_limit=budget,
         period_type=period_type,
         enforce=False,
@@ -360,7 +360,7 @@ class TestAutoTriageIsNotAPerson:
         prepared(db, tenant_like_production())
         totals = ingestion.latest_totals(db, UsageView.USER)
         # Only the real person's 3 credits, not the 10 from automation.
-        assert totals == {"user-akash": Decimal("3")}
+        assert totals == {"user-carol": Decimal("3")}
 
     def test_the_credits_still_count_at_project_level(self, db: Session) -> None:
         """The brief says Auto Triage belongs to the project, and it does."""
@@ -374,7 +374,7 @@ class TestAutoTriageIsNotAPerson:
         assert ingestion.is_synthetic_subject(name) is True
 
     def test_a_real_person_is_not_treated_as_automation(self) -> None:
-        assert ingestion.is_synthetic_subject("Akash Singh") is False
+        assert ingestion.is_synthetic_subject("Carol Chen") is False
         assert ingestion.is_synthetic_subject("autonomy.team@example.com") is False
 
 

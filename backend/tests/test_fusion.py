@@ -617,7 +617,7 @@ class TestChoice:
     def test_user_limits_cannot_choose(self, db: Session) -> None:
         setup_tenant(db)
         with pytest.raises(limits_service.LimitError):
-            make_limit(db, entity_type=EntityType.USER, entity_id="user-harsh", actions=["fusion"])
+            make_limit(db, entity_type=EntityType.USER, entity_id="user-alice", actions=["fusion"])
 
     def test_empty_or_unknown_is_refused(self, db: Session) -> None:
         with pytest.raises(limits_service.LimitError):
@@ -654,7 +654,7 @@ class TestChoice:
             "/api/limits",
             json={
                 "entity_type": "user",
-                "entity_id": "user-harsh",
+                "entity_id": "user-alice",
                 "credit_limit": 5,
                 "project_actions": ["fusion"],
             },
@@ -686,7 +686,7 @@ class TestChoice:
         db.commit()
         db.expire_all()
         assert api.project_actions == ["fusion"]
-        bad = "entity_type,entity_id,credit_limit,project_actions\nuser,user-harsh,3,fusion\n"
+        bad = "entity_type,entity_id,credit_limit,project_actions\nuser,user-alice,3,fusion\n"
         assert limits_csv.import_limits(db, content=bad, actor=ACTOR, dry_run=True).errors
 
     def test_preview_shows_fusion_and_the_guard_counts_it(self, db: Session) -> None:

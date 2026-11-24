@@ -38,13 +38,13 @@ class TestLimitCrud:
     ) -> None:
         response = admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 100},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 100},
         )
         assert response.status_code == httpx.codes.CREATED
         body = response.json()
         assert body["enforce"] is False
         assert body["warning_threshold_pct"] == 80
-        assert body["entity_label"] == "Harsh Gokani"
+        assert body["entity_label"] == "Alice Archer"
 
     def test_entity_labels_are_resolved_from_the_synced_model(
         self, admin_client: TestClient, tenant: FakeTenant
@@ -58,7 +58,7 @@ class TestLimitCrud:
     def test_a_duplicate_limit_is_rejected(
         self, admin_client: TestClient, tenant: FakeTenant
     ) -> None:
-        payload = {"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 100}
+        payload = {"entity_type": "user", "entity_id": "user-alice", "credit_limit": 100}
         admin_client.post("/api/limits", json=payload)
         response = admin_client.post("/api/limits", json=payload)
         assert response.status_code == httpx.codes.BAD_REQUEST
@@ -71,7 +71,7 @@ class TestLimitCrud:
             "/api/limits",
             json={
                 "entity_type": "user",
-                "entity_id": "user-harsh",
+                "entity_id": "user-alice",
                 "credit_limit": 10,
                 "period_type": "custom",
             },
@@ -85,7 +85,7 @@ class TestLimitCrud:
             "/api/limits",
             json={
                 "entity_type": "user",
-                "entity_id": "user-harsh",
+                "entity_id": "user-alice",
                 "credit_limit": 10,
                 "include_member_usage": True,
             },
@@ -112,7 +112,7 @@ class TestLimitCrud:
     ) -> None:
         response = admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": -1},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": -1},
         )
         assert response.status_code == httpx.codes.UNPROCESSABLE_ENTITY
 
@@ -123,7 +123,7 @@ class TestLimitCrud:
             "/api/limits",
             json={
                 "entity_type": "user",
-                "entity_id": "user-harsh",
+                "entity_id": "user-alice",
                 "credit_limit": 10,
                 "sneaky": "value",
             },
@@ -135,7 +135,7 @@ class TestLimitCrud:
     ) -> None:
         admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         )
         admin_client.post(
             "/api/limits",
@@ -147,7 +147,7 @@ class TestLimitCrud:
     def test_a_limit_can_be_updated(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         limit_id = admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         ).json()["id"]
         response = admin_client.patch(
             f"/api/limits/{limit_id}", json={"credit_limit": 25, "enforce": True}
@@ -161,7 +161,7 @@ class TestLimitCrud:
     ) -> None:
         limit_id = admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         ).json()["id"]
         admin_client.patch(f"/api/limits/{limit_id}", json={"credit_limit": 40})
 
@@ -181,7 +181,7 @@ class TestLimitCrud:
         assert viewer_client.get("/api/limits").status_code == httpx.codes.OK
         response = viewer_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         )
         assert response.status_code == httpx.codes.FORBIDDEN
 
@@ -195,13 +195,13 @@ class TestLimitStateInResponses:
     ) -> None:
         limit_id = admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-sean", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-bob", "credit_limit": 10},
         ).json()["id"]
 
         client = connection_service.get_client(db)
         evaluation.evaluate_all(db, client=client, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Sean Casey", credits=13, actions={"triage": 13})
+        tenant.set_user_credits(name="Bob Baker", credits=13, actions={"triage": 13})
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, actor=ACTOR)
@@ -221,12 +221,12 @@ class TestLimitStateInResponses:
     ) -> None:
         admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-sean", "credit_limit": 1},
+            json={"entity_type": "user", "entity_id": "user-bob", "credit_limit": 1},
         )
         client = connection_service.get_client(db)
         evaluation.evaluate_all(db, client=client, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Sean Casey", credits=50, actions={"triage": 50})
+        tenant.set_user_credits(name="Bob Baker", credits=50, actions={"triage": 50})
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, actor=ACTOR)
@@ -241,10 +241,10 @@ class TestExemptions:
     ) -> None:
         created = admin_client.post(
             "/api/exemptions",
-            json={"entity_type": "user", "entity_id": "user-harsh", "reason": "on call"},
+            json={"entity_type": "user", "entity_id": "user-alice", "reason": "on call"},
         )
         assert created.status_code == httpx.codes.CREATED
-        assert created.json()["entity_label"] == "Harsh Gokani"
+        assert created.json()["entity_label"] == "Alice Archer"
 
         assert len(admin_client.get("/api/exemptions").json()) == 1
         assert (
@@ -259,8 +259,8 @@ class TestExemptions:
         """An exemption that left someone restricted would be a trap."""
         limit = CreditLimit(
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
-            entity_label="Harsh Gokani",
+            entity_id="user-alice",
+            entity_label="Alice Archer",
             credit_limit=1,
             period_type="monthly",
             enforce=True,
@@ -270,12 +270,12 @@ class TestExemptions:
         client = connection_service.get_client(db)
         enforcement.apply_enforcement(db, client, limit=limit, period_key="2026-08", actor=ACTOR)
         db.commit()
-        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
         admin_client.post(
-            "/api/exemptions", json={"entity_type": "user", "entity_id": "user-harsh"}
+            "/api/exemptions", json={"entity_type": "user", "entity_id": "user-alice"}
         )
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
     def test_removing_an_exemption_lets_the_next_cycle_restrict_again(
         self, admin_client: TestClient, db: Session, tenant: FakeTenant
@@ -317,7 +317,7 @@ class TestExemptions:
         self, viewer_client: TestClient, tenant: FakeTenant
     ) -> None:
         response = viewer_client.post(
-            "/api/exemptions", json={"entity_type": "user", "entity_id": "user-harsh"}
+            "/api/exemptions", json={"entity_type": "user", "entity_id": "user-alice"}
         )
         assert response.status_code == httpx.codes.FORBIDDEN
 

@@ -57,17 +57,17 @@ def test_user_credit_increase_restores_roles(db: Session) -> None:
     limit = add_limit(
         db,
         entity_type=EntityType.USER,
-        entity_id="user-harsh",
+        entity_id="user-alice",
         credit_limit=5,
         enforce=True,
-        label="Harsh Gokani",
+        label="Alice Archer",
     )
     # Establish baseline (0 used)
     evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
     db.commit()
 
     # User consumes 20 credits (breaches 5 limit)
-    tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=20)
+    tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=20)
     ingestion.ingest_usage(db, client)
     db.commit()
 
@@ -82,7 +82,7 @@ def test_user_credit_increase_restores_roles(db: Session) -> None:
         )
     )
     assert state1.status == LimitStatus.RESTRICTED
-    assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+    assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
     # 2. Increase credit limit for user to 50 (usage 20 < 50)
     limit.credit_limit = 50
@@ -102,7 +102,7 @@ def test_user_credit_increase_restores_roles(db: Session) -> None:
     assert state2.restored_at is not None
 
     # Roles restored back on user
-    assert any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+    assert any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
     actions = list(
         db.scalars(
@@ -270,21 +270,21 @@ def test_update_limit_service_restores_immediately_on_credit_increase(db: Sessio
     limit = add_limit(
         db,
         entity_type=EntityType.USER,
-        entity_id="user-harsh",
+        entity_id="user-alice",
         credit_limit=5,
         enforce=True,
-        label="Harsh Gokani",
+        label="Alice Archer",
     )
     evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
     db.commit()
 
-    tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=20)
+    tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=20)
     ingestion.ingest_usage(db, client)
     db.commit()
 
     evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
     db.commit()
-    assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+    assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
     # Update limit using limits_service
     limits_service.update_limit(
@@ -292,7 +292,7 @@ def test_update_limit_service_restores_immediately_on_credit_increase(db: Sessio
     )
 
     # Verify restored immediately
-    assert any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+    assert any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
     state = db.scalar(
         select(LimitPeriodState).where(
             LimitPeriodState.limit_id == limit.id, LimitPeriodState.period_key == "2026-08"
@@ -310,25 +310,25 @@ def test_approving_a_credit_request_restores_access_immediately(db: Session) -> 
     limit = add_limit(
         db,
         entity_type=EntityType.USER,
-        entity_id="user-harsh",
+        entity_id="user-alice",
         credit_limit=5,
         enforce=True,
-        label="Harsh Gokani",
+        label="Alice Archer",
     )
     evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
     db.commit()
 
-    tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=20)
+    tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=20)
     ingestion.ingest_usage(db, client)
     db.commit()
     evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
     db.commit()
-    assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+    assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
     request = requests_service.create_request(
         db,
         data=requests_service.RequestInput(
-            entity_type=EntityType.USER, entity_id="user-harsh", requested_limit=500
+            entity_type=EntityType.USER, entity_id="user-alice", requested_limit=500
         ),
         actor=ACTOR,
     )
@@ -336,7 +336,7 @@ def test_approving_a_credit_request_restores_access_immediately(db: Session) -> 
     db.commit()
 
     # Roles are back immediately, without waiting for the next scheduled cycle.
-    assert any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+    assert any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
     state = db.scalar(
         select(LimitPeriodState).where(
             LimitPeriodState.limit_id == limit.id, LimitPeriodState.period_key == "2026-08"

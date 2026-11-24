@@ -46,9 +46,9 @@ from tests.conftest import make_api_key, sqlite_only
 from tests.fake_tenant import FakeTenant, action_row, populated_tenant
 
 ACTOR = AuditActor.system("test")
-HARSH = "harsh.gokani@checkmarx.com"
-AKASH = "akash.singh@checkmarx.com"
-SEAN = "sean.casey@checkmarx.com"
+ALICE = "alice.archer@example.com"
+CAROL = "carol.chen@example.com"
+BOB = "bob.baker@example.com"
 BOT = "ci-webhook-runner"
 
 
@@ -197,24 +197,24 @@ class TestOff:
     def test_off_changes_nothing_anywhere(
         self, db: Session, tenant: FakeTenant, admin_client: TestClient
     ) -> None:
-        scan(tenant, "scan-h1", HARSH, ago=timedelta(days=3))
+        scan(tenant, "scan-h1", ALICE, ago=timedelta(days=3))
         run(force=True)
-        harsh = user_limit(db, "user-harsh", 100)
+        alice = user_limit(db, "user-alice", 100)
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h2", HARSH)
+        scan(tenant, "scan-h2", ALICE)
         result = run()
 
         assert "auto_triage_attribution" not in result.steps
         assert not [path for _method, path in tenant.requests if "/api/scans" in path]
         assert db.scalar(select(func.count()).select_from(AutoTriageCharge)) == 0
         assert db.scalar(select(func.count()).select_from(AutoTriageProjectState)) == 0
-        state = period_state(db, harsh)
-        # Harsh's own reported 3 credits, nothing else.
+        state = period_state(db, alice)
+        # Alice's own reported 3 credits, nothing else.
         assert state.credits_used == Decimal("3") and state.attributed_credits is None
         assert model(db).enabled is False
 
         limits = admin_client.get("/api/limits").json()
-        row = next(item for item in limits if item["entity_id"] == "user-harsh")
+        row = next(item for item in limits if item["entity_id"] == "user-alice")
         assert row["current_period"]["credits_used"] in ("3", "3.0000", 3)
         assert row["current_period"]["auto_triage_attributed"] is None
         dry = admin_client.get("/api/preview/dry-run").json()
@@ -235,7 +235,7 @@ class TestOff:
 
     def test_the_pseudo_user_stays_excluded_when_on(self, db: Session, tenant: FakeTenant) -> None:
         turn_on(db)
-        scan(tenant, "scan-h1", HARSH, ago=timedelta(days=3))
+        scan(tenant, "scan-h1", ALICE, ago=timedelta(days=3))
         run(force=True)
         assert (
             db.scalar(
@@ -256,17 +256,17 @@ class TestObserved:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         # Same interval, wrong branch: auto triage does not run on it.
-        scan(tenant, "scan-s1", SEAN, branch="feature/login")
+        scan(tenant, "scan-s1", BOB, branch="feature/login")
         result = run()
 
         assert result.steps["auto_triage_attribution"]["observed_charges"] == 1
         [charge] = charges(db)
-        assert charge.basis == "observed" and charge.initiator == HARSH
+        assert charge.basis == "observed" and charge.initiator == ALICE
         assert charge.credits == Decimal("4") and charge.scan_ids == ["scan-h1"]
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
-        assert parts(db, "user-sean") == {}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-bob") == {}
         # The listing asked for the configured branch.
         assert any(query.get("branch") == ["main"] for query in tenant.scan_queries)
         # The project keeps every credit it reports; the rest stays on it only.
@@ -280,11 +280,11 @@ class TestObserved:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 16)
-        scan(tenant, "scan-h1", HARSH)
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-h1", ALICE)
+        scan(tenant, "scan-a1", CAROL)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("3")}
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("3")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("3")}
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("3")}
 
     def test_no_scan_in_the_window_widens_to_the_latest_one_before_it(
         self, db: Session, tenant: FakeTenant
@@ -294,11 +294,11 @@ class TestObserved:
         # Observing for a while already: the scan completed after observation
         # began, in an interval whose auto triage had not shown up yet.
         observing_for(db, "proj-api", timedelta(hours=6))
-        scan(tenant, "scan-a0", AKASH, ago=timedelta(hours=5))
+        scan(tenant, "scan-a0", CAROL, ago=timedelta(hours=5))
         set_project(tenant, "proj-api", "payments/api", 12)
         run()
         [*_, charge] = charges(db)
-        assert charge.initiator == AKASH and charge.basis == "observed"
+        assert charge.initiator == CAROL and charge.basis == "observed"
         assert charge.detail and "latest one before" in charge.detail
 
     def test_with_no_scan_at_all_the_increase_stays_on_the_project(
@@ -324,9 +324,9 @@ class TestObserved:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-tools", "platform/tools", 5)
-        scan(tenant, "scan-k1", AKASH, project_id="proj-tools")
+        scan(tenant, "scan-k1", CAROL, project_id="proj-tools")
         run()
-        assert parts(db, "user-akash") == {("proj-tools", "observed"): Decimal("5")}
+        assert parts(db, "user-carol") == {("proj-tools", "observed"): Decimal("5")}
 
     def test_a_project_coming_back_with_consumption_it_had_is_estimated(
         self, db: Session, tenant: FakeTenant
@@ -334,14 +334,14 @@ class TestObserved:
         # platform/tools reports credits from the start, without the per action
         # breakdown (no reading). When the breakdown appears, its auto triage is
         # history, not something that just happened.
-        scan(tenant, "scan-k0", AKASH, ago=timedelta(days=3), project_id="proj-tools")
+        scan(tenant, "scan-k0", CAROL, ago=timedelta(days=3), project_id="proj-tools")
         turn_on(db)
         run(force=True)
         assert db.get(AutoTriageProjectState, "proj-tools") is None
         set_project(tenant, "proj-tools", "platform/tools", 5)
         run()
         assert [c for c in charges(db) if c.project_id == "proj-tools"] == []
-        assert parts(db, "user-akash") == {("proj-tools", "estimated"): Decimal("5")}
+        assert parts(db, "user-carol") == {("proj-tools", "estimated"): Decimal("5")}
 
 
 # ------------------------------------------------------------------ estimated
@@ -352,18 +352,18 @@ class TestEstimated:
         self, db: Session, tenant: FakeTenant
     ) -> None:
         for number in range(3):
-            scan(tenant, f"scan-h{number}", HARSH, ago=timedelta(days=4 + number))
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=9))
+            scan(tenant, f"scan-h{number}", ALICE, ago=timedelta(days=4 + number))
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=9))
         # Not an auto-triage branch: never counted.
         for number in range(5):
-            scan(tenant, f"scan-k{number}", AKASH, ago=timedelta(days=2), branch="develop")
+            scan(tenant, f"scan-k{number}", CAROL, ago=timedelta(days=2), branch="develop")
         set_project(tenant, "proj-api", "payments/api", 8)
         turn_on(db)
         run(force=True)
 
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("6")}
-        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("2")}
-        assert parts(db, "user-akash") == {}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("6")}
+        assert parts(db, "user-bob") == {("proj-api", "estimated"): Decimal("2")}
+        assert parts(db, "user-carol") == {}
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.history_status == "done"
         assert state.branches == ["main"]
@@ -371,18 +371,18 @@ class TestEstimated:
     def test_observed_and_estimated_together_never_exceed_the_project(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=5))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=5))
         set_project(tenant, "proj-api", "payments/api", 8)
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 12)
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-a1", CAROL)
         run()
 
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("4")}
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("4")}
-        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("4")}
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("4")}
+        assert parts(db, "user-bob") == {("proj-api", "estimated"): Decimal("4")}
         assert total_charged(model(db), "proj-api") == Decimal("12")
 
     def test_charges_above_what_is_reported_now_are_scaled_down(
@@ -391,9 +391,9 @@ class TestEstimated:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 16)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("6")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("6")}
         # Older usage ages out of the window: the project now reports less than
         # was charged inside it (not so much less that the read is held back).
         set_project(tenant, "proj-api", "payments/api", 5)
@@ -401,7 +401,7 @@ class TestEstimated:
         m = model(db)
         assert m.projects["proj-api"].scale < 1
         assert total_charged(m, "proj-api") <= Decimal("5")
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("5")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("5")}
 
     def test_mixed_actions_take_only_the_auto_triage_share(self, db: Session) -> None:
         record = UsageRecord(credits_used=Decimal("10"), actions={"auto_triage": 3, "triage": 1})
@@ -425,7 +425,7 @@ class TestUnresolvedInitiator:
     ) -> None:
         turn_on(db)
         run(force=True)
-        sean_limit = user_limit(db, "user-sean", 1000)
+        bob_limit = user_limit(db, "user-bob", 1000)
         set_project(tenant, "proj-api", "payments/api", 14)
         scan(tenant, "scan-b1", BOT, source_origin="PR Webhook")
         run()
@@ -436,26 +436,26 @@ class TestUnresolvedInitiator:
         m = model(db)
         assert m.parts_by_user == {}
         assert m.projects["proj-api"].unresolved == Decimal("4")
-        assert period_state(db, sean_limit).credits_used == Decimal("5")
+        assert period_state(db, bob_limit).credits_used == Decimal("5")
         assert admin_client.get("/api/dashboard").json()["tiles"]["unresolved_scan_initiators"] == 1
         assert db.scalar(
             select(Notification).where(Notification.title.like("Auto-triage credits could not%"))
         )
 
         response = admin_client.post(
-            f"/api/usage/unresolved/{row['id']}/map", json={"user_id": "user-sean"}
+            f"/api/usage/unresolved/{row['id']}/map", json={"user_id": "user-bob"}
         )
         assert response.status_code == 200, response.text
-        assert parts(db, "user-sean") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-bob") == {("proj-api", "observed"): Decimal("4")}
         overview = admin_client.get(
-            "/api/usage/auto-triage-attribution", params={"user_id": "user-sean"}
+            "/api/usage/auto-triage-attribution", params={"user_id": "user-bob"}
         ).json()
         assert overview["users"][0]["total"] in ("4", "4.0000")
         assert overview["recent_charges"][0]["initiator"] == BOT
 
         run()
-        # Lifetime: counts everything attributed, on top of Sean's own 5.
-        state = period_state(db, sean_limit)
+        # Lifetime: counts everything attributed, on top of Bob's own 5.
+        state = period_state(db, bob_limit)
         assert state.attributed_credits == Decimal("4")
         assert state.credits_used == Decimal("9")
 
@@ -471,7 +471,7 @@ class TestFailuresAndCaps:
         first = run(force=True)
         assert first.steps["auto_triage_attribution"]["warnings"] == []
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         tenant.fail_paths["/api/scans"] = 503
         failed = run()
 
@@ -491,7 +491,7 @@ class TestFailuresAndCaps:
         del tenant.fail_paths["/api/scans"]
         run()
         [charge] = charges(db)
-        assert charge.initiator == HARSH and charge.credits == Decimal("4")
+        assert charge.initiator == ALICE and charge.credits == Decimal("4")
 
     def test_an_outage_stops_the_step_instead_of_waiting_on_every_project(
         self, db: Session, tenant: FakeTenant
@@ -517,42 +517,42 @@ class TestFailuresAndCaps:
     def test_per_cycle_cap_defers_to_the_next_cycle_and_keeps_it_on_the_project(
         self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=3), project_id="proj-web")
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=3), project_id="proj-web")
         set_project(tenant, "proj-web", "payments/web", 4)
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 14)
         set_project(tenant, "proj-web", "payments/web", 6)
-        scan(tenant, "scan-h1", HARSH)
-        scan(tenant, "scan-a1", AKASH, project_id="proj-web")
+        scan(tenant, "scan-h1", ALICE)
+        scan(tenant, "scan-a1", CAROL, project_id="proj-web")
         settings_store.set_value(db, settings_store.KEY_ATTRIBUTION_PROJECTS, 1)
         db.commit()
         capped = run()
 
         stats = capped.steps["auto_triage_attribution"]
         assert stats["deferred"] == 1 and stats["warnings"]
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
         # Not traced yet: the history is estimated, the rise is on the project
         # only (it is not the history's).
-        assert parts(db, "user-sean") == {("proj-web", "estimated"): Decimal("4")}
-        assert parts(db, "user-akash") == {}
+        assert parts(db, "user-bob") == {("proj-web", "estimated"): Decimal("4")}
+        assert parts(db, "user-carol") == {}
         assert model(db).projects["proj-web"].unattributed == Decimal("2")
 
         settings_store.set_value(db, settings_store.KEY_ATTRIBUTION_PROJECTS, 50)
         db.commit()
         run()
-        assert parts(db, "user-akash") == {("proj-web", "observed"): Decimal("2")}
-        assert parts(db, "user-sean") == {("proj-web", "estimated"): Decimal("4")}
+        assert parts(db, "user-carol") == {("proj-web", "observed"): Decimal("2")}
+        assert parts(db, "user-bob") == {("proj-web", "estimated"): Decimal("4")}
 
     def test_per_project_cap_leaves_the_rise_on_the_project(
         self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=3))
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=3))
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 13)
         for number in range(3):
-            scan(tenant, f"scan-h{number}", HARSH)
+            scan(tenant, f"scan-h{number}", ALICE)
         monkeypatch.setattr(auto_triage_attribution, "MAX_PAGES_PER_LISTING", 1)
         monkeypatch.setattr(auto_triage_attribution, "SCAN_PAGE_SIZE", 2)
         result = run()
@@ -564,9 +564,9 @@ class TestFailuresAndCaps:
         assert charge.scan_ids == [] and charge.scan_count == 0
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.last_credits == Decimal("13")
-        # Sean's history is the 10 there were when observation began; the 3
+        # Bob's history is the 10 there were when observation began; the 3
         # that could not be traced are not his.
-        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-bob") == {("proj-api", "estimated"): Decimal("10")}
         assert model(db).projects["proj-api"].unattributed == Decimal("3")
 
 
@@ -577,32 +577,32 @@ class TestWindowAndPeriod:
     def test_a_monthly_budget_counts_only_what_is_observed_after_its_baseline(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=4))
         set_project(tenant, "proj-api", "payments/api", 8)
         run(force=True)
-        monthly = user_limit(db, "user-harsh", 100, period=PeriodType.MONTHLY)
-        lifetime = user_limit(db, "user-sean", 100)
-        existing = user_limit(db, "user-akash", 100, period=PeriodType.MONTHLY, count_existing=True)
-        scan(tenant, "scan-a0", AKASH, ago=timedelta(days=4))
+        monthly = user_limit(db, "user-alice", 100, period=PeriodType.MONTHLY)
+        lifetime = user_limit(db, "user-bob", 100)
+        existing = user_limit(db, "user-carol", 100, period=PeriodType.MONTHLY, count_existing=True)
+        scan(tenant, "scan-a0", CAROL, ago=timedelta(days=4))
         turn_on(db)
         run()
 
-        # 8 credits of history: harsh, sean and akash 8/3 each (rounded down).
+        # 8 credits of history: alice, bob and carol 8/3 each (rounded down).
         share = Decimal("2.6666")
-        harsh = period_state(db, monthly)
-        assert harsh.attributed_credits == 0
-        assert harsh.credits_used == 0  # own 3 credits were in the baseline too
+        alice = period_state(db, monthly)
+        assert alice.attributed_credits == 0
+        assert alice.credits_used == 0  # own 3 credits were in the baseline too
         assert period_state(db, lifetime).attributed_credits == share
         assert period_state(db, lifetime).credits_used == Decimal("5") + share
         assert period_state(db, existing).attributed_credits == share
 
         set_project(tenant, "proj-api", "payments/api", 12)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         run()
-        harsh = period_state(db, monthly)
-        assert harsh.attributed_credits == Decimal("4")
-        assert harsh.credits_used == Decimal("4")
+        alice = period_state(db, monthly)
+        assert alice.attributed_credits == Decimal("4")
+        assert alice.credits_used == Decimal("4")
 
     def test_charges_older_than_the_window_drop_out(self, db: Session, tenant: FakeTenant) -> None:
         turn_on(db)
@@ -612,8 +612,8 @@ class TestWindowAndPeriod:
             AutoTriageCharge(
                 project_id="proj-api",
                 basis="observed",
-                initiator=HARSH,
-                initiator_key=HARSH,
+                initiator=ALICE,
+                initiator_key=ALICE,
                 scan_ids=["scan-old"],
                 scan_count=1,
                 credits=Decimal("5"),
@@ -623,7 +623,7 @@ class TestWindowAndPeriod:
             )
         )
         db.commit()
-        assert parts(db, "user-harsh") == {}
+        assert parts(db, "user-alice") == {}
 
     def test_retention_prunes_only_charges_outside_the_window(
         self, db: Session, tenant: FakeTenant
@@ -634,8 +634,8 @@ class TestWindowAndPeriod:
                 AutoTriageCharge(
                     project_id="proj-api",
                     basis="observed",
-                    initiator=HARSH,
-                    initiator_key=HARSH,
+                    initiator=ALICE,
+                    initiator_key=ALICE,
                     scan_count=1,
                     credits=Decimal("1"),
                     window_start=moment,
@@ -664,8 +664,8 @@ class TestWindowAndPeriod:
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 14)
         set_project(tenant, "proj-tools", "platform/tools", 4)
-        scan(tenant, "scan-h1", HARSH)
-        scan(tenant, "scan-k1", AKASH, project_id="proj-tools")
+        scan(tenant, "scan-h1", ALICE)
+        scan(tenant, "scan-k1", CAROL, project_id="proj-tools")
         group = limits_service.create_limit(
             db,
             data=limits_service.LimitInput(
@@ -680,7 +680,7 @@ class TestWindowAndPeriod:
         db.commit()
         run()
         state = period_state(db, group)
-        # Harsh's 4 from payments/api counts; Akash's 4 from platform/tools is
+        # Alice's 4 from payments/api counts; Carol's 4 from platform/tools is
         # already in the group's own project figure.
         assert state.attributed_credits == Decimal("4")
 
@@ -692,12 +692,12 @@ class TestEnforcement:
     def test_turning_it_on_breaches_and_enforces_a_user_limit(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
         run(force=True)
-        limit = user_limit(db, "user-harsh", 5, enforce=True)
+        limit = user_limit(db, "user-alice", 5, enforce=True)
         run()
         assert period_state(db, limit).status == "ok"
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
         dry_before = preview_service.dry_run(db)
         assert next(r for r in dry_before.rows if r.limit_id == limit.id).would_enforce is False
@@ -708,15 +708,15 @@ class TestEnforcement:
         assert state.attributed_credits == Decimal("10")
         assert state.credits_used == Decimal("13")
         assert state.status == "restricted"
-        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
     def test_the_simulation_shows_it_before_any_cycle_applies_it(
         self, db: Session, tenant: FakeTenant, admin_client: TestClient
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
         turn_on(db)
         run(force=True)
-        limit = user_limit(db, "user-harsh", 5, enforce=True)
+        limit = user_limit(db, "user-alice", 5, enforce=True)
         dry = admin_client.get("/api/preview/dry-run").json()
         row = next(item for item in dry["rows"] if item["limit_id"] == limit.id)
         assert Decimal(row["auto_triage_attributed"]) == Decimal("10")
@@ -734,12 +734,12 @@ class TestEnforcement:
     def test_turning_it_on_for_many_people_trips_the_safety_ceiling(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=4))
-        scan(tenant, "scan-a0", AKASH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=4))
+        scan(tenant, "scan-a0", CAROL, ago=timedelta(days=4))
         set_project(tenant, "proj-api", "payments/api", 30)
         run(force=True)
-        for user_id in ("user-harsh", "user-sean", "user-akash"):
+        for user_id in ("user-alice", "user-bob", "user-carol"):
             user_limit(db, user_id, 6, enforce=True)
         settings_store.set_value(db, settings_store.KEY_MAX_NEW_ENFORCEMENTS, 2)
         db.commit()
@@ -752,7 +752,7 @@ class TestEnforcement:
         guard = settings_store.enforcement_guard(db)
         assert guard.paused and "safety ceiling of 2" in (guard.pause_reason or "")
         assert result.steps["evaluate"]["enforced"] == 0
-        for user_id in ("user-harsh", "user-sean", "user-akash"):
+        for user_id in ("user-alice", "user-bob", "user-carol"):
             assert all(role in tenant.role_mappings[user_id] for role in AI_ROLE_NAMES)
 
 
@@ -860,7 +860,7 @@ def test_no_write_lock_is_held_while_scans_are_read(db: Session, tenant: FakeTen
         finally:
             connection.close()
 
-    scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+    scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
     turn_on(db)
     tenant.on_request = probe
     run(force=True)
@@ -892,9 +892,9 @@ def test_ingestion_is_untouched_by_the_setting(db: Session) -> None:
     ingestion.ingest_usage(db, client)
     db.commit()
     totals = ingestion.latest_totals(db, UsageView.USER)
-    assert totals.get("user-harsh") == Decimal("3")
+    assert totals.get("user-alice") == Decimal("3")
     index = evaluation.UsageIndex(db)
-    assert index.user_total("user-harsh") == (Decimal("3"), True)
+    assert index.user_total("user-alice") == (Decimal("3"), True)
 
 
 # ---------------------------------------------------------- review regressions
@@ -956,14 +956,14 @@ class TestObservationRestarts:
     ) -> None:
         turn_on(db)
         run(force=True)
-        monthly = user_limit(db, "user-harsh", 50, period=PeriodType.MONTHLY)
+        monthly = user_limit(db, "user-alice", 50, period=PeriodType.MONTHLY)
         run()
         assert period_state(db, monthly).attributed_credits == 0
         settings_store.set_value(db, settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR, False)
         db.commit()
         # Weeks of auto triage while it was off.
         set_state(db, "proj-api", last_collected_at=utcnow() - timedelta(days=60))
-        scan(tenant, "scan-old", HARSH, ago=timedelta(days=40))
+        scan(tenant, "scan-old", ALICE, ago=timedelta(days=40))
         set_project(tenant, "proj-api", "payments/api", 100)
         run()
         turn_on(db)
@@ -972,7 +972,7 @@ class TestObservationRestarts:
         assert [c for c in charges(db) if c.basis == "observed"] == []
         # The gap is history: estimated, so a monthly budget does not count it.
         assert period_state(db, monthly).attributed_credits == 0
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("100")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("100")}
         assert result.steps["auto_triage_attribution"]["restarted"] >= 1
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.last_transactions == 100
@@ -980,7 +980,7 @@ class TestObservationRestarts:
 
         # From here on it is observed again.
         set_project(tenant, "proj-api", "payments/api", 104)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         run()
         assert period_state(db, monthly).attributed_credits == Decimal("4")
 
@@ -999,7 +999,7 @@ class TestObservationRestarts:
             last_credits=Decimal("1"),
             last_collected_at=utcnow() - timedelta(days=30),
         )
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         set_project(tenant, "proj-api", "payments/api", 14)
         run()
         assert charges(db) == []
@@ -1017,12 +1017,12 @@ class TestObservationRestarts:
         set_state(db, "proj-api", last_collected_at=utcnow() - timedelta(days=60))
         # proj-tools appears while the other cursors are from the earlier
         # enablement: its consumption may be from any time in the gap.
-        scan(tenant, "scan-k0", AKASH, ago=timedelta(days=20), project_id="proj-tools")
+        scan(tenant, "scan-k0", CAROL, ago=timedelta(days=20), project_id="proj-tools")
         set_project(tenant, "proj-tools", "platform/tools", 5)
         turn_on(db)
         run()
         assert [c for c in charges(db) if c.project_id == "proj-tools"] == []
-        assert parts(db, "user-akash") == {("proj-tools", "estimated"): Decimal("5")}
+        assert parts(db, "user-carol") == {("proj-tools", "estimated"): Decimal("5")}
 
     def test_changing_the_lookback_window_restarts_observation(
         self, db: Session, tenant: FakeTenant
@@ -1030,7 +1030,7 @@ class TestObservationRestarts:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         run()
         assert len(charges(db)) == 1
         settings_store.set_value(db, settings_store.KEY_USAGE_PERIOD, "last_90_days")
@@ -1048,7 +1048,7 @@ class TestObservationRestarts:
         tenant.scans["proj-api"][0]["updatedAt"] = stale
         tenant.scans["proj-api"][0]["createdAt"] = stale
         set_project(tenant, "proj-api", "payments/api", 23)
-        scan(tenant, "scan-h2", HARSH)
+        scan(tenant, "scan-h2", ALICE)
         run()
         assert [c.credits for c in charges(db)] == [Decimal("4"), Decimal("3")]
 
@@ -1057,12 +1057,12 @@ class TestCursorFollowsTransactions:
     def test_a_reading_without_the_breakdown_or_a_missing_row_is_no_reading(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
         turn_on(db)
         run(force=True)
-        monthly = user_limit(db, "user-harsh", 50, period=PeriodType.MONTHLY)
+        monthly = user_limit(db, "user-alice", 50, period=PeriodType.MONTHLY)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("10")}
         # Same credits, no per-action breakdown for the row.
         tenant.set_entity_credits(
             view="project", name="payments/api", credits=10, entity_id="proj-api"
@@ -1075,7 +1075,7 @@ class TestCursorFollowsTransactions:
         run()
         assert charges(db) == []
         assert period_state(db, monthly).attributed_credits == 0
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("10")}
         assert result.steps["auto_triage_attribution"]["no_reading"] == 1
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.last_transactions == 10
@@ -1089,10 +1089,10 @@ class TestCursorFollowsTransactions:
             actions={"auto_triage": 100, "triage": 50},
         )
         set_price(tenant, 100)
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
         turn_on(db)
         run(force=True)
-        monthly = user_limit(db, "user-harsh", 1000, period=PeriodType.MONTHLY)
+        monthly = user_limit(db, "user-alice", 1000, period=PeriodType.MONTHLY)
         run()
         for credits in (110, 100, 110, 100, 110):
             set_price(tenant, credits)
@@ -1121,11 +1121,11 @@ class TestCursorFollowsTransactions:
             entity_id="proj-api",
             actions={"auto_triage": 110, "triage": 50},
         )
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         run()
         [charge] = charges(db)
         # 10 new transactions at 1.10 credits each.
-        assert charge.initiator == HARSH and charge.credits == Decimal("11")
+        assert charge.initiator == ALICE and charge.credits == Decimal("11")
 
     def test_transactions_ageing_out_move_the_cursor_down_without_charging(
         self, db: Session, tenant: FakeTenant
@@ -1138,7 +1138,7 @@ class TestCursorFollowsTransactions:
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.last_transactions == 6
         set_project(tenant, "proj-api", "payments/api", 9)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         run()
         [charge] = charges(db)
         assert charge.credits == Decimal("3")
@@ -1161,11 +1161,11 @@ class TestWhichScansCount:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 20)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         for number in range(9):
             scan(tenant, f"scan-n{number}", None, source_origin="scheduler")
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("1")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("1")}
         unattributed = [c for c in charges(db) if c.basis == "unattributed"]
         assert [c.scan_count for c in unattributed] == [9]
         assert unattributed[0].credits == Decimal("9")
@@ -1173,35 +1173,35 @@ class TestWhichScansCount:
     def test_history_counts_scans_without_an_initiator_too(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
         for number in range(9):
             scan(tenant, f"scan-n{number}", None, ago=timedelta(days=3))
         turn_on(db)
         run(force=True)
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("1")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("1")}
         assert model(db).projects["proj-api"].unattributed == Decimal("9")
 
     def test_only_completed_and_partial_scans_count(self, db: Session, tenant: FakeTenant) -> None:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h1", HARSH, status="Partial")
-        scan(tenant, "scan-s1", SEAN, status="Failed")
-        scan(tenant, "scan-a1", AKASH, status="Canceled")
+        scan(tenant, "scan-h1", ALICE, status="Partial")
+        scan(tenant, "scan-s1", BOB, status="Failed")
+        scan(tenant, "scan-a1", CAROL, status="Canceled")
         scan(tenant, "scan-b1", BOT, status="Running")
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
-        assert parts(db, "user-sean") == {} and parts(db, "user-akash") == {}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-bob") == {} and parts(db, "user-carol") == {}
 
     def test_history_ignores_scans_that_did_not_complete(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4), status="Partial")
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=4), status="Failed")
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4), status="Partial")
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=4), status="Failed")
         turn_on(db)
         run(force=True)
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("10")}
-        assert parts(db, "user-sean") == {}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-bob") == {}
 
     def test_a_scan_just_before_the_previous_reading_shares_the_increase(
         self, db: Session, tenant: FakeTenant
@@ -1210,12 +1210,12 @@ class TestWhichScansCount:
         run(force=True)
         # Completed ten minutes before the reading that was just dealt with:
         # its auto triage can land in the next reading (the lag).
-        scan(tenant, "scan-h1", HARSH, ago=timedelta(minutes=10))
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-h1", ALICE, ago=timedelta(minutes=10))
+        scan(tenant, "scan-a1", CAROL)
         set_project(tenant, "proj-api", "payments/api", 14)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("2")}
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("2")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("2")}
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("2")}
         assert all(charge.detail is None for charge in charges(db))
 
     def test_history_outside_the_window_is_not_estimated_against(
@@ -1227,15 +1227,15 @@ class TestWhichScansCount:
             db,
             "proj-api",
             history=[
-                [HARSH, (utcnow() - timedelta(days=400)).date().isoformat(), 5],
-                [SEAN, (utcnow() - timedelta(days=3)).date().isoformat(), 1],
+                [ALICE, (utcnow() - timedelta(days=400)).date().isoformat(), 5],
+                [BOB, (utcnow() - timedelta(days=3)).date().isoformat(), 1],
             ],
             history_status="done",
         )
-        # Harsh's scans are out of the window, and so is the part of the
-        # history they stand for: only Sean's one in six sampled scans is left.
-        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("1.6666")}
-        assert parts(db, "user-harsh") == {}
+        # Alice's scans are out of the window, and so is the part of the
+        # history they stand for: only Bob's one in six sampled scans is left.
+        assert parts(db, "user-bob") == {("proj-api", "estimated"): Decimal("1.6666")}
+        assert parts(db, "user-alice") == {}
         assert model(db).projects["proj-api"].unattributed == Decimal("8.3334")
 
 
@@ -1244,14 +1244,14 @@ class TestWidenFallbackBounds:
         self, db: Session, tenant: FakeTenant
     ) -> None:
         # Before observation: that scan belongs to the estimate, not to a rise.
-        scan(tenant, "scan-a0", AKASH, ago=timedelta(days=5))
+        scan(tenant, "scan-a0", CAROL, ago=timedelta(days=5))
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 12)
         run()
         [charge] = charges(db)
         assert charge.basis == "unattributed" and charge.initiator is None
-        assert parts(db, "user-akash") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-carol") == {("proj-api", "estimated"): Decimal("10")}
 
     def test_it_does_not_reach_outside_the_lookback_window(
         self, db: Session, tenant: FakeTenant
@@ -1259,7 +1259,7 @@ class TestWidenFallbackBounds:
         turn_on(db)
         run(force=True)
         observing_for(db, "proj-api", timedelta(days=500))
-        scan(tenant, "scan-a0", AKASH, ago=timedelta(days=380))
+        scan(tenant, "scan-a0", CAROL, ago=timedelta(days=380))
         set_project(tenant, "proj-api", "payments/api", 12)
         run()
         [charge] = charges(db)
@@ -1273,7 +1273,7 @@ class TestWidenFallbackBounds:
         observing_for(db, "proj-api", timedelta(days=3))
         # Completed before the last charged interval: its own auto triage was
         # dealt with then.
-        scan(tenant, "scan-a0", AKASH, ago=timedelta(hours=30))
+        scan(tenant, "scan-a0", CAROL, ago=timedelta(hours=30))
         moment = utcnow() - timedelta(hours=20)
         db.add(
             AutoTriageCharge(
@@ -1291,7 +1291,7 @@ class TestWidenFallbackBounds:
         set_project(tenant, "proj-api", "payments/api", 12)
         run()
         assert charges(db)[-1].basis == "unattributed"
-        assert parts(db, "user-akash") == {}
+        assert parts(db, "user-carol") == {}
 
 
 class TestOneProjectFailing:
@@ -1303,8 +1303,8 @@ class TestOneProjectFailing:
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 14)
         set_project(tenant, "proj-web", "payments/web", 6)
-        scan(tenant, "scan-h1", HARSH)
-        scan(tenant, "scan-a1", AKASH, project_id="proj-web")
+        scan(tenant, "scan-h1", ALICE)
+        scan(tenant, "scan-a1", CAROL, project_id="proj-web")
         real = scans_api.list_project_scans
 
         def broken(client, *, project_id, **kwargs):  # type: ignore[no-untyped-def]
@@ -1318,14 +1318,14 @@ class TestOneProjectFailing:
         stats = result.steps["auto_triage_attribution"]
         assert any("proj-api" in warning for warning in stats["warnings"])
         assert "evaluate" in result.steps
-        assert parts(db, "user-akash") == {("proj-web", "observed"): Decimal("2")}
+        assert parts(db, "user-carol") == {("proj-web", "observed"): Decimal("2")}
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.last_transactions == 10
         assert state.last_error and "ValueError" in state.last_error
 
         monkeypatch.setattr(scans_api, "list_project_scans", real)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
 
     def test_an_overlong_initiator_is_cut_to_the_column_width(
         self, db: Session, tenant: FakeTenant
@@ -1347,9 +1347,9 @@ class TestOneProjectFailing:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h1", HARSH, branch="develop")
+        scan(tenant, "scan-h1", ALICE, branch="develop")
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
 
 
 class TestBusyProjects:
@@ -1360,14 +1360,14 @@ class TestBusyProjects:
         run(force=True)
         # Busy hours well before the interval: those scans finished long ago.
         for number in range(6):
-            scan(tenant, f"scan-k{number}", AKASH, ago=timedelta(hours=6 + number))
+            scan(tenant, f"scan-k{number}", CAROL, ago=timedelta(hours=6 + number))
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         monkeypatch.setattr(auto_triage_attribution, "MAX_PAGES_PER_LISTING", 1)
         monkeypatch.setattr(auto_triage_attribution, "SCAN_PAGE_SIZE", 2)
         result = run()
         assert result.steps["auto_triage_attribution"]["capped"] == 0
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
 
 
 class TestPeriodBaseline:
@@ -1380,11 +1380,11 @@ class TestPeriodBaseline:
         scan(tenant, "scan-b1", BOT)
         run()
         # The monthly budget opens after that charge was observed.
-        monthly = user_limit(db, "user-sean", 1000, period=PeriodType.MONTHLY)
+        monthly = user_limit(db, "user-bob", 1000, period=PeriodType.MONTHLY)
         run()
-        map_initiator(admin_client, BOT, "user-sean")
+        map_initiator(admin_client, BOT, "user-bob")
         run()
-        assert parts(db, "user-sean") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-bob") == {("proj-api", "observed"): Decimal("4")}
         assert period_state(db, monthly).attributed_credits == 0
 
     def test_a_new_period_does_not_count_charges_from_the_last_one(
@@ -1392,10 +1392,10 @@ class TestPeriodBaseline:
     ) -> None:
         turn_on(db)
         run(force=True)
-        monthly = user_limit(db, "user-harsh", 1000, period=PeriodType.MONTHLY)
+        monthly = user_limit(db, "user-alice", 1000, period=PeriodType.MONTHLY)
         run()
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         run()
         assert period_state(db, monthly).attributed_credits == Decimal("4")
         # A new month opens: its baseline is taken after that charge.
@@ -1410,11 +1410,11 @@ class TestPeriodBaseline:
     ) -> None:
         turn_on(db)
         run(force=True)
-        limit = user_limit(db, "user-sean", 1000)
+        limit = user_limit(db, "user-bob", 1000)
         set_project(tenant, "proj-api", "payments/api", 14)
         scan(tenant, "scan-b1", BOT)
         run()
-        map_initiator(admin_client, BOT, "user-sean")
+        map_initiator(admin_client, BOT, "user-bob")
         # Mapped, but no cycle has evaluated it yet.
         detail = admin_client.get(f"/api/limits/{limit.id}").json()["current_period"]
         attributed = detail["auto_triage_attributed"]
@@ -1478,13 +1478,13 @@ class TestUnmatchedProjectRows:
             entity_id="proj-new",
             actions={"auto_triage": 40},
         )
-        scan(tenant, "scan-a0", AKASH, ago=timedelta(days=2), project_id="proj-new")
+        scan(tenant, "scan-a0", CAROL, ago=timedelta(days=2), project_id="proj-new")
         run()
         run()
-        monthly = user_limit(db, "user-sean", 1000, period=PeriodType.MONTHLY)
+        monthly = user_limit(db, "user-bob", 1000, period=PeriodType.MONTHLY)
         run()
         tenant.add_project(project_id="proj-new", name="team/new")
-        scan(tenant, "scan-s1", SEAN, project_id="proj-new")
+        scan(tenant, "scan-s1", BOB, project_id="proj-new")
         result = run(force=True)
 
         assert [c for c in charges(db) if c.project_id == "proj-new"] == []
@@ -1498,7 +1498,7 @@ class TestUnmatchedProjectRows:
             if part.project_id == "proj-new"
         )
         assert total_charged(m, "proj-new") <= Decimal("40")
-        assert parts(db, "user-akash")[("proj-new", "estimated")] > 0
+        assert parts(db, "user-carol")[("proj-new", "estimated")] > 0
 
     def test_an_unmatched_row_without_an_id_is_taken_as_possibly_this_project(
         self, db: Session, tenant: FakeTenant
@@ -1514,7 +1514,7 @@ class TestUnmatchedProjectRows:
         drop_row_named(tenant, "team/old-name")
         tenant.add_project(project_id="proj-new", name="team/new")
         set_project(tenant, "proj-new", "team/new", 40)
-        scan(tenant, "scan-s1", SEAN, project_id="proj-new")
+        scan(tenant, "scan-s1", BOB, project_id="proj-new")
         run(force=True)
         assert [c for c in charges(db) if c.project_id == "proj-new"] == []
 
@@ -1533,9 +1533,9 @@ class TestUnmatchedProjectRows:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-tools", "platform/tools", 5)
-        scan(tenant, "scan-k1", AKASH, project_id="proj-tools")
+        scan(tenant, "scan-k1", CAROL, project_id="proj-tools")
         run()
-        assert parts(db, "user-akash") == {("proj-tools", "observed"): Decimal("5")}
+        assert parts(db, "user-carol") == {("proj-tools", "observed"): Decimal("5")}
 
 
 class TestAlreadyChargedScans:
@@ -1544,20 +1544,20 @@ class TestAlreadyChargedScans:
     ) -> None:
         turn_on(db)
         run(force=True)
-        scan(tenant, "scan-h1", HARSH, ago=timedelta(minutes=2))
+        scan(tenant, "scan-h1", ALICE, ago=timedelta(minutes=2))
         set_project(tenant, "proj-api", "payments/api", 14)
         run()
         # The next interval opens a lag before this reading: scan-h1 is in it.
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None
         set_state(db, "proj-api", last_collected_at=state.last_collected_at - timedelta(minutes=1))
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-a1", CAROL)
         set_project(tenant, "proj-api", "payments/api", 18)
         run()
         # scan-h1 is not charged again, but it stays in the split: its share
         # of this rise (late auto triage of it, perhaps) stays on the project.
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("2")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("2")}
         latest = [(c.basis, c.scan_ids, c.credits) for c in charges(db)[1:]]
         assert latest == [
             ("unattributed", ["scan-h1"], Decimal("2")),
@@ -1577,14 +1577,14 @@ class TestAlreadyChargedScans:
             observing_since=state.observing_since - timedelta(days=1),
             last_collected_at=state.last_collected_at - timedelta(hours=2),
         )
-        scan(tenant, "scan-h1", HARSH, ago=timedelta(minutes=110))
+        scan(tenant, "scan-h1", ALICE, ago=timedelta(minutes=110))
         set_project(tenant, "proj-api", "payments/api", 14)
         run()
         # An hour later, a rise with no scan in its interval.
         set_state(db, "proj-api", last_collected_at=utcnow() - timedelta(hours=1))
         set_project(tenant, "proj-api", "payments/api", 18)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
         assert charges(db)[-1].basis == "unattributed"
 
     def test_a_charged_scan_whose_update_time_moves_is_not_charged_again(
@@ -1593,10 +1593,10 @@ class TestAlreadyChargedScans:
         turn_on(db)
         run(force=True)
         observing_for(db, "proj-api", timedelta(days=1))
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         set_project(tenant, "proj-api", "payments/api", 14)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
         # That charge was three hours ago, and the last reading one hour ago.
         [charge] = charges(db)
         charge.window_start = utcnow() - timedelta(hours=3, minutes=30)
@@ -1610,7 +1610,7 @@ class TestAlreadyChargedScans:
         tenant.scans["proj-api"][0]["updatedAt"] = moved.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         set_project(tenant, "proj-api", "payments/api", 18)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
         assert charges(db)[-1].basis == "unattributed"
 
     def test_the_widen_fallback_stops_at_the_end_of_the_previous_charged_interval(
@@ -1626,18 +1626,18 @@ class TestAlreadyChargedScans:
             observing_since=state.observing_since - timedelta(days=1),
             last_collected_at=state.last_collected_at - timedelta(hours=2),
         )
-        scan(tenant, "scan-h1", HARSH, ago=timedelta(minutes=110))
+        scan(tenant, "scan-h1", ALICE, ago=timedelta(minutes=110))
         # Not an auto-triage branch while that interval was charged: it
         # triggered no auto triage then.
-        scan(tenant, "scan-s1", SEAN, ago=timedelta(minutes=100), branch="develop")
+        scan(tenant, "scan-s1", BOB, ago=timedelta(minutes=100), branch="develop")
         set_project(tenant, "proj-api", "payments/api", 14)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
         tenant.set_auto_triage_config("proj-api", enabled=False, branches=None)
         set_state(db, "proj-api", last_collected_at=utcnow() - timedelta(hours=1))
         set_project(tenant, "proj-api", "payments/api", 18)
         run()
-        assert parts(db, "user-sean") == {}
+        assert parts(db, "user-bob") == {}
         assert charges(db)[-1].basis == "unattributed"
 
 
@@ -1645,26 +1645,26 @@ class TestHistoryCeiling:
     def test_a_rise_that_could_not_be_read_is_not_estimated_to_aged_out_history(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
         turn_on(db)
         run(force=True)
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("10")}
         # Six of the ten history transactions age out of the window.
         set_project(tenant, "proj-api", "payments/api", 4)
         run()
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.history_ceiling == 4
-        # Six new ones from Akash's scan, in an interval that cannot be read.
-        scan(tenant, "scan-a1", AKASH)
+        # Six new ones from Carol's scan, in an interval that cannot be read.
+        scan(tenant, "scan-a1", CAROL)
         set_project(tenant, "proj-api", "payments/api", 10)
         tenant.fail_paths["/api/scans"] = 503
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("4")}
         assert model(db).projects["proj-api"].unattributed == Decimal("6")
         del tenant.fail_paths["/api/scans"]
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("4")}
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("6")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("4")}
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("6")}
 
     def test_a_price_rise_does_not_inflate_the_history_beyond_its_transactions(
         self, db: Session, tenant: FakeTenant
@@ -1680,37 +1680,37 @@ class TestHistoryCeiling:
 
         row(10)
         set_price(tenant, 100)
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
         turn_on(db)
         run(force=True)
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("10")}
         row(16)
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-a1", CAROL)
         run()
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("6")}
-        # Twice the credits per transaction now: Harsh's ten are worth 20; the
-        # rest of the new A_p is Akash's six, charged at the old price.
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("6")}
+        # Twice the credits per transaction now: Alice's ten are worth 20; the
+        # rest of the new A_p is Carol's six, charged at the old price.
         set_price(tenant, 200)
         run()
         m = model(db)
         assert m.projects["proj-api"].auto_triage_credits == Decimal("32")
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("20")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("20")}
         assert m.projects["proj-api"].unattributed == Decimal("6")
 
     def test_a_state_without_a_ceiling_estimates_as_before(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
         turn_on(db)
         run(force=True)
         # What the migration leaves on an existing row.
         set_state(db, "proj-api", history_ceiling=None)
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("10")}
         set_project(tenant, "proj-api", "payments/api", 7)
         run()
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None and state.history_ceiling == 7
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("7")}
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("7")}
 
 
 class TestRowsThatSayNothing:
@@ -1720,7 +1720,7 @@ class TestRowsThatSayNothing:
         set_project(tenant, "proj-web", "payments/web", 4)
         turn_on(db)
         run(force=True)
-        monthly = user_limit(db, "user-sean", 1000, period=PeriodType.MONTHLY)
+        monthly = user_limit(db, "user-bob", 1000, period=PeriodType.MONTHLY)
         run()
         tenant.set_entity_credits(
             view="project", name="payments/web", credits=0, entity_id="proj-web"
@@ -1730,7 +1730,7 @@ class TestRowsThatSayNothing:
         state = db.get(AutoTriageProjectState, "proj-web")
         assert state is not None and state.last_transactions == 4
         set_project(tenant, "proj-web", "payments/web", 4)
-        scan(tenant, "scan-s1", SEAN, project_id="proj-web")
+        scan(tenant, "scan-s1", BOB, project_id="proj-web")
         run()
         assert [c for c in charges(db) if c.project_id == "proj-web"] == []
         assert period_state(db, monthly).attributed_credits == 0
@@ -1762,7 +1762,7 @@ class TestRowsThatSayNothing:
     def test_an_unreadable_count_is_no_reading(self, db: Session, tenant: FakeTenant) -> None:
         turn_on(db)
         run(force=True)
-        monthly = user_limit(db, "user-harsh", 1000, period=PeriodType.MONTHLY)
+        monthly = user_limit(db, "user-alice", 1000, period=PeriodType.MONTHLY)
         run()
         for count in ("10", -3):
             drop_project_row(tenant, "proj-api")
@@ -1773,7 +1773,7 @@ class TestRowsThatSayNothing:
             assert state is not None and state.last_transactions == 10
         drop_project_row(tenant, "proj-api")
         set_project(tenant, "proj-api", "payments/api", 10)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         run()
         assert charges(db) == []
         assert period_state(db, monthly).attributed_credits == 0
@@ -1818,11 +1818,11 @@ class TestNoTenantPrice:
             entity_id="proj-api",
             actions={"auto_triage": 1, "remediation": 1},
         )
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=4))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
         turn_on(db)
         run(force=True)
         assert auto_triage_attribution.auto_triage_price(db) is None
-        assert parts(db, "user-harsh") == {}
+        assert parts(db, "user-alice") == {}
         tenant.set_entity_credits(
             view="project",
             name="payments/api",
@@ -1830,9 +1830,9 @@ class TestNoTenantPrice:
             entity_id="proj-api",
             actions={"auto_triage": 2, "remediation": 1},
         )
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-a1", CAROL)
         run()
-        assert parts(db, "user-akash") == {} and parts(db, "user-harsh") == {}
+        assert parts(db, "user-carol") == {} and parts(db, "user-alice") == {}
         assert charges(db) == []
 
 
@@ -1844,19 +1844,19 @@ class TestLongScans:
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 14)
         # A six hour scan that completed in this interval.
-        scan(tenant, "scan-h1", HARSH, created_at=utcnow() - timedelta(hours=6))
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-h1", ALICE, created_at=utcnow() - timedelta(hours=6))
+        scan(tenant, "scan-a1", CAROL)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("2")}
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("2")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("2")}
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("2")}
 
     def test_older_scans_on_the_last_page_do_not_change_truncation(
         self, tenant: FakeTenant
     ) -> None:
         since = utcnow() - timedelta(hours=1)
         for number in range(3):
-            scan(tenant, f"scan-n{number}", HARSH, ago=timedelta(minutes=number))
-        scan(tenant, "scan-long", AKASH, created_at=since - timedelta(hours=5))
+            scan(tenant, f"scan-n{number}", ALICE, ago=timedelta(minutes=number))
+        scan(tenant, "scan-long", CAROL, created_at=since - timedelta(hours=5))
         client = tenant.client()
         capped = scans_api.list_project_scans(
             client, project_id="proj-api", since=since, page_size=2, max_pages=1
@@ -1889,10 +1889,10 @@ class TestObservationEpochStamp:
         assert settings_store.auto_triage_observation_epoch(db) == first
         # So the next rise is observed, not restarted.
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         result = run()
         assert result.steps["auto_triage_attribution"]["restarted"] == 0
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
 
 
 # -------------------------------------------------- third review regressions
@@ -1913,43 +1913,43 @@ class TestHistoryAgeingOutNetted:
     def test_history_ageing_out_by_date_lowers_the_estimate_when_netted(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=300))
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=2))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=300))
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=2))
         turn_on(db)
         run(force=True)
-        assert parts(db, "user-harsh") == {("proj-api", "estimated"): Decimal("5")}
-        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("5")}
-        # Four old transactions age out while Akash's scan adds four: the count
+        assert parts(db, "user-alice") == {("proj-api", "estimated"): Decimal("5")}
+        assert parts(db, "user-bob") == {("proj-api", "estimated"): Decimal("5")}
+        # Four old transactions age out while Carol's scan adds four: the count
         # stays at 10, so nothing is seen as new and the ceiling stays.
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-a1", CAROL)
         run()
-        assert parts(db, "user-akash") == {}
-        # Harsh's history scan leaves the window: half the sampled history is
-        # gone, whatever the count says. Sean keeps at most his own half.
-        age_history_of(db, HARSH, 400)
+        assert parts(db, "user-carol") == {}
+        # Alice's history scan leaves the window: half the sampled history is
+        # gone, whatever the count says. Bob keeps at most his own half.
+        age_history_of(db, ALICE, 400)
         m = model(db)
-        assert parts(db, "user-harsh") == {}
-        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("5")}
+        assert parts(db, "user-alice") == {}
+        assert parts(db, "user-bob") == {("proj-api", "estimated"): Decimal("5")}
         assert m.projects["proj-api"].unattributed == Decimal("5")
         assert total_charged(m, "proj-api") <= Decimal("5")
 
     def test_more_arriving_than_ageing_out_charges_only_the_net_rise(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        scan(tenant, "scan-h0", HARSH, ago=timedelta(days=300))
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=2))
+        scan(tenant, "scan-h0", ALICE, ago=timedelta(days=300))
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=2))
         turn_on(db)
         run(force=True)
         # Five age out, eight arrive: a rise of three is all that is seen.
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-a1", CAROL)
         set_project(tenant, "proj-api", "payments/api", 13)
         run()
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("3")}
-        age_history_of(db, HARSH, 400)
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("3")}
+        age_history_of(db, ALICE, 400)
         m = model(db)
         # What is left of the history (five) is never exceeded.
-        assert parts(db, "user-harsh") == {}
-        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("5")}
+        assert parts(db, "user-alice") == {}
+        assert parts(db, "user-bob") == {("proj-api", "estimated"): Decimal("5")}
         assert m.projects["proj-api"].unattributed == Decimal("5")
 
 
@@ -1959,17 +1959,17 @@ class TestLateLandingShare:
     ) -> None:
         turn_on(db)
         run(force=True)
-        scan(tenant, "scan-h1", HARSH, ago=timedelta(minutes=2))
+        scan(tenant, "scan-h1", ALICE, ago=timedelta(minutes=2))
         set_project(tenant, "proj-api", "payments/api", 14)
         run()
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None
         set_state(db, "proj-api", last_collected_at=state.last_collected_at - timedelta(minutes=1))
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-a1", CAROL)
         set_project(tenant, "proj-api", "payments/api", 22)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("4")}
         latest = [(c.basis, c.scan_ids, c.credits) for c in charges(db)[1:]]
         assert latest == [
             ("unattributed", ["scan-h1"], Decimal("4")),
@@ -1989,15 +1989,15 @@ class TestOldScansTouchedLater:
         scan(
             tenant,
             "scan-h-old",
-            HARSH,
+            ALICE,
             ago=timedelta(minutes=5),
             created_at=utcnow() - timedelta(days=20),
         )
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-a1", CAROL)
         set_project(tenant, "proj-api", "payments/api", 18)
         run()
-        assert parts(db, "user-harsh") == {}
-        assert parts(db, "user-akash") == {("proj-api", "observed"): Decimal("8")}
+        assert parts(db, "user-alice") == {}
+        assert parts(db, "user-carol") == {("proj-api", "observed"): Decimal("8")}
         assert [c.scan_ids for c in charges(db)] == [["scan-a1"]]
 
     def test_the_widen_fallback_does_not_take_an_old_touched_scan_either(
@@ -2009,13 +2009,13 @@ class TestOldScansTouchedLater:
         scan(
             tenant,
             "scan-h-old",
-            HARSH,
+            ALICE,
             ago=timedelta(minutes=5),
             created_at=utcnow() - timedelta(days=20),
         )
         set_project(tenant, "proj-api", "payments/api", 18)
         run()
-        assert parts(db, "user-harsh") == {}
+        assert parts(db, "user-alice") == {}
         [charge] = charges(db)
         assert charge.basis == "unattributed" and charge.credits == Decimal("8")
 
@@ -2027,7 +2027,7 @@ class TestOldScansTouchedLater:
         turn_on(db)
         run(force=True)
         observing_for(db, "proj-api", timedelta(days=30))
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         set_project(tenant, "proj-api", "payments/api", 14)
         run()
         [charge] = charges(db)
@@ -2042,7 +2042,7 @@ class TestOldScansTouchedLater:
         )
         set_project(tenant, "proj-api", "payments/api", 18)
         run()
-        assert parts(db, "user-harsh") == {("proj-api", "observed"): Decimal("4")}
+        assert parts(db, "user-alice") == {("proj-api", "observed"): Decimal("4")}
         assert charges(db)[-1].basis == "unattributed"
 
     def test_only_charges_near_the_interval_are_read(self, db: Session) -> None:
@@ -2052,8 +2052,8 @@ class TestOldScansTouchedLater:
             return AutoTriageCharge(
                 project_id="proj-api",
                 basis="observed",
-                initiator=HARSH,
-                initiator_key=HARSH,
+                initiator=ALICE,
+                initiator_key=ALICE,
                 scan_ids=[scan_id],
                 scan_count=1,
                 credits=Decimal("1"),
@@ -2103,10 +2103,10 @@ class TestBreakdownWithoutTotal:
         state = db.get(AutoTriageProjectState, "proj-api")
         assert state is not None
         assert state.last_transactions == 10 and state.history_ceiling == 10
-        scan(tenant, "scan-a1", AKASH)
+        scan(tenant, "scan-a1", CAROL)
         put(breakdown(12, [("auto_triage", 10), ("triage", 2)], total=12))
         run()
-        assert parts(db, "user-akash") == {}
+        assert parts(db, "user-carol") == {}
         assert charges(db) == []
 
 
@@ -2114,21 +2114,21 @@ class TestCappedIntervalOnRecord:
     def test_a_capped_rise_is_not_estimated_to_history_without_a_ceiling(
         self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        scan(tenant, "scan-s0", SEAN, ago=timedelta(days=3))
+        scan(tenant, "scan-s0", BOB, ago=timedelta(days=3))
         turn_on(db)
         run(force=True)
         # A row from before the ceiling existed.
         set_state(db, "proj-api", history_ceiling=None)
         set_project(tenant, "proj-api", "payments/api", 13)
         for number in range(3):
-            scan(tenant, f"scan-h{number}", HARSH)
+            scan(tenant, f"scan-h{number}", ALICE)
         monkeypatch.setattr(auto_triage_attribution, "MAX_PAGES_PER_LISTING", 1)
         monkeypatch.setattr(auto_triage_attribution, "SCAN_PAGE_SIZE", 2)
         result = run()
         assert result.steps["auto_triage_attribution"]["capped"] == 1
         assert result.steps["auto_triage_attribution"]["unattributed_charges"] == 1
-        assert parts(db, "user-sean") == {("proj-api", "estimated"): Decimal("10")}
-        assert parts(db, "user-harsh") == {}
+        assert parts(db, "user-bob") == {("proj-api", "estimated"): Decimal("10")}
+        assert parts(db, "user-alice") == {}
         assert model(db).projects["proj-api"].unattributed == Decimal("3")
 
 
@@ -2161,11 +2161,11 @@ class TestListingReachedSinceAtTheCap:
     ) -> None:
         since = utcnow() - timedelta(hours=1)
         for number in range(4):
-            scan(tenant, f"scan-n{number}", HARSH, ago=timedelta(minutes=number))
+            scan(tenant, f"scan-n{number}", ALICE, ago=timedelta(minutes=number))
         scan(
             tenant,
             "scan-before",
-            AKASH,
+            CAROL,
             created_at=since - timedelta(hours=2),
             ago=timedelta(hours=2),
         )
@@ -2178,7 +2178,7 @@ class TestListingReachedSinceAtTheCap:
         assert [s.id for s in listing.older] == ["scan-before"]
         assert listing.requests == 3
         # One more scan after since than the pages hold: truncated.
-        scan(tenant, "scan-n4", HARSH, ago=timedelta(minutes=4))
+        scan(tenant, "scan-n4", ALICE, ago=timedelta(minutes=4))
         listing = scans_api.list_project_scans(
             client, project_id="proj-api", since=since, page_size=2, max_pages=2
         )

@@ -83,7 +83,7 @@ class TestDemoSnapshotIsolation:
         db.commit()
         totals_live = ingestion.latest_totals(db, UsageView.USER)
         assert not any(k.startswith("demo-") for k in totals_live)
-        assert "user-harsh" in totals_live  # the real entity is still visible
+        assert "user-alice" in totals_live  # the real entity is still visible
 
         settings_store.set_value(db, settings_store.KEY_DEMO_MODE, True)
         db.commit()

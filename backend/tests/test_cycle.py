@@ -168,7 +168,7 @@ class TestResilience:
                 select(Notification).where(Notification.category == "attribution")
             )
         assert notification is not None
-        assert "departed.person@checkmarx.com" in notification.title
+        assert "departed.person@example.com" in notification.title
 
 
 class TestScheduler:
@@ -308,7 +308,7 @@ class TestExpiredGrantRollback:
         request = requests_service.create_request(
             db,
             data=requests_service.RequestInput(
-                entity_type=EntityType.USER, entity_id="user-harsh", requested_limit=500
+                entity_type=EntityType.USER, entity_id="user-alice", requested_limit=500
             ),
             actor=AuditActor.system("test"),
         )
@@ -326,7 +326,7 @@ class TestExpiredGrantRollback:
         result = cycle.run_cycle(trigger="manual", force_org_sync=True)
         assert result.steps["grant_expiry"] == {"ok": True, "reverted": 1}
         with session_scope() as session:
-            limit = session.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh"))
+            limit = session.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice"))
             assert limit is None
             reverted = session.get(CreditRequest, request.id)
             assert reverted is not None and reverted.reverted is True

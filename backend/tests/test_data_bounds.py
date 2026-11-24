@@ -111,7 +111,7 @@ class TestLimitCeiling:
         tenant = populated_tenant()
         org_sync.sync_org_model(db, tenant.client())
         db.commit()
-        content = "entity_type,entity_id,credit_limit\nuser,user-harsh,99999999999\n"
+        content = "entity_type,entity_id,credit_limit\nuser,user-alice,99999999999\n"
         result = limits_csv.import_limits(db, content=content, actor=ACTOR, dry_run=False)
         assert result.errors and result.created == 0
 

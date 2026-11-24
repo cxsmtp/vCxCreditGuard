@@ -190,8 +190,8 @@ class TestBatchedEnforcement:
         big = group_limit(db)  # the lower id: evaluated first
         user = CreditLimit(
             entity_type=EntityType.USER,
-            entity_id="user-sean",
-            entity_label="Sean",
+            entity_id="user-bob",
+            entity_label="Bob",
             credit_limit=1,
             period_type=PeriodType.MONTHLY,
             enforce=True,

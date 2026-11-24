@@ -44,7 +44,7 @@ def _add_limit(db: Session, **kwargs) -> CreditLimit:
 class TestBlastRadius:
     def test_a_user_limit_restricts_only_that_user(self, tenant: FakeTenant, db: Session) -> None:
         blast = preview_service.blast_radius(
-            db, entity_type=EntityType.USER, entity_id="user-harsh"
+            db, entity_type=EntityType.USER, entity_id="user-alice"
         )
         assert blast.remove_user_roles == 1
         assert blast.affected_users == 1
@@ -71,13 +71,13 @@ class TestBlastRadius:
         limits_service.add_exemption(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             reason="break glass",
             actor=ACTOR,
         )
         db.commit()
         blast = preview_service.blast_radius(
-            db, entity_type=EntityType.USER, entity_id="user-harsh"
+            db, entity_type=EntityType.USER, entity_id="user-alice"
         )
         assert blast.exempt is True
         assert blast.total_actions == 0
@@ -99,7 +99,7 @@ class TestBlastRadius:
     ) -> None:
         response = viewer_client.get(
             "/api/preview/blast-radius",
-            params={"entity_type": "user", "entity_id": "user-harsh"},
+            params={"entity_type": "user", "entity_id": "user-alice"},
         )
         assert response.status_code == httpx.codes.OK
 
@@ -119,21 +119,21 @@ class TestDryRun:
     ) -> CreditLimit:
         client = tenant.client()
         # Baseline at a low reading so the delta, not history, drives the breach.
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=1)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=1)
         ingestion.ingest_usage(db, client)
         db.commit()
         limit = _add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
-            entity_label="Harsh Gokani",
+            entity_id="user-alice",
+            entity_label="Alice Archer",
             credit_limit=5,
             enforce=enforce,
         )
         evaluation.evaluate_all(db, client=None, actor=ACTOR)  # baseline only, no enforcement
         db.commit()
         # Now blow past the limit.
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         db.commit()
         return limit
@@ -144,13 +144,13 @@ class TestDryRun:
         _add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
-            entity_label="Harsh Gokani",
+            entity_id="user-alice",
+            entity_label="Alice Archer",
             credit_limit=1_000_000,
             enforce=True,
         )
         body = admin_client.get("/api/preview/dry-run").json()
-        row = next(r for r in body["rows"] if r["entity_id"] == "user-harsh")
+        row = next(r for r in body["rows"] if r["entity_id"] == "user-alice")
         assert row["would_enforce"] is False
         assert row["projected_status"] in {"ok", "warned"}
 
@@ -161,7 +161,7 @@ class TestDryRun:
         body = admin_client.get("/api/preview/dry-run").json()
         assert body["would_enforce_count"] >= 1
         assert body["affected_users"] >= 1
-        row = next(r for r in body["rows"] if r["entity_id"] == "user-harsh")
+        row = next(r for r in body["rows"] if r["entity_id"] == "user-alice")
         assert row["projected_status"] == "breached"
         assert row["would_enforce"] is True
         assert row["blast"]["remove_user_roles"] == 1
@@ -171,7 +171,7 @@ class TestDryRun:
     ) -> None:
         self._breaching_user_limit(db, tenant, enforce=False)
         body = admin_client.get("/api/preview/dry-run").json()
-        row = next(r for r in body["rows"] if r["entity_id"] == "user-harsh")
+        row = next(r for r in body["rows"] if r["entity_id"] == "user-alice")
         assert row["projected_status"] == "breached"
         assert row["would_enforce"] is False
         assert row["blast"] is None
@@ -196,7 +196,7 @@ class TestDryRun:
         assert not db.deleted, f"dry_run staged deletes: {db.deleted}"
         # Sanity: the projection still saw the breach even though it wrote nothing.
         assert status_before == LimitStatus.OK
-        row = next(r for r in result.rows if r.entity_id == "user-harsh")
+        row = next(r for r in result.rows if r.entity_id == "user-alice")
         assert row.projected_status == LimitStatus.BREACHED
         assert row.would_enforce is True
 
@@ -207,14 +207,14 @@ class TestDryRun:
         # so the preview must count the whole reported total - not assume zero -
         # or it would claim an over-budget limit is fine right up until it bites.
         client = tenant.client()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=40)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=40)
         ingestion.ingest_usage(db, client)
         db.commit()
         _add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
-            entity_label="Harsh Gokani",
+            entity_id="user-alice",
+            entity_label="Alice Archer",
             credit_limit=5,
             enforce=True,
             period_type=PeriodType.LIFETIME,
@@ -222,7 +222,7 @@ class TestDryRun:
         # No evaluation has run, so there is no LimitPeriodState yet.
         assert db.scalar(select(func.count()).select_from(LimitPeriodState)) == 0
         result = preview_service.dry_run(db)
-        row = next(r for r in result.rows if r.entity_id == "user-harsh")
+        row = next(r for r in result.rows if r.entity_id == "user-alice")
         assert row.projected_status == LimitStatus.BREACHED
         assert row.would_enforce is True
         assert row.credits_used == Decimal("40")

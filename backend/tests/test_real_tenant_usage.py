@@ -258,8 +258,8 @@ def people_tenant() -> FakeTenant:
     # An integration identity: one handle, no email (62% of credits live).
     tenant.set_user_credits(name="acme-scm-integration", credits=24350)
     tenant.set_user_credits(name="renovate[bot]", credits=860)
-    # A person the fuzzy matcher attributes (to Harsh Gokani).
-    tenant.set_user_credits(name="harsh.gokani-cx", credits=12)
+    # A person the fuzzy matcher attributes (to Alice Archer).
+    tenant.set_user_credits(name="alice.archer-cx", credits=12)
     return tenant
 
 
@@ -302,7 +302,7 @@ class TestUnmatchedPeople:
         # Only the person nothing matched; not the integration, the bot or the
         # auto-matched person.
         assert titles == [
-            "Credit usage could not be matched to a user: departed.person@checkmarx.com"
+            "Credit usage could not be matched to a user: departed.person@example.com"
         ]
 
         dashboard = admin_client.get("/api/dashboard").json()
@@ -317,7 +317,7 @@ class TestUnmatchedPeople:
         users = {row["label"]: row for row in dashboard["top_users"]}
         assert users["acme-scm-integration"]["automation"] is True
         assert users["renovate[bot]"]["automation"] is True
-        assert users["departed.person@checkmarx.com"]["automation"] is False
+        assert users["departed.person@example.com"]["automation"] is False
         summary = dashboard["attribution"]
         assert summary["automation"] == 2
         assert Decimal(summary["automation_credits"]) == Decimal("25210")

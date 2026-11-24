@@ -90,7 +90,7 @@ def make_notification(
         body="Something happened that an admin should know about.",
         entity_type="user",
         entity_id="user-1",
-        entity_label="Harsh Gokani",
+        entity_label="Alice Archer",
         dedupe_key=f"test-{title}-{severity}",
     )
     db.commit()
@@ -143,16 +143,16 @@ class TestEmail:
 
     def test_message_content(self, db: Session) -> None:
         configure_email(db)
-        notification = make_notification(db, title="User Harsh Gokani restricted")
+        notification = make_notification(db, title="User Alice Archer restricted")
         delivery.deliver_pending(db, smtp_factory=FakeSmtp)
         db.commit()
 
         message = FakeSmtp.instances[0].messages[0]
-        assert message["Subject"] == "[CxCreditGuard] User Harsh Gokani restricted"
+        assert message["Subject"] == "[CxCreditGuard] User Alice Archer restricted"
         assert message["To"] == "ops@example.com"
         body = message.get_content()
-        assert "Harsh Gokani" in body
-        assert "Entity: user Harsh Gokani" in body
+        assert "Alice Archer" in body
+        assert "Entity: user Alice Archer" in body
         assert str(notification.created_at.year) in body
         assert message["X-CxCreditGuard-Severity"] == "critical"
 
@@ -234,7 +234,7 @@ class TestWebhook:
         body = captured["body"]
         assert body["severity"] == "critical"
         assert body["category"] == "enforcement"
-        assert body["entity"]["label"] == "Harsh Gokani"
+        assert body["entity"]["label"] == "Alice Archer"
         assert body["source"]["name"] == "CxCreditGuard"
 
     def test_signature_covers_the_timestamp_and_body(self, db: Session) -> None:

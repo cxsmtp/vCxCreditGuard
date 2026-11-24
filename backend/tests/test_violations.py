@@ -281,7 +281,7 @@ class TestUsageAfter:
             db,
             data=limits_service.LimitInput(
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
+                entity_id="user-alice",
                 credit_limit=2,
                 period_type=PeriodType.LIFETIME,
                 enforce=True,
@@ -294,8 +294,8 @@ class TestUsageAfter:
         assert db.scalar(select(EnforcementAction)).status == "applied"
         assert rows(db, KIND_USAGE_AFTER) == []
         tenant.set_user_credits(
-            name="Harsh Gokani",
-            email="harsh.gokani@checkmarx.com",
+            name="Alice Archer",
+            email="alice.archer@example.com",
             credits=6,
             actions={"remediation": 2},
         )
@@ -303,10 +303,10 @@ class TestUsageAfter:
         found = rows(db, KIND_USAGE_AFTER)
         assert len(found) == 1
         assert found[0].evidence["rise_by_action"] == {"remediation": 1}
-        assert found[0].actor == "Harsh Gokani"
+        assert found[0].actor == "Alice Archer"
         tenant.set_user_credits(
-            name="Harsh Gokani",
-            email="harsh.gokani@checkmarx.com",
+            name="Alice Archer",
+            email="alice.archer@example.com",
             credits=9,
             actions={"remediation": 3},
         )
@@ -323,13 +323,13 @@ class TestUsageAfter:
         acting against the restriction: the restriction cannot take that role,
         and said so once when it was applied."""
         tenant.add_group(group_id="grp-ai", name="AI Users", roles=["view-risk-management"])
-        tenant.join_group("user-harsh", "grp-ai")
+        tenant.join_group("user-alice", "grp-ai")
         assert cycle.run_cycle(trigger="manual", force_org_sync=True).steps["violations"]
         limits_service.create_limit(
             db,
             data=limits_service.LimitInput(
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
+                entity_id="user-alice",
                 credit_limit=2,
                 period_type=PeriodType.LIFETIME,
                 enforce=True,
@@ -343,8 +343,8 @@ class TestUsageAfter:
         assert action.status == "applied"
         assert action.undo_snapshot["kept_effective"]
         tenant.set_user_credits(
-            name="Harsh Gokani",
-            email="harsh.gokani@checkmarx.com",
+            name="Alice Archer",
+            email="alice.archer@example.com",
             credits=6,
             actions={"remediation": 2},
         )

@@ -48,13 +48,13 @@ def tenant(db: Session, monkeypatch: pytest.MonkeyPatch) -> FakeTenant:
 def _mid_period_burn(db: Session, tenant: FakeTenant) -> CreditLimit:
     """A user that spends steadily through the month, baselined early."""
     client = tenant.client()
-    tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=1)
+    tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=1)
     ingestion.ingest_usage(db, client)
     db.commit()
     limit = CreditLimit(
         entity_type=EntityType.USER,
-        entity_id="user-harsh",
-        entity_label="Harsh Gokani",
+        entity_id="user-alice",
+        entity_label="Alice Archer",
         credit_limit=100,
         period_type=PeriodType.MONTHLY,
         enforce=True,
@@ -63,7 +63,7 @@ def _mid_period_burn(db: Session, tenant: FakeTenant) -> CreditLimit:
     db.commit()
     evaluation.evaluate_all(db, client=None, now=AUG_02, actor=ACTOR)  # baseline ~1
     db.commit()
-    tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=51)
+    tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=51)
     ingestion.ingest_usage(db, client)
     db.commit()
     return limit
@@ -76,7 +76,7 @@ class TestProjection:
     def _seed_and_check(self, db: Session, tenant: FakeTenant) -> None:
         _mid_period_burn(db, tenant)
         projections = reporting_service.forward_projection(db, now=AUG_16)
-        row = next(p for p in projections if p.entity_id == "user-harsh")
+        row = next(p for p in projections if p.entity_id == "user-alice")
         # ~50 credits over ~15 days -> ~3.3/day -> ~103 by end of a 31-day month.
         assert row.credits_used == Decimal("50")
         assert row.burn_per_day > Decimal("3")
@@ -90,15 +90,15 @@ class TestProjection:
         db.add(
             CreditLimit(
                 entity_type=EntityType.USER,
-                entity_id="user-akash",
-                entity_label="Akash",
+                entity_id="user-carol",
+                entity_label="Carol",
                 credit_limit=100,
                 period_type=PeriodType.MONTHLY,
             )
         )
         db.commit()
         projections = reporting_service.forward_projection(db, now=AUG_16)
-        assert all(p.entity_id != "user-akash" for p in projections)
+        assert all(p.entity_id != "user-carol" for p in projections)
 
 
 class TestImpact:
@@ -113,14 +113,14 @@ class TestImpact:
 
     def test_over_budget_is_summed(self, tenant: FakeTenant, db: Session) -> None:
         client = tenant.client()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=1)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=1)
         ingestion.ingest_usage(db, client)
         db.commit()
         db.add(
             CreditLimit(
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
-                entity_label="Harsh Gokani",
+                entity_id="user-alice",
+                entity_label="Alice Archer",
                 credit_limit=10,
                 period_type=PeriodType.MONTHLY,
                 enforce=True,
@@ -129,7 +129,7 @@ class TestImpact:
         db.commit()
         evaluation.evaluate_all(db, client=None, now=AUG_02, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=35)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=35)
         ingestion.ingest_usage(db, client)
         db.commit()
         impact = reporting_service.impact_summary(db, now=AUG_16)
@@ -143,14 +143,14 @@ class TestImpact:
         from app.services import limits_service
 
         client = tenant.client()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=1)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=1)
         ingestion.ingest_usage(db, client)
         db.commit()
         db.add(
             CreditLimit(
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
-                entity_label="Harsh Gokani",
+                entity_id="user-alice",
+                entity_label="Alice Archer",
                 credit_limit=10,
                 period_type=PeriodType.MONTHLY,
                 enforce=True,
@@ -159,11 +159,11 @@ class TestImpact:
         db.commit()
         evaluation.evaluate_all(db, client=None, now=AUG_02, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=35)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=35)
         ingestion.ingest_usage(db, client)
         db.commit()
         limits_service.add_exemption(
-            db, entity_type=ET.USER, entity_id="user-harsh", reason="break glass", actor=ACTOR
+            db, entity_type=ET.USER, entity_id="user-alice", reason="break glass", actor=ACTOR
         )
         db.commit()
         impact = reporting_service.impact_summary(db, now=AUG_16)

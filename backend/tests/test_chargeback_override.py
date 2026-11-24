@@ -48,14 +48,14 @@ def tenant(db: Session, monkeypatch: pytest.MonkeyPatch) -> FakeTenant:
 class TestChargeback:
     def test_groups_by_business_unit_with_cost(self, tenant: FakeTenant, db: Session) -> None:
         client = tenant.client()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=1)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=1)
         ingestion.ingest_usage(db, client)
         db.commit()
         db.add(
             CreditLimit(
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
-                entity_label="Harsh Gokani",
+                entity_id="user-alice",
+                entity_label="Alice Archer",
                 credit_limit=100,
                 period_type=PeriodType.MONTHLY,
                 business_unit="Platform",
@@ -64,8 +64,8 @@ class TestChargeback:
         db.add(
             CreditLimit(
                 entity_type=EntityType.USER,
-                entity_id="user-akash",
-                entity_label="Akash",
+                entity_id="user-carol",
+                entity_label="Carol",
                 credit_limit=50,
                 period_type=PeriodType.MONTHLY,
             )  # no business unit -> unassigned
@@ -73,7 +73,7 @@ class TestChargeback:
         db.commit()
         evaluation.evaluate_all(db, client=None, now=AUG_02, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=21)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=21)
         ingestion.ingest_usage(db, client)
         db.commit()
         settings_store.set_value(db, settings_store.KEY_CREDIT_UNIT_COST, 0.5)
@@ -90,7 +90,7 @@ class TestChargeback:
         db.add(
             CreditLimit(
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
+                entity_id="user-alice",
                 credit_limit=100,
                 period_type=PeriodType.MONTHLY,
                 business_unit="Platform",
@@ -110,7 +110,7 @@ class TestOverride:
         exemption = limits_service.add_exemption(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             reason="incident bridge",
             expires_at=utcnow() + timedelta(hours=4),
             actor=ACTOR,
@@ -124,7 +124,7 @@ class TestOverride:
         limits_service.add_exemption(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             reason="initial",
             expires_at=utcnow() + timedelta(hours=2),
             actor=ACTOR,
@@ -133,7 +133,7 @@ class TestOverride:
         limits_service.add_exemption(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             reason="extended",
             expires_at=utcnow() + timedelta(days=5),
             actor=ACTOR,
@@ -149,7 +149,7 @@ class TestOverride:
             limits_service.add_exemption(
                 db,
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
+                entity_id="user-alice",
                 reason="oops",
                 expires_at=utcnow() - timedelta(hours=1),
                 actor=ACTOR,
@@ -159,27 +159,27 @@ class TestOverride:
         db.add(
             Exemption(
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
-                entity_label="Harsh Gokani",
+                entity_id="user-alice",
+                entity_label="Alice Archer",
                 reason="temporary",
                 expires_at=utcnow() - timedelta(minutes=1),
             )
         )
         # A permanent exemption must survive the sweep.
-        db.add(Exemption(entity_type=EntityType.USER, entity_id="user-akash", reason="permanent"))
+        db.add(Exemption(entity_type=EntityType.USER, entity_id="user-carol", reason="permanent"))
         db.commit()
 
         removed = limits_service.expire_overrides(db)
         db.commit()
         assert removed == 1
         remaining = {e.entity_id for e in db.scalars(select(Exemption))}
-        assert remaining == {"user-akash"}
+        assert remaining == {"user-carol"}
 
     def test_cycle_expires_overrides(self, tenant: FakeTenant, db: Session) -> None:
         db.add(
             Exemption(
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
+                entity_id="user-alice",
                 reason="temporary",
                 expires_at=utcnow() - timedelta(minutes=1),
             )
@@ -197,7 +197,7 @@ class TestOverride:
             "/api/exemptions",
             json={
                 "entity_type": "user",
-                "entity_id": "user-harsh",
+                "entity_id": "user-alice",
                 "reason": "x",
                 "expires_at": future,
             },
@@ -210,7 +210,7 @@ class TestOverride:
             "/api/exemptions",
             json={
                 "entity_type": "user",
-                "entity_id": "user-sean",
+                "entity_id": "user-bob",
                 "reason": "x",
                 "expires_at": past,
             },

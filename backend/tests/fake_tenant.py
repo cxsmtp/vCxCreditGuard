@@ -979,27 +979,27 @@ def populated_tenant() -> FakeTenant:
     tenant.add_group(group_id="grp-payments", name="Payments")
 
     tenant.add_user(
-        user_id="user-harsh",
-        username="harsh.gokani@checkmarx.com",
-        email="harsh.gokani@checkmarx.com",
-        first_name="Harsh",
-        last_name="Gokani",
+        user_id="user-alice",
+        username="alice.archer@example.com",
+        email="alice.archer@example.com",
+        first_name="Alice",
+        last_name="Archer",
         groups=["AA-Platform"],
     )
     tenant.add_user(
-        user_id="user-sean",
-        username="sean.casey@checkmarx.com",
-        email="sean.casey@checkmarx.com",
-        first_name="Sean",
-        last_name="Casey",
+        user_id="user-bob",
+        username="bob.baker@example.com",
+        email="bob.baker@example.com",
+        first_name="Bob",
+        last_name="Baker",
         groups=["Payments"],
     )
     tenant.add_user(
-        user_id="user-akash",
-        username="akash",
-        email="akash.singh@checkmarx.com",
-        first_name="Akash",
-        last_name="Singh",
+        user_id="user-carol",
+        username="carol",
+        email="carol.chen@example.com",
+        first_name="Carol",
+        last_name="Chen",
         groups=["AA-Platform", "Payments"],
     )
 
@@ -1015,13 +1015,13 @@ def populated_tenant() -> FakeTenant:
 
     # Resolvable by email, by display name, and not at all.
     tenant.set_user_credits(
-        name="Harsh Gokani",
-        email="harsh.gokani@checkmarx.com",
+        name="Alice Archer",
+        email="alice.archer@example.com",
         credits=3,
         actions={"remediation": 1},
     )
-    tenant.set_user_credits(name="Sean Casey", credits=5, actions={"triage": 5})
-    tenant.set_user_credits(name="departed.person@checkmarx.com", credits=7)
+    tenant.set_user_credits(name="Bob Baker", credits=5, actions={"triage": 5})
+    tenant.set_user_credits(name="departed.person@example.com", credits=7)
 
     tenant.set_entity_credits(
         view="application", name="Payments", credits=12, entity_id="app-payments"

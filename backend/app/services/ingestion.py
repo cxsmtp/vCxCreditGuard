@@ -201,7 +201,7 @@ class UserIndex:
         """The deterministic ladder: email, then username, then unambiguous name.
 
         Full name is last and only when unambiguous: two people called
-        "Sean Casey" must not have one budget between them.
+        "Bob Baker" must not have one budget between them.
         """
         for candidate in (email, name):
             if candidate and usage_api.looks_like_email(candidate):

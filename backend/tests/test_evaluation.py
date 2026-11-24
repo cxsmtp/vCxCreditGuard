@@ -75,7 +75,7 @@ class TestBaselines:
         """The API reports a year of history. A brand new monthly budget must not
         start out already exhausted by consumption that predates it."""
         tenant, client = prepare(db)
-        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-sean", credit_limit=10)
+        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-bob", credit_limit=10)
 
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
@@ -88,11 +88,11 @@ class TestBaselines:
 
     def test_usage_is_the_increase_over_the_baseline(self, db: Session) -> None:
         tenant, client = prepare(db)
-        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-sean", credit_limit=10)
+        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-bob", credit_limit=10)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
 
-        tenant.set_user_credits(name="Sean Casey", credits=9, actions={"triage": 9})
+        tenant.set_user_credits(name="Bob Baker", credits=9, actions={"triage": 9})
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -105,12 +105,12 @@ class TestBaselines:
         self, db: Session
     ) -> None:
         tenant, client = prepare(db)
-        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-sean", credit_limit=10)
+        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-bob", credit_limit=10)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
 
         # Old consumption drops out of the sliding window.
-        tenant.set_user_credits(name="Sean Casey", credits=2, actions={"triage": 2})
+        tenant.set_user_credits(name="Bob Baker", credits=2, actions={"triage": 2})
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -128,7 +128,7 @@ class TestBaselines:
         limit = add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-sean",
+            entity_id="user-bob",
             credit_limit=10,
             period_type=PeriodType.LIFETIME,
         )
@@ -146,15 +146,15 @@ class TestThresholds:
         limit = add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-sean",
+            entity_id="user-bob",
             credit_limit=10,
             warning_threshold_pct=80,
-            label="Sean Casey",
+            label="Bob Baker",
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
 
-        tenant.set_user_credits(name="Sean Casey", credits=13, actions={"triage": 13})
+        tenant.set_user_credits(name="Bob Baker", credits=13, actions={"triage": 13})
         ingestion.ingest_usage(db, client)
         db.commit()
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -170,10 +170,10 @@ class TestThresholds:
 
     def test_no_warning_below_the_threshold(self, db: Session) -> None:
         tenant, client = prepare(db)
-        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-sean", credit_limit=10)
+        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-bob", credit_limit=10)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Sean Casey", credits=12, actions={"triage": 12})
+        tenant.set_user_credits(name="Bob Baker", credits=12, actions={"triage": 12})
         ingestion.ingest_usage(db, client)
         db.commit()
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -184,10 +184,10 @@ class TestThresholds:
     def test_the_warning_notification_is_raised_once_per_period(self, db: Session) -> None:
         """A two minute scheduler would otherwise send this 720 times a day."""
         tenant, client = prepare(db)
-        add_limit(db, entity_type=EntityType.USER, entity_id="user-sean", credit_limit=10)
+        add_limit(db, entity_type=EntityType.USER, entity_id="user-bob", credit_limit=10)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Sean Casey", credits=14, actions={"triage": 14})
+        tenant.set_user_credits(name="Bob Baker", credits=14, actions={"triage": 14})
         ingestion.ingest_usage(db, client)
         db.commit()
 
@@ -203,13 +203,13 @@ class TestThresholds:
         limit = add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-sean",
+            entity_id="user-bob",
             credit_limit=10,
             warning_threshold_pct=50,
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Sean Casey", credits=10, actions={"triage": 10})
+        tenant.set_user_credits(name="Bob Baker", credits=10, actions={"triage": 10})
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -221,12 +221,12 @@ class TestMonitorOnly:
     def test_monitor_only_notifies_and_changes_nothing(self, db: Session) -> None:
         tenant, client = prepare(db)
         add_limit(
-            db, entity_type=EntityType.USER, entity_id="user-harsh", credit_limit=5, enforce=False
+            db, entity_type=EntityType.USER, entity_id="user-alice", credit_limit=5, enforce=False
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
 
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=20)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=20)
         ingestion.ingest_usage(db, client)
         db.commit()
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -236,7 +236,7 @@ class TestMonitorOnly:
         assert result.monitor_only == 1
         assert result.enforced == 0
         # Zero side effects in the tenant.
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         assert db.scalar(select(EnforcementAction)) is None
 
         notification = db.scalar(
@@ -260,22 +260,22 @@ class TestEnforcement:
         limit = add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             credit_limit=5,
             enforce=True,
-            label="Harsh Gokani",
+            label="Alice Archer",
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
 
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=20)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=20)
         ingestion.ingest_usage(db, client)
         db.commit()
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
 
         assert result.enforced == 1
-        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         assert state_of(db, limit).status == LimitStatus.RESTRICTED
 
     def test_a_breached_project_limit_disables_project_ai(self, db: Session) -> None:
@@ -326,31 +326,31 @@ class TestEnforcement:
     def test_evaluation_without_a_client_cannot_enforce(self, db: Session) -> None:
         tenant, client = prepare(db)
         add_limit(
-            db, entity_type=EntityType.USER, entity_id="user-harsh", credit_limit=1, enforce=True
+            db, entity_type=EntityType.USER, entity_id="user-alice", credit_limit=1, enforce=True
         )
         result = evaluation.evaluate_all(db, client=None, now=AUGUST, actor=ACTOR)
         db.commit()
         assert result.enforced == 0
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
     def test_an_exempt_entity_is_flagged_but_not_restricted(self, db: Session) -> None:
         tenant, client = prepare(db)
-        db.add(Exemption(entity_type=EntityType.USER, entity_id="user-harsh", reason="lead"))
+        db.add(Exemption(entity_type=EntityType.USER, entity_id="user-alice", reason="lead"))
         add_limit(
-            db, entity_type=EntityType.USER, entity_id="user-harsh", credit_limit=1, enforce=True
+            db, entity_type=EntityType.USER, entity_id="user-alice", credit_limit=1, enforce=True
         )
         db.commit()
         # Baseline first, then spend past the limit.
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         db.commit()
 
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
         assert result.enforced == 0
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         notification = db.scalar(
             select(Notification).where(Notification.title.like("%reached its credit limit%"))
         )
@@ -366,7 +366,7 @@ class TestPrecedence:
         add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-akash",
+            entity_id="user-carol",
             credit_limit=1_000_000,
             enforce=True,
         )
@@ -448,7 +448,7 @@ class TestPrecedence:
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        # 12 from projects, plus Sean 5 and Akash 0.
+        # 12 from projects, plus Bob 5 and Carol 0.
         assert state_of(db, limit).reported_total == Decimal("17")
 
     def test_application_usage_falls_back_to_summing_projects(self, db: Session) -> None:
@@ -501,10 +501,10 @@ class TestUnavailableUsage:
 class TestRollover:
     def test_a_new_period_resets_the_counter(self, db: Session) -> None:
         tenant, client = prepare(db)
-        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-sean", credit_limit=10)
+        limit = add_limit(db, entity_type=EntityType.USER, entity_id="user-bob", credit_limit=10)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Sean Casey", credits=14, actions={"triage": 14})
+        tenant.set_user_credits(name="Bob Baker", credits=14, actions={"triage": 14})
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -520,22 +520,22 @@ class TestRollover:
     def test_rollover_restores_access_automatically(self, db: Session) -> None:
         tenant, client = prepare(db)
         limit = add_limit(
-            db, entity_type=EntityType.USER, entity_id="user-harsh", credit_limit=1, enforce=True
+            db, entity_type=EntityType.USER, entity_id="user-alice", credit_limit=1, enforce=True
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
         result = evaluation.evaluate_all(db, client=client, now=SEPTEMBER, actor=ACTOR)
         db.commit()
 
         assert result.restored == 1
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         assert state_of(db, limit, "2026-08").status == LimitStatus.RESTORED
 
     def test_hold_until_released_survives_the_rollover(self, db: Session) -> None:
@@ -543,14 +543,14 @@ class TestRollover:
         limit = add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             credit_limit=1,
             enforce=True,
             hold_until_released=True,
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -559,23 +559,23 @@ class TestRollover:
         result = evaluation.evaluate_all(db, client=client, now=SEPTEMBER, actor=ACTOR)
         db.commit()
         assert result.restored == 0
-        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         assert state_of(db, limit, "2026-08").status == LimitStatus.RESTRICTED
 
-    def _restrict_harsh_for_several_cycles(self, db: Session, **limit_kwargs):
+    def _restrict_alice_for_several_cycles(self, db: Session, **limit_kwargs):
         """Restrict in August, then run more ordinary August cycles, as production does."""
         tenant, client = prepare(db)
         limit = add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             credit_limit=1,
             enforce=True,
             **limit_kwargs,
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         db.commit()
         for _ in range(3):
@@ -584,7 +584,7 @@ class TestRollover:
         return tenant, client, limit
 
     def test_a_restriction_stays_marked_restricted_on_later_cycles(self, db: Session) -> None:
-        _tenant, _client, limit = self._restrict_harsh_for_several_cycles(db)
+        _tenant, _client, limit = self._restrict_alice_for_several_cycles(db)
         assert state_of(db, limit, "2026-08").status == LimitStatus.RESTRICTED
 
     def test_rollover_restores_a_restriction_that_lasted_several_cycles(self, db: Session) -> None:
@@ -592,28 +592,28 @@ class TestRollover:
         # cycle. The rollover restore must still happen: before this was driven by
         # the action rows, the period was labelled "restored" while the roles
         # stayed removed in Checkmarx for good.
-        tenant, client, limit = self._restrict_harsh_for_several_cycles(db)
-        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        tenant, client, limit = self._restrict_alice_for_several_cycles(db)
+        assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
         result = evaluation.evaluate_all(db, client=client, now=SEPTEMBER, actor=ACTOR)
         db.commit()
 
         assert result.restored == 1
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         assert state_of(db, limit, "2026-08").status == LimitStatus.RESTORED
 
     def test_hold_until_released_survives_rollover_after_several_cycles(self, db: Session) -> None:
-        tenant, client, limit = self._restrict_harsh_for_several_cycles(
+        tenant, client, limit = self._restrict_alice_for_several_cycles(
             db, hold_until_released=True
         )
         result = evaluation.evaluate_all(db, client=client, now=SEPTEMBER, actor=ACTOR)
         db.commit()
         assert result.restored == 0
-        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         assert state_of(db, limit, "2026-08").status == LimitStatus.RESTRICTED
 
     def test_rollover_without_a_connection_is_not_recorded_as_restored(self, db: Session) -> None:
-        tenant, client, limit = self._restrict_harsh_for_several_cycles(db)
+        tenant, client, limit = self._restrict_alice_for_several_cycles(db)
 
         # No client this cycle: nothing can be lifted, so nothing may be claimed.
         evaluation.evaluate_all(db, client=None, now=SEPTEMBER, actor=ACTOR)
@@ -624,43 +624,43 @@ class TestRollover:
         result = evaluation.evaluate_all(db, client=client, now=SEPTEMBER, actor=ACTOR)
         db.commit()
         assert result.restored == 1
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
 
 class TestIsolation:
     def test_one_failing_restore_does_not_block_other_limits(self, db: Session) -> None:
         tenant, client = prepare(db)
-        harsh = add_limit(
-            db, entity_type=EntityType.USER, entity_id="user-harsh", credit_limit=1, enforce=True
+        alice = add_limit(
+            db, entity_type=EntityType.USER, entity_id="user-alice", credit_limit=1, enforce=True
         )
-        sean = add_limit(
-            db, entity_type=EntityType.USER, entity_id="user-sean", credit_limit=1, enforce=True
+        bob = add_limit(
+            db, entity_type=EntityType.USER, entity_id="user-bob", credit_limit=1, enforce=True
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
-        tenant.set_user_credits(name="Sean Casey", credits=50, actions={"triage": 50})
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
+        tenant.set_user_credits(name="Bob Baker", credits=50, actions={"triage": 50})
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        for user_id in ("user-harsh", "user-sean"):
+        for user_id in ("user-alice", "user-bob"):
             assert not any(role in tenant.role_mappings[user_id] for role in AI_ROLE_NAMES)
 
         # Both budgets are raised, so both restrictions should lift. Checkmarx
         # rejects every call about the first user (as it would for a deleted one).
-        harsh.credit_limit = 1000
-        sean.credit_limit = 1000
+        alice.credit_limit = 1000
+        bob.credit_limit = 1000
         db.commit()
-        tenant.fail_paths["/users/user-harsh/role-mappings"] = 404
+        tenant.fail_paths["/users/user-alice/role-mappings"] = 404
 
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
 
-        assert any(f"limit {harsh.id}" in error for error in result.errors)
+        assert any(f"limit {alice.id}" in error for error in result.errors)
         # The second limit was still evaluated and its user got access back.
-        assert all(role in tenant.role_mappings["user-sean"] for role in AI_ROLE_NAMES)
-        assert state_of(db, sean).status == LimitStatus.RESTORED
+        assert all(role in tenant.role_mappings["user-bob"] for role in AI_ROLE_NAMES)
+        assert state_of(db, bob).status == LimitStatus.RESTORED
 
 
 class TestLimitChanges:
@@ -669,22 +669,22 @@ class TestLimitChanges:
 
         tenant, client = prepare(db)
         limit = add_limit(
-            db, entity_type=EntityType.USER, entity_id="user-harsh", credit_limit=1, enforce=True
+            db, entity_type=EntityType.USER, entity_id="user-alice", credit_limit=1, enforce=True
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
-        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
         limits_service.update_limit(
             db, limit=limit, changes={"enforce": False}, actor=ACTOR, client=client
         )
         db.commit()
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
     def test_deleting_a_limit_lifts_its_restrictions(self, db: Session) -> None:
         from app.services import limits_service
@@ -712,7 +712,7 @@ class TestLimitChanges:
     def test_an_inactive_limit_is_not_evaluated(self, db: Session) -> None:
         tenant, client = prepare(db)
         limit = add_limit(
-            db, entity_type=EntityType.USER, entity_id="user-harsh", credit_limit=1, enforce=True
+            db, entity_type=EntityType.USER, entity_id="user-alice", credit_limit=1, enforce=True
         )
         limit.is_active = False
         db.commit()
@@ -727,7 +727,7 @@ class TestMisconfiguration:
         add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             credit_limit=1,
             enforce=True,
             period_type=PeriodType.CUSTOM,
@@ -737,7 +737,7 @@ class TestMisconfiguration:
 
         assert result.errors
         assert result.enforced == 0
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         assert db.scalar(select(Notification).where(Notification.title.like("%misconfigured%")))
 
     def test_a_closed_custom_period_is_not_enforced(self, db: Session) -> None:
@@ -745,7 +745,7 @@ class TestMisconfiguration:
         limit = add_limit(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             credit_limit=1,
             enforce=True,
             period_type=PeriodType.CUSTOM,
@@ -767,7 +767,7 @@ def test_thresholds_are_accepted_across_the_range(db: Session, threshold: int) -
     limit = add_limit(
         db,
         entity_type=EntityType.USER,
-        entity_id="user-sean",
+        entity_id="user-bob",
         credit_limit=100,
         warning_threshold_pct=threshold,
     )

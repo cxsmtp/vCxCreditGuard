@@ -50,7 +50,7 @@ def setup_tenant(db: Session, tenant: FakeTenant | None = None):
     return tenant, client
 
 
-def user_limit(db: Session, user_id: str = "user-harsh") -> CreditLimit:
+def user_limit(db: Session, user_id: str = "user-alice") -> CreditLimit:
     limit = CreditLimit(
         entity_type=EntityType.USER,
         entity_id=user_id,
@@ -125,7 +125,7 @@ class TestConfigurableRoleList:
         )
         assert action.undo_snapshot["ai_roles"] == list(DEFAULT_AI_ROLE_NAMES)
         assert action.undo_snapshot["kept_effective"] == []
-        assert "view-scans" in tenant.role_mappings["user-harsh"]
+        assert "view-scans" in tenant.role_mappings["user-alice"]
         # Nothing about groups or composites to report for an ordinary user.
         assert count(db, Notification, Notification.title.like("%keeps AI access%")) == 0
 
@@ -139,7 +139,7 @@ class TestConfigurableRoleList:
         tenant, client = setup_tenant(db)
         set_ai_roles(db, [RM_TAB, "view-projects"])
         apply(db, client, user_limit(db))
-        held = tenant.role_mappings["user-harsh"]
+        held = tenant.role_mappings["user-alice"]
         assert RM_TAB not in held and "view-projects" not in held
         assert RM in held and RM_DASH in held and "view-scans" in held
         action = only_action(db)
@@ -160,20 +160,20 @@ class TestConfigurableRoleList:
         # nothing this restriction took is handed back early.
         assert enforcement.return_roles_outside_the_restriction(db, client, actor=ACTOR) == 0
         # Re-granted directly, a role of the *recorded* list is drift...
-        tenant.role_mappings["user-harsh"].append("view-projects")
+        tenant.role_mappings["user-alice"].append("view-projects")
         outcome = apply(db, client, limit)
         assert [a.kind for a in outcome.reconciled] == [EnforcementKind.REMOVE_USER_ROLES]
-        assert "view-projects" not in tenant.role_mappings["user-harsh"]
+        assert "view-projects" not in tenant.role_mappings["user-alice"]
         # ...one only on the new list is not this restriction's business.
-        assert RM in tenant.role_mappings["user-harsh"]
+        assert RM in tenant.role_mappings["user-alice"]
         held = apply(db, client, limit)
         assert held.reconciled == []
-        assert RM in tenant.role_mappings["user-harsh"]
+        assert RM in tenant.role_mappings["user-alice"]
 
         action = only_action(db)
         assert enforcement.restore_action(db, client, action=action, actor=ACTOR)
         db.commit()
-        held_roles = set(tenant.role_mappings["user-harsh"])
+        held_roles = set(tenant.role_mappings["user-alice"])
         assert {RM_TAB, "view-projects", RM, RM_DASH, "view-scans"} <= held_roles
 
     def test_view_scans_from_an_old_restriction_is_still_returned_once(self, db: Session) -> None:
@@ -196,14 +196,14 @@ class TestConfigurableRoleList:
         ]
         action.undo_snapshot = legacy
         db.commit()
-        tenant.role_mappings["user-harsh"] = ["view-projects"]
+        tenant.role_mappings["user-alice"] = ["view-projects"]
         assert enforcement.return_roles_outside_the_restriction(db, client, actor=ACTOR) == 1
-        assert tenant.role_mappings["user-harsh"] == ["view-projects", "view-scans"]
+        assert tenant.role_mappings["user-alice"] == ["view-projects", "view-scans"]
         # Once only: it is out of the snapshot now.
         assert enforcement.return_roles_outside_the_restriction(db, client, actor=ACTOR) == 0
         enforcement.restore_action(db, client, action=only_action(db), actor=ACTOR)
         db.commit()
-        assert set(tenant.role_mappings["user-harsh"]) == {
+        assert set(tenant.role_mappings["user-alice"]) == {
             "view-projects",
             "view-scans",
             *DEFAULT_AI_ROLE_NAMES,
@@ -236,16 +236,16 @@ class TestRoleSources:
     ) -> None:
         tenant = populated_tenant()
         tenant.add_group(group_id="grp-ai", name="AI Users", roles=[RM])
-        tenant.join_group("user-harsh", "grp-ai")
+        tenant.join_group("user-alice", "grp-ai")
         tenant, client = setup_tenant(db, tenant)
         limit = user_limit(db)
 
         outcome = apply(db, client, limit)
         assert len(outcome.applied) == 1
         # Only the direct mappings are removed; the group is left alone.
-        assert not any(r in tenant.role_mappings["user-harsh"] for r in DEFAULT_AI_ROLE_NAMES)
+        assert not any(r in tenant.role_mappings["user-alice"] for r in DEFAULT_AI_ROLE_NAMES)
         assert tenant.group_role_mappings["grp-ai"] == [RM]
-        assert RM in tenant.effective_roles("user-harsh")
+        assert RM in tenant.effective_roles("user-alice")
         action = only_action(db)
         kept = action.undo_snapshot["kept_effective"]
         assert kept == [
@@ -274,13 +274,13 @@ class TestRoleSources:
         # Restore gives back exactly the direct mappings it took.
         enforcement.restore_action(db, client, action=only_action(db), actor=ACTOR)
         db.commit()
-        assert all(r in tenant.role_mappings["user-harsh"] for r in DEFAULT_AI_ROLE_NAMES)
+        assert all(r in tenant.role_mappings["user-alice"] for r in DEFAULT_AI_ROLE_NAMES)
 
     def test_a_role_held_through_a_parent_group(self, db: Session) -> None:
         tenant = populated_tenant()
         tenant.add_group(group_id="grp-parent", name="Engineering", roles=[RM_DASH])
         tenant.add_group(group_id="grp-child", name="Backend", path="/Engineering/Backend")
-        tenant.join_group("user-harsh", "grp-child")
+        tenant.join_group("user-alice", "grp-child")
         tenant, client = setup_tenant(db, tenant)
         apply(db, client, user_limit(db))
         kept = role_sources.kept_from_entries(only_action(db).undo_snapshot["kept_effective"])
@@ -291,11 +291,11 @@ class TestRoleSources:
     def test_a_role_held_through_a_composite_role(self, db: Session) -> None:
         tenant = populated_tenant()
         tenant.add_client_role("ai-bundle", contains=["view-projects", RM_TAB])
-        tenant.role_mappings["user-harsh"].append("ai-bundle")
+        tenant.role_mappings["user-alice"].append("ai-bundle")
         tenant, client = setup_tenant(db, tenant)
         limit = user_limit(db)
         apply(db, client, limit)
-        assert "ai-bundle" in tenant.role_mappings["user-harsh"]  # composites untouched
+        assert "ai-bundle" in tenant.role_mappings["user-alice"]  # composites untouched
         kept = role_sources.kept_from_entries(only_action(db).undo_snapshot["kept_effective"])
         assert list(kept) == [RM_TAB]
         assert kept[RM_TAB][0].describe() == "role ai-bundle"
@@ -308,7 +308,7 @@ class TestRoleSources:
         tenant = populated_tenant()
         tenant.add_client_role("ai-bundle", contains=[RM])
         tenant.add_group(group_id="grp-ai", name="AI Users", roles=["ai-bundle"])
-        tenant.join_group("user-harsh", "grp-ai")
+        tenant.join_group("user-alice", "grp-ai")
         tenant, client = setup_tenant(db, tenant)
         apply(db, client, user_limit(db))
         kept = role_sources.kept_from_entries(only_action(db).undo_snapshot["kept_effective"])
@@ -335,10 +335,10 @@ class TestRoleSources:
         tenant.fail_requests[("GET", "/role-mappings/clients/" + tenant_uuid() + "/composite")] = (
             403
         )
-        tenant.fail_requests[("GET", "/users/user-harsh/groups")] = 403
+        tenant.fail_requests[("GET", "/users/user-alice/groups")] = 403
         outcome = apply(db, client, user_limit(db))
         assert len(outcome.applied) == 1 and outcome.failed == []
-        assert not any(r in tenant.role_mappings["user-harsh"] for r in DEFAULT_AI_ROLE_NAMES)
+        assert not any(r in tenant.role_mappings["user-alice"] for r in DEFAULT_AI_ROLE_NAMES)
         snapshot = only_action(db).undo_snapshot
         assert "the user's effective roles" in snapshot["role_sources_unread"]
         assert "the user's groups" in snapshot["role_sources_unread"]
@@ -351,7 +351,7 @@ class TestRoleSources:
     ) -> None:
         tenant = populated_tenant()
         tenant.add_group(group_id="grp-ai", name="AI Users", roles=[RM])
-        tenant.join_group("user-harsh", "grp-ai")
+        tenant.join_group("user-alice", "grp-ai")
         tenant, client = setup_tenant(db, tenant)
         tenant.fail_requests[("GET", "/groups/grp-ai/role-mappings/")] = 404
         limit = user_limit(db)
@@ -433,14 +433,14 @@ class TestSimulation:
         tenant.add_client_role(
             "ai-bundle", contains=["view-projects", RM_DASH], description="AI power users"
         )
-        tenant.role_mappings["user-harsh"].append("ai-bundle")
+        tenant.role_mappings["user-alice"].append("ai-bundle")
         tenant.add_group(group_id="grp-ai", name="AI Users", roles=[RM])
-        tenant.join_group("user-harsh", "grp-ai")
+        tenant.join_group("user-alice", "grp-ai")
         tenant, client = setup_tenant(db, tenant)
         set_ai_roles(db, [*DEFAULT_AI_ROLE_NAMES, "ai-bundle"])
 
         blast = preview_service.blast_radius(
-            db, entity_type=EntityType.USER, entity_id="user-harsh", client=client
+            db, entity_type=EntityType.USER, entity_id="user-alice", client=client
         )
         assert blast.ai_roles == [*DEFAULT_AI_ROLE_NAMES, "ai-bundle"]
         [user] = blast.user_roles
@@ -460,7 +460,7 @@ class TestSimulation:
     def test_without_a_client_the_roles_are_not_read(self, db: Session) -> None:
         setup_tenant(db)
         blast = preview_service.blast_radius(
-            db, entity_type=EntityType.USER, entity_id="user-harsh"
+            db, entity_type=EntityType.USER, entity_id="user-alice"
         )
         [user] = blast.user_roles
         assert user.read is False
@@ -470,10 +470,10 @@ class TestSimulation:
         tenant, client = setup_tenant(db)
         roles = preview_service.RolePreviewer(db, client, max_users=1)
         first = preview_service.blast_radius(
-            db, entity_type=EntityType.USER, entity_id="user-harsh", roles=roles
+            db, entity_type=EntityType.USER, entity_id="user-alice", roles=roles
         )
         second = preview_service.blast_radius(
-            db, entity_type=EntityType.USER, entity_id="user-sean", roles=roles
+            db, entity_type=EntityType.USER, entity_id="user-bob", roles=roles
         )
         assert first.user_roles[0].read is True
         assert second.user_roles[0].read is False
@@ -486,7 +486,7 @@ class TestSimulation:
     ) -> None:
         tenant = populated_tenant()
         tenant.add_group(group_id="grp-ai", name="AI Users", roles=[RM])
-        tenant.join_group("user-harsh", "grp-ai")
+        tenant.join_group("user-alice", "grp-ai")
         tenant, client = setup_tenant(db, tenant)
         connection_service.save_connection(
             db, api_key=make_api_key(tenant="acme-corp"), actor=ACTOR
@@ -494,7 +494,7 @@ class TestSimulation:
         db.commit()
         monkeypatch.setattr(connection_service, "get_client", lambda _s: tenant.client())
         response = admin_client.get(
-            "/api/preview/blast-radius", params={"entity_type": "user", "entity_id": "user-harsh"}
+            "/api/preview/blast-radius", params={"entity_type": "user", "entity_id": "user-alice"}
         )
         assert response.status_code == 200
         body = response.json()
@@ -719,7 +719,7 @@ class TestNoWriteLockAcrossCalls:
 
         tenant = populated_tenant()
         tenant.add_group(group_id="grp-ai", name="AI Users", roles=[RM])
-        tenant.join_group("user-harsh", "grp-ai")
+        tenant.join_group("user-alice", "grp-ai")
         tenant, client = setup_tenant(db, tenant)
         limit = user_limit(db)
         held = _watch_for_write_locks(tenant)
@@ -884,7 +884,7 @@ class TestPreviewAccess:
     ) -> None:
         tenant = populated_tenant()
         tenant.add_group(group_id="grp-secret", name="Secret Team", roles=[RM])
-        tenant.join_group("user-harsh", "grp-secret")
+        tenant.join_group("user-alice", "grp-secret")
         tenant, _client = setup_tenant(db, tenant)
         connect(db, monkeypatch, tenant)
         built: list[object] = []
@@ -894,7 +894,7 @@ class TestPreviewAccess:
         )
         before = len(tenant.requests)
         response = viewer_client.get(
-            "/api/preview/blast-radius", params={"entity_type": "user", "entity_id": "user-harsh"}
+            "/api/preview/blast-radius", params={"entity_type": "user", "entity_id": "user-alice"}
         )
         assert response.status_code == 200
         [user] = response.json()["user_roles"]
@@ -912,11 +912,11 @@ class TestPreviewAccess:
     ) -> None:
         tenant = populated_tenant()
         tenant.add_group(group_id="grp-secret", name="Secret Team", roles=[RM])
-        tenant.join_group("user-harsh", "grp-secret")
+        tenant.join_group("user-alice", "grp-secret")
         tenant, _client = setup_tenant(db, tenant)
         connect(db, monkeypatch, tenant)
         response = admin_client.get(
-            "/api/preview/blast-radius", params={"entity_type": "user", "entity_id": "user-harsh"}
+            "/api/preview/blast-radius", params={"entity_type": "user", "entity_id": "user-alice"}
         )
         assert response.json()["user_roles"][0]["kept"] == [
             {"name": RM, "sources": ["group /Secret Team"]}
@@ -931,7 +931,7 @@ class TestPreviewBudget:
         tenant.fail_requests[("GET", "/auth/admin/")] = 503
         before = len(tenant.requests)
         roles = preview_service.RolePreviewer(db, client)
-        users = [roles.user(uid, uid) for uid in ("user-harsh", "user-sean")]
+        users = [roles.user(uid, uid) for uid in ("user-alice", "user-bob")]
         assert len(tenant.requests) - before <= 1
         assert slept == []
         for user in users:
@@ -942,7 +942,7 @@ class TestPreviewBudget:
         tenant, client = setup_tenant(db)
         before = len(tenant.requests)
         roles = preview_service.RolePreviewer(db, client, budget_seconds=0)
-        user = roles.user("user-harsh", "Harsh")
+        user = roles.user("user-alice", "Alice")
         assert user.read is False
         assert "ran out" in (user.note or "")
         assert len(tenant.requests) == before
@@ -954,46 +954,46 @@ class TestPreviewBudget:
         tenant, client = setup_tenant(db)
         slept: list[float] = []
         client._sleep = lambda seconds: slept.append(seconds)
-        tenant.fail_requests[("GET", "/users/user-harsh/groups")] = 503
-        before = requests(tenant, "GET", "/users/user-harsh/groups")
+        tenant.fail_requests[("GET", "/users/user-alice/groups")] = 503
+        before = requests(tenant, "GET", "/users/user-alice/groups")
         with single_attempt(2.0), pytest.raises(CheckmarxUnavailableError):
-            iam.fetch_user_groups(client, user_id="user-harsh")
-        assert requests(tenant, "GET", "/users/user-harsh/groups") == before + 1
+            iam.fetch_user_groups(client, user_id="user-alice")
+        assert requests(tenant, "GET", "/users/user-alice/groups") == before + 1
         assert slept == []
         # Outside it (enforcement), the full retry policy is unchanged.
         with pytest.raises(CheckmarxUnavailableError):
-            iam.fetch_user_groups(client, user_id="user-harsh")
-        assert requests(tenant, "GET", "/users/user-harsh/groups") > before + 2
+            iam.fetch_user_groups(client, user_id="user-alice")
+        assert requests(tenant, "GET", "/users/user-alice/groups") > before + 2
         assert slept
 
     def test_a_failed_client_lookup_is_not_repeated_per_user(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
         tenant.fail_requests[("GET", f"/auth/admin/realms/{tenant_name()}/clients")] = 403
         roles = preview_service.RolePreviewer(db, client)
-        roles.user("user-harsh", None)
+        roles.user("user-alice", None)
         after_first = requests(tenant, "GET", "/clients")
-        second = roles.user("user-sean", None)
+        second = roles.user("user-bob", None)
         assert requests(tenant, "GET", "/clients") == after_first
         assert second.read is True and "the user's effective roles" in second.unread
 
     def test_readings_are_reused_briefly_across_requests(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
-        first = preview_service.RolePreviewer(db, client).user("user-harsh", "Harsh")
+        first = preview_service.RolePreviewer(db, client).user("user-alice", "Alice")
         assert first.read is True
         before = len(tenant.requests)
-        again = preview_service.RolePreviewer(db, client).user("user-harsh", "Harsh G.")
+        again = preview_service.RolePreviewer(db, client).user("user-alice", "Alice G.")
         assert len(tenant.requests) == before
-        assert again.read is True and again.user_label == "Harsh G."
+        assert again.read is True and again.user_label == "Alice G."
         # A connection change drops them.
         connection_service.reset_client_cache()
-        preview_service.RolePreviewer(db, client).user("user-harsh", "Harsh")
+        preview_service.RolePreviewer(db, client).user("user-alice", "Alice")
         assert len(tenant.requests) > before
 
     def test_an_already_restricted_user_is_not_read_again(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
         apply(db, client, user_limit(db))
         before = len(tenant.requests)
-        user = preview_service.RolePreviewer(db, client).user("user-harsh", "Harsh")
+        user = preview_service.RolePreviewer(db, client).user("user-alice", "Alice")
         assert len(tenant.requests) == before
         assert user.read is False and user.already_restricted is True
         assert "Already restricted" in (user.note or "")
@@ -1030,7 +1030,7 @@ class TestRoleSourceAccuracy:
 
         tenant = populated_tenant()
         tenant.add_group(group_id="grp-ai", name="AI Users", roles=[RM])
-        tenant.join_group("user-harsh", "grp-ai")
+        tenant.join_group("user-alice", "grp-ai")
         tenant, client = setup_tenant(db, tenant)
         real = iam.fetch_user_effective_client_roles
         calls = {"n": 0}
@@ -1056,7 +1056,7 @@ class TestRoleSourceAccuracy:
         real = tenant.effective_roles
 
         def with_hidden(user_id: str) -> set[str]:
-            return real(user_id) | ({RM} if user_id == "user-harsh" else set())
+            return real(user_id) | ({RM} if user_id == "user-alice" else set())
 
         monkeypatch.setattr(tenant, "effective_roles", with_hidden)
         limit = user_limit(db)
@@ -1075,10 +1075,10 @@ class TestRoleSourceAccuracy:
         tenant = populated_tenant()
         for i in range(role_sources.MAX_GROUPS_PER_USER + 10):
             tenant.add_group(group_id=f"g{i}", name=f"G{i}", roles=[])
-            tenant.join_group("user-harsh", f"g{i}")
+            tenant.join_group("user-alice", f"g{i}")
         tenant, client = setup_tenant(db, tenant)
         found = enforcement.RoleResolver(client).sources.read_user(
-            "user-harsh", ai_roles=DEFAULT_AI_ROLE_NAMES
+            "user-alice", ai_roles=DEFAULT_AI_ROLE_NAMES
         )
         [note] = [u for u in found.unread if "group" in u]
         assert f"beyond the first {role_sources.MAX_GROUPS_PER_USER}" in note
@@ -1090,10 +1090,10 @@ class TestRoleSourceAccuracy:
         for level in range(depth):
             tenant.add_client_role(f"nest-{level}", contains=[f"nest-{level + 1}"])
         tenant.add_client_role(f"nest-{depth}", contains=[RM])
-        tenant.role_mappings["user-harsh"].append("nest-0")
+        tenant.role_mappings["user-alice"].append("nest-0")
         tenant, client = setup_tenant(db, tenant)
         found = enforcement.RoleResolver(client).sources.read_user(
-            "user-harsh", ai_roles=DEFAULT_AI_ROLE_NAMES
+            "user-alice", ai_roles=DEFAULT_AI_ROLE_NAMES
         )
         assert any("nest-0" in u and "levels deep" in u for u in found.unread), found.unread
 
@@ -1102,7 +1102,7 @@ class TestRoleSourceAccuracy:
     ) -> None:
         tenant = populated_tenant()
         tenant.add_client_role("ext-bundle", contains=[])
-        tenant.role_mappings["user-harsh"].append("ext-bundle")
+        tenant.role_mappings["user-alice"].append("ext-bundle")
         tenant, client = setup_tenant(db, tenant)
         real = iam.fetch_client_role_composites
 
@@ -1116,7 +1116,7 @@ class TestRoleSourceAccuracy:
 
         monkeypatch.setattr(iam, "fetch_client_role_composites", other_client)
         found = enforcement.RoleResolver(client).sources.read_user(
-            "user-harsh", ai_roles=DEFAULT_AI_ROLE_NAMES
+            "user-alice", ai_roles=DEFAULT_AI_ROLE_NAMES
         )
         assert found.indirect == {}
 
@@ -1124,12 +1124,12 @@ class TestRoleSourceAccuracy:
         tenant, client = setup_tenant(db)
         key_permissions.discard_pending_denials()
         tenant.fail_requests[("GET", f"/clients/{tenant_uuid()}/roles")] = 403
-        preview_service.RolePreviewer(db, client).user("user-harsh", None)
+        preview_service.RolePreviewer(db, client).user("user-alice", None)
         assert key_permissions.pending_denials() >= 1
         key_permissions.discard_pending_denials()
         # The optional source reads stay off it.
         tenant.fail_requests.clear()
-        tenant.fail_requests[("GET", "/users/user-harsh/groups")] = 403
+        tenant.fail_requests[("GET", "/users/user-alice/groups")] = 403
         preview_service.reset_role_cache()
-        preview_service.RolePreviewer(db, client).user("user-harsh", None)
+        preview_service.RolePreviewer(db, client).user("user-alice", None)
         assert key_permissions.pending_denials() == 0

@@ -559,7 +559,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
       <h2>Attribution &amp; disputes</h2>
       <p>
         The consumption feed identifies users inconsistently: some rows carry a clean email, some a
-        display name, some a service-style handle like <code>cx-ryan-wakeham</code>. Attribution runs
+        display name, some a service-style handle like <code>cx-dave-dawson</code>. Attribution runs
         in two stages so credits reach the right person's budget.
       </p>
       <h3>Stage 1 — exact match</h3>
@@ -567,9 +567,9 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
       <h3>Stage 2 — similarity, for the messy tail</h3>
       <p>
         A handle the exact ladder can't place is normalised to a <em>token set</em> — the <code>cx-</code>
-        prefix stripped, an email reduced to its local part — so <code>cx-ryan-wakeham</code>,
-        <code>Ryan Wakeham</code> and <code>ryan.wakeham@checkmarx.com</code> all reduce to
-        <code>{ryan, wakeham}</code> and score against every synced user. The score, kept deliberately
+        prefix stripped, an email reduced to its local part — so <code>cx-dave-dawson</code>,
+        <code>Dave Dawson</code> and <code>dave.dawson@example.com</code> all reduce to
+        <code>{dave, dawson}</code> and score against every synced user. The score, kept deliberately
         conservative because a wrong match bills the wrong person, decides the outcome:
       </p>
       <div class="tablewrap"><table>

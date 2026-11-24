@@ -15,9 +15,9 @@ from tests.fake_tenant import FakeTenant
 REAL_SAMPLE = {
     "items": [
         {
-            "name": "Aslesha Nargolkar",
-            "email": "aslesha.nargolkar@checkmarx.com",
-            "userEmail": "aslesha.nargolkar@checkmarx.com",
+            "name": "Erin Ellis",
+            "email": "erin.ellis@example.com",
+            "userEmail": "erin.ellis@example.com",
             "creditsUsed": 1,
             "percentOfTotal": 0.1,
             "actionsPerformed": {
@@ -26,7 +26,7 @@ REAL_SAMPLE = {
             },
         },
         {
-            "name": "Aaron Zhou",
+            "name": "Felix Fisher",
             "creditsUsed": 1,
             "percentOfTotal": 0.1,
             "actionsPerformed": {
@@ -35,7 +35,7 @@ REAL_SAMPLE = {
             },
         },
         {
-            "name": "jonathan.davis@checkmarx.com",
+            "name": "grace.green@example.com",
             "creditsUsed": 1,
             "percentOfTotal": 0.1,
             "actionsPerformed": {
@@ -44,9 +44,9 @@ REAL_SAMPLE = {
             },
         },
         {
-            "name": "Harsh Gokani",
-            "email": "harsh.gokani@checkmarx.com",
-            "userEmail": "harsh.gokani@checkmarx.com",
+            "name": "Alice Archer",
+            "email": "alice.archer@example.com",
+            "userEmail": "alice.archer@example.com",
             "creditsUsed": 3,
             "percentOfTotal": 0.3,
             "actionsPerformed": {
@@ -55,7 +55,7 @@ REAL_SAMPLE = {
             },
         },
         {
-            "name": "Matthew Torkington",
+            "name": "Matthew Ingram",
             "creditsUsed": 4,
             "percentOfTotal": 0.39,
             "actionsPerformed": {
@@ -84,20 +84,20 @@ class TestParsePage:
     def test_email_fields_are_preferred_for_the_subject_key(self) -> None:
         page = usage.parse_usage_page(REAL_SAMPLE)
         item = page.items[0]
-        assert item.subject_key == "aslesha.nargolkar@checkmarx.com"
-        assert item.subject_name == "Aslesha Nargolkar"
-        assert item.subject_email == "aslesha.nargolkar@checkmarx.com"
+        assert item.subject_key == "erin.ellis@example.com"
+        assert item.subject_name == "Erin Ellis"
+        assert item.subject_email == "erin.ellis@example.com"
 
     def test_display_name_only_rows_key_on_the_name(self) -> None:
         item = usage.parse_usage_page(REAL_SAMPLE).items[1]
-        assert item.subject_key == "aaron zhou"
+        assert item.subject_key == "felix fisher"
         assert item.subject_email is None
 
     def test_an_email_in_the_name_field_is_treated_as_an_email(self) -> None:
         """Several real rows carry the address in name and no email field."""
         item = usage.parse_usage_page(REAL_SAMPLE).items[2]
-        assert item.subject_key == "jonathan.davis@checkmarx.com"
-        assert item.subject_email == "jonathan.davis@checkmarx.com"
+        assert item.subject_key == "grace.green@example.com"
+        assert item.subject_email == "grace.green@example.com"
 
     def test_credits_are_decimal_not_float(self) -> None:
         item = usage.parse_usage_page(REAL_SAMPLE).items[3]
@@ -119,7 +119,7 @@ class TestParsePage:
         assert usage.parse_usage_page(REAL_SAMPLE).items[4].percent_of_total == 0.39
 
     def test_raw_row_is_retained_for_audit(self) -> None:
-        assert usage.parse_usage_page(REAL_SAMPLE).items[0].raw["name"] == "Aslesha Nargolkar"
+        assert usage.parse_usage_page(REAL_SAMPLE).items[0].raw["name"] == "Erin Ellis"
 
 
 class TestParseEdgeCases:

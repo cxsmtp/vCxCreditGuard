@@ -4,13 +4,13 @@ The consumption feed identifies a user by whatever string the action was
 reported under. Most rows carry a clean email or display name that the exact
 ladder in :mod:`app.services.ingestion` resolves. What is left over is the messy
 tail the exact ladder cannot touch: service-style handles such as
-``cx-ryan-wakeham`` for *Ryan Wakeham*, a bare email local part, a first name on
+``cx-dave-dawson`` for *Dave Dawson*, a bare email local part, a first name on
 its own, or a small typo. Left unmatched these credits count towards nobody's
 limit, which is exactly the usage a limit is meant to catch.
 
 This module turns both sides into a normalised *token set* and scores them, so
-``cx-ryan-wakeham`` and ``ryan.wakeham@checkmarx.com`` land on the same
-``{ryan, wakeham}`` and match at full confidence. The score drives a three-way
+``cx-dave-dawson`` and ``dave.dawson@example.com`` land on the same
+``{dave, dawson}`` and match at full confidence. The score drives a three-way
 decision, deliberately conservative because a wrong auto-match silently bills the
 wrong person:
 
@@ -43,7 +43,7 @@ AMBIGUITY_MARGIN = 0.05
 MAX_SUGGESTIONS = 5
 
 # Leading connector prefixes stripped from a handle before comparison, so
-# ``cx-ryan-wakeham`` compares as ``ryan wakeham``.
+# ``cx-dave-dawson`` compares as ``dave dawson``.
 _PREFIX_TOKENS = frozenset({"cx", "svc", "srv"})
 
 # Handles that are automation rather than people. Matched exactly (or on the
@@ -137,8 +137,8 @@ def tokenize(*values: str | None) -> frozenset[str]:
     """Turn one or more identity strings into a comparable token set.
 
     Drops a leading connector prefix (``cx``) and single-character noise, so
-    ``cx-ryan-wakeham``, ``Ryan Wakeham`` and ``ryan.wakeham@checkmarx.com`` all
-    reduce to ``{ryan, wakeham}``.
+    ``cx-dave-dawson``, ``Dave Dawson`` and ``dave.dawson@example.com`` all
+    reduce to ``{dave, dawson}``.
     """
     collected: set[str] = set()
     for value in values:
@@ -192,8 +192,8 @@ def is_integration_identity(name: str | None, email: str | None) -> bool:
 def similarity(a: frozenset[str], b: frozenset[str]) -> float:
     """Similarity of two token sets in ``[0, 1]``.
 
-    Blends token overlap (order-independent, so "Wakeham Ryan" matches "Ryan
-    Wakeham") with a character-level ratio that rescues typos and nicknames
+    Blends token overlap (order-independent, so "Dawson Dave" matches "Dave
+    Dawson") with a character-level ratio that rescues typos and nicknames
     ("mathew" vs "matthew"). The larger of the two wins, so either signal alone
     is enough.
     """

@@ -481,16 +481,16 @@ The listing needs read access to scans (`GET /api/scans/`) for the API key.
 The consumption feed identifies users by display name and email, not by id, and
 inconsistently: some rows carry `email` and `userEmail`, some carry an address in
 `name`, some carry only a display name, and some carry a service-style handle like
-`cx-ryan-wakeham`. Attribution happens in two stages.
+`cx-dave-dawson`. Attribution happens in two stages.
 
 **Exact ladder first.** Email, then an email found in `name`, then username, then
-unambiguous full name. Two people called "Sean Casey" never share a budget: an
+unambiguous full name. Two people called "Bob Baker" never share a budget: an
 ambiguous full name is not matched.
 
 **Similarity for the tail** (`services/subject_matching.py`). A handle the ladder
 cannot place is normalised to a token set — the `cx-` prefix stripped, an email
-reduced to its local part — so `cx-ryan-wakeham`, `Ryan Wakeham` and
-`ryan.wakeham@checkmarx.com` all reduce to `{ryan, wakeham}` and score against
+reduced to its local part — so `cx-dave-dawson`, `Dave Dawson` and
+`dave.dawson@example.com` all reduce to `{dave, dawson}` and score against
 every synced user. The score, deliberately conservative because a wrong match
 bills the wrong person, decides:
 
@@ -2160,7 +2160,7 @@ Run the diagnostic. It answers the question directly and touches nothing:
 
 ```sh
 cd backend
-python -m scripts.diagnose_usage --project "singakash/CxHybrid"
+python -m scripts.diagnose_usage --project "carolorg/CxHybrid"
 python -m scripts.diagnose_usage --user "someone@example.com"
 ```
 

@@ -31,7 +31,7 @@ def test_syncs_every_entity_type(db: Session) -> None:
     assert result.groups == 2
     assert result.projects == 3
     assert result.applications == 1
-    assert db.scalar(select(CxUser).where(CxUser.id == "user-harsh")) is not None
+    assert db.scalar(select(CxUser).where(CxUser.id == "user-alice")) is not None
 
 
 def test_user_fields_are_stored(db: Session) -> None:
@@ -39,11 +39,11 @@ def test_user_fields_are_stored(db: Session) -> None:
     org_sync.sync_org_model(db, tenant.client())
     db.commit()
 
-    user = db.get(CxUser, "user-harsh")
+    user = db.get(CxUser, "user-alice")
     assert user is not None
-    assert user.username == "harsh.gokani@checkmarx.com"
-    assert user.email == "harsh.gokani@checkmarx.com"
-    assert user.display_name == "Harsh Gokani"
+    assert user.username == "alice.archer@example.com"
+    assert user.email == "alice.archer@example.com"
+    assert user.display_name == "Alice Archer"
     assert user.auth_provider == "saml"
     assert "view-risk-management" in (user.role_names or [])
     assert user.group_names == ["AA-Platform"]
@@ -64,11 +64,11 @@ def test_group_membership_is_resolved_from_names_to_ids(db: Session) -> None:
     db.commit()
 
     memberships = {(row.group_id, row.user_id) for row in db.scalars(select(CxGroupMembership))}
-    assert ("grp-platform", "user-harsh") in memberships
-    assert ("grp-payments", "user-sean") in memberships
+    assert ("grp-platform", "user-alice") in memberships
+    assert ("grp-payments", "user-bob") in memberships
     # A user in two groups gets two rows.
-    assert ("grp-platform", "user-akash") in memberships
-    assert ("grp-payments", "user-akash") in memberships
+    assert ("grp-platform", "user-carol") in memberships
+    assert ("grp-payments", "user-carol") in memberships
 
 
 def test_duplicate_group_names_are_reported_not_guessed(db: Session) -> None:
@@ -162,7 +162,7 @@ def test_repo_id_is_captured_when_the_payload_carries_it(db: Session) -> None:
 def test_integer_repo_id_is_captured_and_normalised(db: Session) -> None:
     """Checkmarx reports repoId as an integer; it must still be captured."""
     tenant = FakeTenant()
-    tenant.add_project(project_id="proj-api", name="singakash/CxHybrid", repo_id=228481)
+    tenant.add_project(project_id="proj-api", name="carolorg/CxHybrid", repo_id=228481)
     org_sync.sync_org_model(db, tenant.client())
     db.commit()
     # Normalised to a string so it can be stored and used in the repos-manager URL.
@@ -213,14 +213,14 @@ def test_memberships_are_rebuilt_so_removals_take_effect(db: Session) -> None:
     db.commit()
 
     for user in tenant.users:
-        if user["id"] == "user-akash":
+        if user["id"] == "user-carol":
             user["groups"] = ["AA-Platform"]
     org_sync.sync_org_model(db, tenant.client())
     db.commit()
 
     memberships = {(row.group_id, row.user_id) for row in db.scalars(select(CxGroupMembership))}
-    assert ("grp-payments", "user-akash") not in memberships
-    assert ("grp-platform", "user-akash") in memberships
+    assert ("grp-payments", "user-carol") not in memberships
+    assert ("grp-platform", "user-carol") in memberships
 
 
 def test_application_links_to_invisible_projects_are_warned_about(db: Session) -> None:
@@ -294,10 +294,10 @@ def test_groups_refused_memberships_resolve_to_the_stored_group_ids(
     db.commit()
     assert result.memberships == len(before)
     assert before == {
-        ("grp-platform", "user-harsh"),
-        ("grp-payments", "user-sean"),
-        ("grp-platform", "user-akash"),
-        ("grp-payments", "user-akash"),
+        ("grp-platform", "user-alice"),
+        ("grp-payments", "user-bob"),
+        ("grp-platform", "user-carol"),
+        ("grp-payments", "user-carol"),
     }
     assert _memberships(db) == before
     # The groups are kept as synced, not soft deleted.
@@ -309,12 +309,12 @@ def test_sync_heals_once_groups_can_be_read_again(db: Session, quiet_listeners: 
     org_sync.sync_org_model(db, tenant.client())
     db.commit()
     # In Checkmarx: Payments is deleted and a new group takes its name, and a
-    # new group appears that Sean joins.
+    # new group appears that Bob joins.
     tenant.groups[:] = [group for group in tenant.groups if group["id"] != "grp-payments"]
     tenant.add_group(group_id="grp-new", name="Payments")
     tenant.add_group(group_id="grp-ops", name="Ops")
     for user in tenant.users:
-        if user["id"] == "user-sean":
+        if user["id"] == "user-bob":
             user["groups"] = ["Payments", "Ops"]
 
     tenant.fail_requests[("GET", "/groups")] = 403
@@ -323,7 +323,7 @@ def test_sync_heals_once_groups_can_be_read_again(db: Session, quiet_listeners: 
     # Known edge case while groups cannot be read: the reused name resolves to
     # the group stored under it before, and the unknown group is not invented.
     memberships = _memberships(db)
-    assert ("grp-payments", "user-sean") in memberships
+    assert ("grp-payments", "user-bob") in memberships
     assert not any(group == "grp-ops" for group, _user in memberships)
 
     tenant.fail_requests.clear()
@@ -331,8 +331,8 @@ def test_sync_heals_once_groups_can_be_read_again(db: Session, quiet_listeners: 
     db.commit()
     memberships = _memberships(db)
     assert not any(group == "grp-payments" for group, _user in memberships)
-    assert ("grp-new", "user-sean") in memberships
-    assert ("grp-ops", "user-sean") in memberships
+    assert ("grp-new", "user-bob") in memberships
+    assert ("grp-ops", "user-bob") in memberships
     assert db.get(CxGroup, "grp-payments").is_deleted
 
 

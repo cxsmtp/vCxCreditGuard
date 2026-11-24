@@ -46,12 +46,12 @@ class TestSelfServiceGating:
     ) -> None:
         response = admin_client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 500},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 500},
         )
         assert response.status_code == httpx.codes.CREATED, response.text
         body = response.json()
         assert body["status"] == "pending"
-        assert body["entity_label"] == "Harsh Gokani"
+        assert body["entity_label"] == "Alice Archer"
         assert body["requested_by_name"] == "admin"
 
     def test_viewer_is_blocked_when_self_service_is_off(
@@ -59,7 +59,7 @@ class TestSelfServiceGating:
     ) -> None:
         response = viewer_client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 500},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 500},
         )
         assert response.status_code == httpx.codes.FORBIDDEN
         assert response.json()["detail"]["code"] == "self_service_disabled"
@@ -80,7 +80,7 @@ class TestSelfServiceGating:
         login(client, "viewer", VIEWER_PASSWORD)
         response = client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 500},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 500},
         )
         assert response.status_code == httpx.codes.CREATED, response.text
         assert response.json()["requested_by_name"] == "viewer"
@@ -116,7 +116,7 @@ class TestListVisibility:
         _enable_self_service(client)
         admin_client_resp = client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 100},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 100},
         )
         assert admin_client_resp.status_code == httpx.codes.CREATED
         client.post("/api/auth/logout")
@@ -124,7 +124,7 @@ class TestListVisibility:
         login(client, "viewer", VIEWER_PASSWORD)
         client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-akash", "requested_limit": 200},
+            json={"entity_type": "user", "entity_id": "user-carol", "requested_limit": 200},
         )
         mine = client.get("/api/requests").json()
         assert len(mine) == 1
@@ -142,7 +142,7 @@ class TestApproval:
     ) -> None:
         created = admin_client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 500},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 500},
         ).json()
 
         response = admin_client.post(f"/api/requests/{created['id']}/approve", json={})
@@ -155,7 +155,7 @@ class TestApproval:
 
         limit = db.scalar(
             select(CreditLimit).where(
-                CreditLimit.entity_type == "user", CreditLimit.entity_id == "user-harsh"
+                CreditLimit.entity_type == "user", CreditLimit.entity_id == "user-alice"
             )
         )
         assert limit is not None
@@ -169,11 +169,11 @@ class TestApproval:
         # Seed an existing limit, then request more and approve part of it.
         admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 100},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 100},
         )
         created = admin_client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 1000},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 1000},
         ).json()
 
         response = admin_client.post(
@@ -183,13 +183,13 @@ class TestApproval:
         assert body["approved_limit"] == 300
         assert body["previous_limit"] == 100
 
-        limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh"))
+        limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice"))
         assert limit.credit_limit == 300
 
     def test_denying_records_the_reason(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         created = admin_client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 500},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 500},
         ).json()
         response = admin_client.post(
             f"/api/requests/{created['id']}/deny", json={"note": "Budget is frozen this quarter."}
@@ -204,7 +204,7 @@ class TestApproval:
     ) -> None:
         created = admin_client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 500},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 500},
         ).json()
         admin_client.post(f"/api/requests/{created['id']}/approve", json={})
         again = admin_client.post(f"/api/requests/{created['id']}/deny", json={})
@@ -216,7 +216,7 @@ class TestApproval:
     ) -> None:
         created = admin_client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 500},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 500},
         ).json()
         response = admin_client.post(
             f"/api/requests/{created['id']}/approve",
@@ -237,7 +237,7 @@ class TestApproval:
         login(client, "admin", ADMIN_PASSWORD)
         created = client.post(
             "/api/requests",
-            json={"entity_type": "user", "entity_id": "user-harsh", "requested_limit": 500},
+            json={"entity_type": "user", "entity_id": "user-alice", "requested_limit": 500},
         ).json()
         client.post("/api/auth/logout")
 
@@ -257,7 +257,7 @@ class TestTemporaryGrantRollback:
                 db,
                 data=limits_service.LimitInput(
                     entity_type=EntityType.USER,
-                    entity_id="user-harsh",
+                    entity_id="user-alice",
                     credit_limit=previous,
                     period_type="monthly",
                 ),
@@ -266,7 +266,7 @@ class TestTemporaryGrantRollback:
         request = requests_service.create_request(
             db,
             data=requests_service.RequestInput(
-                entity_type=EntityType.USER, entity_id="user-harsh", requested_limit=granted
+                entity_type=EntityType.USER, entity_id="user-alice", requested_limit=granted
             ),
             actor=ACTOR,
         )
@@ -286,7 +286,7 @@ class TestTemporaryGrantRollback:
         reverted = requests_service.revert_expired_grants(db, now=utcnow() + timedelta(hours=2))
         db.commit()
         assert reverted == 1
-        assert db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh")) is None
+        assert db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice")) is None
         assert db.get(CreditRequest, request.id).reverted is True
 
     def test_expired_grant_restores_the_previous_budget(
@@ -295,7 +295,7 @@ class TestTemporaryGrantRollback:
         self._make_approved_request(db, previous=100, granted=500, expires_in_hours=1)
         requests_service.revert_expired_grants(db, now=utcnow() + timedelta(hours=2))
         db.commit()
-        limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh"))
+        limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice"))
         assert limit is not None
         assert limit.credit_limit == 100
 
@@ -304,7 +304,7 @@ class TestTemporaryGrantRollback:
 
         self._make_approved_request(db, previous=100, granted=500, expires_in_hours=1)
         # An admin changes the limit after the grant; the expiry must not undo it.
-        limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh"))
+        limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice"))
         limits_service.update_limit(db, limit=limit, changes={"credit_limit": 750}, actor=ACTOR)
         db.commit()
 
@@ -312,7 +312,7 @@ class TestTemporaryGrantRollback:
         db.commit()
         assert reverted == 0
         assert (
-            db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh")).credit_limit
+            db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice")).credit_limit
             == 750
         )
 
@@ -325,14 +325,14 @@ class TestTemporaryGrantRollback:
         from app.services import limits_service
 
         self._make_approved_request(db, previous=None, granted=500, expires_in_hours=1)
-        limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh"))
+        limit = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice"))
         limits_service.update_limit(db, limit=limit, changes={"credit_limit": 500}, actor=ACTOR)
         db.commit()
 
         reverted = requests_service.revert_expired_grants(db, now=utcnow() + timedelta(hours=2))
         db.commit()
         assert reverted == 0
-        surviving = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh"))
+        surviving = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice"))
         assert surviving is not None and surviving.credit_limit == 500
 
     def test_overlapping_grants_chain_the_rollback_baseline(
@@ -345,7 +345,7 @@ class TestTemporaryGrantRollback:
         second = requests_service.create_request(
             db,
             data=requests_service.RequestInput(
-                entity_type=EntityType.USER, entity_id="user-harsh", requested_limit=800
+                entity_type=EntityType.USER, entity_id="user-alice", requested_limit=800
             ),
             actor=ACTOR,
         )
@@ -360,7 +360,7 @@ class TestTemporaryGrantRollback:
 
         requests_service.revert_expired_grants(db, now=utcnow() + timedelta(hours=3))
         db.commit()
-        assert db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh")) is None
+        assert db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice")) is None
 
     def test_a_future_grant_is_not_touched(self, tenant: FakeTenant, db: Session) -> None:
         self._make_approved_request(db, previous=None, granted=500, expires_in_hours=10)
@@ -368,7 +368,7 @@ class TestTemporaryGrantRollback:
         db.commit()
         assert reverted == 0
         assert (
-            db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh")).credit_limit
+            db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice")).credit_limit
             == 500
         )
 
