@@ -464,18 +464,20 @@ def plan_targets(
     entity_type: str,
     entity_id: str,
     project_actions: Iterable[str] | None = None,
+    protected_roles: frozenset[str] | None = None,
 ) -> list[Target]:
     """Every concrete change a breach of this limit implies, exemptions removed.
 
     ``project_actions`` is what a project, group or application limit turns off
     (``effective_project_actions``); None means the legacy pair, Auto Triage and
-    PR triage and remediation.
+    PR triage and remediation. ``protected_roles``, when the caller has read
+    them once for many limits, saves reading them again for each.
     """
     chosen = set(LEGACY_PROJECT_ACTIONS if project_actions is None else project_actions)
     if entity_type == EntityType.USER:
         if is_exempt(session, entity_type=EntityType.USER, entity_id=entity_id):
             return []
-        if protection_reason(session, entity_id) is not None:
+        if protection_reason(session, entity_id, protected_roles=protected_roles) is not None:
             return []
         user = session.get(CxUser, entity_id)
         return [

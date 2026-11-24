@@ -162,6 +162,32 @@ class UsageIndex:
         self.application_dimension = ingestion.dimension_supported(session, UsageView.APPLICATION)
         self.user_dimension = ingestion.dimension_supported(session, UsageView.USER)
         self._attribution: auto_triage_attribution.AttributionModel | None = None
+        # Read on first use, once for every limit (reports and previews ask
+        # about hundreds of limits in one request).
+        self._states: dict[str, dict[int, LimitPeriodState]] = {}
+        self._exempt: set[tuple[str, str]] | None = None
+
+    def period_state(self, limit_id: int, period_key: str) -> LimitPeriodState | None:
+        """The stored state of a limit's period, read for every limit at once."""
+        if period_key not in self._states:
+            self._states[period_key] = {
+                state.limit_id: state
+                for state in self._session.scalars(
+                    select(LimitPeriodState).where(LimitPeriodState.period_key == period_key)
+                )
+            }
+        return self._states[period_key].get(limit_id)
+
+    def is_exempt(self, entity_type: str, entity_id: str) -> bool:
+        """``enforcement.is_exempt``, from one read of every exemption."""
+        if self._exempt is None:
+            self._exempt = {
+                (kind, eid)
+                for kind, eid in self._session.execute(
+                    select(Exemption.entity_type, Exemption.entity_id)
+                )
+            }
+        return (str(entity_type), entity_id) in self._exempt
 
     @property
     def attribution(self) -> auto_triage_attribution.AttributionModel:
@@ -1195,11 +1221,7 @@ def period_usage(
     drift from the evaluation arithmetic.
     """
     reported_total, available = index.reported_total(limit)
-    state = session.scalar(
-        select(LimitPeriodState).where(
-            LimitPeriodState.limit_id == limit.id, LimitPeriodState.period_key == window.key
-        )
-    )
+    state = index.period_state(limit.id, window.key)
     baseline = (
         state.baseline_credits
         if state is not None

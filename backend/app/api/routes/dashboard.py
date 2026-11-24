@@ -552,16 +552,17 @@ def auto_triage_attribution_overview(
     if not model.enabled:
         return AutoTriageAttributionOverview(enabled=False, available=False)
 
-    names: dict[tuple[str, str], str | None] = {}
+    # Every name at once: the model can hold thousands of projects and people.
+    names: dict[tuple[str, str], str | None] = {
+        (CxProject.__tablename__, project_id): name
+        for project_id, name in db.execute(select(CxProject.id, CxProject.name))
+    }
+    names.update(
+        ((CxUser.__tablename__, user.id), user.display_name) for user in db.scalars(select(CxUser))
+    )
 
     def label(kind, entity_id: str) -> str | None:  # type: ignore[no-untyped-def]
-        key = (kind.__tablename__, entity_id)
-        if key not in names:
-            row = db.get(kind, entity_id)
-            names[key] = (
-                (row.display_name if isinstance(row, CxUser) else row.name) if row else None
-            )
-        return names[key]
+        return names.get((kind.__tablename__, entity_id))
 
     projects = [
         AutoTriageProjectAttribution(
