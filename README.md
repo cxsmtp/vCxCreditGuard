@@ -500,7 +500,7 @@ bills the wrong person, decides:
 | ---------- | ------- |
 | **≥ 85%**, one clear winner | Attributed automatically and written to the audit log. Still overridable. |
 | **≥ 60%**, or an auto-worthy near-tie between two people | Left **uncounted** and raised as a *dispute* with ranked suggestions to confirm on the Settings page. |
-| below 60% | Unmatched, mapped by hand. Automation is told apart: handles with `[bot]`, and integration identities (no email, matching nobody, and a handle that looks like one: a `-`, `_` or digit, or a word such as github, jenkins, svc or integration; "Priya" or "张伟" stay people). It stays listed in the *Unmatched* tab, marked *Automation* and mappable, but is not chased as a person: no "could not be matched" notice, one "new automation identity" notice instead. |
+| below 60% | Unmatched, mapped by hand. Automation is told apart: handles with `[bot]`, and integration identities: no email, matching nobody, and a handle with a CI/SCM token as a whole part of it (`-bot`, `_bot`, `-ci`, `svc-`, `-svc`, `github-actions`, `gitlab-ci`, `azure-pipelines`, ...) or that is a CI/SCM product's own lowercase name (`jenkins`). Digits, hyphens and underscores alone say nothing, and a token never matches inside a word: "jsmith2", "Jean-Luc", "mary_ann", "jenkinson", "Jenkins" (a display name), "tokenaga", "Priya" and "张伟" stay people. It stays listed in the *Unmatched* tab, marked *Automation* and mappable, but is not chased as a person: no "could not be matched" notice, and one "new automation identity" notice instead, once per subject ever (`unresolved_subject.automation_noticed_at`; subjects already automation at the upgrade are marked without a notice). |
 
 Nothing is ever dropped: every subject lands in `unresolved_subject` with its
 status, and the Settings page groups them into **Disputes**, **Auto-matched** and
@@ -517,17 +517,39 @@ name to a project or application under Settings → Attribution
 name match always wins over a mapping, and a mapping to a project that is gone is
 shown as broken and ignored.
 
-**A mapping moves usage that was already reported.** Mapping a name (or a user
-subject) moves the credits the latest reading has under it to the target, and
-unmapping moves them back. Those credits were spent somewhere in the lookback
-window before the mapping, so a monthly or quarterly budget that does not count
-usage already reported when its period opened shifts its period's baseline by
-exactly the credits moved: they are not counted against the current period,
-and what is spent from then on is. Mapping, unmapping and mapping again leave the
-baseline where it was. A budget that counts existing usage (lifetime, custom, or
-*count existing usage*) counts them. Every budget, group and application
-fallback included, is covered; the shift is in the audit entry and in the
-confirmation shown after the mapping.
+**Mappings count forward only.** The feed reports cumulative totals over its
+lookback window, so a name that starts to count towards a user, project or
+application part way would otherwise bring everything it reported before into
+the current budget period at once. Instead, when an admin maps a name (or a user
+subject), the name is *anchored* at the total it has reported so far
+(`usage_anchor.offset_credits`, with when it was made and the reading it was
+taken from), and only what it reports beyond that counts towards the target
+(`usage_record.attributed_credits`; null means all of it). The same holds when a
+name starts to match by itself (a project renamed to it, or a sync that brings
+the entity it names): it is anchored at its total in the previous reading. A name
+seen for the first time counts in full: all of it is new. If the lookback window
+rolls past old usage so that the name reports less than its anchor, the anchor
+moves down to the new total, so it never counts less than nothing.
+
+No budget's baseline is moved, for any period type, so a mapping cannot race an
+evaluation or another mapping: mapping writes and the ingest's writes of a new
+reading take the same lock (a transaction-scoped advisory lock on PostgreSQL,
+the write lock on SQLite), which neither holds across a call to Checkmarx One,
+and the anchor is taken once, in the mapping's own transaction, from the latest
+live reading (never a demo one). Unmapping takes away exactly what the name
+added since it was mapped; mapping again takes a fresh anchor, so nothing is
+counted twice. If part of what it added was counted in an earlier period, the
+current period's count falls only to zero, never below. A budget that counts
+existing usage (lifetime, custom, or *count existing usage*) counts usage already
+reported under its own names, but a mapped name only from the mapping on. The
+confirmation after a mapping, and its audit entry, say how much the name has
+already reported (and does not count) and, on unmapping or mapping elsewhere,
+how much it no longer adds to the previous target. Mappings made before this
+version keep counting in full (anchored at 0): every stored baseline already
+contains what they reported. Usage after a restriction compares each name
+counting towards the restricted person or project with the same name in the
+reading pinned at the restriction, or, for a name mapped later, the reading it
+was anchored at.
 
 ## What the enforcement actions actually are
 

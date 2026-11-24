@@ -30,6 +30,7 @@ EXPECTED_TABLES = {
     "cx_user",
     "dimension_state",
     "entity_mapping",
+    "usage_anchor",
     "enforcement_action",
     "exemption",
     "limit_period_state",

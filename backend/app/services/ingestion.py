@@ -16,11 +16,11 @@ is safe to enforce a project limit at all.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.checkmarx import usage as usage_api
@@ -38,6 +38,7 @@ from app.models.usage import (
     DimensionState,
     EntityMapping,
     UnresolvedSubject,
+    UsageAnchor,
     UsageRecord,
     UsageSnapshot,
 )
@@ -286,13 +287,7 @@ def build_user_index(session: Session) -> UserIndex:
     for key in duplicates:
         by_full_name.pop(key, None)
 
-    pinned = {
-        row.subject_key: row.mapped_user_id
-        for row in session.scalars(
-            select(UnresolvedSubject).where(UnresolvedSubject.mapped_user_id.is_not(None))
-        )
-        if row.mapped_user_id
-    }
+    pinned = _pinned_users(session)
     return UserIndex(
         by_email=by_email,
         by_username=by_username,
@@ -301,6 +296,17 @@ def build_user_index(session: Session) -> UserIndex:
         pinned=pinned,
         profiles=tuple(profiles),
     )
+
+
+def _pinned_users(session: Session) -> dict[str, str]:
+    """An admin's user mappings: {reported subject: user id}."""
+    return {
+        row.subject_key: row.mapped_user_id
+        for row in session.scalars(
+            select(UnresolvedSubject).where(UnresolvedSubject.mapped_user_id.is_not(None))
+        )
+        if row.mapped_user_id
+    }
 
 
 def _named_index(
@@ -773,6 +779,23 @@ def _store_dimension(
     result = DimensionResult(view_by=str(view), supported=True, snapshot_id=snapshot.id)
     total = Decimal("0")
 
+    # Mappings and the readings they re-point are changed under this lock, so
+    # they are read here, after taking it, not from the indexes built before
+    # the network reads: a mapping made while this cycle was reading counts
+    # from its own anchor, never from a stale index.
+    attribution_lock(session)
+    if view == UsageView.USER:
+        user_index = replace(user_index, pinned=_pinned_users(session))
+    elif view in (UsageView.PROJECT, UsageView.APPLICATION):
+        model = CxProject if view == UsageView.PROJECT else CxApplication
+        fresh = entity_mappings(session).get(str(view))
+        by_id, by_name = _named_index(session, model, fresh)
+        if view == UsageView.PROJECT:
+            projects_by_id, projects_by_name = by_id, by_name
+        else:
+            apps_by_id, apps_by_name = by_id, by_name
+    anchors = _Anchors(session, view, snapshot)
+
     for item in merged.values():
         outcome: MatchOutcome | None = None
         if view == UsageView.USER:
@@ -809,6 +832,9 @@ def _store_dimension(
                 entity_type=entity_type,
                 entity_id=entity_id,
                 credits_used=item.credits_used,
+                attributed_credits=anchors.attribute(
+                    item.subject_key[:320], entity_id, item.credits_used
+                ),
                 percent_of_total=item.percent_of_total,
                 transactions=item.transactions,
                 actions=item.actions or None,
@@ -994,6 +1020,234 @@ def _apply_user_outcome(
         )
 
 
+# ------------------------------------------------------- forward-only attribution
+#
+# The consumption feed reports cumulative totals over its lookback window. A
+# name that starts to count towards an entity part way (an admin maps it, a
+# project is renamed to it, or a sync brings the entity it names) would
+# otherwise bring everything it ever reported into the entity's current budget
+# period at once. Instead, the name is anchored at its reported total when it
+# starts to count (``UsageAnchor.offset_credits``), and only what it reports
+# beyond that counts (``UsageRecord.attributed_credits``). Period baselines are
+# never shifted, so a mapping cannot race an evaluation.
+
+# Mapping writes and the ingest's record writes both run under this lock, and
+# neither holds it across a network call.
+_ATTRIBUTION_LOCK_KEY = 0x43584147  # "CXAG"
+ATTRIBUTION_LOCK_SETTING = "attribution.lock"
+
+
+def attribution_lock(session: Session) -> None:
+    """Serialise mapping writes against the ingest, until the transaction ends.
+
+    PostgreSQL: a transaction-scoped advisory lock. SQLite: a write statement,
+    which takes the database's single write lock at once (the driver opens the
+    transaction at the first write); reads after it see every earlier commit.
+    """
+    bind = session.get_bind()
+    if bind.dialect.name == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _ATTRIBUTION_LOCK_KEY})
+        return
+    from app.models.connection import AppSetting
+
+    session.execute(
+        update(AppSetting)
+        .where(AppSetting.key == ATTRIBUTION_LOCK_SETTING)
+        .values(value=AppSetting.value)
+    )
+
+
+def latest_live_snapshot(
+    session: Session, view: UsageView | str, *, excluding: int | None = None
+) -> UsageSnapshot | None:
+    """The newest believed reading from the tenant (never a demo one)."""
+    from app.services import settings_store
+
+    query = select(UsageSnapshot).where(
+        UsageSnapshot.view_by == str(view),
+        UsageSnapshot.held_reason.is_(None),
+        UsageSnapshot.period_param.is_distinct_from(settings_store.DEMO_PERIOD_PARAM),
+    )
+    if excluding is not None:
+        query = query.where(UsageSnapshot.id != excluding)
+    return session.scalar(
+        query.order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc()).limit(1)
+    )
+
+
+class _Anchors:
+    """Where each name's usage starts to count, for one dimension's new reading."""
+
+    def __init__(self, session: Session, view: UsageView, snapshot: UsageSnapshot) -> None:
+        self.session = session
+        self.view = str(view)
+        self.snapshot = snapshot
+        self.now = utcnow()
+        self.anchors = {
+            anchor.subject_key: anchor
+            for anchor in session.scalars(
+                select(UsageAnchor).where(UsageAnchor.view_by == self.view)
+            )
+        }
+        self.previous = latest_live_snapshot(session, view, excluding=snapshot.id)
+        self.before: dict[str, tuple[str | None, Decimal, Decimal | None]] = {}
+        if self.previous is not None:
+            self.before = {
+                key: (entity_id, Decimal(credits or 0), attributed)
+                for key, entity_id, credits, attributed in session.execute(
+                    select(
+                        UsageRecord.subject_key,
+                        UsageRecord.entity_id,
+                        UsageRecord.credits_used,
+                        UsageRecord.attributed_credits,
+                    ).where(UsageRecord.snapshot_id == self.previous.id)
+                )
+            }
+
+    def attribute(self, key: str, entity_id: str | None, credits: Decimal) -> Decimal | None:
+        """What of ``credits`` counts towards ``entity_id`` (None: all of it)."""
+        credits = Decimal(credits or 0)
+        anchor = self.anchors.get(key)
+        if entity_id is None:
+            # Counts nowhere now. Should it count somewhere again later, it
+            # starts afresh from that reading: usage in between counted nowhere.
+            if anchor is not None and anchor.released_at is None:
+                anchor.released_at = self.now
+                anchor.released_credits = credits
+            return None
+        if anchor is not None and anchor.released_at is None and anchor.entity_id == entity_id:
+            if credits < Decimal(anchor.offset_credits):
+                # The lookback window rolled past usage from before the anchor:
+                # re-anchor, so the name never counts less than nothing.
+                anchor.offset_credits = credits
+                anchor.snapshot_id = self.snapshot.id
+                anchor.anchored_at = self.now
+            return credits - Decimal(anchor.offset_credits)
+        before = self.before.get(key)
+        reference: int | None = None
+        if before is None:
+            # Not in the last reading (a new name): all of it is new usage.
+            start = Decimal("0")
+        elif before[0] == entity_id:
+            # Already counted towards this entity, in full or from an offset.
+            start = before[1] - before[2] if before[2] is not None else Decimal("0")
+            reference = self.previous.id if self.previous is not None else None
+        else:
+            # It counted elsewhere, or nowhere: only what comes after counts here.
+            start = before[1]
+            reference = self.previous.id if self.previous is not None else None
+        start = max(Decimal("0"), min(start, credits))
+        if start == 0 and anchor is None:
+            return None
+        if anchor is None:
+            anchor = UsageAnchor(view_by=self.view, subject_key=key)
+            self.session.add(anchor)
+            self.anchors[key] = anchor
+        anchor.entity_id = entity_id
+        anchor.offset_credits = start
+        anchor.snapshot_id = reference if start > 0 else None
+        anchor.anchored_at = self.now
+        anchor.reason = ANCHOR_FIRST_MATCH
+        anchor.released_at = None
+        anchor.released_credits = None
+        return credits - start
+
+
+ANCHOR_MAPPING = "mapping"
+ANCHOR_FIRST_MATCH = "first_match"
+
+
+@dataclass
+class SubjectMove:
+    """What re-pointing one reported name did to the latest reading."""
+
+    name: str
+    # What the name has reported in the latest reading.
+    reported: Decimal = Decimal("0")
+    # Where it counted before, and what of it counted there: no longer.
+    previous_entity: str | None = None
+    removed: Decimal = Decimal("0")
+    # False: a real name match wins over the mapping, so nothing moved.
+    followed: bool = True
+    changed: bool = False
+
+
+def move_subject(
+    session: Session,
+    *,
+    view: UsageView | str,
+    subject_key: str,
+    entity_type: str,
+    entity_id: str | None,
+    follows,  # type: ignore[no-untyped-def]
+) -> SubjectMove:
+    """Point a reported name at ``entity_id`` (None: at nothing), forward only.
+
+    Call under ``attribution_lock``. The latest live reading's row is re-pointed
+    at once, and the name is anchored at what it has reported so far: only what
+    it reports from now on counts towards the new entity. Unmapping takes away
+    exactly what the name added since it was mapped. ``follows(record)`` says
+    whether the row follows the mapping (a real name match wins).
+    """
+    view = str(view)
+    snapshot = latest_live_snapshot(session, view)
+    record = (
+        session.scalar(
+            select(UsageRecord).where(
+                UsageRecord.snapshot_id == snapshot.id,
+                UsageRecord.view_by == view,
+                UsageRecord.subject_key == subject_key,
+            )
+        )
+        if snapshot is not None
+        else None
+    )
+    move = SubjectMove(name=(record.subject_name or record.subject_key) if record else subject_key)
+    credits = Decimal(record.credits_used or 0) if record is not None else Decimal("0")
+    move.reported = credits
+    if record is not None:
+        move.previous_entity = record.entity_id
+        if not follows(record):
+            move.followed = False
+            return move
+        if record.entity_id is not None and record.entity_id == entity_id:
+            return move
+        if record.entity_id is not None:
+            move.removed = Decimal(
+                record.attributed_credits
+                if record.attributed_credits is not None
+                else record.credits_used or 0
+            )
+    anchor = session.scalar(
+        select(UsageAnchor).where(
+            UsageAnchor.view_by == view, UsageAnchor.subject_key == subject_key
+        )
+    )
+    now = utcnow()
+    if entity_id is None:
+        if anchor is not None and anchor.released_at is None:
+            anchor.released_at = now
+            anchor.released_credits = credits
+    else:
+        if anchor is None:
+            anchor = UsageAnchor(view_by=view, subject_key=subject_key)
+            session.add(anchor)
+        anchor.entity_id = entity_id
+        anchor.offset_credits = credits
+        anchor.snapshot_id = snapshot.id if snapshot is not None else None
+        anchor.anchored_at = now
+        anchor.reason = ANCHOR_MAPPING
+        anchor.released_at = None
+        anchor.released_credits = None
+    if record is not None:
+        record.entity_type = entity_type
+        record.entity_id = entity_id
+        record.attributed_credits = Decimal("0") if entity_id is not None else None
+    move.changed = True
+    session.flush()
+    return move
+
+
 # ------------------------------------------------------------------ reading back
 
 
@@ -1017,12 +1271,20 @@ def latest_snapshot(session: Session, view: UsageView | str) -> UsageSnapshot | 
 
 
 def latest_totals(session: Session, view: UsageView | str) -> dict[str, Decimal]:
-    """Reported credit totals keyed by resolved entity id, from the newest snapshot."""
+    """Credit totals keyed by resolved entity id, from the newest snapshot.
+
+    A name that started to count towards an entity after it had already
+    reported usage (an admin's mapping, or a rename that made it match) adds
+    only what it reported since: ``attributed_credits``.
+    """
     snapshot = latest_snapshot(session, view)
     if snapshot is None:
         return {}
     rows = session.execute(
-        select(UsageRecord.entity_id, func.sum(UsageRecord.credits_used))
+        select(
+            UsageRecord.entity_id,
+            func.sum(func.coalesce(UsageRecord.attributed_credits, UsageRecord.credits_used)),
+        )
         .where(
             UsageRecord.snapshot_id == snapshot.id,
             UsageRecord.entity_id.is_not(None),

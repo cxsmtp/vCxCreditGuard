@@ -204,7 +204,7 @@ class UnresolvedSubjectResponse(BaseModel):
     # who started scans whose auto triage is charged to people (only raised
     # while that setting is on). Both are mapped the same way.
     source: str = "consumption"
-    # After a mapping: what moved, and how budgets count it.
+    # After a mapping: where the subject's usage counts from now on.
     confirmation: str | None = None
 
 
@@ -225,9 +225,11 @@ class UnmatchedEntityResponse(BaseModel):
     mapped_label: str | None = None
     # Mapped to a project or application that is no longer synced: ignored.
     mapping_broken: bool = False
-    # After a mapping: what moved, and how budgets count it.
+    # Mapped, but the name now matches a synced entity by itself, which wins.
+    overridden: bool = False
+    overridden_by: str | None = None
+    # After a mapping: where the name's usage counts from now on.
     confirmation: str | None = None
-    baseline_shifts: list[dict[str, Any]] = []
 
 
 class MapEntityRequest(StrictModel):

@@ -271,12 +271,15 @@ class TestUnresolvedSubjects:
         assert response.status_code == httpx.codes.OK
         assert response.json()["mapped_user_label"] == "Carol Chen"
 
+        # Forward only: the 7 credits reported before the mapping do not count;
+        # what the subject reports from then on does.
+        tenant.set_user_credits(name="departed.person@example.com", credits=10)
         client = connection_service.get_client(db)
         ingestion.ingest_usage(db, client)
         db.commit()
         from app.models.enums import UsageView
 
-        assert float(ingestion.latest_totals(db, UsageView.USER)["user-carol"]) == 7.0
+        assert float(ingestion.latest_totals(db, UsageView.USER)["user-carol"]) == 3.0
 
     def test_mapping_attributes_immediately(
         self, admin_client: TestClient, db: Session, tenant: FakeTenant
@@ -292,8 +295,11 @@ class TestUnresolvedSubjects:
 
         from app.models.enums import UsageView
 
-        # No new ingest has run, yet the credits already count towards the user.
-        assert float(ingestion.latest_totals(db, UsageView.USER)["user-carol"]) == 7.0
+        # No new ingest has run, yet the latest reading already counts the
+        # subject towards the user: forward only, so the 7 credits it had
+        # already reported add nothing.
+        assert float(ingestion.latest_totals(db, UsageView.USER)["user-carol"]) == 0.0
+        assert "The 7 credits it has already reported do not." in body["confirmation"]
 
     def test_clearing_a_mapping_reverts_the_snapshot(
         self, admin_client: TestClient, db: Session, tenant: FakeTenant

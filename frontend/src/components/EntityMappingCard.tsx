@@ -24,18 +24,24 @@ import {
  * project or application (a live tenant reported most project credits under
  * "org/repo" names), and the admin's mappings of them.
  */
+const PAGE = 200;
+
 export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
   const toast = useToast();
+  // One page from the server at a time; "Show more" asks for a longer one.
+  const [shown, setShown] = useState(PAGE);
   const rows = useResource<UnmatchedEntity[]>(
     (signal) =>
-      isAdmin ? api.get("/api/usage/unmatched-entities", undefined, signal) : Promise.resolve([]),
-    [isAdmin],
+      isAdmin
+        ? api.get("/api/usage/unmatched-entities", { limit: shown }, signal)
+        : Promise.resolve([]),
+    [isAdmin, shown],
   );
   const [mapping, setMapping] = useState<UnmatchedEntity | null>(null);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<OrgEntity[]>([]);
   const [busy, setBusy] = useState(false);
-  // What the last mapping moved, and how budgets count it.
+  // Where the last mapped name's usage counts from now on.
   const [confirmation, setConfirmation] = useState<string | null>(null);
 
   useEffect(() => {
@@ -70,7 +76,11 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
         entity_id: entityId,
       });
       setConfirmation(saved.confirmation ?? null);
-      toast.success(entityId ? `Mapped. This usage now counts towards that ${mapping.view}.` : "Mapping cleared.");
+      toast.success(
+        entityId
+          ? `Mapped. Usage reported under this name from now on counts towards that ${mapping.view}.`
+          : "Mapping cleared.",
+      );
       setMapping(null);
       await rows.reload();
     } catch (caught) {
@@ -86,7 +96,7 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
   return (
     <Card
       title="Projects and applications not matched"
-      description="Usage Checkmarx reports under a repository or application name that matches no project or application synced from /api/projects and /api/applications. It counts towards no project, group or application limit until it is mapped. A name that is no project at all (a repository scanned outside one) can be left: it is still counted tenant wide."
+      description="Usage Checkmarx reports under a repository or application name that matches no project or application synced from /api/projects and /api/applications. It counts towards no project, group or application limit until it is mapped, and a mapping counts forward only: what the name reported before it was mapped is not counted, so no budget period gains past usage. A name that is no project at all (a repository scanned outside one) can be left: it is still counted tenant wide."
     >
       {confirmation && (
         <div className="mb-4">
@@ -126,6 +136,10 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
                     <span title="Mapped to a project or application that is no longer synced, so the mapping is ignored. Map it again.">
                       <Badge tone="critical">Mapping broken: {row.mapped_entity_id} is gone</Badge>
                     </span>
+                  ) : row.overridden ? (
+                    <span title="This name now matches a synced project or application by itself, and a real name match always wins over a mapping. The mapping applies again if that match goes away, and then only to usage reported from then on.">
+                      <Badge tone="warning">Overridden: counts towards {row.overridden_by}</Badge>
+                    </span>
                   ) : row.mapped_entity_id ? (
                     <Badge tone="good">{row.mapped_label ?? row.mapped_entity_id}</Badge>
                   ) : (
@@ -149,6 +163,13 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
             ))}
           </tbody>
         </Table>
+      )}
+      {data.length >= shown && (
+        <div className="mt-3">
+          <Button variant="secondary" onClick={() => setShown(shown + PAGE)}>
+            Show more
+          </Button>
+        </div>
       )}
 
       <Modal

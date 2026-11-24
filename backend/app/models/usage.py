@@ -105,6 +105,11 @@ class UsageRecord(Base):
     transactions: Mapped[int | None] = mapped_column(Integer)
     # Per action breakdown: {"triage": 3, "remediation": 1}
     actions: Mapped[dict | None] = mapped_column(JSONColumn)
+    # What of ``credits_used`` counts towards ``entity_id``, when not all of it:
+    # a name mapped (or first matched) after it had already reported usage
+    # counts only what it reported since (``credits_used`` minus the anchor's
+    # offset, see UsageAnchor). Null means all of it.
+    attributed_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     # The row as the feed sent it. Kept for a week (RAW_KEEP_DAYS in
     # app/services/retention.py), and for as long as the snapshot is one a
     # reader needs it on (the latest, the readings a period's usage breakdown
@@ -163,6 +168,9 @@ class UnresolvedSubject(Base):
     match_score: Mapped[float | None] = mapped_column(Float)
     # Ranked candidates: [{"user_id", "label", "score"}], best first.
     suggestions: Mapped[list | None] = mapped_column(JSONColumn)
+    # When the "new automation identity" notice was raised for this subject
+    # (once ever; the notice itself is pruned by retention).
+    automation_noticed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
 
 class EntityMapping(Base):
@@ -186,6 +194,44 @@ class EntityMapping(Base):
     mapped_by: Mapped[str | None] = mapped_column(String(128))
 
     __table_args__ = (UniqueConstraint("view_by", "subject_key", name="entity_mapping_subject"),)
+
+
+class UsageAnchor(Base):
+    """Where a reported name's usage starts counting towards an entity.
+
+    The consumption feed reports cumulative totals over its lookback window,
+    so a name that starts counting towards an entity (an admin's mapping, or a
+    project renamed to it or a user synced or auto-matched later) would bring
+    its whole history into that entity's current period. An anchor records the
+    name's reported total when that happened (``offset_credits``), and only
+    what it reports beyond that counts (``UsageRecord.attributed_credits``).
+
+    One per reported name. Written in the mapping's own transaction, from the
+    latest live reading and under the attribution lock (or by ingestion, for a
+    name that starts to match by itself), and never rewritten otherwise,
+    except to re-anchor when the lookback window rolls the total below the
+    offset. Unmapping notes the release (``released_at``, the name's total
+    then); mapping again takes a fresh anchor. No period baseline is ever
+    changed by a mapping.
+    """
+
+    __tablename__ = "usage_anchor"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    view_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    offset_credits: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    # The reading the offset was taken from (None: no reading had the name).
+    snapshot_id: Mapped[int | None] = mapped_column(Integer)
+    anchored_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    # "mapping" (an admin) or "first_match" (it started to match by itself).
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Set when the mapping was removed: the name's total then.
+    released_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    released_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+
+    __table_args__ = (UniqueConstraint("view_by", "subject_key", name="usage_anchor_subject"),)
 
 
 class AutoTriageCharge(Base):

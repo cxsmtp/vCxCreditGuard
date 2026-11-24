@@ -34,6 +34,7 @@ from app.models.usage import (
     SchedulerLock,
     SchedulerRun,
     UnresolvedSubject,
+    UsageAnchor,
     UsageRecord,
     UsageSnapshot,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "SchedulerLock",
     "SchedulerRun",
     "UnresolvedSubject",
+    "UsageAnchor",
     "UsageRecord",
     "UsageSnapshot",
     "UtilitySession",

@@ -123,9 +123,11 @@ class TestAttribution:
         """Two people with the same name must not share one budget."""
         tenant = FakeTenant()
         tenant.add_user(
-            user_id="u1", username="bob.baker@a.com", first_name="Bob", last_name="Baker"
+            user_id="u1", username="bob.baker@example.com", first_name="Bob", last_name="Baker"
         )
-        tenant.add_user(user_id="u2", username="s.baker@b.com", first_name="Bob", last_name="Baker")
+        tenant.add_user(
+            user_id="u2", username="s.baker@example.org", first_name="Bob", last_name="Baker"
+        )
         tenant.set_user_credits(name="Bob Baker", credits=5)
         client = synced(db, tenant)
         ingestion.ingest_usage(db, client)
@@ -188,7 +190,12 @@ class TestAttribution:
 
         ingestion.ingest_usage(db, client)
         db.commit()
-        assert ingestion.latest_totals(db, UsageView.USER)["user-carol"] == Decimal("7")
+        # Forward only: what it had reported before the pin does not count.
+        assert ingestion.latest_totals(db, UsageView.USER)["user-carol"] == Decimal("0")
+        tenant.set_user_credits(name="departed.person@example.com", credits=10)
+        ingestion.ingest_usage(db, client)
+        db.commit()
+        assert ingestion.latest_totals(db, UsageView.USER)["user-carol"] == Decimal("3")
 
     def test_applications_and_projects_match_by_id_then_name(self, db: Session) -> None:
         tenant = populated_tenant()
@@ -368,7 +375,13 @@ class TestFuzzyAttribution:
         ingestion.ingest_usage(db, client)
         db.commit()
         assert db.scalar(select(UnresolvedSubject)) is None
-        assert ingestion.latest_totals(db, UsageView.USER)["user-dave"] == Decimal("4")
+        # It counts towards Dave from the reading it first matched in: the 4
+        # credits reported before he synced are not this period's usage.
+        assert ingestion.latest_totals(db, UsageView.USER)["user-dave"] == Decimal("0")
+        tenant.set_user_credits(name="Dave Dawson", email="dave.dawson@example.com", credits=6)
+        ingestion.ingest_usage(db, client)
+        db.commit()
+        assert ingestion.latest_totals(db, UsageView.USER)["user-dave"] == Decimal("2")
 
 
 def test_latest_totals_is_empty_before_any_ingestion(db: Session) -> None:

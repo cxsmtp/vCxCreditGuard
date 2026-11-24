@@ -383,7 +383,8 @@ class TestUnmatchedProjects:
     def test_an_admin_maps_a_name_to_a_project(
         self, db: Session, connected, admin_client: TestClient
     ) -> None:
-        connected(self._tenant())
+        tenant = self._tenant()
+        connected(tenant)
         cycle.run_cycle(trigger="manual", force_org_sync=True)
         listed = admin_client.get("/api/usage/unmatched-entities").json()
         assert {row["subject_key"] for row in listed} >= {"example-org/payments-api"}
@@ -399,12 +400,14 @@ class TestUnmatchedProjects:
         assert response.status_code == httpx.codes.OK, response.text
         assert response.json()["mapped_label"] == "payments/api"
         db.expire_all()
-        # At once on the latest reading...
-        assert ingestion.latest_totals(db, UsageView.PROJECT)["proj-api"] == Decimal("878")
-        # ...and on every later one.
+        # At once on the latest reading, forward only: the 870 credits the name
+        # had already reported add nothing to the project's own 8...
+        assert ingestion.latest_totals(db, UsageView.PROJECT)["proj-api"] == Decimal("8")
+        # ...and on every later one, what it reports from then on counts.
+        tenant.set_entity_credits(view="project", name="example-org/payments-api", credits=900)
         cycle.run_cycle(trigger="manual")
         db.expire_all()
-        assert ingestion.latest_totals(db, UsageView.PROJECT)["proj-api"] == Decimal("878")
+        assert ingestion.latest_totals(db, UsageView.PROJECT)["proj-api"] == Decimal("38")
         assert ingestion.entity_mappings(db)["project"] == {"example-org/payments-api": "proj-api"}
         assert (
             db.scalar(

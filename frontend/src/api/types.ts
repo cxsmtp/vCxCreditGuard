@@ -375,7 +375,10 @@ export interface UnmatchedEntity {
   mapped_label: string | null;
   /** Mapped to a project or application that is no longer synced: ignored. */
   mapping_broken?: boolean;
-  /** After a mapping: what moved, and how budgets count it. */
+  /** Mapped, but the name now matches a synced entity by itself, which wins. */
+  overridden?: boolean;
+  overridden_by?: string | null;
+  /** After a mapping: where the name's usage counts from now on. */
   confirmation?: string | null;
 }
 
