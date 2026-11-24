@@ -6,8 +6,9 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import AdminUser, DbSession
+from app.api.deps import AdminUser, AuthContext, DbSession
 from app.core.passwords import PasswordPolicyError
+from app.db import locking
 from app.db.base import utcnow
 from app.models.auth import UtilityUser
 from app.models.enums import UtilityRole
@@ -95,9 +96,20 @@ def update_account(
                 "message": "You cannot remove your own Admin role or disable your own account.",
             },
         )
-    if payload.role == UtilityRole.VIEWER or payload.is_active is False:
-        remaining_admins = _count_other_active_admins(db, exclude_id=user.id)
-        if user.role == UtilityRole.ADMIN and remaining_admins == 0:
+    removes_admin = user.role == UtilityRole.ADMIN and (
+        payload.role == UtilityRole.VIEWER or payload.is_active is False
+    )
+    if removes_admin:
+        # Two admins demoting each other at the same moment would each find the
+        # other still an Admin. One such change at a time, each counting what
+        # the one before it committed.
+        user = _serialize_admin_changes(db, ctx, user_id)
+        before = {"role": user.role, "is_active": user.is_active, "email": user.email}
+        if (
+            user.role == UtilityRole.ADMIN
+            and _count_other_active_admins(db, exclude_id=user.id) == 0
+        ):
+            db.rollback()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={
@@ -236,14 +248,21 @@ def delete_account(user_id: int, ctx: AdminUser, db: DbSession) -> MessageRespon
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "self_delete", "message": "You cannot delete your own account."},
         )
-    if user.role == UtilityRole.ADMIN and _count_other_active_admins(db, exclude_id=user.id) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "last_admin",
-                "message": "This is the last active Admin account and cannot be deleted.",
-            },
-        )
+    if user.role == UtilityRole.ADMIN:
+        # As in update_account: one change that can remove an Admin at a time.
+        user = _serialize_admin_changes(db, ctx, user_id)
+        if (
+            user.role == UtilityRole.ADMIN
+            and _count_other_active_admins(db, exclude_id=user.id) == 0
+        ):
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "last_admin",
+                    "message": "This is the last active Admin account and cannot be deleted.",
+                },
+            )
 
     username = user.username
     record_audit(
@@ -258,6 +277,30 @@ def delete_account(user_id: int, ctx: AdminUser, db: DbSession) -> MessageRespon
     db.delete(user)
     db.commit()
     return MessageResponse(message=f"Account {username} deleted.")
+
+
+def _serialize_admin_changes(db: Session, ctx: AuthContext, user_id: int) -> UtilityUser:
+    """Take the lock every change able to remove an active Admin takes first, and
+    return the target account as it is now.
+
+    Held to the end of the transaction, so the count that follows sees every such
+    change committed before it, and none can commit between the count and the
+    write it allows. The acting admin is read again under it too: one who was
+    demoted, disabled or deleted by the change just before may not make this one.
+    """
+    locking.serialize(db, locking.ADMIN_SET_LOCK_KEY)
+    acting = db.get(UtilityUser, ctx.user.id, populate_existing=True)
+    if acting is None or acting.role != UtilityRole.ADMIN or not acting.is_active:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action requires the Admin role.",
+        )
+    user = db.get(UtilityUser, user_id, populate_existing=True)
+    if user is None:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such account.")
+    return user
 
 
 def _count_other_active_admins(db: Session, *, exclude_id: int) -> int:

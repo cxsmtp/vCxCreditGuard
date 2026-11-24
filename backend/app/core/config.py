@@ -12,6 +12,7 @@ import binascii
 import functools
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -21,6 +22,34 @@ MASTER_KEY_LENGTH = 32
 
 class ConfigError(RuntimeError):
     """Raised when the process is configured in a way we refuse to run with."""
+
+
+def _check_cors_origin(origin: str) -> None:
+    """Refuse a CXCG_ALLOWED_ORIGINS entry that is not one exact origin.
+
+    Cross-origin requests are allowed with credentials (the session cookie), so
+    every entry must name one origin exactly. A wildcard would not be read as
+    "nobody": with credentials allowed, the CORS middleware answers a ``*`` by
+    echoing back whatever origin asked, which lets any web page read the API
+    with the visitor's session.
+    """
+    parts = urlsplit(origin)
+    exact = (
+        parts.scheme in {"http", "https"}
+        and bool(parts.hostname)
+        and "*" not in origin
+        and not parts.username
+        and not parts.password
+        and parts.path in {"", "/"}
+        and not parts.query
+        and not parts.fragment
+    )
+    if not exact:
+        raise ConfigError(
+            f"CXCG_ALLOWED_ORIGINS entry {origin[:100]!r} is not an exact origin. List "
+            "each origin as scheme://host[:port] (for example http://localhost:5173), "
+            "separated by commas; wildcards are not accepted."
+        )
 
 
 class Settings(BaseSettings):
@@ -91,6 +120,8 @@ class Settings(BaseSettings):
                 "CXCG_COOKIE_SECURE cannot be false when CXCG_ENV=production. "
                 "Serve the utility over HTTPS or run with CXCG_ENV=development."
             )
+        for origin in self.cors_origins:
+            _check_cors_origin(origin)
         return self
 
     @property
@@ -103,7 +134,13 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins(self) -> list[str]:
-        return [origin.strip() for origin in self.allowed_origins.split(",") if origin.strip()]
+        # The browser sends an origin without a trailing slash; one in the
+        # setting would never match.
+        return [
+            origin.strip().rstrip("/")
+            for origin in self.allowed_origins.split(",")
+            if origin.strip()
+        ]
 
     def master_key_bytes(self) -> bytes:
         """Resolve the 32 byte master key from env var or mounted secret file.

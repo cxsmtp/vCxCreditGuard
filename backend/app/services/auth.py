@@ -37,6 +37,7 @@ from app.core.passwords import (
     verify_password,
 )
 from app.core.tokens import hash_token, new_token, tokens_equal
+from app.db import locking
 from app.db.base import utcnow
 from app.models.auth import (
     LoginAttempt,
@@ -324,13 +325,28 @@ def complete_password_reset(
     )
     now = utcnow()
     user = session.get(UtilityUser, row.user_id) if row is not None else None
-    if (
-        row is None
-        or row.used_at is not None
-        or row.expires_at <= now
-        or user is None
-        or not user.is_active
-    ):
+    usable = (
+        row is not None
+        and row.used_at is None
+        and row.expires_at > now
+        and user is not None
+        and user.is_active
+    )
+    if usable and row is not None:
+        # Spend the token in one conditional statement, before anything else is
+        # changed. Two redemptions of the same token at the same moment both see
+        # it unused above; only one of them gets to mark it used. (A weak new
+        # password below rolls this back with everything else.)
+        claimed = session.execute(
+            update(PasswordResetToken)
+            .where(PasswordResetToken.id == row.id, PasswordResetToken.used_at.is_(None))
+            .values(used_at=now)
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        usable = claimed == 1
+        if usable:
+            row.used_at = now
+    if not usable or user is None or row is None:
         # Audited so repeated invalid redemptions (a brute-force or a stale link
         # being retried) are visible; the endpoint that calls this is rate limited.
         record_audit(
@@ -344,12 +360,13 @@ def complete_password_reset(
         )
         raise InvalidResetToken
 
+    # The sign-in counters first, then the account: the order a sign-in takes
+    # them in, so a sign-in at the same moment waits instead of deadlocking.
+    clear_login_throttle(session, username=user.username)
     # Validates policy before any mutation, then revokes sessions and audits.
     set_password(session, user=user, new_password=new_password, actor=actor)
-    row.used_at = now
     user.failed_login_count = 0
     user.locked_until = None
-    clear_login_throttle(session, username=user.username)
     session.flush()
     record_audit(
         session,
@@ -423,24 +440,7 @@ def _check_rate_limit(
     allowance = limit if limit is not None else settings.login_rate_limit_per_minute
     now = utcnow()
     window_start = now - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
-    row = session.scalar(
-        select(LoginAttempt).where(
-            LoginAttempt.identifier == identifier, LoginAttempt.ip_address == ip_address
-        )
-    )
-    if row is None:
-        row = LoginAttempt(
-            identifier=identifier,
-            ip_address=ip_address,
-            window_started_at=now,
-            attempt_count=1,
-            last_attempt_at=now,
-            failure_count=0,
-        )
-        session.add(row)
-        session.flush()
-        return row
-
+    row = _locked_attempt_row(session, identifier=identifier, ip_address=ip_address, now=now)
     if row.window_started_at < window_start:
         row.window_started_at = now
         row.attempt_count = 1
@@ -503,23 +503,44 @@ def _account_row(session: Session, identifier: str) -> LoginAttempt:
     Kept for every username that is tried, real or not, so that the account-wide
     lock behaves identically either way and reveals nothing about which exist.
     """
-    row = session.scalar(
-        select(LoginAttempt).where(
-            LoginAttempt.identifier == identifier, LoginAttempt.ip_address == ACCOUNT_WIDE
-        )
+    return _locked_attempt_row(
+        session, identifier=identifier, ip_address=ACCOUNT_WIDE, now=utcnow()
     )
+
+
+def _locked_attempt_row(
+    session: Session, *, identifier: str, ip_address: str, now: datetime
+) -> LoginAttempt:
+    """The counter row for (identifier, address), locked until the transaction ends.
+
+    Concurrent sign-ins must not each read the same count and each write it back
+    plus one: a burst of guesses would then cost a single attempt, and a lockout
+    one of them set would go unseen by the rest. So the row is locked before it
+    is read (and created, ignoring a concurrent creation, if it is missing); a
+    second request for the same row waits here for the first to commit and then
+    reads what it wrote. A new row starts at zero attempts in a fresh window.
+    """
+    locking.begin_write(session)
+    query = (
+        select(LoginAttempt)
+        .where(LoginAttempt.identifier == identifier, LoginAttempt.ip_address == ip_address)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    row = session.scalar(query)
     if row is None:
-        now = utcnow()
-        row = LoginAttempt(
-            identifier=identifier,
-            ip_address=ACCOUNT_WIDE,
-            window_started_at=now,
-            attempt_count=0,
-            last_attempt_at=now,
-            failure_count=0,
+        session.execute(
+            locking.insert_ignoring_conflict(session, LoginAttempt).values(
+                identifier=identifier,
+                ip_address=ip_address,
+                window_started_at=now,
+                attempt_count=0,
+                last_attempt_at=now,
+                failure_count=0,
+            )
         )
-        session.add(row)
-        session.flush()
+        row = session.scalar(query)
+        assert row is not None  # inserted above, or by whoever beat us to it
     return row
 
 
@@ -692,6 +713,10 @@ def authenticate(
         )
         raise AccountDisabled
 
+    # Every sign-in for this username holds the account-wide row locked (above),
+    # so the second factor below is checked against the user as the previous
+    # sign-in left it: a code, or a recovery code, cannot be used twice by two
+    # sign-ins at once.
     if user.totp_enabled:
         if not totp_code:
             # Not a failure: the client must prompt for the second factor. The

@@ -16,7 +16,12 @@ Two things worth knowing:
 * **The cloud metadata address is refused.** The webhook URL is admin configured,
   so it is trusted by design, but posting a signed payload to a link-local
   metadata endpoint is never a legitimate use and is the one case worth blocking
-  outright.
+  outright. It is refused however it is written (``2852039166``,
+  ``0xa9fea9fe``, ``[::ffff:169.254.169.254]``) and, for a name, at the moment
+  of connecting, against the address the name resolves to then: a name that
+  resolves to an allowed address when it is saved and to the metadata address
+  later (DNS rebinding) is refused as well. The same goes for the mail server.
+  Redirects are never followed.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import ipaddress
 import json
 import logging
 import smtplib
+import socket
 import ssl
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -35,6 +41,7 @@ from email.message import EmailMessage
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpcore
 import httpx
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -65,6 +72,12 @@ TIMESTAMP_HEADER = "X-CxCreditGuard-Timestamp"
 
 # Cloud instance metadata. Never a legitimate webhook target.
 BLOCKED_HOSTS = frozenset({"169.254.169.254", "metadata.google.internal", "fd00:ec2::254"})
+# The same, as addresses, so that any spelling of them is caught.
+BLOCKED_ADDRESSES = frozenset(
+    {ipaddress.ip_address("169.254.169.254"), ipaddress.ip_address("fd00:ec2::254")}
+)
+# NAT64's well-known prefix: an IPv4 address embedded in an IPv6 one.
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 SmtpFactory = Callable[[str, int, float], smtplib.SMTP]
 
@@ -217,7 +230,7 @@ def deliver_pending(
         return result
 
     owns_client = http_client is None
-    client = http_client or httpx.Client(timeout=WEBHOOK_TIMEOUT_SECONDS)
+    client = http_client or webhook_client()
     try:
         for notification in candidates:
             outcome: dict[str, Any] = {"attempts": 1}
@@ -460,11 +473,39 @@ def send_direct_email(
 IMPLICIT_TLS_PORT = 465
 
 
+class _GuardedSMTP(smtplib.SMTP):
+    """SMTP that connects only to an address ``guarded_addresses`` allows.
+
+    The TLS handshake (STARTTLS, or SMTPS below) still checks the certificate
+    against the configured host name.
+    """
+
+    def _get_socket(self, host, port, timeout):  # type: ignore[no-untyped-def]
+        try:
+            addresses = guarded_addresses(host, port)
+        except TargetRefused as exc:
+            raise DeliveryError(str(exc)) from exc
+        except httpcore.ConnectError as exc:
+            raise OSError(str(exc)) from exc
+        last: OSError | None = None
+        for address in addresses:
+            try:
+                return socket.create_connection((address, port), timeout, self.source_address)
+            except OSError as exc:
+                last = exc
+        assert last is not None
+        raise last
+
+
+class _GuardedSMTPSSL(smtplib.SMTP_SSL, _GuardedSMTP):
+    """SMTPS over a guarded connection (SMTP_SSL wraps what _GuardedSMTP opens)."""
+
+
 def _default_smtp_factory(host: str, port: int, timeout: float) -> smtplib.SMTP:
     if port == IMPLICIT_TLS_PORT:
         # "SMTPS": the server expects TLS before anything else is said.
-        return smtplib.SMTP_SSL(host=host, port=port, timeout=timeout, context=_tls_context())
-    return smtplib.SMTP(host=host, port=port, timeout=timeout)
+        return _GuardedSMTPSSL(host=host, port=port, timeout=timeout, context=_tls_context())
+    return _GuardedSMTP(host=host, port=port, timeout=timeout)
 
 
 def _tls_context() -> ssl.SSLContext:
@@ -516,28 +557,158 @@ def sign_payload(body: bytes, *, secret: str, timestamp: str) -> str:
     return f"sha256={digest}"
 
 
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+def forbidden_address(address: IPAddress) -> str | None:
+    """Why ``address`` may never be connected to (None: it may).
+
+    The cloud metadata endpoints and link-local addresses, including an IPv4
+    one carried inside an IPv6 address (IPv4-mapped, NAT64), which reaches the
+    same place. Private ranges are allowed: an internal relay is a supported
+    deployment.
+    """
+    if isinstance(address, ipaddress.IPv6Address):
+        embedded = address.ipv4_mapped
+        if embedded is None and address in _NAT64_PREFIX:
+            embedded = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+        reason = forbidden_address(embedded) if embedded is not None else None
+        if reason:
+            return reason
+    if address in BLOCKED_ADDRESSES:
+        return "a cloud metadata address"
+    if address.is_link_local:
+        return "a link-local address"
+    return None
+
+
+def _literal_address(host: str) -> IPAddress | None:
+    """The address ``host`` spells, read as a connection would read it, or None.
+
+    Besides the usual forms, the resolver takes the old inet_aton spellings of
+    an IPv4 address (``2852039166``, ``0xa9fea9fe``, ``0251.0376.0251.0376``,
+    ``169.254.43518``), so they are read the same way here.
+    """
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(host))
+    except (OSError, ValueError):
+        return None
+
+
 def assert_webhook_target_allowed(url: str) -> None:
     """Refuse the cloud metadata endpoint. Everything else is the admin's choice.
 
-    Deliberately does no DNS resolution. Resolving here would add a live lookup to
-    every delivery, turn a transient DNS failure into a delivery failure, and still
-    leave a gap between the check and the connection, since the name can resolve
-    differently a moment later. Blocking the known metadata names and any literal
-    link-local address covers the case that is never legitimate, without pretending
-    to be a general egress control. Posting to an internal host is a supported
+    A check on the URL as written: the known metadata names, and an address
+    written in any form. A name is checked again when the connection is made,
+    against what it resolves to at that moment (``guarded_addresses``), so this
+    does no DNS lookup of its own. Posting to an internal host is a supported
     deployment, so private ranges are allowed.
     """
-    host = (urlsplit(url).hostname or "").lower()
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
     if not host:
         raise DeliveryError("the webhook URL has no host")
     if host in BLOCKED_HOSTS:
         raise DeliveryError("refusing to post to a cloud metadata address")
+    address = _literal_address(host)
+    reason = forbidden_address(address) if address is not None else None
+    if reason:
+        raise DeliveryError(f"refusing to post to {reason}")
+
+
+class TargetRefused(httpcore.ConnectError):
+    """A connection was refused because of where it would have gone."""
+
+
+def guarded_addresses(host: str, port: int) -> list[str]:
+    """The addresses ``host`` resolves to now, if none of them is forbidden.
+
+    Called at the moment of connecting, and the connection is then made to one
+    of exactly these addresses, so a name cannot pass a check and then resolve
+    somewhere else (DNS rebinding). If any address is forbidden the name is
+    refused outright rather than trying the others. The messages do not repeat
+    the host: the webhook URL is a secret.
+    """
+    name = host.strip("[]").lower().rstrip(".")
+    if name in BLOCKED_HOSTS:
+        raise TargetRefused("refusing to connect to a cloud metadata address")
     try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return
-    if address.is_link_local:
-        raise DeliveryError("refusing to post to a link-local address")
+        infos = socket.getaddrinfo(name, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise httpcore.ConnectError(f"the host name could not be resolved ({exc})") from exc
+    addresses: list[str] = []
+    for _family, _type, _proto, _canonical, sockaddr in infos:
+        text = str(sockaddr[0]).split("%", 1)[0]
+        reason = forbidden_address(ipaddress.ip_address(text))
+        if reason:
+            raise TargetRefused(f"refusing to connect: the host name resolves to {reason}")
+        if text not in addresses:
+            addresses.append(text)
+    if not addresses:
+        raise httpcore.ConnectError("the host name resolved to no address")
+    return addresses
+
+
+class _GuardedBackend(httpcore.NetworkBackend):
+    """httpcore's own network backend, connecting only to vetted addresses.
+
+    TLS is started afterwards with the URL's host name, so the certificate is
+    still checked against the name, not the address.
+    """
+
+    def __init__(self) -> None:
+        self._inner = httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.NetworkStream:
+        last: Exception | None = None
+        for address in guarded_addresses(host, port):
+            try:
+                return self._inner.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last = exc
+        assert last is not None
+        raise last
+
+    def connect_unix_socket(
+        self, path: str, timeout: float | None = None, socket_options: Any = None
+    ) -> httpcore.NetworkStream:
+        return self._inner.connect_unix_socket(path, timeout=timeout, socket_options=socket_options)
+
+    def sleep(self, seconds: float) -> None:
+        self._inner.sleep(seconds)
+
+
+def webhook_client() -> httpx.Client:
+    """The HTTP client webhooks are posted with: connections are guarded
+    (``guarded_addresses``) and redirects are not followed.
+
+    Through an HTTP proxy from the environment (``HTTPS_PROXY``) the proxy makes
+    the connection, so it is the proxy's own egress rules that apply to the
+    name; the URL check (``assert_webhook_target_allowed``) still runs.
+    """
+    client = httpx.Client(timeout=WEBHOOK_TIMEOUT_SECONDS, follow_redirects=False)
+    pool = getattr(client._transport, "_pool", None)  # noqa: SLF001 - see the test
+    if pool is None or not hasattr(pool, "_network_backend"):
+        client.close()
+        raise DeliveryError("the webhook connection cannot be guarded with this httpx version")
+    pool._network_backend = _GuardedBackend()  # noqa: SLF001
+    return client
 
 
 def post_webhook(
@@ -569,6 +740,8 @@ def post_webhook(
             timeout=WEBHOOK_TIMEOUT_SECONDS,
         )
     except httpx.HTTPError as exc:
+        if isinstance(exc.__cause__, TargetRefused):
+            raise DeliveryError(str(exc.__cause__)) from exc
         raise DeliveryError(f"webhook request failed: {type(exc).__name__}") from exc
 
     if not response.is_success:
@@ -617,7 +790,7 @@ def send_test_notification(
 
     if config.webhook_enabled:
         owns_client = http_client is None
-        client = http_client or httpx.Client(timeout=WEBHOOK_TIMEOUT_SECONDS)
+        client = http_client or webhook_client()
         try:
             post_webhook(sample, config=config, client=client)
             outcome["webhook"] = "sent"

@@ -937,7 +937,12 @@ def collect(
             # increase stays on the project. The other projects go on.
             session.rollback()
             if isinstance(exc, CheckmarxError):
-                message = f"Scans of project {task.project_id} could not be read: {exc}"
+                # Shown in the Notification Center (viewers too) and sent by
+                # mail and webhook: redacted like every other error shown there.
+                message = (
+                    f"Scans of project {task.project_id} could not be read: "
+                    f"{error_text.public_error(exc)}"
+                )
                 logger.warning("Auto-triage attribution: %s", message)
             else:
                 message = (
