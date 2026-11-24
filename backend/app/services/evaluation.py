@@ -71,6 +71,7 @@ from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGro
 from app.services import (
     auto_triage_attribution,
     enforcement,
+    error_text,
     ingestion,
     notifications,
     pacing,
@@ -380,7 +381,7 @@ def evaluate_all(
                 "The safety check could not be completed this cycle, so no new restriction "
                 "was applied."
             )
-            result.errors.append(f"enforcement safety check: {exc}")
+            result.errors.append(f"enforcement safety check: {error_text.public_error(exc)}")
         verification = _plan_verification(session, config, moment)
         budget.verify_ids = verification.pop("ids")  # type: ignore[assignment]
         if (
@@ -454,7 +455,7 @@ def evaluate_all(
             # whatever that limit left half-written so the next one starts clean.
             session.rollback()
             logger.exception("Evaluation of limit %s failed", limit_id)
-            result.errors.append(f"limit {limit_id}: {exc}")
+            result.errors.append(f"limit {limit_id}: {error_text.public_error(exc)}")
             continue
         # One short transaction per limit: its state is durable before the next
         # limit starts talking to Checkmarx, and no lock outlives its own work.
@@ -634,7 +635,7 @@ def _continue_rollouts(
         except Exception as exc:  # noqa: BLE001 - one limit must never block the rest
             session.rollback()
             logger.exception("Continuing the rollout of limit %s failed", limit_id)
-            result.errors.append(f"limit {limit_id}: {exc}")
+            result.errors.append(f"limit {limit_id}: {error_text.public_error(exc)}")
 
 
 def _manual_pause(session: Session) -> str | None:
@@ -937,8 +938,8 @@ def _lift_unjustified_restrictions(
                 result.restored += 1
         except Exception as exc:  # noqa: BLE001 - one stuck restore must not stop the cycle
             session.rollback()
-            logger.warning("Could not lift restriction %s: %s", action_id, exc)
-            result.errors.append(f"restore {action_id}: {exc}")
+            logger.warning("Could not lift restriction %s", action_id, exc_info=True)
+            result.errors.append(f"restore {action_id}: {error_text.public_error(exc)}")
 
     for limit_id, limit in harmless_limits.items():
         try:
@@ -948,8 +949,8 @@ def _lift_unjustified_restrictions(
             session.commit()
         except Exception as exc:  # noqa: BLE001
             session.rollback()
-            logger.warning("Could not lift the restrictions of limit %s: %s", limit_id, exc)
-            result.errors.append(f"limit {limit_id}: {exc}")
+            logger.warning("Could not lift the restrictions of limit %s", limit_id, exc_info=True)
+            result.errors.append(f"limit {limit_id}: {error_text.public_error(exc)}")
 
 
 def _evaluate_one(
@@ -1356,7 +1357,8 @@ def _close_stale_periods(
                 budget=budget,
             )
         except Exception as exc:  # noqa: BLE001 - one failure must not stop the cycle
-            result.errors.append(f"limit {limit.id}: could not restore after rollover: {exc}")
+            shown = error_text.public_error(exc)
+            result.errors.append(f"limit {limit.id}: could not restore after rollover: {shown}")
             logger.exception("Rollover restore failed for limit %s", limit.id)
             if state is not None:
                 state.status = LimitStatus.RESTRICTED

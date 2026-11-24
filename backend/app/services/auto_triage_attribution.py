@@ -117,7 +117,7 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
-from app.services import ingestion, notifications, pacing, settings_store
+from app.services import error_text, ingestion, notifications, pacing, settings_store
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome
 
@@ -942,7 +942,7 @@ def collect(
             else:
                 message = (
                     f"Auto triage of project {task.project_id} could not be attributed: "
-                    f"{type(exc).__name__}: {str(exc)[:300]}"
+                    f"{error_text.public_error(exc)}"
                 )
                 logger.exception("Auto-triage attribution: %s", message)
             result.warnings.append(message)

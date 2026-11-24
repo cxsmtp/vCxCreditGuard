@@ -76,7 +76,7 @@ from app.models.violations import (
     STATUS_RESOLVED,
     PolicyViolation,
 )
-from app.services import ingestion, notifications, pacing, settings_store, usage_mix
+from app.services import error_text, ingestion, notifications, pacing, settings_store, usage_mix
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -697,7 +697,9 @@ def _detect_scans(session: Session, client: CheckmarxClient, result: DetectionRe
             logger.warning(
                 "Could not list the scans of restricted project %s: %s", watch.project_id, exc
             )
-            result.errors.append(f"{watch.label or watch.project_id}: {exc}")
+            result.errors.append(
+                f"{watch.label or watch.project_id}: {error_text.public_error(exc)}"
+            )
             continue
         result.scans_read += len(listing.scans)
         project = _ProjectScans(
@@ -790,7 +792,9 @@ def _detect_scans(session: Session, client: CheckmarxClient, result: DetectionRe
             logger.warning(
                 "Could not record the scans of project %s", watch.project_id, exc_info=True
             )
-            result.errors.append(f"{watch.label or watch.project_id}: {exc}")
+            result.errors.append(
+                f"{watch.label or watch.project_id}: {error_text.public_error(exc)}"
+            )
     _save_cursors(session, cursors, live)
     session.commit()
 
@@ -1269,7 +1273,7 @@ def _detect_usage(session: Session, result: DetectionResult) -> None:
         except Exception as exc:  # noqa: BLE001 - one target must not stop the others
             session.rollback()
             logger.warning("Could not check usage after restricting %s", target_id, exc_info=True)
-            result.errors.append(f"usage of {target_id}: {exc}")
+            result.errors.append(f"usage of {target_id}: {error_text.public_error(exc)}")
 
 
 def _usage_for_target(

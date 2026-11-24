@@ -41,6 +41,7 @@ from app.models.usage import CreditBalanceSnapshot, SchedulerLock, SchedulerRun
 from app.services import (
     auto_triage_attribution,
     delivery,
+    error_text,
     evaluation,
     ingestion,
     key_permissions,
@@ -263,14 +264,17 @@ def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> Cyc
     except Exception as exc:  # noqa: BLE001 - the scheduler thread must survive anything
         logger.exception("Cycle failed unexpectedly")
         result.status = RunStatus.FAILED
-        result.errors.append(str(exc))
+        # Shown in the run history: an unexpected error is named, not quoted
+        # (its detail is in the server log, logged just above).
+        shown = error_text.public_error(exc)
+        result.errors.append(shown)
         with session_scope() as session:
             if result.run_id is not None:
                 run = session.get(SchedulerRun, result.run_id)
                 if run is not None:
                     run.finished_at = utcnow()
                     run.status = RunStatus.FAILED
-                    run.error = str(exc)[:4000]
+                    run.error = shown[:4000]
                     run.stats = result.steps
     finally:
         with session_scope() as session:
@@ -308,11 +312,12 @@ def _run_step(
             logger.warning("Cycle step %s failed: %s", name, exc)
         else:
             logger.exception("Cycle step %s failed", name)
-        result.steps[name] = {"ok": False, "error": str(exc)}
+        shown = error_text.public_error(exc)
+        result.steps[name] = {"ok": False, "error": shown}
         if degrades_run:
-            result.errors.append(f"{name}: {exc}")
+            result.errors.append(f"{name}: {shown}")
             result.status = RunStatus.PARTIAL
-            _warn_committed(session, name, str(exc))
+            _warn_committed(session, name, shown)
         return False
     finally:
         _record_refusals(session)

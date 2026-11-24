@@ -21,7 +21,7 @@ from app.checkmarx.client import CheckmarxClient
 from app.db.base import utcnow
 from app.models.enums import EntityType, PeriodType, RequestStatus, Severity
 from app.models.limits import CreditLimit, CreditRequest
-from app.services import limits_service, notifications, settings_store
+from app.services import error_text, limits_service, notifications, settings_store
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -470,7 +470,7 @@ def revert_expired_grants(
         except Exception as exc:  # noqa: BLE001
             session.rollback()
             logger.exception("Rolling back expired grant %s failed", request_id)
-            failures.append(f"request {request_id}: {exc}")
+            failures.append(f"request {request_id}: {error_text.public_error(exc)}")
     if failures:
         raise GrantExpiryError(
             f"{len(failures)} expired grant(s) could not be rolled back and will be "
