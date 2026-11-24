@@ -1,0 +1,311 @@
+name: Release
+
+# Publishes the single-container image to the PRIVATE package
+# ghcr.io/cxsmtp/vcxcreditguard when a version tag is pushed, and only then:
+#
+#   git tag -a v1.2.3 -m "What changed, in a few lines"   # the notes shown in the app
+#   git push origin v1.2.3
+#
+# The base image of the latest release is reused, so an app-only release installs
+# as one small layer. Add a line "base: refresh" to the tag's message to build
+# on the base tag's current digest (OS, Python, OpenSSL fixes): that release is
+# then installed by replacing the image.
+#
+# Installations read it with a read-only token (read:packages) entered on
+# Settings -> Updates, and install the app layer in place (see README "Updates").
+#
+# One-time setup by the repository owner (README "Updates", "One-time setup"):
+#   * Environment "release" (Settings -> Environments): required reviewers, and
+#     deployments limited to tags matching v*.*.*. The signing key is the
+#     environment secret CXCG_RELEASE_SIGNING_KEY (never a repository secret), so
+#     it is only handed to this job once a reviewer approved the run.
+#   * Tag ruleset (Settings -> Rules -> Rulesets -> New tag ruleset) targeting
+#     v*: restrict creations, updates and deletions to the release managers
+#     (bypass list) and block force pushes.
+#   * backend/app/updates/release-signing-key.pub holds the public key.
+# Without the secret, or with the placeholder public key, this workflow FAILS:
+# a release is never published unsigned.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/cxsmtp/vcxcreditguard
+  # The base image's tag; its digest is resolved below and is what the image is
+  # built FROM and what the dependency hash names. Keep in step with the default
+  # in deploy/podman/Dockerfile.
+  PYTHON_TAG: python:3.11-alpine
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: release
+    steps:
+      # Third-party actions are pinned by full commit SHA (the tag in the comment).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The annotated tag's message is the release notes.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Signing tools (hash-pinned; no secret in this step's environment)
+        # Installed BEFORE the signing key is exported to any step, from wheels
+        # whose sha256 is committed: nothing installed here can see the key's
+        # install-time environment, and nothing unpinned is installed later.
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes --only-binary=:all: -r .github/release-requirements.txt
+
+      - name: A real public key is committed
+        # The placeholder means installations could not verify the release.
+        run: |
+          cd backend && python -m scripts.release_manifest check-key
+
+      - name: Version from the tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$'; then
+            echo "::error::$tag is not a release tag (vX.Y.Z)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp the version into the app
+        # app/__init__.py is the one place the version lives; the tag decides it.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i -E "s/^__version__ = .*/__version__ = \"${VERSION}\"/" backend/app/__init__.py
+          grep -q "^__version__ = \"${VERSION}\"$" backend/app/__init__.py
+
+      - name: Release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          notes=""
+          if [ -f CHANGELOG.md ]; then
+            # The "## <version>" (or "## v<version>") section, if there is one.
+            notes="$(awk -v v="$VERSION" '
+              /^## / { if (found) exit; if ($2 == v || $2 == "v" v || $2 == "[" v "]") { found = 1; next } }
+              found { print }' CHANGELOG.md)"
+          fi
+          if [ -z "$notes" ]; then
+            notes="$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' \
+              | sed -e '/-----BEGIN PGP SIGNATURE-----/,$d' -e '/^[[:space:]]*base:[[:space:]]*refresh[[:space:]]*$/d')"
+          fi
+          printf '%s' "$notes" | head -c 3500 > "$RUNNER_TEMP/notes.txt"
+
+      - name: Database migrations (label, read before anything is downloaded)
+        # Installations on PostgreSQL see from this label alone that a release
+        # changes the schema; the verified files decide again after download.
+        id: migrations
+        run: |
+          revisions="$(python - <<'PY'
+          import pathlib, re
+          line = re.compile(r"""^revision(?:\s*:\s*str)?\s*=\s*["']([0-9A-Za-z_]+)["']""", re.M)
+          found = set()
+          for path in pathlib.Path("backend/alembic/versions").glob("*.py"):
+              match = line.search(path.read_text(encoding="utf-8"))
+              if match:
+                  found.add(match.group(1))
+          print(" ".join(sorted(found)))
+          PY
+          )"
+          echo "revisions=$revisions" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Base image digest
+        # The base is named by digest in the dependency hash, so a new base makes
+        # the release "needs a new image" (installed by replacing the image, not as
+        # a layer). By default the LATEST RELEASE's base is reused, so a release
+        # that changes only the app stays installable in place. A new base (OS,
+        # Python, OpenSSL fixes) is taken when the tag's message has a line
+        # "base: refresh", when nothing was published yet, or when PYTHON_TAG
+        # changed. (The OS packages installed on the base are in the hash too: a
+        # new libpq revision also means a new image.)
+        id: base
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          previous=""
+          if git for-each-ref "refs/tags/$TAG_NAME" --format='%(contents)' \
+              | grep -Eqx '[[:space:]]*base:[[:space:]]*refresh[[:space:]]*'; then
+            echo "The tag asks for a new base image."
+          else
+            previous="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Image}}' 2>/dev/null \
+              | python -c '
+          import json, os, re, sys
+          try:
+              data = json.load(sys.stdin)
+          except ValueError:
+              sys.exit(0)
+          if "config" not in data:  # an index: one config per platform
+              data = data.get("linux/amd64") or {}
+          labels = (data.get("config") or {}).get("Labels") or {}
+          name = str(labels.get("org.opencontainers.image.base.name") or "")
+          if re.fullmatch(re.escape(os.environ["PYTHON_TAG"]) + r"@sha256:[0-9a-f]{64}", name):
+              print(name)
+          ' || true)"
+          fi
+          if [ -n "$previous" ]; then
+            echo "image=$previous" >> "$GITHUB_OUTPUT"
+            echo "refreshed=no (the latest release's)" >> "$GITHUB_OUTPUT"
+            echo "Base image: $previous (the latest release's; a tag line 'base: refresh' takes a new one)"
+            exit 0
+          fi
+          digest="$(docker buildx imagetools inspect "$PYTHON_TAG" --format '{{json .Manifest}}' \
+            | python -c 'import json, sys; print(json.load(sys.stdin)["digest"])')"
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::could not resolve the digest of $PYTHON_TAG"
+            exit 1
+          fi
+          echo "image=$PYTHON_TAG@$digest" >> "$GITHUB_OUTPUT"
+          echo "refreshed=yes" >> "$GITHUB_OUTPUT"
+          echo "Base image: $PYTHON_TAG@$digest (new)"
+
+      - name: Build the release manifest
+        id: manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PYTHON_IMAGE: ${{ steps.base.outputs.image }}
+        run: |
+          docker buildx build -f deploy/podman/Dockerfile \
+            --build-arg PYTHON_IMAGE="$PYTHON_IMAGE" \
+            --build-arg CXCG_REVISION="$GITHUB_SHA" \
+            --target release-manifest --output type=local,dest="$RUNNER_TEMP/manifest" .
+          deps="$(python - "$RUNNER_TEMP/manifest/release-manifest.json" "$VERSION" <<'PY'
+          import json, re, sys
+          manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert manifest["version"] == sys.argv[2], manifest["version"]
+          assert re.fullmatch(r"[0-9a-f]{64}", manifest["deps_hash"]), manifest["deps_hash"]
+          bad = [p for p in manifest["files"] if p.endswith((".pyc", ".pyo")) or "__pycache__" in p]
+          assert not bad, bad
+          print(manifest["deps_hash"])
+          PY
+          )"
+          echo "deps=$deps" >> "$GITHUB_OUTPUT"
+          echo "release manifest for $VERSION, dependency hash $deps"
+
+      - name: Sign the release manifest
+        id: sign
+        env:
+          SIGNING_KEY: ${{ secrets.CXCG_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::The CXCG_RELEASE_SIGNING_KEY secret of the release environment is not set: a release is never published unsigned."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          signature="$(cd backend && python -m scripts.release_manifest sign \
+            --manifest "$RUNNER_TEMP/manifest/release-manifest.json" --key-file "$RUNNER_TEMP/key.pem")" \
+            || { rm -f "$RUNNER_TEMP/key.pem"; exit 1; }
+          rm -f "$RUNNER_TEMP/key.pem"
+          echo "signature=$signature" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the signature against the committed public key
+        # What installations will check: fails (not warns) on any mismatch.
+        env:
+          SIGNATURE: ${{ steps.sign.outputs.signature }}
+        run: |
+          cd backend && python -m scripts.release_manifest verify \
+            --manifest "$RUNNER_TEMP/manifest/release-manifest.json" --signature "$SIGNATURE"
+
+      - name: Build the image
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PYTHON_IMAGE: ${{ steps.base.outputs.image }}
+          SIGNATURE: ${{ steps.sign.outputs.signature }}
+          DEPS: ${{ steps.manifest.outputs.deps }}
+          MIGRATIONS: ${{ steps.migrations.outputs.revisions }}
+        run: |
+          docker buildx build -f deploy/podman/Dockerfile --load -t cxcreditguard:release \
+            --build-arg PYTHON_IMAGE="$PYTHON_IMAGE" \
+            --build-arg CXCG_REVISION="$GITHUB_SHA" \
+            --build-arg CXCG_RELEASE_SIGNATURE="$SIGNATURE" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.title=CxCreditGuard" \
+            --label "org.opencontainers.image.base.name=$PYTHON_IMAGE" \
+            --label "io.cxcreditguard.deps=$DEPS" \
+            --label "io.cxcreditguard.signed=true" \
+            --label "io.cxcreditguard.migrations=$MIGRATIONS" \
+            --label "io.cxcreditguard.release-notes=$(cat "$RUNNER_TEMP/notes.txt")" \
+            .
+
+      - name: Check the image
+        # The files in the image are exactly the signed ones; /app is not
+        # writable by the app's user; it starts through the launcher, answers its
+        # health check with the tagged version, and its dependency hash is the
+        # one in the label.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SIGNATURE: ${{ steps.sign.outputs.signature }}
+          DEPS: ${{ steps.manifest.outputs.deps }}
+        run: |
+          docker run --rm --entrypoint cat cxcreditguard:release /app/release-manifest.json \
+            > "$RUNNER_TEMP/in-image.json"
+          cmp "$RUNNER_TEMP/in-image.json" "$RUNNER_TEMP/manifest/release-manifest.json" \
+            || { echo "::error::the image's release-manifest.json is not the signed one"; exit 1; }
+          in_image_sig="$(docker run --rm --entrypoint cat cxcreditguard:release /app/release-manifest.sig | tr -d '\n')"
+          [ "$in_image_sig" = "$SIGNATURE" ] \
+            || { echo "::error::the image's release-manifest.sig is not the signature"; exit 1; }
+          if docker run --rm --entrypoint sh cxcreditguard:release -c 'touch /app/app/.w 2>/dev/null'; then
+            echo "::error::/app is writable by the app's user"; exit 1
+          fi
+          inside="$(docker run --rm --entrypoint cat cxcreditguard:release /usr/local/share/cxcreditguard/image.json)"
+          echo "$inside" | grep -q "\"deps_hash\": \"$DEPS\"" \
+            || { echo "::error::the image's dependency hash differs from the label"; echo "$inside"; exit 1; }
+          docker run -d --name release-check -p 127.0.0.1:8000:8000 cxcreditguard:release
+          for _ in $(seq 1 40); do
+            body="$(curl -s http://127.0.0.1:8000/healthz || true)"
+            echo "$body" | grep -q "\"version\":\"$VERSION\"" && break
+            sleep 3
+          done
+          docker logs release-check 2>&1 | tail -n 20
+          echo "$body" | grep -q "\"version\":\"$VERSION\"" || { echo "::error::did not come up as $VERSION"; exit 1; }
+          docker rm -f release-check
+
+      - name: Push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DEPS: ${{ steps.manifest.outputs.deps }}
+          PYTHON_IMAGE: ${{ steps.base.outputs.image }}
+          BASE_REFRESHED: ${{ steps.base.outputs.refreshed }}
+        run: |
+          docker tag cxcreditguard:release "$IMAGE:$VERSION"
+          docker tag cxcreditguard:release "$IMAGE:latest"
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+          {
+            echo "### Published $IMAGE:$VERSION"
+            echo ""
+            echo "- signed: yes (verified against the committed public key)"
+            echo "- base image: \`$PYTHON_IMAGE\` (new: $BASE_REFRESHED)"
+            echo "- dependency hash: \`$DEPS\`"
+          } >> "$GITHUB_STEP_SUMMARY"

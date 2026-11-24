@@ -45,11 +45,17 @@ COPY backend/pyproject.toml backend/constraints.txt ./
 # The trailing "|| true" is parenthesised on purpose: unparenthesised it would
 # apply to the whole chain and let a failed dependency install produce an image.
 # kics-scan ignore-block
+# Only the project's dependencies are installed, read from pyproject.toml (whose
+# version is read from the app itself, which is copied in later).
 RUN apk add --no-cache libpq \
     && apk add --no-cache --virtual .build gcc musl-dev python3-dev libpq-dev \
-    && pip install --no-cache-dir -c constraints.txt . "psycopg[c]" \
+    && python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" > /tmp/requirements.txt \
+    && pip install --no-cache-dir -c constraints.txt -r /tmp/requirements.txt "psycopg[c]" \
+    && rm /tmp/requirements.txt \
     && apk del .build \
-    && (pip uninstall -y pip setuptools wheel 2>/dev/null || true)
+    && (pip uninstall -y pip setuptools wheel 2>/dev/null || true) \
+    && mkdir -p /usr/local/share/cxcreditguard \
+    && printf '{"created": "%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /usr/local/share/cxcreditguard/image.json
 
 COPY backend/alembic.ini ./
 COPY backend/alembic ./alembic
@@ -73,7 +79,15 @@ RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
     && addgroup -g 10001 cxcg \
     && adduser -D -H -u 10001 -G cxcg cxcg \
     && mkdir -p /app/data \
-    && chown -R cxcg:cxcg /app
+    && chown cxcg:cxcg /app/data \
+    && chmod -R u=rwX,go=rX /app/alembic /app/app /app/scripts
+# /app stays owned by root and read-only for the app's user; only /app/data is
+# writable. image.json records when the OS packages were installed: Settings ->
+# Updates says when the image is older than 90 days.
+
+# Settings -> Updates shows the steps for this deployment: it is updated by
+# rebuilding the image from a release tag (README "Updates"), not in place.
+ENV CXCG_DEPLOYMENT=compose
 
 USER cxcg
 

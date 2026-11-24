@@ -33,6 +33,7 @@ PURPOSE_WEBHOOK_URL: Final = "webhook-url"
 PURPOSE_TOTP_SECRET: Final = "totp-secret"
 PURPOSE_KEY_CHECK: Final = "master-key-check"
 PURPOSE_RECOVERY_CODE: Final = "totp-recovery-code"
+PURPOSE_UPDATE_TOKEN: Final = "update-registry-token"
 
 
 class DecryptionError(RuntimeError):

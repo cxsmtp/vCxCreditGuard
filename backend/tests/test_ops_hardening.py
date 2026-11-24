@@ -51,22 +51,13 @@ class TestAttestation:
         db.flush()
         assert ops_hardening.attestation(db).config_digest != before
 
-    def test_update_status_tracks_a_recorded_latest_version(self, db: Session) -> None:
-        assert ops_hardening.update_status(db)["update_available"] is False
-        ops_hardening.set_latest_version(db, version="99.0.0", actor=ACTOR)
-        db.flush()
-        status_ = ops_hardening.update_status(db)
-        assert status_["latest"] == "99.0.0" and status_["update_available"] is True
-        # An older recorded version is not an update.
-        ops_hardening.set_latest_version(db, version="0.0.1", actor=ACTOR)
-        db.flush()
-        assert ops_hardening.update_status(db)["update_available"] is False
-
-    def test_versions_of_differing_length_compare_equal(self, db: Session) -> None:
-        # "x.y" and "x.y.0" are the same version, not an available update.
-        ops_hardening.set_latest_version(db, version=f"{__version__}.0", actor=ACTOR)
-        db.flush()
-        assert ops_hardening.update_status(db)["update_available"] is False
+    def test_update_status_without_a_check_reports_no_update(self, db: Session) -> None:
+        # The updater's own tests (test_updates.py) cover a release being found.
+        assert ops_hardening.update_status(db) == {
+            "current": __version__,
+            "latest": None,
+            "update_available": False,
+        }
 
 
 class TestWatchdog:

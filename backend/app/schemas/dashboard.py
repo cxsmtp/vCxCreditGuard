@@ -360,6 +360,9 @@ class MeResponse(BaseModel):
     # Open policy violations, for the top-bar light and the nav badge. Admins
     # only (viewers do not see violations); None for a viewer.
     open_violations: int | None = None
+    # Admins only: the updater's light for the top bar (update available, needs
+    # a registry token, token refused, needs a new image), or None.
+    update_notice: dict[str, str] | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
 

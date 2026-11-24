@@ -37,6 +37,113 @@ export interface Me {
   key_permissions?: KeyPermissionSummary | null;
   /** Open policy violations (admins only; null for a viewer). */
   open_violations?: number | null;
+  /** The updater's top-bar light (admins only; null when nothing needs attention). */
+  update_notice?: UpdateNotice | null;
+}
+
+export interface UpdateNotice {
+  kind:
+    | "available"
+    | "needs_token"
+    | "token_invalid"
+    | "needs_image"
+    | "needs_signing_key"
+    | "image_old"
+    | "installing";
+  tone: "warn" | "bad" | "off";
+  label: string;
+  detail: string;
+}
+
+export interface UpdateRelease {
+  version: string;
+  created: string | null;
+  revision: string;
+  signed: boolean;
+  needs_image: boolean;
+  newer: boolean;
+  running: boolean;
+  installed: boolean;
+  failed: string | null;
+  /** Rolled back by an admin: auto-update does not install it again. */
+  skipped: string | null;
+  /** From the release's migrations label; null when the release does not say. */
+  schema_change: boolean | null;
+  notes: string;
+}
+
+export interface InstalledVersion {
+  version: string;
+  installed_at: string | null;
+  installed_by: string | null;
+  signed: boolean;
+  revision: string;
+  bytes: number | null;
+  running: boolean;
+  failed: string | null;
+  skipped: string | null;
+}
+
+export interface UpdateEvent {
+  id: string;
+  at: string;
+  type: string;
+  version?: string;
+  from?: string;
+  to?: string;
+  reason?: string;
+  seconds?: number;
+  restored_backup?: string | null;
+  code?: number;
+  by?: string;
+}
+
+export interface UpdatesStatus {
+  image: string;
+  egress_hosts: string[];
+  deployment: "single" | "compose" | "source";
+  supervised: boolean;
+  running: { version: string; source: "built-in" | "installed" | "source" };
+  built_in: string;
+  installed: InstalledVersion[];
+  available: UpdateRelease[];
+  latest: string | null;
+  update_available: boolean;
+  latest_needs_image: boolean;
+  /** The release auto-update would install (fits this image, not failed or skipped). */
+  latest_installable: string | null;
+  whats_new: { version: string; notes: string }[];
+  rollback: {
+    possible: boolean;
+    target: string | null;
+    target_version?: string;
+    restores_backup: boolean;
+    since: string | null;
+    reason: string;
+  };
+  selection: { version: string | null; previous: string | null; at: string | null; by: string | null };
+  settings: { auto_enabled: boolean; quiet_hour: number; timezone: string };
+  token: { configured: boolean; status: "ok" | "invalid" | "missing" | "unknown" };
+  /** invalid: a key is configured but unusable, so every install is refused. */
+  signing: { configured: boolean; invalid?: boolean; auto_waits: boolean; message: string };
+  image_age: { created: string | null; days: number | null; stale: boolean; max_days: number };
+  skipped: Record<string, { at: string; by: string; reason: string }>;
+  database: { kind: string; backups: boolean };
+  last_check: { at: string; error: string | null; count?: number } | null;
+  last_auto: { at: string; result: string } | null;
+  job: {
+    version: string;
+    by: string;
+    automatic: boolean;
+    state: "running" | "switching" | "failed";
+    step: string;
+    error: string;
+    started_at: string;
+  } | null;
+  failed: Record<string, { at: string; reason: string }>;
+  events: UpdateEvent[];
+  image_command: string;
+  notice: UpdateNotice | null;
 }
 
 export type KeyPermissionVerdict = "ok" | "limited" | "insufficient" | "unknown";

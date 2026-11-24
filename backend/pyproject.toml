@@ -1,6 +1,8 @@
 [project]
 name = "cxcreditguard"
-version = "0.1.0"
+# The version lives in app/__init__.py (__version__) only; a release tag vX.Y.Z
+# stamps it there before the image is built (.github/workflows/release.yml).
+dynamic = ["version"]
 description = "Self-hosted governance utility for Checkmarx One AI credit consumption"
 requires-python = ">=3.11"
 dependencies = [
@@ -31,6 +33,9 @@ dev = [
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "app.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["app*"]
