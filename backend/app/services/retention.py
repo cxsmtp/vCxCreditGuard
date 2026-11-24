@@ -19,11 +19,12 @@ per cycle), so besides the window two things keep them in check:
   that matched no entity (their reported id). Those keep theirs.
 * **Thinning** (``retention.thin_snapshots``, on by default): whole snapshots,
   never single rows, are thinned to every one of the last 3 days, one an hour
-  per dimension up to 40 days (the longest monthly period, 31 days, plus the
-  week raw rows are kept, with margin), and one a day after that. A snapshot
-  anything refers to is never removed (``pinned_snapshots``). Batched, a
-  transaction per batch, so no long lock; idempotent; summarised in the prune's
-  audit entry.
+  per dimension up to 40 days, and one a day after that. The tiers are a
+  resolution choice for the trend and for someone reading the history, not
+  what correctness rests on: every snapshot a calculation refers to is pinned
+  exactly (``pinned_snapshots``) and never removed, whatever its age. Batched,
+  a transaction per batch, so no long lock; idempotent; summarised in the
+  prune's audit entry.
 """
 
 from __future__ import annotations
@@ -68,8 +69,12 @@ KEEP_RECENT_SNAPSHOTS = 200
 RAW_KEEP_DAYS = 7
 # Thinning: every snapshot younger than this ...
 THIN_KEEP_ALL_DAYS = 3
-# ... one an hour per dimension up to this age, one a day beyond it.
+# ... one an hour per dimension up to this age, one a day beyond it. A choice
+# of resolution for the trend and the history, not of correctness: every
+# snapshot something reads is pinned (pinned_snapshots), whatever its age.
 THIN_HOURLY_DAYS = 40
+# Ids per IN list in a statement: far below PostgreSQL's 65,535 parameters.
+ID_BATCH = 1000
 # Snapshots per transaction when deleting or clearing, and at most this many
 # per run (a large backlog after an upgrade is worked through over several
 # daily runs, and a run also stops when the cycle's time budget is spent).
@@ -220,7 +225,9 @@ def _prune_snapshots(session: Session, cutoff, pinned: set[int] | None = None) -
     """Drop old snapshots, but always keep a recent tail per dimension, and
     every snapshot something refers to (``pinned``).
 
-    Cascades to their records through the relationship, so no orphan rows are left.
+    The set to delete is worked out here, not in a ``NOT IN`` list (which on
+    PostgreSQL fails beyond 65,535 ids), and deleted in batches, records
+    first, a transaction each, so no orphan rows are left and no lock is long.
     """
     keep_ids: set[int] = set(pinned or ())
     for view in session.scalars(select(UsageSnapshot.view_by).distinct()):
@@ -242,26 +249,30 @@ def _prune_snapshots(session: Session, cutoff, pinned: set[int] | None = None) -
         if believed is not None:
             keep_ids.add(believed)
 
-    doomed = list(
-        session.scalars(
-            select(UsageSnapshot.id).where(
-                UsageSnapshot.collected_at < cutoff,
-                UsageSnapshot.id.notin_(keep_ids) if keep_ids else True,
-            )
+    doomed = [
+        snapshot_id
+        for snapshot_id in session.scalars(
+            select(UsageSnapshot.id)
+            .where(UsageSnapshot.collected_at < cutoff)
+            .order_by(UsageSnapshot.id)
         )
-    )
-    if not doomed:
-        return 0, 0
+        if snapshot_id not in keep_ids
+    ]
+    return _delete_snapshots(session, doomed)
 
-    record_count = int(
-        session.scalar(
-            select(func.count()).select_from(UsageRecord).where(UsageRecord.snapshot_id.in_(doomed))
-        )
-        or 0
-    )
-    session.execute(delete(UsageRecord).where(UsageRecord.snapshot_id.in_(doomed)))
-    session.execute(delete(UsageSnapshot).where(UsageSnapshot.id.in_(doomed)))
-    return len(doomed), record_count
+
+def _delete_snapshots(session: Session, doomed: list[int]) -> tuple[int, int]:
+    """Delete these snapshots and their records in batches. (snapshots, records)."""
+    snapshots = records = 0
+    session.commit()
+    for start in range(0, len(doomed), ID_BATCH):
+        chunk = doomed[start : start + ID_BATCH]
+        deleted = session.execute(delete(UsageRecord).where(UsageRecord.snapshot_id.in_(chunk)))
+        session.execute(delete(UsageSnapshot).where(UsageSnapshot.id.in_(chunk)))
+        session.commit()  # one short transaction per batch
+        snapshots += len(chunk)
+        records += int(deleted.rowcount or 0)
+    return snapshots, records
 
 
 # ------------------------------------------------------------ snapshot thinning
@@ -339,13 +350,20 @@ def pinned_snapshots(session: Session, now: datetime) -> tuple[set[int], set[int
       (``usage_mix``: newest at or before the period's baseline, every
       dimension), which reads the Fusion models from the raw rows;
     * the baseline of every restriction that is, or may be, in force (the
-      rise in usage since it is measured from it: policy violations);
-    * each project's auto-triage cursor (``last_snapshot_id``).
+      rise in usage since it is measured from it: policy violations).
 
-    Kept whole, raw rows cleared like any other: the snapshot each auto-triage
-    charge was observed on (nothing reads its raw rows).
+    Not pinned: the snapshot an auto-triage charge was observed on
+    (``AutoTriageCharge.snapshot_id``) and a project's auto-triage cursor
+    (``AutoTriageProjectState.last_snapshot_id``). Both are plain integers,
+    not foreign keys: the first is only written, the second only compared with
+    the latest snapshot's id; neither is ever loaded. Pinning them kept nearly
+    every project snapshot for the whole lookback window while attribution
+    was on, and a stuck cursor for ever. The charge rows themselves are kept
+    (their own retention: ``_prune_auto_triage_charges``).
+
+    Both sets are the same today; kept apart so a pin that needs the snapshot
+    but not its raw rows can be added without touching the raw clearing.
     """
-    from app.models.usage import AutoTriageProjectState
     from app.services import enforcement
 
     keep_raw: set[int] = set()
@@ -393,24 +411,8 @@ def pinned_snapshots(session: Session, now: datetime) -> tuple[set[int], set[int
             .distinct()
         )
     )
-    keep_raw.update(
-        session.scalars(
-            select(AutoTriageProjectState.last_snapshot_id)
-            .where(AutoTriageProjectState.last_snapshot_id.is_not(None))
-            .distinct()
-        )
-    )
-    keep = set(keep_raw)
-    keep.update(
-        session.scalars(
-            select(AutoTriageCharge.snapshot_id)
-            .where(AutoTriageCharge.snapshot_id.is_not(None))
-            .distinct()
-        )
-    )
     keep_raw.discard(None)  # type: ignore[arg-type]
-    keep.discard(None)  # type: ignore[arg-type]
-    return keep, keep_raw
+    return set(keep_raw), keep_raw
 
 
 def _thin_snapshots(
@@ -480,6 +482,28 @@ def _thin_snapshots(
             break
 
 
+def _clear_raw_of(session: Session, ids: list[int], result: RetentionResult) -> None:
+    """Clear the raw rows of these snapshots (rows that matched nothing keep theirs)."""
+    for start in range(0, len(ids), RAW_BATCH):
+        chunk = ids[start : start + RAW_BATCH]
+        cleared = session.execute(
+            update(UsageRecord)
+            .where(
+                UsageRecord.snapshot_id.in_(chunk),
+                UsageRecord.raw.is_not(None),
+                UsageRecord.entity_id.is_not(None),
+            )
+            .values(raw=null())
+        )
+        session.execute(
+            update(UsageSnapshot)
+            .where(UsageSnapshot.id.in_(chunk), UsageSnapshot.raw.is_not(None))
+            .values(raw=null())
+        )
+        result.raw_cleared_records += int(cleared.rowcount or 0)
+        result.raw_cleared_snapshots += len(chunk)
+
+
 def _clear_old_raw(
     session: Session, now: datetime, keep_raw: set[int], result: RetentionResult
 ) -> None:
@@ -488,14 +512,47 @@ def _clear_old_raw(
     Rows that matched no entity keep theirs (auto-triage attribution reads the
     reported id of such earlier rows); so do the pinned snapshots. A cursor
     (the collection time cleared up to) makes each run start where the last
-    stopped, so rows already cleared are never scanned again.
+    stopped, so rows already cleared are never scanned again. A snapshot the
+    cursor passes while it is pinned is remembered, and cleared by the first
+    run after its pin is released (a period ended, a restriction lifted).
     """
     until = now - timedelta(days=RAW_KEEP_DAYS)
     stored = settings_store.get_value(session, settings_store.KEY_RETENTION_RAW_CLEARED_UNTIL)
+    if isinstance(stored, str):  # the first form: the timestamp alone
+        stored = {"until": stored}
+    stored = stored if isinstance(stored, dict) else {}
     try:
-        since = datetime.fromisoformat(stored) if isinstance(stored, str) else None
-    except ValueError:
+        since = datetime.fromisoformat(stored["until"]) if stored.get("until") else None
+    except (TypeError, ValueError):
         since = None
+    passed_pinned = {int(i) for i in stored.get("pinned") or [] if isinstance(i, int)}
+
+    # Pins released since: clear those now (the ones deleted meanwhile drop out).
+    released = sorted(passed_pinned - keep_raw)
+    if released:
+        existing = [
+            snapshot_id
+            for start in range(0, len(released), ID_BATCH)
+            for snapshot_id in session.scalars(
+                select(UsageSnapshot.id).where(
+                    UsageSnapshot.id.in_(released[start : start + ID_BATCH])
+                )
+            )
+        ]
+        _clear_raw_of(session, existing, result)
+        passed_pinned -= set(released)
+
+    def save(cursor: datetime | None) -> None:
+        settings_store.set_value(
+            session,
+            settings_store.KEY_RETENTION_RAW_CLEARED_UNTIL,
+            {
+                "until": cursor.isoformat() if cursor is not None else None,
+                "pinned": sorted(passed_pinned),
+            },
+        )
+        session.commit()  # one short transaction per batch
+
     query = select(UsageSnapshot.id, UsageSnapshot.collected_at).where(
         UsageSnapshot.collected_at < until, UsageSnapshot.held_reason.is_(None)
     )
@@ -505,32 +562,14 @@ def _clear_old_raw(
         query.order_by(UsageSnapshot.collected_at, UsageSnapshot.id).limit(MAX_SNAPSHOTS_PER_RUN)
     ).all()
     session.commit()
+    if not rows:
+        save(since)
+        return
     for start in range(0, len(rows), RAW_BATCH):
         chunk = rows[start : start + RAW_BATCH]
-        ids = [row.id for row in chunk if row.id not in keep_raw]
-        if ids:
-            cleared = session.execute(
-                update(UsageRecord)
-                .where(
-                    UsageRecord.snapshot_id.in_(ids),
-                    UsageRecord.raw.is_not(None),
-                    UsageRecord.entity_id.is_not(None),
-                )
-                .values(raw=null())
-            )
-            session.execute(
-                update(UsageSnapshot)
-                .where(UsageSnapshot.id.in_(ids), UsageSnapshot.raw.is_not(None))
-                .values(raw=null())
-            )
-            result.raw_cleared_records += int(cleared.rowcount or 0)
-            result.raw_cleared_snapshots += len(ids)
-        settings_store.set_value(
-            session,
-            settings_store.KEY_RETENTION_RAW_CLEARED_UNTIL,
-            chunk[-1].collected_at.isoformat(),
-        )
-        session.commit()  # one short transaction per batch
+        _clear_raw_of(session, [row.id for row in chunk if row.id not in keep_raw], result)
+        passed_pinned.update(row.id for row in chunk if row.id in keep_raw)
+        save(chunk[-1].collected_at)
         if pacing.out_of_time():
             result.skipped.append("raw rows: stopped at the cycle's time budget")
             break
@@ -542,19 +581,14 @@ def _prune_notifications(session: Session, cutoff) -> int:
     A restriction that is still in force must keep the notification that carries its
     Restore access button, however old it is.
     """
-    live_action_ids = set(
-        session.scalars(
-            select(EnforcementAction.id).where(
-                EnforcementAction.status == EnforcementStatus.APPLIED
-            )
-        )
+    # A subquery, not a list of ids: no parameter limit, however many are live.
+    live_action_ids = select(EnforcementAction.id).where(
+        EnforcementAction.status == EnforcementStatus.APPLIED
     )
-    condition = Notification.created_at < cutoff
-    if live_action_ids:
-        condition = condition & (
-            Notification.enforcement_action_id.is_(None)
-            | Notification.enforcement_action_id.notin_(live_action_ids)
-        )
+    condition = (Notification.created_at < cutoff) & (
+        Notification.enforcement_action_id.is_(None)
+        | Notification.enforcement_action_id.notin_(live_action_ids)
+    )
     return _delete_where(session, Notification, condition)
 
 

@@ -179,8 +179,13 @@ class TestThinning:
         assert 35 * 24 - 2 <= len(hourly) <= 35 * 24 + 4
         daily = _ids_between(db, now - timedelta(days=DAYS) - STEP, now - timedelta(days=41))
         assert 3 <= len(daily) <= 6
-        for pinned in (baseline, charge_snapshot, mix_snapshot, legacy_snapshot, ids[-1]):
+        for pinned in (baseline, mix_snapshot, legacy_snapshot, ids[-1]):
             assert db.get(UsageSnapshot, pinned) is not None, pinned
+        # A charge's snapshot is not pinned (nothing reads it); the charge stays.
+        keep, _keep_raw = retention.pinned_snapshots(db, utcnow())
+        assert charge_snapshot not in keep
+        charge = db.scalar(select(AutoTriageCharge))
+        assert charge is not None and charge.snapshot_id == charge_snapshot
         legacy = db.scalar(
             select(EnforcementAction).where(EnforcementAction.idempotency_key == "k2")
         )
@@ -212,18 +217,12 @@ class TestThinning:
         assert old_matched == len(kept_raw)
         assert raw_rows(UsageSnapshot.collected_at < week, UsageRecord.entity_id.is_(None)) > 0
         assert raw_rows(UsageSnapshot.collected_at >= week, UsageRecord.entity_id.is_not(None)) > 0
-        assert (
-            db.get(
-                UsageRecord,
-                db.scalar(
-                    select(UsageRecord.id).where(
-                        UsageRecord.snapshot_id == charge_snapshot,
-                        UsageRecord.entity_id.is_not(None),
-                    )
-                ),
-            ).raw
-            is None
+        charge_row = db.scalar(
+            select(UsageRecord).where(
+                UsageRecord.snapshot_id == charge_snapshot, UsageRecord.entity_id.is_not(None)
+            )
         )
+        assert charge_row is None or charge_row.raw is None
         assert result.raw_cleared_records > 0
 
         # Audited, with the summary.

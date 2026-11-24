@@ -298,14 +298,19 @@ def _simulate_thinning(session: Any, *, days: int, rows: int, interval: int) -> 
     before and after one retention run (thinning is idempotent: one run does
     what a month of daily runs would).
     """
+    from decimal import Decimal
+
     from sqlalchemy import func, insert, select, text
 
     from app.db.base import utcnow
-    from app.models.usage import UsageRecord, UsageSnapshot
-    from app.services import retention
+    from app.models.usage import AutoTriageCharge, UsageRecord, UsageSnapshot
+    from app.services import retention, settings_store
     from app.services.audit import AuditActor
 
     now = utcnow()
+    # With attribution on, (nearly) every project reading shows some project's
+    # Auto Triage rise and so carries a charge: simulated the same way.
+    charging = settings_store.auto_triage_to_initiator(session)
     views = list(session.scalars(select(UsageSnapshot.view_by).distinct()))
     for view in views:
         template = session.scalar(
@@ -340,6 +345,22 @@ def _simulate_thinning(session: Any, *, days: int, rows: int, interval: int) -> 
                 )
                 .returning(UsageSnapshot.id)
             ).scalar_one()
+            if charging and view == "project":
+                moment = now - timedelta(minutes=interval * step)
+                session.execute(
+                    insert(AutoTriageCharge).values(
+                        project_id=records[0].entity_id or "simulated",
+                        basis="observed",
+                        initiator="simulated@example.com",
+                        initiator_key="simulated@example.com",
+                        scan_count=1,
+                        credits=Decimal("1"),
+                        window_start=moment - timedelta(minutes=interval),
+                        window_end=moment,
+                        snapshot_id=snapshot_id,
+                        created_at=moment,
+                    )
+                )
             session.execute(
                 insert(UsageRecord),
                 [
@@ -394,6 +415,9 @@ def _simulate_thinning(session: Any, *, days: int, rows: int, interval: int) -> 
         ).one()
         return {
             "snapshots_per_view": snapshots,
+            "auto_triage_charges": session.scalar(
+                select(func.count()).select_from(AutoTriageCharge)
+            ),
             "disk_mb": round(disk / 1_048_576, 2),
             "records": int(sizes[0]),
             "record_bytes": int(sizes[1]),
@@ -408,6 +432,7 @@ def _simulate_thinning(session: Any, *, days: int, rows: int, interval: int) -> 
     after = measure()
     return {
         "days": days,
+        "attribution": charging,
         "rows_per_snapshot": rows,
         "interval_minutes": interval,
         "before": before,
