@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Query, status
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import AuthContext, CurrentUser, DbSession
 from app.models.enums import EntityType
 from app.schemas.preview import (
     BlastRadiusResponse,
     DryRunResponse,
     DryRunRowResponse,
+    KeptRolePreviewResponse,
+    ProjectWarningResponse,
+    RemovedRolePreviewResponse,
     TargetPreviewResponse,
+    UserRolesPreviewResponse,
 )
-from app.services import limits_service, preview_service
+from app.services import connection as connection_service
+from app.services import limits_service, preview_service, settings_store
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/preview", tags=["preview"])
 
@@ -32,6 +41,39 @@ def _blast_to_response(blast: preview_service.BlastRadius) -> BlastRadiusRespons
         disable_repo_fusion=blast.disable_repo_fusion,
         total_actions=blast.total_actions,
         project_actions=blast.project_actions,
+        ai_roles=blast.ai_roles,
+        user_roles=[
+            UserRolesPreviewResponse(
+                user_id=user.user_id,
+                user_label=user.user_label,
+                read=user.read,
+                removed=[
+                    RemovedRolePreviewResponse(
+                        name=role.name, description=role.description, grants=role.grants
+                    )
+                    for role in user.removed
+                ],
+                kept=[
+                    KeptRolePreviewResponse(name=role.name, sources=role.sources)
+                    for role in user.kept
+                ],
+                not_held=user.not_held,
+                unread=user.unread,
+                note=user.note,
+                already_restricted=user.already_restricted,
+            )
+            for user in blast.user_roles
+        ],
+        user_roles_truncated=blast.user_roles_truncated,
+        user_roles_note=blast.user_roles_note,
+        warnings=[
+            ProjectWarningResponse(
+                project_id=warning.project_id,
+                project_label=warning.project_label,
+                message=warning.message,
+            )
+            for warning in blast.warnings
+        ],
         targets=[
             TargetPreviewResponse(
                 kind=target.kind,
@@ -42,6 +84,34 @@ def _blast_to_response(blast: preview_service.BlastRadius) -> BlastRadiusRespons
             for target in blast.targets
         ],
     )
+
+
+def _roles_previewer(db, ctx: AuthContext) -> preview_service.RolePreviewer:  # type: ignore[no-untyped-def]
+    """Reads users' roles from Checkmarx One for this request, when it can.
+
+    Admins only: what a person holds and through which groups is read with the
+    stored key's IAM admin access, so a viewer gets the plain preview (which
+    roles a restriction removes) and no IAM read is made for them. A preview
+    never fails because the tenant cannot be reached: the roles are then
+    simply not read, and the preview says so.
+    """
+    if not ctx.is_admin:
+        return preview_service.RolePreviewer(
+            db,
+            None,
+            why_not_read="What a user holds in Checkmarx One is shown to admins only, so the "
+            "user's roles were not read.",
+        )
+    if settings_store.demo_mode(db):
+        return preview_service.RolePreviewer(
+            db, None, why_not_read="Demo mode is on, so the user's roles were not read."
+        )
+    try:
+        client = connection_service.optional_client(db)
+    except Exception:  # noqa: BLE001 - a preview must render without the tenant
+        logger.warning("No Checkmarx client for the preview", exc_info=True)
+        client = None
+    return preview_service.RolePreviewer(db, client)
 
 
 @router.get("/blast-radius", response_model=BlastRadiusResponse)
@@ -72,7 +142,11 @@ def get_blast_radius(
                 detail={"code": "invalid_project_actions", "message": str(exc)},
             ) from exc
     blast = preview_service.blast_radius(
-        db, entity_type=str(entity_type), entity_id=entity_id, project_actions=actions
+        db,
+        entity_type=str(entity_type),
+        entity_id=entity_id,
+        project_actions=actions,
+        roles=_roles_previewer(db, ctx),
     )
     return _blast_to_response(blast)
 
@@ -80,9 +154,11 @@ def get_blast_radius(
 @router.get("/dry-run", response_model=DryRunResponse)
 def get_dry_run(ctx: CurrentUser, db: DbSession) -> DryRunResponse:
     """Project what the next cycle would decide, without writing anything."""
-    result = preview_service.dry_run(db)
+    result = preview_service.dry_run(db, roles=_roles_previewer(db, ctx))
     return DryRunResponse(
         generated_at=result.generated_at,
+        user_roles_truncated=result.user_roles_truncated,
+        user_roles_note=result.user_roles_note,
         would_enforce_count=result.would_enforce_count,
         would_warn_count=result.would_warn_count,
         affected_projects=result.affected_projects,

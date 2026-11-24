@@ -504,6 +504,9 @@ export interface AppSettings {
   protected_roles: string;
   /** Turning Fusion off also tries to lock it against per-scan override (unverified). */
   fusion_lock_override: boolean;
+  /** The client roles a user restriction removes (from now on), and the built-in default. */
+  ai_roles: string[];
+  default_ai_roles: string[];
   current_schedule_description: string;
 }
 
@@ -674,6 +677,58 @@ export interface TargetPreview {
   target_label: string | null;
 }
 
+export interface ClientRole {
+  name: string;
+  description: string | null;
+  composite: boolean;
+  /** A short description CreditGuard knows for this role (the default AI roles). */
+  known_description: string | null;
+  /** Looks like an administration role: choosing it needs a confirmation. */
+  admin_like?: boolean;
+  /** A protected role (Settings -> Enforcement): it cannot be an AI role. */
+  protected?: boolean;
+}
+
+export interface ClientRoles {
+  available: boolean;
+  message: string | null;
+  roles: ClientRole[];
+  ai_roles: string[];
+  default_ai_roles: string[];
+}
+
+export interface RemovedRolePreview {
+  name: string;
+  description: string | null;
+  /** The roles it contains when composite; [] when not; null when unreadable. */
+  grants: string[] | null;
+}
+
+export interface KeptRolePreview {
+  name: string;
+  sources: string[];
+}
+
+export interface UserRolesPreview {
+  user_id: string;
+  user_label: string | null;
+  /** Whether the user's roles were read from Checkmarx One at all. */
+  read: boolean;
+  removed: RemovedRolePreview[];
+  kept: KeptRolePreview[];
+  not_held: string[];
+  unread: string[];
+  note: string | null;
+  /** A restriction already holds, so the roles were not read again. */
+  already_restricted?: boolean;
+}
+
+export interface ProjectWarning {
+  project_id: string;
+  project_label: string | null;
+  message: string;
+}
+
 export interface BlastRadius {
   entity_type: EntityType;
   entity_id: string;
@@ -689,6 +744,13 @@ export interface BlastRadius {
   total_actions: number;
   targets: TargetPreview[];
   project_actions?: ProjectAction[];
+  /** The roles a user restriction removes, and per user what they would lose. */
+  ai_roles?: string[];
+  user_roles?: UserRolesPreview[];
+  user_roles_truncated?: boolean;
+  user_roles_note?: string | null;
+  /** Projects where turning Auto Triage off may not hold. */
+  warnings?: ProjectWarning[];
 }
 
 export interface DryRunRow {
@@ -717,6 +779,8 @@ export interface DryRunResult {
   affected_projects: number;
   affected_users: number;
   rows: DryRunRow[];
+  user_roles_truncated?: boolean;
+  user_roles_note?: string | null;
 }
 
 export interface CsvImportResult {

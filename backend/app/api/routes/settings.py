@@ -9,10 +9,16 @@ from fastapi import APIRouter, HTTPException, status
 
 from app import scheduler
 from app.api.deps import AdminUser, CurrentUser, DbSession
+from app.checkmarx import iam
 from app.checkmarx import usage as usage_api
 from app.models.enums import Severity
-from app.schemas.dashboard import SettingsResponse, SettingsUpdateRequest
-from app.services import delivery, settings_store
+from app.schemas.dashboard import (
+    ClientRoleResponse,
+    ClientRolesResponse,
+    SettingsResponse,
+    SettingsUpdateRequest,
+)
+from app.services import delivery, role_sources, settings_store
 from app.services.audit import record_audit
 
 logger = logging.getLogger(__name__)
@@ -49,6 +55,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "max_new_targets_per_cycle": settings_store.KEY_MAX_NEW_TARGETS,
     "protected_roles": settings_store.KEY_PROTECTED_ROLES,
     "fusion_lock_override": settings_store.KEY_FUSION_LOCK,
+    "ai_roles": settings_store.KEY_AI_ROLES,
     "charge_auto_triage_to_scan_initiator": settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR,
 }
 
@@ -119,6 +126,8 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         max_new_targets_per_cycle=guard.max_new_targets_per_cycle,
         protected_roles=", ".join(sorted(guard.protected_roles)),
         fusion_lock_override=settings_store.fusion_lock_enabled(db),
+        ai_roles=list(settings_store.ai_role_names(db)),
+        default_ai_roles=list(iam.DEFAULT_AI_ROLE_NAMES),
         charge_auto_triage_to_scan_initiator=bool(
             values.get(settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR) is True
         ),
@@ -182,6 +191,28 @@ def update_settings(
                     ),
                 },
             )
+
+    confirm_admin_roles = bool(changes.pop("confirm_admin_roles", None))
+    if "ai_roles" in changes:
+        protected = (
+            settings_store.parse_protected_roles(changes["protected_roles"])
+            if changes.get("protected_roles") is not None
+            else settings_store.enforcement_guard(db).protected_roles
+        )
+        changes["ai_roles"] = _validated_ai_roles(
+            db,
+            changes["ai_roles"],
+            protected=protected,
+            confirm_admin_roles=confirm_admin_roles,
+        )
+    elif changes.get("protected_roles") is not None:
+        # The other way round: protecting a role the list already names.
+        _refuse_protected_ai_roles(
+            list(settings_store.ai_role_names(db)),
+            settings_store.parse_protected_roles(changes["protected_roles"]),
+        )
+    if not changes:
+        return _read(db)
 
     before = _read(db).model_dump(exclude={"current_schedule_description"})
     audited_changes: dict[str, object] = {}
@@ -249,6 +280,132 @@ def update_settings(
             logger.exception("Could not apply the new schedule to the running scheduler")
 
     return _read(db)
+
+
+@router.get("/client-roles", response_model=ClientRolesResponse)
+def client_roles(ctx: AdminUser, db: DbSession) -> ClientRolesResponse:
+    """The tenant's roles on the platform client, for choosing the AI roles.
+
+    Cached briefly; a failed read is reported in the answer, never as an error.
+    """
+    listing = role_sources.tenant_client_roles(db)
+    protected = settings_store.enforcement_guard(db).protected_roles
+    return ClientRolesResponse(
+        available=listing.available,
+        message=listing.message,
+        roles=[
+            ClientRoleResponse(
+                name=role.name,
+                description=role.description,
+                composite=role.composite,
+                known_description=iam.ROLE_DESCRIPTIONS.get(role.name),
+                admin_like=settings_store.admin_like_role(role.name),
+                protected=role.name.lower() in protected,
+            )
+            for role in listing.roles
+        ],
+        ai_roles=list(settings_store.ai_role_names(db)),
+        default_ai_roles=list(iam.DEFAULT_AI_ROLE_NAMES),
+    )
+
+
+def _refuse_protected_ai_roles(names: list[str], protected: frozenset[str]) -> None:
+    """An AI role may not be a protected role: a person holding a protected
+    role is never restricted, so the restriction would silently do nothing."""
+    clashing = [name for name in names if name.lower() in protected]
+    if clashing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "protected_ai_roles",
+                "message": (
+                    f"{', '.join(clashing)} "
+                    + ("is a protected role" if len(clashing) == 1 else "are protected roles")
+                    + " (Settings → Enforcement): a person holding a protected role is never "
+                    "restricted, so naming it here would make a user restriction do nothing for "
+                    "everyone who holds it. Remove it from this list, or from the protected "
+                    "roles."
+                ),
+            },
+        )
+
+
+def _validated_ai_roles(  # type: ignore[no-untyped-def]
+    db,
+    value: object,
+    *,
+    protected: frozenset[str] = frozenset(),
+    confirm_admin_roles: bool = False,
+) -> list[str]:
+    """The AI role list, checked against the roles the tenant actually has.
+
+    A protected role is refused: its holders are never restricted, so a list
+    that names it would silently restrict nobody who holds it. A role that looks
+    like an administration role (settings_store.ADMIN_ROLE_PATTERNS) is refused
+    unless the request confirms it (``confirm_admin_roles``). When the tenant's
+    roles cannot be read, only names already trusted (the current list or the
+    default one) are accepted: nothing unknown gets in.
+    """
+    names = settings_store.normalise_role_names(value)
+    if not names:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_ai_roles",
+                "message": "Name at least one role: with none, a user restriction would "
+                "remove nothing.",
+            },
+        )
+    _refuse_protected_ai_roles(names, protected)
+    admin_like = [name for name in names if settings_store.admin_like_role(name)]
+    if admin_like and not confirm_admin_roles:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "admin_ai_roles_unconfirmed",
+                "message": (
+                    f"{', '.join(admin_like)} "
+                    + (
+                        "looks like an administration role"
+                        if len(admin_like) == 1
+                        else "look like administration roles"
+                    )
+                    + ": a user restriction would take it from anyone over a budget, along "
+                    "with everything it allows besides AI features. Confirm to save it anyway."
+                ),
+                "roles": admin_like,
+            },
+        )
+    listing = role_sources.tenant_client_roles(db, fresh=True)
+    if listing.available:
+        unknown = [name for name in names if name not in listing.names()]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "unknown_ai_roles",
+                    "message": (
+                        f"Not a role on the tenant's {iam.PLATFORM_CLIENT_ID} client: "
+                        f"{', '.join(unknown)}. Pick roles from the list."
+                    ),
+                },
+            )
+        return names
+    trusted = set(settings_store.ai_role_names(db)) | set(iam.DEFAULT_AI_ROLE_NAMES)
+    unchecked = [name for name in names if name not in trusted]
+    if unchecked:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "ai_roles_unverifiable",
+                "message": (
+                    f"{', '.join(unchecked)} could not be checked against the tenant's roles "
+                    f"({listing.message or 'they could not be read'}). Try again when the "
+                    "Checkmarx One connection works."
+                ),
+            },
+        )
+    return names
 
 
 @router.post("/test-notification")

@@ -12,7 +12,7 @@ import type {
   PeriodType,
   ProjectAction,
 } from "../api/types";
-import { BlastSummary } from "./PreviewPage";
+import { BlastDetails, BlastSummary } from "./PreviewPage";
 import { EntityPicker } from "../components/EntityPicker";
 import { ExportMenu } from "../components/ExportMenu";
 import type { ExportColumn } from "../lib/export";
@@ -1130,6 +1130,7 @@ function LimitDialog({
                 <p className="mt-1">
                   <BlastSummary blast={blast} />
                 </p>
+                <BlastDetails blast={blast} />
                 {needsAck && (
                   <label className="mt-3 flex items-start gap-2 text-sm">
                     <input

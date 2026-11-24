@@ -351,8 +351,11 @@ SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(
         id="iam_client_roles",
         label="IAM admin: client roles",
-        purpose="List the AI roles on the ast-app client",
-        cant="list the AI roles",
+        purpose=(
+            "List the roles on the ast-app client: the AI roles a user restriction removes "
+            "(Settings → Enforcement) are chosen from these"
+        ),
+        cant="list the client's roles (the AI roles among them)",
         method="GET",
         path="/auth/admin/realms/<tenant>/clients/{clientUuid}/roles",
         kind="read",

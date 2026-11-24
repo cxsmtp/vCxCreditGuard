@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
@@ -57,6 +57,24 @@ class FakeTenant:
     )
     # user id -> role names currently mapped
     role_mappings: dict[str, list[str]] = field(default_factory=dict)
+    # The client's roles (name -> id), served by GET clients/{uuid}/roles.
+    client_roles: dict[str, str] = field(default_factory=lambda: dict(ALL_ROLES))
+    # Composite client roles: role name -> the role names it contains.
+    composite_roles: dict[str, list[str]] = field(default_factory=dict)
+    # Role descriptions, as Keycloak's full role representation carries them.
+    role_descriptions: dict[str, str] = field(default_factory=dict)
+    # user id -> ids of the groups the user is a direct member of, as the
+    # Keycloak admin GET users/{id}/groups reports them (with their paths).
+    user_groups: dict[str, list[str]] = field(default_factory=dict)
+    # group id -> client role names mapped to the group.
+    group_role_mappings: dict[str, list[str]] = field(default_factory=dict)
+    # Answer 2xx to an Auto Triage PUT but keep nothing, like a project that
+    # cannot override an account-wide ("select all") Auto Triage setting.
+    ignore_auto_triage_writes: bool = False
+    # project id -> the auto_triage entry's allowOverride, verbatim.
+    auto_triage_allow_override: dict[str, Any] = field(default_factory=dict)
+    # Answer 2xx to a remediationSeverities PATCH but keep nothing.
+    drop_pr_remediation_writes: bool = False
     # project id -> {"enabled": bool, "config": {...}}
     auto_triage: dict[str, dict[str, Any]] = field(default_factory=dict)
     # repo id -> remediation severities
@@ -162,7 +180,14 @@ class FakeTenant:
         )
         self.role_mappings[user_id] = list(role_names)
 
-    def add_group(self, *, group_id: str, name: str, path: str | None = None) -> None:
+    def add_group(
+        self,
+        *,
+        group_id: str,
+        name: str,
+        path: str | None = None,
+        roles: list[str] | None = None,
+    ) -> None:
         self.groups.append(
             {
                 "id": group_id,
@@ -172,6 +197,71 @@ class FakeTenant:
                 "subGroups": [],
             }
         )
+        if roles is not None:
+            self.group_role_mappings[group_id] = list(roles)
+
+    def add_client_role(
+        self,
+        name: str,
+        *,
+        contains: list[str] | None = None,
+        description: str | None = None,
+    ) -> None:
+        """A client role on ast-app; ``contains`` makes it a composite role."""
+        self.client_roles.setdefault(name, f"role-{name}")
+        if contains is not None:
+            self.composite_roles[name] = list(contains)
+        if description is not None:
+            self.role_descriptions[name] = description
+
+    def join_group(self, user_id: str, group_id: str) -> None:
+        self.user_groups.setdefault(user_id, []).append(group_id)
+
+    def _known_role(self, name: str) -> bool:
+        # ALL_ROLES as well: a test may add a role to the module-level table.
+        return name in self.client_roles or name in ALL_ROLES
+
+    def _role_payload(self, name: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "id": self.client_roles.get(name) or ALL_ROLES[name],
+            "name": name,
+            "composite": name in self.composite_roles,
+            "clientRole": True,
+            "containerId": CLIENT_UUID,
+        }
+        if name in self.role_descriptions:
+            payload["description"] = self.role_descriptions[name]
+        return payload
+
+    def _group_by_id(self, group_id: str) -> dict[str, Any] | None:
+        return next((group for group in self.groups if group["id"] == group_id), None)
+
+    def _expanded(self, names: list[str]) -> set[str]:
+        """The roles named, with everything their composites contain."""
+        found: set[str] = set()
+        pending = list(names)
+        while pending:
+            name = pending.pop()
+            if name in found:
+                continue
+            found.add(name)
+            pending.extend(self.composite_roles.get(name, []))
+        return found
+
+    def effective_roles(self, user_id: str) -> set[str]:
+        """Direct, group (parent groups included) and composite roles of a user."""
+        names = list(self.role_mappings.get(user_id, []))
+        for group_id in self.user_groups.get(user_id, []):
+            group = self._group_by_id(group_id)
+            paths = [group_id]
+            if group is not None:
+                parts = group["path"].strip("/").split("/")
+                for depth in range(1, len(parts)):
+                    parent = "/" + "/".join(parts[:depth])
+                    paths.extend(g["id"] for g in self.groups if g["path"] == parent)
+            for gid in paths:
+                names.extend(self.group_role_mappings.get(gid, []))
+        return self._expanded(names)
 
     def add_project(
         self,
@@ -442,7 +532,51 @@ class FakeTenant:
         if path.endswith(f"/clients/{CLIENT_UUID}/roles"):
             return httpx.Response(
                 200,
-                json=[{"id": role_id, "name": name} for name, role_id in ALL_ROLES.items()],
+                json=[self._role_payload(name) for name in {**ALL_ROLES, **self.client_roles}],
+            )
+
+        if f"/clients/{CLIENT_UUID}/roles/" in path and path.endswith("/composites"):
+            role_name = unquote(path.split("/roles/")[1].rsplit("/composites", 1)[0])
+            if role_name not in self.client_roles:
+                return httpx.Response(404, json={"error": "Could not find role"})
+            return httpx.Response(
+                200,
+                json=[
+                    self._role_payload(child)
+                    for child in self.composite_roles.get(role_name, [])
+                    if child in self.client_roles
+                ],
+            )
+
+        if f"/auth/admin/realms/{TENANT}/groups/" in path and "/role-mappings/clients/" in path:
+            group_id = path.split("/groups/")[1].split("/role-mappings")[0]
+            names = list(self.group_role_mappings.get(group_id, []))
+            if path.endswith("/composite"):
+                names = sorted(self._expanded(names))
+            return httpx.Response(
+                200, json=[self._role_payload(name) for name in names if name in self.client_roles]
+            )
+
+        if f"/auth/admin/realms/{TENANT}/users/" in path and path.endswith("/groups"):
+            user_id = path.split("/users/")[1].split("/groups")[0]
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": group["id"], "name": group["name"], "path": group["path"]}
+                    for group_id in self.user_groups.get(user_id, [])
+                    if (group := self._group_by_id(group_id)) is not None
+                ],
+            )
+
+        if "/role-mappings/clients/" in path and path.endswith("/composite"):
+            user_id = path.split("/users/")[1].split("/role-mappings")[0]
+            return httpx.Response(
+                200,
+                json=[
+                    self._role_payload(name)
+                    for name in sorted(self.effective_roles(user_id))
+                    if self._known_role(name)
+                ],
             )
 
         if "/role-mappings/clients/" in path:
@@ -605,9 +739,7 @@ class FakeTenant:
         if request.method == "GET":
             return httpx.Response(
                 200,
-                json=[
-                    {"id": ALL_ROLES[name], "name": name} for name in current if name in ALL_ROLES
-                ],
+                json=[self._role_payload(name) for name in current if self._known_role(name)],
             )
 
         body = json.loads(request.content or b"[]")
@@ -634,12 +766,16 @@ class FakeTenant:
                             "feature": "auto_triage",
                             "enabled": state["enabled"],
                             "config": state["config"],
-                            "allowOverride": {"branches": True, "projects": True},
+                            "allowOverride": self.auto_triage_allow_override.get(
+                                project_id, {"branches": True, "projects": True}
+                            ),
                         }
                     ],
                 },
             )
         body = json.loads(request.content or b"{}")
+        if self.ignore_auto_triage_writes:
+            return httpx.Response(200, json={"status": "ok"})
         for entry in body.get("configurations", []):
             if entry.get("feature") == "auto_triage":
                 state["enabled"] = bool(entry.get("enabled"))
@@ -666,7 +802,7 @@ class FakeTenant:
         if "projectId" not in params:
             return httpx.Response(400, json={"message": "projectId is required"})
         body = json.loads(request.content or b"{}")
-        if "remediationSeverities" in body:
+        if "remediationSeverities" in body and not self.drop_pr_remediation_writes:
             self.repo_severities[repo_id] = list(body.get("remediationSeverities", []))
         if isinstance(body.get("fusionScanConfig"), dict) and not self.drop_repo_fusion_writes:
             self.repo_fusion[repo_id] = dict(body["fusionScanConfig"])

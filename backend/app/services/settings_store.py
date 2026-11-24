@@ -8,6 +8,7 @@ secret values encrypted under their own purpose and never returned unmasked.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.checkmarx.iam import DEFAULT_AI_ROLE_NAMES
 from app.checkmarx.usage import DEFAULT_PERIOD
 from app.core.crypto import (
     PURPOSE_SMTP_PASSWORD,
@@ -111,6 +113,13 @@ KEY_PROTECTED_ROLES = "enforcement.protected_roles"
 # Checkmarx One honours that lock for ad hoc scans is not verified, and a
 # tenant that rejects the lock still gets Fusion turned off without it.
 KEY_FUSION_LOCK = "enforcement.fusion_lock_override"
+# The client roles (on the platform client, ast-app) a user restriction removes.
+# The default is the three general Risk Management roles AI Triage and AI
+# Remediation are reached through, so an upgrade changes nothing. A change
+# applies to restrictions made from then on: each restriction records the list
+# it used, and its Restore and drift check go by that record.
+KEY_AI_ROLES = "enforcement.ai_roles"
+AI_ROLES_MAX = 50
 
 # Attribution: when on, the Auto Triage credits a project reports are also
 # charged to the person (a synced Checkmarx user) whose scan triggered the auto
@@ -184,6 +193,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_CEILING_WAIVED_ONCE: False,
     KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
     KEY_FUSION_LOCK: True,
+    KEY_AI_ROLES: list(DEFAULT_AI_ROLE_NAMES),
     KEY_AUTO_TRIAGE_TO_INITIATOR: False,
 }
 
@@ -309,17 +319,57 @@ def enforcement_guard(session: Session) -> EnforcementGuard:
             get_value(session, KEY_MAX_NEW_TARGETS), DEFAULTS[KEY_MAX_NEW_TARGETS]
         ),
         ceiling_waived_once=bool(get_value(session, KEY_CEILING_WAIVED_ONCE, False)),
-        protected_roles=frozenset(
-            name.strip().lower()
-            for name in str(roles or "").replace(";", ",").split(",")
-            if name.strip()
-        ),
+        protected_roles=parse_protected_roles(roles),
     )
 
 
 def fusion_lock_enabled(session: Session) -> bool:
     """Whether turning Fusion off also tries to lock it against per-scan override."""
     return get_value(session, KEY_FUSION_LOCK, DEFAULTS[KEY_FUSION_LOCK]) is not False
+
+
+# Role names that look like administration roles. Taking one away from a person
+# over a budget would take away far more than AI features, so choosing one as an
+# AI role needs an explicit confirmation.
+ADMIN_ROLE_PATTERNS: tuple[str, ...] = ("*admin*", "manage-*", "realm-*", "iam-*")
+
+
+def admin_like_role(name: str) -> bool:
+    """Whether a role name matches one of ADMIN_ROLE_PATTERNS (case ignored)."""
+    lowered = name.strip().lower()
+    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in ADMIN_ROLE_PATTERNS)
+
+
+def parse_protected_roles(value: Any) -> frozenset[str]:
+    """The protected role names (lowercase) from the stored comma separated text."""
+    return frozenset(
+        name.strip().lower()
+        for name in str(value or "").replace(";", ",").split(",")
+        if name.strip()
+    )
+
+
+def normalise_role_names(value: Any) -> list[str]:
+    """A list of role names, trimmed, without blanks or repeats, in order."""
+    if isinstance(value, str):
+        value = value.replace(";", ",").split(",")
+    if not isinstance(value, list | tuple):
+        return []
+    seen: dict[str, None] = {}
+    for entry in value:
+        if isinstance(entry, str) and entry.strip():
+            seen.setdefault(entry.strip(), None)
+    return list(seen)
+
+
+def ai_role_names(session: Session) -> tuple[str, ...]:
+    """The client roles a user restriction removes from now on.
+
+    Falls back to the default list when unset or unusable, so a stray stored
+    value can never make a restriction remove nothing.
+    """
+    names = normalise_role_names(get_value(session, KEY_AI_ROLES, DEFAULTS[KEY_AI_ROLES]))
+    return tuple(names[:AI_ROLES_MAX]) or DEFAULT_AI_ROLE_NAMES
 
 
 def action_rates(session: Session) -> dict[str, Any] | None:

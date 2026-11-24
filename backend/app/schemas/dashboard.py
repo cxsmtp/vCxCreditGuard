@@ -224,6 +224,9 @@ class SettingsResponse(BaseModel):
     # Turning Fusion off also tries to lock it against per-scan override
     # (allowOverride false). Unverified that Checkmarx One honours the lock.
     fusion_lock_override: bool = True
+    # The client roles a user restriction removes (and the built-in default).
+    ai_roles: list[str] = Field(default_factory=list)
+    default_ai_roles: list[str] = Field(default_factory=list)
     # Charge each project's auto-triage credits also to the person whose scan
     # triggered it. Off by default.
     charge_auto_triage_to_scan_initiator: bool = False
@@ -263,6 +266,10 @@ class SettingsUpdateRequest(StrictModel):
     max_new_targets_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
     protected_roles: str | None = Field(default=None, max_length=1024)
     fusion_lock_override: bool | None = None
+    ai_roles: list[str] | None = Field(default=None, max_length=50)
+    # Not a setting: says the admin confirmed that ai_roles may include roles
+    # that look like administration roles (settings_store.ADMIN_ROLE_PATTERNS).
+    confirm_admin_roles: bool | None = None
     charge_auto_triage_to_scan_initiator: bool | None = None
 
     @field_validator("schedule_mode")
@@ -271,6 +278,23 @@ class SettingsUpdateRequest(StrictModel):
         if value is not None and value not in {"interval", "cron"}:
             raise ValueError("Schedule mode must be interval or cron.")
         return value
+
+    @field_validator("ai_roles")
+    @classmethod
+    def _check_ai_roles(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        names: dict[str, None] = {}
+        for entry in value:
+            name = entry.strip() if isinstance(entry, str) else ""
+            if not name or len(name) > 128:
+                raise ValueError("Each AI role must be a role name of 1 to 128 characters.")
+            names.setdefault(name, None)
+        if not names:
+            raise ValueError(
+                "Name at least one role: with none, a user restriction would remove nothing."
+            )
+        return list(names)
 
     @field_validator("webhook_url")
     @classmethod
@@ -415,3 +439,25 @@ class AutoTriageAttributionOverview(BaseModel):
     initiators: list[AutoTriageInitiator] = Field(default_factory=list)
     # The newest recorded charges (filtered like the rest), newest first.
     recent_charges: list[AutoTriageChargeResponse] = Field(default_factory=list)
+
+
+class ClientRoleResponse(BaseModel):
+    name: str
+    description: str | None = None
+    composite: bool = False
+    # A short description CreditGuard knows for this role (the default AI roles).
+    known_description: str | None = None
+    # Looks like an administration role: choosing it needs a confirmation.
+    admin_like: bool = False
+    # A protected role (Settings -> Enforcement): it cannot be an AI role.
+    protected: bool = False
+
+
+class ClientRolesResponse(BaseModel):
+    """The tenant's roles on the platform client, for the AI roles picker."""
+
+    available: bool
+    message: str | None = None
+    roles: list[ClientRoleResponse] = Field(default_factory=list)
+    ai_roles: list[str] = Field(default_factory=list)
+    default_ai_roles: list[str] = Field(default_factory=list)

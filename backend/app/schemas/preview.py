@@ -17,6 +17,37 @@ class TargetPreviewResponse(BaseModel):
     target_label: str | None
 
 
+class RemovedRolePreviewResponse(BaseModel):
+    name: str
+    description: str | None = None
+    # The roles it contains when composite; [] when not; null when unreadable.
+    grants: list[str] | None = None
+
+
+class KeptRolePreviewResponse(BaseModel):
+    name: str
+    sources: list[str] = []
+
+
+class UserRolesPreviewResponse(BaseModel):
+    user_id: str
+    user_label: str | None
+    read: bool
+    removed: list[RemovedRolePreviewResponse] = []
+    kept: list[KeptRolePreviewResponse] = []
+    not_held: list[str] = []
+    unread: list[str] = []
+    note: str | None = None
+    # A restriction already holds, so the roles were not read again.
+    already_restricted: bool = False
+
+
+class ProjectWarningResponse(BaseModel):
+    project_id: str
+    project_label: str | None
+    message: str
+
+
 class BlastRadiusResponse(BaseModel):
     entity_type: EntityType
     entity_id: str
@@ -34,6 +65,13 @@ class BlastRadiusResponse(BaseModel):
     targets: list[TargetPreviewResponse]
     # What the limit turns off on its projects ([] for a user limit).
     project_actions: list[str] = []
+    # The roles a user restriction removes, and per user what they would lose.
+    ai_roles: list[str] = []
+    user_roles: list[UserRolesPreviewResponse] = []
+    user_roles_truncated: bool = False
+    user_roles_note: str | None = None
+    # Projects where turning Auto Triage off may not hold.
+    warnings: list[ProjectWarningResponse] = []
 
 
 class DryRunRowResponse(BaseModel):
@@ -63,3 +101,5 @@ class DryRunResponse(BaseModel):
     affected_projects: int
     affected_users: int
     rows: list[DryRunRowResponse]
+    user_roles_truncated: bool = False
+    user_roles_note: str | None = None

@@ -369,7 +369,7 @@ status, and the Settings page groups them into **Disputes**, **Auto-matched** an
 
 | Level breached | What changes |
 | -------------- | ------------ |
-| User | The AI roles (`view-risk-management`, `view-risk-management-dashboard`, `view-risk-management-tab`) are unmapped from the user on the `ast-app` client. Nothing else is touched: whether the user can view scans (`view-scans`) stays whatever their Checkmarx permission says |
+| User | The AI roles are unmapped from the user on the `ast-app` client: the list under Settings → Enforcement (*Roles a user restriction removes*, API field `ai_roles`), by default `view-risk-management`, `view-risk-management-dashboard`, `view-risk-management-tab`. Only roles mapped to the user **directly** can be removed; one held through a group or a composite role is reported, not taken (see below). Nothing else is touched: whether the user can view scans (`view-scans`) stays whatever their Checkmarx permission says |
 | Project | What the limit's **What to turn off for projects** choice selects (`project_actions`): **Auto Triage** is disabled via `PUT /api/ai-agents-coordinator/projects/{id}/configuration`; **PR triage and remediation** is disabled by clearing `remediationSeverities` via `PATCH /api/repos-manager/repo/{repo_id}?projectId={id}`; **Fusion** is turned off by writing `scan.config.ai.fusionEnabled` = `"false"` via `PATCH /api/configuration/project?project-id={id}` and, for a project with a repository, `fusionScanConfig.enabled` = `false` via the same repos-manager `PATCH` |
 | Group | The chosen project actions, on every project in the group |
 | Application | The chosen project actions, on every project in the application |
@@ -393,6 +393,122 @@ flag **and its full config**, the prior severity list, and for Fusion the whole
 repository's prior `fusionScanConfig`. Restore replays that snapshot. A feature
 that was already off before the utility touched it stays off afterwards, and a
 restore never resets branches, severity levels or the Fusion model.
+
+**Restricting a user, in detail.**
+
+* **Which roles.** The default three are *general* Risk Management roles: AI
+  Triage and AI Remediation are reached through them today, so a person
+  restricted also loses the Risk Management pages and dashboard. Settings →
+  Enforcement, *Roles a user restriction removes* (setting
+  `enforcement.ai_roles`, API field `ai_roles`), changes the list. Names are
+  checked against the roles the tenant actually has on `ast-app`
+  (`GET /api/settings/client-roles`, admins only, cached for a minute, never an
+  error when IAM cannot be read; while it cannot, only names already in the
+  list or the defaults are accepted). An empty list is refused, and so is a
+  protected role (its holders are never restricted, so naming it would make a
+  restriction do nothing for them; protecting a role the list names is refused
+  the same way). A role that looks like an administration role (`*admin*`,
+  `manage-*`, `realm-*`, `iam-*`) is saved only with an explicit confirmation
+  (API field `confirm_admin_roles: true`; the picker marks such roles and asks
+  first). An upgrade changes nothing: the default is the three roles above.
+* **10 January.** Checkmarx One is to ship dedicated AI Triage and AI
+  Remediation permissions and roles on 10 January. When they are on your
+  tenant, add them to the list and remove the general ones: no code change is
+  needed.
+* **A change applies to restrictions made from then on.** Every user
+  restriction records the list it used (`ai_roles` on its undo snapshot).
+  Restore gives back exactly the roles that restriction recorded as removed; the
+  drift check looks for those roles only; and the pass that returns roles an
+  earlier version should not have taken (`view-scans`, once) goes by the
+  recorded list too, the default one for a restriction made before the list
+  was a setting. Protected roles work as before.
+* **Where each role comes from.** Before restricting, CreditGuard reads, best
+  effort: the user's direct client role mappings (as before), their effective
+  client roles (`GET .../users/{id}/role-mappings/clients/{clientUuid}/composite`),
+  their groups (`GET .../users/{id}/groups`) with the parent groups worked out
+  from the group paths (`GET /auth/realms/<tenant>/groups`) and each group's
+  client role mappings (`GET .../groups/{id}/role-mappings/clients/{clientUuid}`),
+  and which composite roles contain an AI role
+  (`GET .../clients/{clientUuid}/roles/{roleName}/composites`). These follow
+  Keycloak's admin REST API (Checkmarx One's IAM is Keycloak based) and are
+  **not verified on a real Checkmarx One tenant**: any refusal (403), 404 or
+  other failure only means *source unknown*, is listed on the record
+  (`role_sources_unread`), never stops the restriction and is not reported on
+  the key permission check (the platform client and its role list, which the
+  key is checked for, still are). The reads are bounded: at most 50 of a
+  user's groups (the rest are listed as not read), composite roles followed 4
+  levels deep (deeper nesting is listed as not read), and only the composite
+  children that belong to `ast-app` (matched by client id, never by name).
+  Realm-level composite roles (a realm's default roles, for example) are not
+  traversed: an AI role held through one shows as *source unknown*.
+* **What is removed.** Only the AI roles mapped to the user directly. A role
+  still held through a group or a composite role stays effective however the
+  direct mapping is changed, so for that role the restriction **is not
+  effective**. It is recorded on the action (`kept_effective`, with each
+  source), said once in a notification (*<user> keeps <role> through group
+  <name> / role <name>; CreditGuard removed only the direct mapping. Remove it
+  from the group or role in Checkmarx One, or add the user to an exemption*),
+  and audited once (`enforcement.not_effective`). CreditGuard never changes a
+  group or a composite role: that would take the role from everyone else who
+  holds it that way. It is not re-notified each cycle.
+* **Read back.** After the direct mappings are removed, the effective roles are
+  read back once (the direct mappings when the effective ones cannot be read;
+  nothing is then reported as kept, and the unread read-back is listed).
+  A removed role still read as held for no reason that can be seen is in doubt,
+  as with Fusion: the first time is a quiet retry on the next cycle; the second
+  time it is recorded as kept through a source that cannot be seen. A role still
+  mapped directly on two consecutive read-backs means the tenant did not keep
+  the removal: said once (*AI role removal not kept*), not sent again this
+  period, still restorable.
+* **Drift.** A role of the recorded list mapped to the user directly again is
+  drift, as before. A role effective only through a group or a composite role is
+  not drift: it was reported when the restriction was applied. Nor is usage by
+  a person who keeps an AI role that way a *usage kept rising after a
+  restriction* violation.
+* **Simulation.** The Simulation page and the blast radius in the limit form
+  show, for each user who would be restricted, the roles that would be removed
+  (with what each grants: its composite children, and for the default three
+  *Risk Management pages and dashboard; AI Triage/Remediation are reached from
+  here*), the roles that would stay effective and where from, and what could
+  not be read. Admins only: a viewer sees which roles a restriction removes,
+  and no IAM read is made for them. The tenant is read best effort for the
+  request: at most 50 users per preview (the page says when it stopped there),
+  each read tried once with a 5 s timeout, 10 s in all, and nothing more once
+  IAM does not answer (the remaining users say *not read: Checkmarx IAM did not
+  answer*). A user already restricted is not read again (*already
+  restricted*). A user's reading is reused for a minute (dropped when the
+  connection changes). Not read at all in demo mode or without a connection.
+
+**Auto Triage and PR triage and remediation are read back.** Both writes are
+read back once, like Fusion's: what was there before always stays on the
+record, so Restore stays exact. Still on (Auto Triage) or still listing
+severities (PR triage and remediation) straight after the write, the outcome is
+in doubt and the next cycle tries again, quietly. Still so after that attempt
+too:
+
+* Auto Triage is taken to be **set account-wide** ("select all") with the
+  project unable to override it: said once (*<project>: Auto Triage is set
+  account-wide*, audit `enforcement.not_restricted`), the action stays
+  restorable, the write is not sent again for the rest of the period, and it is
+  never a policy violation every cycle. The configuration's `allowOverride`
+  (seen as `{"projects": false, "branches": true, ...}` on a project-scope read)
+  is recorded verbatim on the action (`auto_triage_allow_override`, and
+  `auto_triage_allow_override_read_back`); its meaning is not documented and is
+  not interpreted. The Simulation page says that turning Auto Triage off *may
+  not hold* for a project whose latest restriction (in its limit's current
+  period, else the latest one) found it set account-wide; or, softly (*not
+  verified yet*), for one whose latest restriction is not applied, was not read
+  back, and was read with `allowOverride.projects` false. That shape is the
+  ordinary one, so an applied restriction never warns because of it. A later
+  read that shows Auto Triage off on the project (a restriction applied and
+  read back off, or one verified to hold) withdraws an earlier account-wide
+  conclusion.
+* PR triage and remediation is taken not to be kept by the tenant: said once
+  (*PR triage and remediation change not kept*), restorable, not sent again
+  this period.
+
+A read-back that fails says nothing either way; the drift check reads the
+setting again next cycle.
 
 **Turning Fusion off, in detail.** One kind per write, like the other halves:
 `disable_fusion` (the project's scan setting) and `disable_repo_fusion` (the
@@ -698,8 +814,9 @@ backend/app/
                  applications, AI toggles, Fusion settings), credits (pool,
                  action rates), scans
   services/      connection, auth, audit, org_sync, ingestion, periods,
-                 evaluation, enforcement, violations, usage_mix,
-                 limits_service, notifications, settings_store, cycle
+                 evaluation, enforcement, role_sources (where a user's
+                 roles come from), violations, usage_mix, limits_service,
+                 notifications, settings_store, cycle
   scheduler.py   APScheduler wiring, reconfigurable at runtime
   api/           dependencies (auth, CSRF, RBAC), middleware, routes
   schemas/       request and response models with strict validation
@@ -946,6 +1063,7 @@ The key needs to reach these endpoints:
 | Credit usage | `GET /api/credits/consumption` | Read credit consumption |
 | Scans (only with auto-triage charging on) | `GET /api/scans/`, `GET /api/ai-agents-coordinator/projects/{id}/configuration` | Read scans and project configuration |
 | Role mapping (enforce mode only) | `GET`/`POST`/`DELETE` `/auth/admin/realms/<tenant>/users/{id}/role-mappings/clients/{clientUuid}`, plus `GET .../clients` and `GET .../clients/{uuid}/roles` | IAM admin, sufficient to manage role mappings |
+| Where a user's roles come from (optional, enforce mode and Simulation) | `GET .../users/{id}/role-mappings/clients/{clientUuid}/composite`, `GET .../users/{id}/groups`, `GET .../groups/{id}/role-mappings/clients/{clientUuid}`, `GET .../clients/{clientUuid}/roles/{roleName}/composites` (Keycloak admin API, unverified on Checkmarx One) | IAM admin, read users, groups and roles; without it the source of a role is *unknown* and nothing else changes. Not part of the key permission check |
 | Project AI toggles (enforce mode only) | `GET`/`PUT` `/api/ai-agents-coordinator/projects/{id}/configuration`, `PATCH /api/repos-manager/repo/{repoId}?projectId={id}` | Manage project configuration |
 | Fusion (enforce mode, limits that turn Fusion off) | `GET`/`PATCH` `/api/configuration/project?project-id={id}`, and the repos-manager `PATCH` above for `fusionScanConfig` (unverified) | Read and manage project configuration |
 | Credits per action (optional) | `GET /api/v1/credits/action-rates` | Read credits; without it Fusion is given as transaction counts |
@@ -1356,6 +1474,10 @@ failure of this tool is restricting many people at once for a wrong reason.
   until at least three readings in a row over at least two hours tell the same
   story. Limits keep being judged on the last believed reading meanwhile, and
   each cycle that holds one reports it as a warning in its result.
+- **Roles a user restriction removes.** The client roles a user restriction
+  takes (API field `ai_roles`; default the three Risk Management roles), picked
+  from the tenant's own roles. Applies to restrictions made from then on. See
+  [Restricting a user, in detail](#what-the-enforcement-actions-actually-are).
 - **Fusion lock.** *Lock Fusion against per-scan override* (on by default, API
   field `fusion_lock_override`): when a limit turns Fusion off, also set
   `allowOverride: false` on the project's setting. Not verified to stop a scan
@@ -1501,6 +1623,20 @@ They are listed because each has a cost worth knowing about.
    the request the UI sends when the project value is reset to the inherited
    one; if it is a per-key call, Restore can use it for an entry whose
    `origin_level_before` is not `Project`.
+
+7. **Where a user's roles come from.** The effective-roles, user-groups,
+   group-role-mapping and composite-role reads follow Keycloak's admin REST API
+   and are not verified against a real Checkmarx One tenant. Each failure is
+   *source unknown*, never a reason not to restrict; a removed role then still
+   read as held is decided on the next attempt (in doubt once, concluded the
+   second time). A realm-level composite role containing an AI role is seen
+   only as *source unknown*.
+8. **Auto Triage's `allowOverride`.** The project-scope Auto Triage
+   configuration carries `allowOverride` (`{"projects": false, "branches":
+   true, ...}` in a captured HAR). What each key means is not documented: it is
+   recorded verbatim and only used, best effort, for the Simulation's *may not
+   hold* warning. That a project cannot override an account-wide ("select
+   all") setting is concluded from two read-backs, not from this field.
 
 Settled since the first draft: the `period` parameter accepts exactly
 `last_month`, `last_30_days`, `last_90_days`, `last_180_days` and `last_year`, all

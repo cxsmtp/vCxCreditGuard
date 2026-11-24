@@ -283,6 +283,10 @@ _cached_key: tuple[str, str, str, str] | None = None
 def reset_client_cache() -> None:
     """Drop the cached client and token. Called whenever the connection changes."""
     global _cached_client, _cached_token_manager, _cached_key
+    from app.services import preview_service, role_sources
+
+    role_sources.reset_client_role_cache()
+    preview_service.reset_role_cache()
     with _cache_lock:
         if _cached_client is not None:
             _cached_client.close()
