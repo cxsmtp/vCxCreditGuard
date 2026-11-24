@@ -77,6 +77,9 @@ COPY backend/pyproject.toml backend/constraints.txt ./
 # busybox...) take the fixes Alpine published since the base was built. What it
 # installs is recorded in os-packages.txt like everything else, so a release
 # whose upgrade brought new revisions is a new image, never an app layer.
+# pip is removed once the dependencies are in, and so is ensurepip: its bundled
+# pip wheel carries pip's vendored urllib3/msgpack/setuptools copies, which the
+# app never uses (nothing installs packages at run time).
 RUN apk upgrade --no-cache \
     && apk add --no-cache libpq \
     && apk add --no-cache --virtual .build gcc musl-dev python3-dev libpq-dev \
@@ -85,6 +88,7 @@ RUN apk upgrade --no-cache \
     && rm /tmp/requirements.txt \
     && apk del .build \
     && (pip uninstall -y pip setuptools wheel 2>/dev/null || true) \
+    && rm -rf /usr/local/lib/python3*/ensurepip \
     && mkdir -p /usr/local/share/cxcreditguard \
     && apk info -v 2>/dev/null | sort > /usr/local/share/cxcreditguard/os-packages.txt \
     && date -u +%Y-%m-%dT%H:%M:%SZ > /usr/local/share/cxcreditguard/os-installed-at
