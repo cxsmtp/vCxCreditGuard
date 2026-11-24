@@ -73,7 +73,15 @@ class TestPrSeverityShapes:
 
     @pytest.mark.parametrize(
         "value",
-        ["CRITICAL,HIGH", {"isEditable": True}, {"value": "CRITICAL"}, [1, 2], None, 3],
+        [
+            "CRITICAL,HIGH",
+            {"isEditable": True},
+            {"value": "CRITICAL"},
+            {"value": None, "isEditable": True},
+            [1, 2],
+            None,
+            3,
+        ],
     )
     def test_unknown_shapes_are_refused(self, value) -> None:
         with pytest.raises(platform.PrSeveritiesShapeError):
@@ -163,6 +171,38 @@ class TestPrSeverityShapes:
         notice = db.scalar(select(Notification).where(Notification.title.like("%left unchanged")))
         assert notice is not None and "neither a list" in notice.body
 
+    @pytest.mark.parametrize(
+        ("shape", "editable", "words"),
+        [("wrapped", False, "not editable"), ("null", True, "no value (null)")],
+    )
+    def test_not_editable_or_null_is_left_alone_and_reported(
+        self, db: Session, shape: str, editable: bool, words: str
+    ) -> None:
+        tenant = populated_tenant()
+        tenant.repo_severities_shape = shape
+        tenant.repo_severities_editable = editable
+        tenant, client = setup_tenant(db, tenant)
+        outcome = enforcement.apply_enforcement(
+            db, client, limit=project_limit(db), period_key=PERIOD, actor=ACTOR
+        )
+        db.commit()
+        assert [a.kind for a in outcome.applied] == [EnforcementKind.DISABLE_AUTO_TRIAGE]
+        assert tenant.repo_patches == []
+        notice = db.scalar(select(Notification).where(Notification.title.like("%left unchanged")))
+        assert notice is not None and words in notice.body
+
+    def test_restore_reads_first_and_writes_in_the_shape_found_now(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        limit = project_limit(db)
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        action = action_of(db, EnforcementKind.DISABLE_PR_REMEDIATION)
+        assert action.undo_snapshot["severities_form"]["shape"] == "wrapped"
+        tenant.repo_severities_shape = "list"  # the tenant changed since
+        assert enforcement.restore_action(db, client, action=action, actor=ACTOR)
+        db.commit()
+        assert tenant.repo_patches[-1][1]["remediationSeverities"] == ["CRITICAL", "HIGH"]
+
     def test_a_restriction_recorded_before_the_shape_was_kept_reads_it_on_restore(
         self, db: Session
     ) -> None:
@@ -224,10 +264,9 @@ class TestAutoTriageRoundTrip:
         assert tenant.auto_triage["proj-api"]["enabled"] is False
         (project_id, body) = tenant.auto_triage_puts[-1]
         assert project_id == "proj-api"
-        # Top level fields as read.
-        assert {k: v for k, v in body.items() if k != "configurations"} == {
-            k: v for k, v in before.items() if k != "configurations"
-        }
+        # Only the configurations: scope and projectId are named by the path, and
+        # allowAiUsage mirrors the tenant's inherited switch (never echoed).
+        assert set(body) == {"configurations"}
         sent, read = _features(body), _features(before)
         assert set(sent) == {"auto_triage", "auto_remediation"}
         assert sent["auto_remediation"] == read["auto_remediation"]
@@ -275,6 +314,27 @@ class TestAutoTriageRoundTrip:
         assert [a.kind for a in outcome.reconciled] == [EnforcementKind.DISABLE_AUTO_TRIAGE]
         assert tenant.auto_triage["proj-api"]["enabled"] is False
         assert tenant.auto_remediation["proj-api"]["enabled"] is True
+
+    def test_a_change_to_other_settings_is_kept_in_doubt_and_reported(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+
+        def flip(request) -> None:
+            if request.method == "PUT" and "/ai-agents-coordinator/" in str(request.url):
+                tenant.allow_ai_usage["proj-api"] = False
+
+        tenant.on_request = flip
+        limit = project_limit(db, actions=["auto_triage"])
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
+        db.commit()
+        action = action_of(db, EnforcementKind.DISABLE_AUTO_TRIAGE)
+        assert action.undo_snapshot[enforcement.OUTCOME_UNKNOWN] is True
+        assert any(
+            "allowAiUsage" in text for text in action.undo_snapshot["auto_triage_side_effects"]
+        )
+        notice = db.scalar(
+            select(Notification).where(Notification.title.like("%changed other settings"))
+        )
+        assert notice is not None and "allowAiUsage" in notice.body
 
     def test_no_put_when_the_configuration_shape_is_unknown(self) -> None:
         tenant = populated_tenant()

@@ -1149,6 +1149,30 @@ def _enforce_target(
         "auto_triage_seen_off"
     ):
         _clear_account_wide(session, action)
+    side_effects = captured.outcome.get("auto_triage_side_effects")
+    if side_effects:
+        # Turning Auto Triage off changed another setting of the project: the
+        # outcome is not what was intended, so it stays in doubt and is said.
+        action.undo_snapshot = {**snapshot, OUTCOME_UNKNOWN: True}
+        notifications.notify(
+            session,
+            category=notifications.CATEGORY_ENFORCEMENT,
+            severity=Severity.WARNING,
+            title=f"{target.target_label}: turning Auto Triage off changed other settings",
+            body=(
+                "Checkmarx One read back other settings of the project's AI agent "
+                "configuration changed after Auto Triage was turned off: "
+                f"{'; '.join(side_effects)}. "
+                "CreditGuard sent them back as it read them, so the tenant may not take the "
+                "configuration as it was sent. Check the project's AI settings in Checkmarx One; "
+                "Restore puts Auto Triage back as it was."
+            ),
+            entity_type=limit.entity_type,
+            entity_id=limit.entity_id,
+            entity_label=limit.entity_label,
+            dedupe_key=f"auto_triage_side_effects:{action.id}",
+            enforcement_action_id=action.id,
+        )
     session.flush()
     outcome.applied.append(action)
 
@@ -1600,6 +1624,13 @@ def _capture(
                 f"was left unchanged. {exc} Auto Triage on the project is restricted as normal.",
                 title=f"{target.target_label}: PR triage and remediation left unchanged",
             ) from exc
+        if read is not None and not read.editable:
+            raise NotRestricted(
+                f"The PR triage and remediation setting of {target.target_label}'s repository "
+                "is marked as not editable (isEditable false, set at a higher level), so it "
+                "was left unchanged. Auto Triage on the project is restricted as normal.",
+                title=f"{target.target_label}: PR triage and remediation left unchanged",
+            )
         if read is not None:
             # The real, current severities (captured before disabling) - this is
             # what a Restore must reproduce, including MEDIUM/LOW if configured -
@@ -1905,6 +1936,11 @@ def _capture_auto_triage(
         except CheckmarxError as exc:
             logger.info("Could not read Auto Triage back on %s: %s", label, exc)
             return
+        side_effects = platform.auto_triage_side_effects(state.raw, after.raw)
+        if side_effects:
+            # The write changed what CreditGuard does not own. Kept in doubt
+            # and reported (Phase 4); Restore still puts Auto Triage back.
+            outcome["auto_triage_side_effects"] = side_effects
         if after.allow_override is not None:
             outcome["auto_triage_allow_override_read_back"] = after.allow_override
         if not after.enabled:
@@ -2606,6 +2642,12 @@ def _reconcile_once(
         )
         if read is not None and not read.severities:
             return RECONCILE_HELD  # read back as disabled
+        if read is not None and not read.editable:
+            _conclude_on_reads(resolver)
+            raise platform.PrSeveritiesShapeError(
+                "The repository's PR triage and remediation setting reads as not editable "
+                "(isEditable false), so it was not written again."
+            )
         # Written in the shape just read; unreadable, in the shape recorded when
         # the restriction was applied. A restriction recorded before the shape
         # was kept, and unreadable now, is not written at all.
@@ -3231,19 +3273,23 @@ def _undo(
                 "The repository id recorded for this action is missing, so PR triage and "
                 "remediation cannot be restored automatically."
             )
-        form = snapshot.get("severities_form")
-        if not isinstance(form, dict):
-            # Recorded before the shape was kept: read it now, so the value goes
-            # back in the shape the tenant uses. Unreadable or unknown, nothing
-            # is written and the restore is reported as failed (and retried).
-            form = platform.read_pr_remediation(
-                client, repo_id=repo_id, project_id=action.target_id
+        # Read first, as a re-assert does: the value goes back in the shape the
+        # tenant uses now, and not at all when the read is in an unknown shape
+        # or says the setting is not editable. Unreadable, the shape recorded at
+        # capture is used; with none recorded either, nothing is written and the
+        # restore is reported as failed (and retried).
+        current = platform.read_pr_remediation(client, repo_id=repo_id, project_id=action.target_id)
+        if current is not None and not current.editable:
+            raise CheckmarxError(
+                "The repository's PR triage and remediation setting reads as not editable "
+                "(isEditable false), so it could not be put back automatically."
             )
-            if form is None:
-                raise CheckmarxError(
-                    "The repository's PR triage and remediation setting cannot be read, so "
-                    "the shape to restore it in is not known; it was not written."
-                )
+        form = current if current is not None else snapshot.get("severities_form")
+        if form is None:
+            raise CheckmarxError(
+                "The repository's PR triage and remediation setting cannot be read, so "
+                "the shape to restore it in is not known; it was not written."
+            )
         platform.set_pr_remediation_severities(
             client,
             repo_id=repo_id,

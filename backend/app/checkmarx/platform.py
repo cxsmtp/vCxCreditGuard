@@ -41,6 +41,7 @@ Shapes seen on a live tenant (2026-11), which the code below is written to:
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -221,11 +222,16 @@ def auto_triage_put_body(
 ) -> dict[str, Any]:
     """The ``PUT`` body that changes Auto Triage and nothing else.
 
-    ``payload`` is the configuration exactly as it was read. It is sent back
-    whole - other features (``auto_remediation``), every ``allowOverride`` and
-    the top level fields included - with only the ``auto_triage`` entry's
-    ``enabled`` and ``config`` changed, so a tenant that treats the ``PUT`` as
-    the whole configuration does not reset what CreditGuard does not own.
+    ``payload`` is the configuration exactly as it was read. Its
+    ``configurations`` are sent back whole - other features
+    (``auto_remediation``) and every ``allowOverride`` included - with only the
+    ``auto_triage`` entry's ``enabled`` and ``config`` changed, so a tenant
+    that treats the ``PUT`` as the whole configuration does not reset what
+    CreditGuard does not own. Nothing else at the top level is sent: ``scope``
+    and ``projectId`` are named by the path, and ``allowAiUsage`` mirrors the
+    tenant's inherited AI switch, which echoing could pin on the project.
+    (The exact body the Checkmarx One UI sends is not yet confirmed; see the
+    README's Remaining unknowns.)
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("configurations"), list):
         raise CheckmarxResponseError(
@@ -233,7 +239,7 @@ def auto_triage_put_body(
             "Triage was not changed: writing it without the rest of the configuration could "
             "reset the project's other AI features."
         )
-    body = copy.deepcopy(payload)
+    body = {"configurations": copy.deepcopy(payload["configurations"])}
     entries: list[Any] = body["configurations"]
     for entry in entries:
         if isinstance(entry, dict) and entry.get("feature") == AUTO_TRIAGE_FEATURE:
@@ -251,6 +257,35 @@ def auto_triage_put_body(
         }
     )
     return body
+
+
+def auto_triage_side_effects(before: Any, after: Any) -> list[str]:
+    """What changed, besides ``auto_triage``, between two configuration reads:
+    another feature's entry (``auto_remediation``) or ``allowAiUsage``. Empty
+    when either read is not in the known shape (nothing to compare)."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return []
+
+    def others(payload: dict[str, Any]) -> dict[str, str]:
+        entries = payload.get("configurations")
+        return {
+            str(entry.get("feature")): json.dumps(entry, sort_keys=True, default=str)
+            for entry in (entries if isinstance(entries, list) else [])
+            if isinstance(entry, dict) and entry.get("feature") != AUTO_TRIAGE_FEATURE
+        }
+
+    changes: list[str] = []
+    was, now = others(before), others(after)
+    for feature in sorted(set(was) | set(now)):
+        if was.get(feature) != now.get(feature):
+            changes.append(
+                f"the {feature} feature (was {was.get(feature)}, now {now.get(feature)})"
+            )
+    if before.get("allowAiUsage") != after.get("allowAiUsage"):
+        changes.append(
+            f"allowAiUsage (was {before.get('allowAiUsage')!r}, now {after.get('allowAiUsage')!r})"
+        )
+    return changes
 
 
 def set_auto_triage(
@@ -307,6 +342,12 @@ class PrSeverities:
     shape: str
     fields: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def editable(self) -> bool:
+        """False when the read says the setting may not be changed
+        (``"isEditable": false``, set higher up): nothing is written then."""
+        return self.fields.get("isEditable") is not False
+
     def form(self) -> dict[str, Any]:
         """The shape, for an undo snapshot (JSON)."""
         return {"shape": self.shape, "fields": copy.deepcopy(self.fields)}
@@ -320,6 +361,11 @@ def parse_pr_severities(value: Any) -> PrSeverities:
     """
     if isinstance(value, list) and all(isinstance(entry, str) for entry in value):
         return PrSeverities(severities=[entry for entry in value if entry], shape=PR_SHAPE_LIST)
+    if isinstance(value, dict) and "value" in value and value["value"] is None:
+        raise PrSeveritiesShapeError(
+            f"The repository's {PR_SEVERITIES_FIELD} came back with no value (null). Whether "
+            "that means off or not configured is not known, so CreditGuard does not change it."
+        )
     if isinstance(value, dict):
         inner = value.get("value")
         if isinstance(inner, list) and all(isinstance(entry, str) for entry in inner):

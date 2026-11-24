@@ -84,6 +84,8 @@ class FakeTenant:
     # ({"value": [...], "isEditable": true}, as on a live tenant), "list" (the
     # older bare list), or "string" (a shape CreditGuard does not know).
     repo_severities_shape: str = "wrapped"
+    # The wrapped form's isEditable, as served.
+    repo_severities_editable: bool = True
     # Every repos-manager PATCH body, as (repo id, body), for assertions.
     repo_patches: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     # project id -> the auto_remediation feature entry, as a live tenant lists
@@ -91,6 +93,9 @@ class FakeTenant:
     # no config), the way a tenant that takes the PUT as the whole
     # configuration would.
     auto_remediation: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # project id -> the top level allowAiUsage of the AI agent configuration
+    # (inherited from the tenant; True when absent).
+    allow_ai_usage: dict[str, bool] = field(default_factory=dict)
     # Every Auto Triage PUT body, as (project id, body), for assertions.
     auto_triage_puts: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     # project id -> scans, in the shape GET /api/scans/ returns them.
@@ -811,7 +816,7 @@ class FakeTenant:
                 json={
                     "scope": "project",
                     "projectId": project_id,
-                    "allowAiUsage": True,
+                    "allowAiUsage": self.allow_ai_usage.get(project_id, True),
                     "configurations": configurations,
                 },
             )
@@ -849,7 +854,9 @@ class FakeTenant:
             severities = list(self.repo_severities.get(repo_id, []))
             served: Any = severities
             if self.repo_severities_shape == "wrapped":
-                served = {"value": severities, "isEditable": True}
+                served = {"value": severities, "isEditable": self.repo_severities_editable}
+            elif self.repo_severities_shape == "null":
+                served = {"value": None, "isEditable": True}
             elif self.repo_severities_shape == "string":
                 served = ",".join(severities)
             settings: dict[str, Any] = {
