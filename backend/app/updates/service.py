@@ -281,6 +281,8 @@ class UpdateService:
         self._lock = threading.Lock()
         self.job: Job | None = None
         self._last_manual_check: float | None = None
+        # Timers started for a switch, so close() can cancel them.
+        self._timers: list[threading.Timer] = []
 
     # -- plumbing
 
@@ -1256,6 +1258,7 @@ class UpdateService:
                 # Should the launcher never act on the request, cycles resume.
                 timer = threading.Timer(SCHEDULER_RESUME_SECONDS, running.resume)
                 timer.daemon = True
+                self._timers.append(timer)
                 timer.start()
 
     def _ask_launcher(self, kind: str, by: str) -> None:
@@ -1272,7 +1275,22 @@ class UpdateService:
 
         timer = threading.Timer(SWITCH_DELAY_SECONDS + 0.2, nudge)
         timer.daemon = True
+        self._timers.append(timer)
         timer.start()
+
+    def close(self, timeout: float = 30.0) -> None:
+        """Wait for a background install to finish and cancel pending timers.
+
+        Called when the service is replaced, so no thread of this service
+        touches the database once it is gone.
+        """
+        job = self.job
+        thread = job.thread if job is not None else None
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout)
+        for timer in self._timers:
+            timer.cancel()
+        self._timers.clear()
 
     # ---------------------------------------------------------- rollback
 
@@ -1649,10 +1667,16 @@ def get_service() -> UpdateService:
 
 
 def set_service(service: UpdateService | None) -> None:
-    """Test helper: replace (or reset) the process-wide service."""
+    """Test helper: replace (or reset) the process-wide service.
+
+    The service being replaced is closed first: its background install, if
+    any, finishes before the replacement takes over.
+    """
     global _service
     with _service_lock:
-        _service = service
+        previous, _service = _service, service
+    if previous is not None and previous is not service:
+        previous.close()
 
 
 def scheduled_tick() -> None:

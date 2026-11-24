@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import tarfile
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1366,3 +1367,43 @@ class TestFollowUpReview:
         second = service.auto_tick(self.QUIET)
         # README: "the newest one that fits this image is installed".
         assert second == f"Installing {V_NEXT}.", (first, second)
+
+
+class TestReplacingTheService:
+    """A replaced service's background work ends before the next one takes over.
+
+    Before this, a background install from one test could still be running when
+    the next test started. Reaching the database after the first test's settings
+    were gone, it built an engine on the default SQLite file, and the next test
+    used that engine: "no such table" on PostgreSQL, now and then.
+    """
+
+    def test_set_service_waits_for_a_running_install(
+        self, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        service = make_service(tmp_path, builtin_dir, FakeRegistry([Release(V_NEXT)]))
+        release = threading.Event()
+        finished: list[bool] = []
+
+        def work() -> None:
+            release.wait(5)
+            time.sleep(0.2)
+            finished.append(True)
+
+        job = update_service.Job(version=V_NEXT, by="admin", automatic=False)
+        job.thread = threading.Thread(target=work, daemon=True)
+        service.job = job
+        job.thread.start()
+        release.set()
+        update_service.set_service(None)
+        assert finished == [True], "set_service returned while the install was still running"
+
+    def test_close_cancels_pending_timers(self, tmp_path: Path, builtin_dir: Path) -> None:
+        service = make_service(tmp_path, builtin_dir, FakeRegistry([]))
+        fired: list[bool] = []
+        timer = threading.Timer(0.5, lambda: fired.append(True))
+        service._timers.append(timer)
+        timer.start()
+        service.close()
+        time.sleep(0.8)
+        assert fired == []
