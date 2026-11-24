@@ -56,7 +56,7 @@ from app.models.limits import (
     effective_project_actions,
 )
 from app.models.org import CxApplicationProject, CxProject, CxProjectGroup, CxUser
-from app.services import key_permissions, notifications, settings_store, usage_mix
+from app.services import key_permissions, notifications, role_sources, settings_store, usage_mix
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -215,7 +215,14 @@ class NotRestricted(Exception):  # noqa: N818 - a decision, not an error
 
 class _NotKept(NotRestricted):
     """The tenant accepted the write and, read back on two consecutive attempts,
-    did not keep it. Not certain: what was there before is kept for Restore."""
+    did not keep it. Not certain: what was there before is kept for Restore.
+
+    ``record`` is added to the action's undo snapshot (what the read-back saw).
+    """
+
+    def __init__(self, message: str, *, title: str, record: dict[str, Any] | None = None) -> None:
+        super().__init__(message, title=title)
+        self.record = dict(record or {})
 
 
 class _ReadBackUnchanged(CheckmarxError):
@@ -405,6 +412,7 @@ class RoleResolver:
         self._client = client
         self._client_uuid: str | None = None
         self._roles: dict[str, iam.RoleRef] | None = None
+        self._sources: role_sources.RoleSourceReader | None = None
 
     @property
     def client_uuid(self) -> str:
@@ -417,13 +425,30 @@ class RoleResolver:
             self._roles = iam.fetch_client_roles(self._client, client_uuid=self.client_uuid)
         return self._roles
 
-    def ai_roles(self) -> dict[str, iam.RoleRef]:
-        if self._roles is None:
-            self._roles = iam.fetch_client_roles(self._client, client_uuid=self.client_uuid)
-        missing = [name for name in iam.AI_ROLE_NAMES if name not in self._roles]
-        if missing:
-            logger.warning("Roles not present on the client: %s", ", ".join(missing))
-        return {name: self._roles[name] for name in iam.AI_ROLE_NAMES if name in self._roles}
+    @property
+    def sources(self) -> role_sources.RoleSourceReader:
+        """Best-effort reads of where users' roles come from, cached for the run."""
+        if self._sources is None:
+            self._sources = role_sources.RoleSourceReader(
+                self._client,
+                client_uuid=lambda: self.client_uuid,
+                client_roles=self.all_roles,
+            )
+        return self._sources
+
+
+def snapshot_ai_roles(snapshot: dict[str, Any] | None) -> frozenset[str]:
+    """The roles a user restriction counted as AI roles when it was made.
+
+    Recorded on every user restriction since the list became a setting; one
+    made before that used the default list. A restriction keeps going by its own
+    record (drift, returning roles it should not have taken), so changing the
+    setting only affects restrictions made afterwards.
+    """
+    recorded = (snapshot or {}).get("ai_roles")
+    if isinstance(recorded, list) and recorded:
+        return frozenset(name for name in recorded if isinstance(name, str) and name)
+    return frozenset(iam.DEFAULT_AI_ROLE_NAMES)
 
 
 # ------------------------------------------------------------------- enforcing
@@ -627,7 +652,12 @@ def _enforce_target(
     try:
         # Phase 1: read the tenant's current state. Nothing is changed yet.
         captured = _capture(
-            session, client, target=target, resolver=resolver, protected_roles=protected_roles
+            session,
+            client,
+            target=target,
+            resolver=resolver,
+            protected_roles=protected_roles,
+            retrying=unchanged_before,
         )
         # Phase 2: make the intent and the undo snapshot durable. If an earlier
         # attempt's write may have landed without being recorded, its snapshot
@@ -670,6 +700,7 @@ def _enforce_target(
             # restriction) puts it back - which changes nothing if it was never
             # taken. It is not sent again this period.
             held = dict(action.undo_snapshot)
+            held.update(exc.record)
             held[_NOT_KEPT] = True
             action.undo_snapshot = held
         action.status = EnforcementStatus.FAILED
@@ -836,7 +867,99 @@ def _enforce_target(
         dedupe_key=notifications.enforcement_key(action.id),
         enforcement_action_id=action.id,
     )
+    if target.kind == EnforcementKind.REMOVE_USER_ROLES and snapshot.get("kept_effective"):
+        _report_not_effective(
+            session, limit=limit, target=target, action=action, snapshot=snapshot, actor=actor
+        )
     session.commit()
+
+
+AUDIT_NOT_EFFECTIVE = "enforcement.not_effective"
+
+
+def _not_effective_lines(target_label: str, snapshot: dict[str, Any]) -> list[str]:
+    """One sentence per AI role the user still holds through a group or a role."""
+    kept = role_sources.kept_from_entries(snapshot.get("kept_effective"))
+    removed = {
+        entry.get("role")
+        for entry in snapshot.get("kept_effective") or []
+        if isinstance(entry, dict) and entry.get("direct_removed")
+    }
+    lines: list[str] = []
+    for name, sources in kept.items():
+        how = (
+            "CreditGuard removed only the direct mapping"
+            if name in removed
+            else "CreditGuard can remove only a direct mapping, and the user has none for it"
+        )
+        lines.append(
+            f"{target_label} keeps {name} through {role_sources.describe_sources(sources)}; {how}."
+        )
+    return lines
+
+
+def _report_not_effective(
+    session: Session,
+    *,
+    limit: CreditLimit,
+    target: Target,
+    action: EnforcementAction,
+    snapshot: dict[str, Any],
+    actor: AuditActor,
+) -> None:
+    """Said once per action: the restriction does not take these roles away.
+
+    Groups and composite roles are not changed (that would take the role from
+    everyone else who holds it that way). The record stays on the action; the
+    drift check reads direct mappings only, so this is not repeated each cycle.
+    """
+    label = target.target_label or target.target_id
+    lines = _not_effective_lines(label, snapshot)
+    if not lines:
+        return
+    body = (
+        "\n".join(lines)
+        + "\nThe restriction is not effective for "
+        + ("this role" if len(lines) == 1 else "these roles")
+        + ". Remove it from the group or role in Checkmarx One, or add the user to an "
+        "exemption. CreditGuard does not change groups or composite roles: that would take "
+        "the role from everyone else who holds it that way."
+    )
+    unread = snapshot.get("role_sources_unread") or []
+    if unread:
+        body += f"\nNot known (could not be read): {', '.join(str(item) for item in unread)}."
+    notifications.notify(
+        session,
+        category=notifications.CATEGORY_ENFORCEMENT,
+        severity=Severity.WARNING,
+        title=f"{label} keeps AI access through a group or role",
+        body=body,
+        entity_type=limit.entity_type,
+        entity_id=limit.entity_id,
+        entity_label=limit.entity_label,
+        dedupe_key=notifications.not_effective_key(action.id),
+        enforcement_action_id=action.id,
+    )
+    already = session.scalar(
+        select(AuditLogEntry.id)
+        .where(
+            AuditLogEntry.action == AUDIT_NOT_EFFECTIVE,
+            AuditLogEntry.target_type == AUDIT_TARGET_ACTION,
+            AuditLogEntry.target_id == str(action.id),
+        )
+        .limit(1)
+    )
+    if already is None:
+        record_audit(
+            session,
+            action=AUDIT_NOT_EFFECTIVE,
+            actor=actor,
+            target_type=AUDIT_TARGET_ACTION,
+            target_id=str(action.id),
+            target_label=label,
+            after={"kept_effective": snapshot.get("kept_effective")},
+            detail=" ".join(lines),
+        )
 
 
 def _verify_applied(
@@ -1050,72 +1173,27 @@ def _capture(
     target: Target,
     resolver: RoleResolver,
     protected_roles: frozenset[str] = frozenset(),
+    retrying: bool = False,
 ) -> _Captured:
-    """Read the state a restriction is about to change. Makes no change itself."""
+    """Read the state a restriction is about to change. Makes no change itself.
+
+    ``retrying`` is True when the last attempt's write read back unchanged: a
+    second read-back that finds the same is then a conclusion, not a retry.
+    """
     if target.kind == EnforcementKind.REMOVE_USER_ROLES:
-        client_uuid = resolver.client_uuid
-        current = iam.fetch_user_client_roles(
-            client, user_id=target.target_id, client_uuid=client_uuid
-        )
-        current_names = {role.name for role in current}
-        # The plan already left out anyone the last sync showed as protected;
-        # this catches a role granted since then.
-        why = protection_reason(
-            session, target.target_id, protected_roles=protected_roles, live_roles=current_names
-        )
-        if why is not None:
-            raise ProtectedTarget(
-                f"{target.target_label}'s AI access is not removed automatically because "
-                f"{why}. Raise it with them, or change the protected roles under "
-                "Settings → Enforcement.",
-                label=target.target_label,
-            )
-        to_remove = [role for role in current if role.name in iam.AI_ROLE_NAMES]
-
-        def remove_roles() -> None:
-            if to_remove:
-                iam.remove_user_client_roles(
-                    client, user_id=target.target_id, client_uuid=client_uuid, roles=to_remove
-                )
-
-        return _Captured(
-            snapshot={
-                "kind": str(target.kind),
-                "client_uuid": client_uuid,
-                "removed_roles": [role.as_payload() for role in to_remove],
-                "roles_before": sorted(current_names),
-            },
-            apply=remove_roles,
-            mirror=lambda: None,
+        return _capture_user_roles(
+            session,
+            client,
+            target=target,
+            resolver=resolver,
+            protected_roles=protected_roles,
+            retrying=retrying,
         )
 
     project = session.get(CxProject, target.target_id)
 
     if target.kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
-        state = platform.get_auto_triage(client, project_id=target.target_id)
-
-        def disable_auto_triage() -> None:
-            if state.enabled:
-                platform.set_auto_triage(
-                    client, project_id=target.target_id, enabled=False, config=state.config
-                )
-
-        def mirror_auto_triage() -> None:
-            if project is not None:
-                project.auto_triage_enabled = False
-                project.auto_triage_config = state.config or None
-                project.ai_state_checked_at = utcnow()
-
-        return _Captured(
-            snapshot={
-                "kind": str(target.kind),
-                # False here means it was already off, so restore leaves it off.
-                "enabled_before": bool(state.enabled),
-                "config_before": state.config or {},
-            },
-            apply=disable_auto_triage,
-            mirror=mirror_auto_triage,
-        )
+        return _capture_auto_triage(client, target=target, project=project)
 
     if target.kind == EnforcementKind.DISABLE_PR_REMEDIATION:
         if project is None or not project.repo_id:
@@ -1146,6 +1224,7 @@ def _capture(
                 "project is restricted as normal.",
                 title=f"{target.target_label}: PR triage and remediation left unchanged",
             )
+        label = target.target_label or target.target_id
 
         def disable_pr_remediation() -> None:
             platform.set_pr_remediation_severities(
@@ -1154,6 +1233,31 @@ def _capture(
                 project_id=target.target_id,
                 severities=DISABLED_SEVERITIES,
             )
+            # Read back once, as for Fusion. Severities still listed may be a
+            # stale read: the outcome stays in doubt (what was there before is
+            # kept) and the next cycle tries again, quietly. Still listed after
+            # that attempt too, the tenant is taken not to keep the change: said
+            # once, not sent again this period, never a violation every cycle.
+            # A read that fails says nothing either way (the drift check reads
+            # it again next cycle).
+            after = platform.get_pr_remediation_severities(
+                client, repo_id=repo_id, project_id=target.target_id
+            )
+            if after:
+                raise _ReadBackUnchanged(
+                    f"Checkmarx One accepted clearing the PR triage and remediation severities "
+                    f"of {label}'s repository, but they still read as {', '.join(after)}.",
+                    conclusion=_NotKept(
+                        f"Checkmarx One accepted clearing the PR triage and remediation "
+                        f"severities of {label}'s repository but did not keep it (read back as "
+                        f"{', '.join(after)} on two consecutive attempts). It is not sent again "
+                        "this period. What was there before is kept, so Restore puts it back, "
+                        "which changes nothing if it was never taken. Check the repository's "
+                        "settings in Checkmarx One.",
+                        title=f"{label}: PR triage and remediation change not kept",
+                        record={"severities_read_back": list(after)},
+                    ),
+                )
 
         def mirror_pr_remediation() -> None:
             project.pr_remediation_severities = []
@@ -1176,6 +1280,261 @@ def _capture(
         return _capture_repo_fusion(client, target=target, project=project)
 
     raise CheckmarxError(f"Unknown enforcement kind {target.kind!r}")
+
+
+def _capture_user_roles(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    target: Target,
+    resolver: RoleResolver,
+    protected_roles: frozenset[str],
+    retrying: bool,
+) -> _Captured:
+    """Remove the AI roles mapped to the user directly, and find out which stay.
+
+    The roles removed are the configured list (Settings → Enforcement), recorded
+    on the snapshot so the restriction keeps going by it. Where each AI role
+    comes from is read first, best effort (``role_sources``): one held through a
+    group or a composite role stays effective however the direct mapping is
+    changed, and is reported once instead of being counted as taken away.
+    """
+    client_uuid = resolver.client_uuid
+    current = iam.fetch_user_client_roles(client, user_id=target.target_id, client_uuid=client_uuid)
+    current_names = {role.name for role in current}
+    # The plan already left out anyone the last sync showed as protected;
+    # this catches a role granted since then.
+    why = protection_reason(
+        session, target.target_id, protected_roles=protected_roles, live_roles=current_names
+    )
+    if why is not None:
+        raise ProtectedTarget(
+            f"{target.target_label}'s AI access is not removed automatically because "
+            f"{why}. Raise it with them, or change the protected roles under "
+            "Settings → Enforcement.",
+            label=target.target_label,
+        )
+    ai_roles = settings_store.ai_role_names(session)
+    to_remove = [
+        iam.RoleRef(id=role.id, name=role.name) for role in current if role.name in ai_roles
+    ]
+    removed_names = {role.name for role in to_remove}
+    label = target.target_label or target.target_id
+    reader = resolver.sources
+    # Read before anything changes; never a reason not to restrict.
+    before = reader.read_user(target.target_id, ai_roles=ai_roles, direct=current)
+    stays = before.stays_effective()
+    outcome: dict[str, Any] = {}
+
+    def remove_roles() -> None:
+        kept = dict(stays)
+        if to_remove:
+            iam.remove_user_client_roles(
+                client, user_id=target.target_id, client_uuid=client_uuid, roles=to_remove
+            )
+            kept = _confirm_roles_removed(
+                client,
+                reader,
+                user_id=target.target_id,
+                client_uuid=client_uuid,
+                label=label,
+                ai_roles=ai_roles,
+                removed=removed_names,
+                stays=stays,
+                retrying=retrying,
+            )
+        outcome["kept_effective"] = role_sources.kept_entries(kept, removed=removed_names)
+
+    return _Captured(
+        snapshot={
+            "kind": str(target.kind),
+            "client_uuid": client_uuid,
+            "removed_roles": [role.as_payload() for role in to_remove],
+            "roles_before": sorted(current_names),
+            # What this restriction counts as AI roles (the setting when it was made).
+            "ai_roles": list(ai_roles),
+            "role_sources_unread": before.unread,
+        },
+        apply=remove_roles,
+        mirror=lambda: None,
+        outcome=outcome,
+    )
+
+
+def _confirm_roles_removed(
+    client: CheckmarxClient,
+    reader: role_sources.RoleSourceReader,
+    *,
+    user_id: str,
+    client_uuid: str,
+    label: str,
+    ai_roles: tuple[str, ...],
+    removed: set[str],
+    stays: dict[str, list[role_sources.RoleSource]],
+    retrying: bool,
+) -> dict[str, list[role_sources.RoleSource]]:
+    """Read the user's roles back once after removing the direct mappings.
+
+    Returns the AI roles still effective, with where they come from. One read
+    straight after a write can be behind it, so nothing is concluded from it
+    alone (the pattern Fusion uses): a removed role still read as held for no
+    reason CreditGuard can see is a quiet retry the first time; the second time
+    it is recorded as kept through a source that cannot be seen. A role still
+    mapped *directly* on two consecutive read-backs means the tenant did not
+    keep the removal.
+    """
+    effective = reader.effective(user_id)
+    direct_after: set[str] | None = None
+
+    def read_direct() -> set[str] | None:
+        try:
+            roles = iam.fetch_user_client_roles(client, user_id=user_id, client_uuid=client_uuid)
+        except CheckmarxAuthError:
+            raise
+        except CheckmarxError as exc:
+            logger.info("Could not read %s's roles back: %s", label, exc)
+            return None
+        return {role.name for role in roles}
+
+    if effective is None:
+        # The effective roles cannot be read: what is mapped directly is
+        # still worth checking. Unreadable as well, nothing can be said.
+        direct_after = read_direct()
+        if direct_after is None:
+            return dict(stays)
+        still = sorted(removed & direct_after)
+        if still:
+            raise _roles_not_removed(label, still)
+        return dict(stays)
+
+    kept: dict[str, list[role_sources.RoleSource]] = {}
+    unexplained: list[str] = []
+    for name in ai_roles:
+        if name not in effective:
+            continue
+        if name in stays:
+            kept[name] = stays[name]
+        elif name in removed:
+            unexplained.append(name)
+        else:
+            kept[name] = [role_sources.RoleSource(role_sources.SOURCE_UNKNOWN)]
+    if unexplained:
+        direct_after = read_direct()
+        still = sorted(set(unexplained) & (direct_after or set()))
+        if still:
+            raise _roles_not_removed(label, still)
+        if not retrying:
+            raise _ReadBackUnchanged(
+                f"Checkmarx One accepted removing {', '.join(unexplained)} from {label}, but "
+                "the user's effective roles still include "
+                + ("it" if len(unexplained) == 1 else "them")
+                + ", and no group or composite role was found that grants "
+                + ("it." if len(unexplained) == 1 else "them.")
+            )
+        for name in unexplained:
+            kept[name] = [role_sources.RoleSource(role_sources.SOURCE_UNKNOWN)]
+    return {name: kept[name] for name in ai_roles if name in kept}
+
+
+def _roles_not_removed(label: str, still: list[str]) -> _ReadBackUnchanged:
+    names = ", ".join(still)
+    return _ReadBackUnchanged(
+        f"Checkmarx One accepted removing {names} from {label}, but the user's role "
+        "mappings still list them.",
+        conclusion=_NotKept(
+            f"Checkmarx One accepted removing {names} from {label} but did not keep it (still "
+            "mapped to the user on two consecutive read-backs). It is not sent again this "
+            "period. What was there before is kept, so Restore puts it back, which changes "
+            "nothing if it was never taken. Check the user's roles in Checkmarx One.",
+            title=f"{label}: AI role removal not kept",
+            record={"roles_read_back": still},
+        ),
+    )
+
+
+def _capture_auto_triage(
+    client: CheckmarxClient, *, target: Target, project: CxProject | None
+) -> _Captured:
+    label = target.target_label or target.target_id
+    state = platform.get_auto_triage(client, project_id=target.target_id)
+    outcome: dict[str, Any] = {}
+
+    def disable_auto_triage() -> None:
+        if not state.enabled:
+            return
+        platform.set_auto_triage(
+            client, project_id=target.target_id, enabled=False, config=state.config
+        )
+        # Read back once, as for Fusion. Still on may be a stale read: the
+        # outcome stays in doubt and the next cycle tries again, quietly. Still
+        # on after that attempt too, the project is taken not to be able to
+        # override an account-wide Auto Triage setting: said once, not sent
+        # again this period, never a violation every cycle; what was there
+        # before stays on the record, so Restore puts it back.
+        try:
+            after = platform.get_auto_triage(client, project_id=target.target_id)
+        except CheckmarxAuthError:
+            raise
+        except CheckmarxError as exc:
+            logger.info("Could not read Auto Triage back on %s: %s", label, exc)
+            return
+        if after.allow_override is not None:
+            outcome["auto_triage_allow_override_read_back"] = after.allow_override
+        if after.enabled:
+            seen = _allow_override_words(after.allow_override)
+            raise _ReadBackUnchanged(
+                f"Checkmarx One accepted turning Auto Triage off for {label}, but it still "
+                f"reads as on.{seen}",
+                conclusion=_NotKept(
+                    f"Checkmarx One accepted turning Auto Triage off for {label}, but it still "
+                    "read as on straight after, on two consecutive attempts. This project's "
+                    "Auto Triage is set account-wide and the project cannot override it, so "
+                    "turning it off for the project does not hold. It is not sent again this "
+                    "period. Turn Auto Triage off (or exclude this project) in the account's "
+                    "Auto Triage settings in Checkmarx One, or exempt the project. What was "
+                    f"there before is kept, so Restore puts it back.{seen}",
+                    title=f"{label}: Auto Triage is set account-wide",
+                    record={
+                        "auto_triage_account_wide": True,
+                        "auto_triage_allow_override_read_back": after.allow_override,
+                        "auto_triage_scope_read_back": after.scope,
+                    },
+                ),
+            )
+
+    def mirror_auto_triage() -> None:
+        if project is not None:
+            project.auto_triage_enabled = False
+            project.auto_triage_config = state.config or None
+            project.ai_state_checked_at = utcnow()
+
+    return _Captured(
+        snapshot={
+            "kind": str(target.kind),
+            # False here means it was already off, so restore leaves it off.
+            "enabled_before": bool(state.enabled),
+            "config_before": state.config or {},
+            # Verbatim from the configuration read: kept for the record, not
+            # interpreted.
+            "auto_triage_allow_override": state.allow_override,
+            "auto_triage_scope": state.scope,
+        },
+        apply=disable_auto_triage,
+        mirror=mirror_auto_triage,
+        outcome=outcome,
+    )
+
+
+def _allow_override_words(value: Any) -> str:
+    if value is None:
+        return ""
+    import json
+
+    try:
+        text = json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):
+        text = repr(value)
+    return f" The configuration read back carries allowOverride {text[:300]}."
 
 
 # Checkmarx answers a body it will not accept with one of these.
@@ -1478,6 +1837,12 @@ def _merge_snapshots(previous: dict[str, Any] | None, fresh: dict[str, Any]) -> 
         merged["roles_before"] = sorted(
             set(previous.get("roles_before") or []) | set(fresh.get("roles_before") or [])
         )
+        # Every role either side counted as an AI role stays one: a role an
+        # earlier attempt (or another limit) took as an AI role is not handed
+        # back early as "outside the restriction".
+        merged["ai_roles"] = sorted(snapshot_ai_roles(previous) | snapshot_ai_roles(fresh))
+        if "kept_effective" not in fresh and "kept_effective" in previous:
+            merged["kept_effective"] = previous["kept_effective"]
         return merged
 
     if kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
@@ -1608,7 +1973,13 @@ def _reconcile(
         current = iam.fetch_user_client_roles(
             client, user_id=target.target_id, client_uuid=client_uuid
         )
-        to_remove = [role for role in current if role.name in iam.AI_ROLE_NAMES]
+        # Only a role mapped to the user directly again is drift. One held
+        # through a group or a composite role was reported when the restriction
+        # was applied, and is not read (or reported) again every cycle.
+        ai_roles = snapshot_ai_roles(snapshot)
+        to_remove = [
+            iam.RoleRef(id=role.id, name=role.name) for role in current if role.name in ai_roles
+        ]
         if not to_remove:
             return RECONCILE_HELD
         found.update({"found": {"roles": sorted(role.name for role in to_remove)}})
@@ -1875,13 +2246,18 @@ def _siblings_in_force(session: Session, action: EnforcementAction) -> list[Enfo
 
 def _roles_outside_the_restriction(action: EnforcementAction) -> list[dict[str, str]]:
     """Roles this action's snapshot says were removed that a restriction no longer covers."""
-    removed = (action.undo_snapshot or {}).get("removed_roles") or []
+    snapshot = action.undo_snapshot or {}
+    removed = snapshot.get("removed_roles") or []
+    # Judged by what this restriction counted as AI roles when it was made (the
+    # default list for one made before the list was a setting), never by the
+    # setting now: changing it does not hand back what a restriction in force took.
+    ai_roles = snapshot_ai_roles(snapshot)
     return [
         role
         for role in removed
         if isinstance(role, dict)
         and isinstance(role.get("name"), str)
-        and role["name"] not in iam.AI_ROLE_NAMES
+        and role["name"] not in ai_roles
     ]
 
 
@@ -2512,8 +2888,17 @@ def _enforcement_body(
         lines.append(
             f"The AI roles were removed: {', '.join(name for name in removed if name)}."
             if removed
-            else "The user did not hold the AI roles, so nothing was removed."
+            else "The user did not hold the AI roles directly, so nothing was removed."
         )
+        not_effective = _not_effective_lines(target.target_label or target.target_id, snapshot)
+        if not_effective:
+            lines.extend(not_effective)
+            lines.append(
+                "The restriction is not effective for "
+                + ("that role" if len(not_effective) == 1 else "those roles")
+                + ": remove it from the group or role in Checkmarx One, or add the user to an "
+                "exemption."
+            )
     elif target.kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
         lines.append(
             "Auto Triage was already off for this project."

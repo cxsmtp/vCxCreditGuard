@@ -180,6 +180,11 @@ def lock_not_kept_key(project_id: str, period_key: str) -> str:
     return f"locknotkept:{project_id}:{period_key}"
 
 
+def not_effective_key(action_id: int) -> str:
+    """One "keeps AI access through a group or role" notice per restriction."""
+    return f"noteffective:{action_id}"
+
+
 def restoration_key(action_id: int) -> str:
     return f"restored:{action_id}"
 

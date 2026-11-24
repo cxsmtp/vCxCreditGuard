@@ -6,6 +6,7 @@ import type {
   AppSettings,
   Attestation,
   AutoTriageOverview,
+  ClientRoles,
   CycleRun,
   OrgEntity,
   RestoreResult,
@@ -674,6 +675,14 @@ export function SettingsPage({
                     spellCheck={false}
                   />
                 </Field>
+              </div>
+              <div className="mt-4 border-t border-hairline pt-4">
+                <AiRolesPicker
+                  isAdmin={isAdmin}
+                  value={value("ai_roles") ?? current.ai_roles ?? []}
+                  defaults={current.default_ai_roles ?? []}
+                  onChange={(next) => set({ ai_roles: next })}
+                />
               </div>
               <div className="mt-4 border-t border-hairline pt-4">
                 <Toggle
@@ -2028,5 +2037,125 @@ function DemoCard({
         </div>
       </div>
     </Card>
+  );
+}
+
+/** The client roles a user restriction removes, picked from the tenant's own roles. */
+function AiRolesPicker({
+  isAdmin,
+  value,
+  defaults,
+  onChange,
+}: {
+  isAdmin: boolean;
+  value: string[];
+  defaults: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const roles = useResource<ClientRoles | null>(
+    (signal) =>
+      isAdmin ? api.get<ClientRoles>("/api/settings/client-roles", undefined, signal) : Promise.resolve(null),
+    [isAdmin],
+  );
+  const [choice, setChoice] = useState("");
+  const listing = roles.data;
+  const byName = new Map((listing?.roles ?? []).map((role) => [role.name, role]));
+  const addable = (listing?.roles ?? []).filter((role) => !value.includes(role.name));
+  const isDefault =
+    value.length === defaults.length && value.every((name) => defaults.includes(name));
+
+  function remove(name: string) {
+    const next = value.filter((entry) => entry !== name);
+    if (next.length > 0) onChange(next);
+  }
+
+  return (
+    <div>
+      <p className="text-sm font-medium">Roles a user restriction removes</p>
+      <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+        The client roles (on <code>ast-app</code>) taken from a person who goes over a user
+        budget. The default is the three general Risk Management roles AI Triage and AI
+        Remediation are reached through, so a restricted person also loses the Risk Management
+        pages. When Checkmarx One ships dedicated AI Triage and Remediation roles (announced for
+        10 January), add them here and remove the general ones. A change applies only to
+        restrictions made from then on: a restriction in force keeps, and gives back, exactly
+        the roles it recorded. A role a person holds through a group or a composite role is not
+        taken away by removing their direct mapping; CreditGuard says so when it happens.
+      </p>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {value.map((name) => {
+          const role = byName.get(name);
+          const title = role?.known_description ?? role?.description ?? undefined;
+          return (
+            <span
+              key={name}
+              title={title}
+              className="inline-flex items-center gap-1 rounded border border-hairline px-2 py-0.5 text-xs"
+            >
+              <code>{name}</code>
+              {role?.composite && <Badge tone="neutral">composite</Badge>}
+              {listing?.available && !role && <Badge tone="warning">not on the tenant</Badge>}
+              {isAdmin && value.length > 1 && (
+                <button
+                  type="button"
+                  className="ml-0.5"
+                  aria-label={`Remove ${name}`}
+                  onClick={() => remove(name)}
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  ×
+                </button>
+              )}
+            </span>
+          );
+        })}
+      </div>
+      {isAdmin && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {roles.loading ? (
+            <span className="flex items-center gap-2 text-xs" style={{ color: "var(--text-secondary)" }}>
+              <Spinner size={12} /> Reading the tenant's roles
+            </span>
+          ) : listing?.available ? (
+            <>
+              <Select
+                value={choice}
+                onChange={(event) => setChoice(event.target.value)}
+                aria-label="Role to add"
+                className="max-w-xs"
+              >
+                <option value="">Add a role…</option>
+                {addable.map((role) => (
+                  <option key={role.name} value={role.name}>
+                    {role.name}
+                    {role.composite ? " (composite)" : ""}
+                  </option>
+                ))}
+              </Select>
+              <Button
+                size="sm"
+                disabled={!choice}
+                onClick={() => {
+                  if (choice) onChange([...value, choice]);
+                  setChoice("");
+                }}
+              >
+                Add
+              </Button>
+            </>
+          ) : (
+            <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+              {listing?.message ?? roles.error ?? "The tenant's roles could not be listed."} Only
+              roles already in the list (or the defaults) can be kept until they can be read.
+            </span>
+          )}
+          {!isDefault && (
+            <Button size="sm" onClick={() => onChange([...defaults])}>
+              Back to the default
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

@@ -9,10 +9,16 @@ from fastapi import APIRouter, HTTPException, status
 
 from app import scheduler
 from app.api.deps import AdminUser, CurrentUser, DbSession
+from app.checkmarx import iam
 from app.checkmarx import usage as usage_api
 from app.models.enums import Severity
-from app.schemas.dashboard import SettingsResponse, SettingsUpdateRequest
-from app.services import delivery, settings_store
+from app.schemas.dashboard import (
+    ClientRoleResponse,
+    ClientRolesResponse,
+    SettingsResponse,
+    SettingsUpdateRequest,
+)
+from app.services import delivery, role_sources, settings_store
 from app.services.audit import record_audit
 
 logger = logging.getLogger(__name__)
@@ -49,6 +55,7 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "max_new_targets_per_cycle": settings_store.KEY_MAX_NEW_TARGETS,
     "protected_roles": settings_store.KEY_PROTECTED_ROLES,
     "fusion_lock_override": settings_store.KEY_FUSION_LOCK,
+    "ai_roles": settings_store.KEY_AI_ROLES,
     "charge_auto_triage_to_scan_initiator": settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR,
 }
 
@@ -119,6 +126,8 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         max_new_targets_per_cycle=guard.max_new_targets_per_cycle,
         protected_roles=", ".join(sorted(guard.protected_roles)),
         fusion_lock_override=settings_store.fusion_lock_enabled(db),
+        ai_roles=list(settings_store.ai_role_names(db)),
+        default_ai_roles=list(iam.DEFAULT_AI_ROLE_NAMES),
         charge_auto_triage_to_scan_initiator=bool(
             values.get(settings_store.KEY_AUTO_TRIAGE_TO_INITIATOR) is True
         ),
@@ -182,6 +191,9 @@ def update_settings(
                     ),
                 },
             )
+
+    if "ai_roles" in changes:
+        changes["ai_roles"] = _validated_ai_roles(db, changes["ai_roles"])
 
     before = _read(db).model_dump(exclude={"current_schedule_description"})
     audited_changes: dict[str, object] = {}
@@ -249,6 +261,78 @@ def update_settings(
             logger.exception("Could not apply the new schedule to the running scheduler")
 
     return _read(db)
+
+
+@router.get("/client-roles", response_model=ClientRolesResponse)
+def client_roles(ctx: AdminUser, db: DbSession) -> ClientRolesResponse:
+    """The tenant's roles on the platform client, for choosing the AI roles.
+
+    Cached briefly; a failed read is reported in the answer, never as an error.
+    """
+    listing = role_sources.tenant_client_roles(db)
+    return ClientRolesResponse(
+        available=listing.available,
+        message=listing.message,
+        roles=[
+            ClientRoleResponse(
+                name=role.name,
+                description=role.description,
+                composite=role.composite,
+                known_description=iam.ROLE_DESCRIPTIONS.get(role.name),
+            )
+            for role in listing.roles
+        ],
+        ai_roles=list(settings_store.ai_role_names(db)),
+        default_ai_roles=list(iam.DEFAULT_AI_ROLE_NAMES),
+    )
+
+
+def _validated_ai_roles(db, value: object) -> list[str]:  # type: ignore[no-untyped-def]
+    """The AI role list, checked against the roles the tenant actually has.
+
+    When the tenant's roles cannot be read, only names already trusted (the
+    current list or the default one) are accepted: nothing unknown gets in.
+    """
+    names = settings_store.normalise_role_names(value)
+    if not names:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_ai_roles",
+                "message": "Name at least one role: with none, a user restriction would "
+                "remove nothing.",
+            },
+        )
+    listing = role_sources.tenant_client_roles(db, fresh=True)
+    if listing.available:
+        unknown = [name for name in names if name not in listing.names()]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "unknown_ai_roles",
+                    "message": (
+                        f"Not a role on the tenant's {iam.PLATFORM_CLIENT_ID} client: "
+                        f"{', '.join(unknown)}. Pick roles from the list."
+                    ),
+                },
+            )
+        return names
+    trusted = set(settings_store.ai_role_names(db)) | set(iam.DEFAULT_AI_ROLE_NAMES)
+    unchecked = [name for name in names if name not in trusted]
+    if unchecked:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "ai_roles_unverifiable",
+                "message": (
+                    f"{', '.join(unchecked)} could not be checked against the tenant's roles "
+                    f"({listing.message or 'they could not be read'}). Try again when the "
+                    "Checkmarx One connection works."
+                ),
+            },
+        )
+    return names
 
 
 @router.post("/test-notification")

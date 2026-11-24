@@ -1,6 +1,6 @@
 import { useCallback } from "react";
 import { api } from "../api/client";
-import type { BlastRadius, DryRunResult, DryRunRow } from "../api/types";
+import type { BlastRadius, DryRunResult, DryRunRow, UserRolesPreview } from "../api/types";
 import { ExportMenu } from "../components/ExportMenu";
 import { StatTile } from "../components/StatTile";
 import type { ExportColumn } from "../lib/export";
@@ -9,6 +9,7 @@ import {
   Card,
   EmptyState,
   ErrorNote,
+  InfoNote,
   PageHeader,
   Spinner,
   Table,
@@ -104,6 +105,10 @@ export function PreviewPage() {
             <StatTile label="Users affected" value={String(data.affected_users)} />
           </div>
 
+          {data.user_roles_truncated && data.user_roles_note && (
+            <InfoNote tone="warning">{data.user_roles_note}</InfoNote>
+          )}
+
           <Card
             title="Per-limit projection"
             description={`Generated ${formatDateTime(data.generated_at)}. Sorted so anything that would enforce is at the top.`}
@@ -167,7 +172,16 @@ export function PreviewPage() {
                           </span>
                         )}
                       </Td>
-                      <Td>{row.blast ? <BlastSummary blast={row.blast} /> : <span className="text-xs" style={{ color: "var(--text-muted)" }}>—</span>}</Td>
+                      <Td>
+                        {row.blast ? (
+                          <>
+                            <BlastSummary blast={row.blast} />
+                            <BlastDetails blast={row.blast} />
+                          </>
+                        ) : (
+                          <span className="text-xs" style={{ color: "var(--text-muted)" }}>—</span>
+                        )}
+                      </Td>
                     </tr>
                   ))}
                 </tbody>
@@ -212,5 +226,70 @@ export function BlastSummary({ blast }: { blast: BlastRadius }) {
         </span>
       )}
     </span>
+  );
+}
+
+/** What each person would lose and keep, and where a project setting may not hold. */
+export function BlastDetails({ blast }: { blast: BlastRadius }) {
+  const users = blast.user_roles ?? [];
+  const warnings = blast.warnings ?? [];
+  if (blast.exempt || (users.length === 0 && warnings.length === 0)) return null;
+  return (
+    <div className="mt-1.5 flex max-w-md flex-col gap-1.5 text-xs">
+      {users.map((user) => (
+        <UserRolesDetail key={user.user_id} user={user} aiRoles={blast.ai_roles ?? []} />
+      ))}
+      {blast.user_roles_truncated && blast.user_roles_note && (
+        <p style={{ color: "var(--text-muted)" }}>{blast.user_roles_note}</p>
+      )}
+      {warnings.map((warning) => (
+        <p key={warning.project_id} style={{ color: "var(--status-warning)" }}>
+          {warning.message}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+function UserRolesDetail({ user, aiRoles }: { user: UserRolesPreview; aiRoles: string[] }) {
+  const name = user.user_label ?? user.user_id;
+  if (!user.read) {
+    return (
+      <p style={{ color: "var(--text-secondary)" }}>
+        {name}: {user.note ?? `would lose whichever of ${aiRoles.join(", ")} they hold directly.`}
+      </p>
+    );
+  }
+  return (
+    <div style={{ color: "var(--text-secondary)" }}>
+      <p style={{ color: "var(--text-primary)" }}>{name}</p>
+      {user.removed.length > 0 ? (
+        <ul className="ml-3 list-disc">
+          {user.removed.map((role) => (
+            <li key={role.name}>
+              Loses <code>{role.name}</code>
+              {role.description ? ` (${role.description})` : ""}
+              {role.grants && role.grants.length > 0 && (
+                <>, which also grants {role.grants.join(", ")}</>
+              )}
+              {role.grants === null && <>; what else it grants could not be read</>}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p>Holds none of the AI roles directly, so nothing would be removed.</p>
+      )}
+      {user.kept.length > 0 && (
+        <ul className="ml-3 list-disc" style={{ color: "var(--status-warning)" }}>
+          {user.kept.map((role) => (
+            <li key={role.name}>
+              Keeps <code>{role.name}</code> through {role.sources.join(" and ")}: removing the
+              direct mapping does not take it away
+            </li>
+          ))}
+        </ul>
+      )}
+      {user.note && <p style={{ color: "var(--text-muted)" }}>{user.note}</p>}
+    </div>
   );
 }
