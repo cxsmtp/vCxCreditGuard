@@ -10,7 +10,7 @@ from sqlalchemy import func, or_, select
 from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.checkmarx.errors import CheckmarxError
 from app.models.audit import Notification
-from app.models.enums import Severity
+from app.models.enums import EnforcementStatus, Severity
 from app.models.limits import EnforcementAction
 from app.schemas.limits import (
     EnforcementActionPage,
@@ -147,6 +147,18 @@ def _action_response(row: EnforcementAction) -> EnforcementActionResponse:
     )
 
 
+_LIKE_ESCAPE = "\\"
+
+
+def _escape_like(term: str) -> str:
+    """``term`` for a LIKE pattern, its wildcards (and the escape) taken literally."""
+    return (
+        term.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", _LIKE_ESCAPE + "%")
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
+
+
 @router.get("/enforcements/page", response_model=EnforcementActionPage)
 def page_enforcements(
     ctx: CurrentUser,
@@ -159,61 +171,71 @@ def page_enforcements(
 ) -> EnforcementActionPage:
     """Restrictions, newest first, a page at a time, searchable.
 
-    For a tenant with thousands of restrictions in force: the list is filtered
-    and counted in the database, and only one page is sent.
+    For a tenant with thousands of restrictions in force: the list is filtered,
+    counted and paged in the database, and only one page is read and sent.
+    ``q`` is matched literally (``%``, ``_`` and ``\\`` are not wildcards).
     """
-    query = select(EnforcementAction.id, EnforcementAction.status, EnforcementAction.kind).order_by(
-        EnforcementAction.created_at.desc(), EnforcementAction.id.desc()
-    )
-    if only_active:
-        query = query.where(EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES))
+    conditions = []
     term = q.strip()
     if term:
-        pattern = f"%{term}%"
-        query = query.where(
+        pattern = f"%{_escape_like(term)}%"
+        conditions.append(
             or_(
-                EnforcementAction.target_label.ilike(pattern),
-                EnforcementAction.target_id.ilike(pattern),
-                EnforcementAction.entity_label.ilike(pattern),
-                EnforcementAction.entity_id.ilike(pattern),
+                EnforcementAction.target_label.ilike(pattern, escape=_LIKE_ESCAPE),
+                EnforcementAction.target_id.ilike(pattern, escape=_LIKE_ESCAPE),
+                EnforcementAction.entity_label.ilike(pattern, escape=_LIKE_ESCAPE),
+                EnforcementAction.entity_id.ilike(pattern, escape=_LIKE_ESCAPE),
             )
         )
     if kind:
-        query = query.where(EnforcementAction.kind == kind)
-    rows = db.execute(query).all()
+        conditions.append(EnforcementAction.kind == kind)
     if only_active:
-        # A pending or failed attempt counts only when it may be in force,
-        # which its snapshot says: read for those rows alone (there are few).
-        unsettled = [row.id for row in rows if row.status != "applied"]
-        in_force: set[int] = set()
-        for start in range(0, len(unsettled), 1000):
-            in_force.update(
-                action.id
-                for action in db.scalars(
-                    select(EnforcementAction).where(
-                        EnforcementAction.id.in_(unsettled[start : start + 1000])
-                    )
-                )
-                if enforcement.may_be_in_force(action)
-            )
-        rows = [row for row in rows if row.status == "applied" or row.id in in_force]
-    by_kind: dict[str, int] = {}
-    for row in rows:
-        by_kind[row.kind] = by_kind.get(row.kind, 0) + 1
-    page_ids = [row.id for row in rows[offset : offset + limit]]
-    found = (
-        {
-            action.id: action
+        # Applied, or a pending or failed attempt that may be in force, which
+        # only its snapshot can say: read for those rows alone (there are few),
+        # then counted and paged with the rest in the database.
+        unsettled = [
+            action.id
             for action in db.scalars(
-                select(EnforcementAction).where(EnforcementAction.id.in_(page_ids))
+                select(EnforcementAction).where(
+                    EnforcementAction.status.in_(
+                        [
+                            status
+                            for status in enforcement.RESTORABLE_STATUSES
+                            if status != EnforcementStatus.APPLIED
+                        ]
+                    ),
+                    *conditions,
+                )
             )
-        }
-        if page_ids
-        else {}
+            if enforcement.may_be_in_force(action)
+        ]
+        in_force = EnforcementAction.status == EnforcementStatus.APPLIED
+        if unsettled:
+            in_force = or_(in_force, EnforcementAction.id.in_(unsettled))
+        conditions.append(in_force)
+    total = int(
+        db.scalar(select(func.count()).select_from(EnforcementAction).where(*conditions)) or 0
+    )
+    by_kind = {
+        str(row_kind): int(count)
+        for row_kind, count in db.execute(
+            select(EnforcementAction.kind, func.count())
+            .where(*conditions)
+            .group_by(EnforcementAction.kind)
+        )
+    }
+    items = list(
+        db.scalars(
+            select(EnforcementAction)
+            .where(*conditions)
+            .order_by(EnforcementAction.created_at.desc(), EnforcementAction.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
     )
     return EnforcementActionPage(
-        items=[_action_response(found[action_id]) for action_id in page_ids if action_id in found],
-        total=len(rows),
+        items=[_action_response(action) for action in items],
+        total=total,
         offset=offset,
         limit=limit,
         by_kind=by_kind,

@@ -249,9 +249,22 @@ function UsageBar({ limit }: { limit: Limit }) {
   );
 }
 
-/** "Restricting 1,240 of 2,000 projects" while a large restriction is spread over cycles. */
+/** "Restricting 1,240 of 2,000 projects" while a large restriction is spread over
+ * cycles, and "Lifting: 760 left" while a large one is being lifted. */
 function rolloutNote(limit: Limit) {
   const period = limit.current_period;
+  const lifting = period?.lifting_remaining ?? null;
+  if (lifting != null && lifting > 0) {
+    return (
+      <span
+        className="text-xs"
+        style={{ color: "var(--status-warning)" }}
+        title="More restrictions to lift than one cycle changes: the next cycles lift the rest, before anything new is restricted. The period shows as restored once the last one is lifted."
+      >
+        Lifting: {lifting.toLocaleString()} still in force
+      </span>
+    );
+  }
   const total = period?.rollout_total ?? null;
   const done = period?.rollout_done ?? null;
   if (total == null || done == null || done >= total) return null;

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ApiError, api } from "../api/client";
 import type {
   EnforcementActionItem,
@@ -101,6 +101,14 @@ export function NotificationsPage({
   );
   const restrictionTotal = enforcements.data?.total ?? 0;
   const view = useTableView(enforcements.data?.items ?? [], RESTRICTION_VIEW);
+  // Restoring the last row of the last page leaves that page empty: step back
+  // to the last page that still has rows (the first, when none is left).
+  const restrictionRows = enforcements.data?.items.length ?? 0;
+  useEffect(() => {
+    if (!enforcements.data || restrictionRows > 0 || restrictionPage === 0) return;
+    const lastPage = Math.max(0, Math.ceil(restrictionTotal / RESTRICTIONS_PER_PAGE) - 1);
+    setRestrictionPage(Math.min(restrictionPage - 1, lastPage));
+  }, [enforcements.data, restrictionRows, restrictionPage, restrictionTotal]);
 
   useInterval(() => {
     void feed.reload();

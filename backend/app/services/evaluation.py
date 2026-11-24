@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
@@ -67,7 +67,7 @@ from app.models.limits import (
     LimitPeriodState,
     effective_project_actions,
 )
-from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
+from app.models.org import CxApplicationProject, CxGroupMembership, CxProject, CxProjectGroup
 from app.services import (
     auto_triage_attribution,
     enforcement,
@@ -346,6 +346,19 @@ def evaluate_all(
 
     ``client`` may be omitted to evaluate without any possibility of a write to
     Checkmarx, which is what the monitor-only path and the tests use.
+
+    With a client the cycle's write budget (``pacing``) is spent in a fixed
+    order, so giving access back and keeping restrictions in force never wait
+    behind a rollout:
+
+    1. **Lifts**: restrictions nothing justifies any more (a limit switched
+       off, an exemption), then, limit by limit, the period rollover and a
+       budget that covers the usage again. Usage is evaluated here too; no new
+       restriction is applied yet.
+    2. **Verification**: the restrictions in force chosen for this cycle are
+       read back, and drift re-asserted (``_plan_verification``).
+    3. **New restrictions**, small limits first, then large rollouts with
+       whatever is left.
     """
     moment = now or utcnow()
     actor = actor or AuditActor.system("evaluator")
@@ -366,9 +379,9 @@ def evaluate_all(
             enforcement.return_roles_outside_the_restriction(
                 session, client, actor=actor, resolver=resolver
             )
-        except Exception as exc:  # noqa: BLE001 - a housekeeping pass must not stop the cycle
+        except Exception:  # noqa: BLE001 - a housekeeping pass must not stop the cycle
             session.rollback()
-            logger.warning("Could not return roles outside the restriction: %s", exc)
+            logger.warning("Could not return roles outside the restriction", exc_info=True)
         # Decided once, before anything is restricted: either the whole cycle
         # may apply new restrictions or none of it may. Giving access back is
         # never held up by this.
@@ -382,27 +395,10 @@ def evaluate_all(
                 "was applied."
             )
             result.errors.append(f"enforcement safety check: {error_text.public_error(exc)}")
-        verification = _plan_verification(session, config, moment)
-        budget.verify_ids = verification.pop("ids")  # type: ignore[assignment]
-        if (
-            budget.verify_ids
-            and config.read_concurrency > 1
-            and result.enforcement_paused is None
-            and resolver is not None
-        ):
-            try:
-                verification["read_ahead"] = enforcement.prefetch_verification(
-                    session,
-                    client,
-                    action_ids=budget.verify_ids,
-                    resolver=resolver,
-                    workers=config.read_concurrency,
-                )
-            except Exception as exc:  # noqa: BLE001 - reading ahead is only an optimisation
-                session.rollback()
-                logger.warning("Could not read the restrictions in force ahead: %s", exc)
-        result.pacing = {"verification": verification}
 
+    # Pass 1: usage, warnings, breaches and every lift (rollover, a budget that
+    # covers the usage again). Breached limits to enforce are collected.
+    to_enforce: list[int] = []
     limit_ids = list(
         session.scalars(
             select(CreditLimit.id).where(CreditLimit.is_active.is_(True)).order_by(CreditLimit.id)
@@ -426,10 +422,10 @@ def evaluate_all(
                 moment=moment,
                 client=client,
                 actor=actor,
-                resolver=resolver,
                 result=result,
                 hold=result.enforcement_paused,
                 budget=budget,
+                to_enforce=to_enforce,
             )
         except PeriodError as exc:
             session.rollback()
@@ -463,69 +459,374 @@ def evaluate_all(
         result.evaluated += 1
         result.evaluations.append(evaluation)
 
-    if client is not None and budget is not None and result.postponed:
-        _continue_rollouts(
+    if client is None or budget is None or config is None or resolver is None:
+        return result
+
+    # Pass 2: read back the restrictions in force chosen for this cycle.
+    if result.enforcement_paused is None:
+        result.enforcement_paused = _manual_pause(session)
+    plan = _plan_verification(
+        session,
+        config,
+        moment,
+        paused=result.enforcement_paused,
+        enforcing=frozenset(to_enforce),
+    )
+    verification = plan.stats
+    result.pacing = {"verification": verification}
+    if plan.chosen:
+        if config.read_concurrency > 1:
+            try:
+                verification["read_ahead"] = enforcement.prefetch_verification(
+                    session,
+                    client,
+                    action_ids=plan.chosen,
+                    resolver=resolver,
+                    workers=config.read_concurrency,
+                )
+            except Exception:  # noqa: BLE001 - reading ahead is only an optimisation
+                session.rollback()
+                logger.warning("Could not read the restrictions in force ahead", exc_info=True)
+        checked = enforcement.verify_in_force(
             session,
             client,
+            action_ids=plan.chosen,
+            actor=actor,
+            resolver=resolver,
+            budget=budget,
+        )
+        verification.update(checked.as_stats())
+        result.errors.extend(checked.errors)
+        _take_out_of_rotation(session, checked.failed, moment)
+    # Whatever is in force and was not chosen is not read back again by the
+    # limits' enforcement below.
+    budget.verify_ids = frozenset()
+
+    # Pass 3: new restrictions, small limits first, then large rollouts.
+    if result.enforcement_paused is None and to_enforce:
+        _enforce_pending(
+            session,
+            client,
+            to_enforce,
             moment=moment,
             actor=actor,
             resolver=resolver,
             result=result,
             budget=budget,
         )
-    if budget is not None and result.pacing is not None:
-        result.pacing["writes"] = budget.as_stats()
-        result.pacing["verification"]["verified"] = budget.verified  # type: ignore[index]
+    if result.postponed and result.enforcement_paused is None:
+        budget.postpone_large = None
+        postponed, result.postponed = result.postponed, []
+        _enforce_pending(
+            session,
+            client,
+            postponed,
+            moment=moment,
+            actor=actor,
+            resolver=resolver,
+            result=result,
+            budget=budget,
+        )
+    result.pacing["writes"] = budget.as_stats()
+    verification["verified"] = budget.verified
     return result
 
 
+# Who looks after a restriction in force this cycle (_plan_verification).
+OWNER_PLAN = "plan"  # its breached limit's enforcement: the target is in its plan
+OWNER_KEPT = "kept"  # stays in force outside any plan: verified on its own
+OWNER_LIFTING = "lifting"  # being lifted (the sweep, the rollover, a raised budget)
+OWNER_GONE = "gone"  # the project was deleted in Checkmarx One: nothing to read
+
+
+@dataclass
+class VerificationPlan:
+    stats: dict[str, object]
+    # The restrictions to read back this cycle, oldest-verified first.
+    chosen: list[int]
+
+
+def _owners(
+    session: Session,
+    rows: list,  # type: ignore[type-arg]
+    moment: datetime,
+    enforcing: frozenset[int],
+) -> dict[int, str]:
+    """For each restriction in force, who looks after it this cycle.
+
+    Mirrors the cycle itself, so that a restriction is only ever counted as
+    "verified in rotation" if something will really read it back.
+    ``enforcing``: the limits this cycle found breached and enforces.
+
+    * ``plan``: its limit is enforced this cycle, in its current period, and
+      this target is in what its enforcement plans (the project is still in
+      the group or application, not exempt, not deleted; the user is not
+      exempt or protected);
+    * ``kept``: it stays in force although no plan meets it - a project that
+      left the group or application (lifted, like every restriction of the
+      period, when the period ends), a hold-until-released limit's earlier
+      period (until an admin releases it), a period whose usage cannot be read
+      or whose custom window is closed. Verified on its own;
+    * ``lifting``: the sweep lifts it this cycle (the limit is switched off,
+      deleted or no longer turns this off, the entity or target is exempt or
+      protected, an admin's restore did not finish), or the rollover does (an
+      earlier period of a limit that does not hold), or a budget that covers
+      the usage again does. Not verified: it is being given back;
+    * ``gone``: the project was deleted in Checkmarx One.
+    """
+    limit_ids = {row.limit_id for row in rows if row.limit_id is not None}
+    limits = {
+        limit.id: limit
+        for limit in session.scalars(select(CreditLimit).where(CreditLimit.id.in_(limit_ids)))
+    }
+    exempt = {
+        (str(kind), eid)
+        for kind, eid in session.execute(select(Exemption.entity_type, Exemption.entity_id))
+    }
+    protected = enforcement.protected_users(
+        session, {row.target_id for row in rows if row.target_type == enforcement.TARGET_USER}
+    )
+    deleted = set(session.scalars(select(CxProject.id).where(CxProject.is_deleted.is_(True))))
+    windows: dict[int, PeriodWindow | None] = {}
+    for limit in limits.values():
+        try:
+            windows[limit.id] = current_window(limit, moment)
+        except PeriodError:
+            windows[limit.id] = None
+    states = {
+        (state.limit_id, state.period_key): state
+        for state in session.scalars(
+            select(LimitPeriodState).where(LimitPeriodState.limit_id.in_(limit_ids))
+        )
+        if windows.get(state.limit_id) is not None
+        and state.period_key == windows[state.limit_id].key  # type: ignore[union-attr]
+    }
+    protected_roles = settings_store.enforcement_guard(session).protected_roles
+    planned: set[str] = set()
+    for limit in limits.values():
+        window = windows.get(limit.id)
+        if (
+            limit.id not in enforcing
+            or not limit.is_active
+            or not limit.enforce
+            or window is None
+            or (str(limit.entity_type), limit.entity_id) in exempt
+        ):
+            continue
+        planned.update(
+            enforcement.idempotency_key(
+                limit_id=limit.id,
+                period_key=window.key,
+                kind=str(target.kind),
+                target_id=target.target_id,
+            )
+            for target in enforcement.plan_targets(
+                session,
+                entity_type=limit.entity_type,
+                entity_id=limit.entity_id,
+                project_actions=effective_project_actions(limit),
+                protected_roles=protected_roles,
+            )
+        )
+
+    owners: dict[int, str] = {}
+    for row in rows:
+        limit = limits.get(row.limit_id) if row.limit_id is not None else None
+        target_entity = (
+            EntityType.USER if row.target_type == enforcement.TARGET_USER else EntityType.PROJECT
+        )
+        if (
+            row.reversal_reason == enforcement.ADMIN_REASON
+            or limit is None
+            or not limit.is_active
+            or not limit.enforce
+            or (str(row.entity_type), row.entity_id) in exempt
+            or enforcement.deselected_kind(row.kind, row.target_type, limit)
+            or (str(target_entity), row.target_id) in exempt
+            or row.target_id in protected
+        ):
+            owners[row.id] = OWNER_LIFTING
+            continue
+        if row.idempotency_key in planned:
+            owners[row.id] = OWNER_PLAN
+            continue
+        window = windows.get(limit.id)
+        if window is not None and row.period_key != window.key:
+            # An earlier period: the rollover lifts it, unless the limit holds.
+            owners[row.id] = OWNER_KEPT if limit.hold_until_released else OWNER_LIFTING
+        elif window is not None and row.reversal_reason:
+            owners[row.id] = OWNER_LIFTING  # an automatic lift that did not finish
+        else:
+            # The current period. A target that left its breached limit's plan
+            # stays in force (lifted with the period); one whose limit is
+            # within budget again is being lifted (a "restricted" period
+            # keeps that status until the last one is).
+            state = states.get((limit.id, window.key)) if window is not None else None
+            within_budget = (
+                limit.id not in enforcing
+                and window is not None
+                and window.is_active
+                and state is not None
+                and state.usage_available
+                and state.credits_used < Decimal(limit.credit_limit)
+            )
+            owners[row.id] = OWNER_LIFTING if within_budget else OWNER_KEPT
+        if owners[row.id] == OWNER_KEPT and (
+            row.target_type == enforcement.TARGET_PROJECT and row.target_id in deleted
+        ):
+            owners[row.id] = OWNER_GONE
+    return owners
+
+
 def _plan_verification(
-    session: Session, config: pacing.Pacing | None, moment: datetime
-) -> dict[str, object]:
+    session: Session,
+    config: pacing.Pacing,
+    moment: datetime,
+    *,
+    paused: str | None = None,
+    enforcing: frozenset[int] = frozenset(),
+) -> VerificationPlan:
     """Which restrictions in force are read back this cycle: the oldest-verified.
 
-    Each restriction is read back at most every ``verify_interval_minutes``,
-    spread over the cycles, and never more than the per-cycle cap. ``ids`` is
-    None when verification is not paced (every restriction, every cycle).
+    Chosen only from restrictions the cycle will really read back: every one
+    a breached limit's enforcement plans, and every one that stays in force
+    outside any plan (``_owners``); not the ones being lifted. Each is read
+    back at most every ``verify_interval_minutes``, spread over the cycles,
+    never more than the per-cycle cap; with the interval at 0, every one,
+    every cycle. A restriction that could not be read back at all moves to the
+    back of the rotation (``last_checked_at``), so a persistent failure never
+    takes the slots of the others; it stays due and is counted.
+
+    While enforcement is paused nothing is read back or re-asserted (as before
+    pacing): restrictions in force are left as they are until it resumes.
     """
     rows = session.execute(
         select(
             EnforcementAction.id,
+            EnforcementAction.idempotency_key,
+            EnforcementAction.limit_id,
+            EnforcementAction.period_key,
+            EnforcementAction.kind,
+            EnforcementAction.entity_type,
+            EnforcementAction.entity_id,
+            EnforcementAction.target_type,
+            EnforcementAction.target_id,
+            EnforcementAction.reversal_reason,
             EnforcementAction.last_verified_at,
+            EnforcementAction.last_checked_at,
             EnforcementAction.applied_at,
         ).where(EnforcementAction.status == EnforcementStatus.APPLIED)
     ).all()
-    stats: dict[str, object] = {"in_force": len(rows)}
-    if config is None or config.verify_interval_minutes <= 0:
-        stats["ids"] = None
-        stats["interval_minutes"] = 0
-        return stats
+    owners = _owners(session, rows, moment, enforcing) if rows else {}
+    candidates = [row for row in rows if owners.get(row.id) in (OWNER_PLAN, OWNER_KEPT)]
+    by_owner = dict.fromkeys((OWNER_PLAN, OWNER_KEPT, OWNER_LIFTING, OWNER_GONE), 0)
+    for owner in owners.values():
+        by_owner[owner] += 1
     never = datetime.min.replace(tzinfo=UTC)
+    interval = config.verify_interval_minutes
+    paced = interval > 0
     # Due a little early (a tenth of the interval), so the time the cycles
     # themselves take never pushes a read-back past the interval.
-    interval = config.verify_interval_minutes
-    cutoff = moment - timedelta(minutes=interval - max(1, interval // 10))
-    ordered = sorted(rows, key=lambda row: (row.last_verified_at or never, row.id))
-    due = sum(1 for row in rows if row.last_verified_at is None or row.last_verified_at <= cutoff)
-    wanted = config.verifications_per_cycle(len(rows), due) or 0
-    chosen = ordered[:wanted]
-    oldest = ordered[0].last_verified_at if ordered else None
-    stats.update(
-        {
-            "ids": frozenset(row.id for row in chosen),
-            "interval_minutes": config.verify_interval_minutes,
-            "due": due,
-            "selected": len(chosen),
-            "oldest_verified_minutes_ago": (
-                int((moment - oldest).total_seconds() // 60) if oldest is not None else None
-            ),
-            "never_verified": sum(1 for row in rows if row.last_verified_at is None),
-            # At this size and these settings, the longest a restriction in
-            # force goes without being read back.
-            "each_verified_within_minutes": config.coverage_minutes(len(rows)),
-        }
+    cutoff = moment - timedelta(minutes=interval - max(1, interval // 10)) if paced else moment
+    due = sum(
+        1 for row in candidates if row.last_verified_at is None or row.last_verified_at <= cutoff
     )
-    return stats
+    ordered = sorted(
+        candidates,
+        key=lambda row: (
+            max(row.last_verified_at or never, row.last_checked_at or never),
+            row.id,
+        ),
+    )
+    if paused is not None:
+        chosen: list = []  # type: ignore[type-arg]
+    elif paced:
+        chosen = ordered[: config.verifications_per_cycle(len(candidates), due) or 0]
+    else:
+        chosen = ordered
+    verified_at = [row.last_verified_at for row in candidates if row.last_verified_at is not None]
+    oldest = min(verified_at) if verified_at else None
+    # Unverified for more than twice the interval (or, at interval 0, two
+    # cycles): the rotation is not keeping up, or these cannot be read back.
+    stale_after = timedelta(minutes=2 * (interval if paced else config.interval_minutes))
+    stale = [
+        row
+        for row in candidates
+        if (row.last_verified_at or row.applied_at or moment) < moment - stale_after
+    ]
+    stats: dict[str, object] = {
+        "in_force": len(rows),
+        "rotation": len(candidates),
+        "in_a_plan": by_owner[OWNER_PLAN],
+        "outside_a_plan": by_owner[OWNER_KEPT],
+        "being_lifted": by_owner[OWNER_LIFTING],
+        "target_deleted": by_owner[OWNER_GONE],
+        "interval_minutes": interval,
+        "due": due,
+        "selected": len(chosen),
+        "oldest_verified_minutes_ago": (
+            int((moment - oldest).total_seconds() // 60) if oldest is not None else None
+        ),
+        "never_verified": sum(1 for row in candidates if row.last_verified_at is None),
+        # At this size and these settings, the longest a restriction in force
+        # (in a plan or not) goes without being read back.
+        "each_verified_within_minutes": config.coverage_minutes(len(candidates)),
+        "unverified_beyond_twice_the_interval": len(stale),
+    }
+    if paused is not None:
+        stats["paused"] = True
+    elif stale:
+        _notify_unverified(session, stale, stale_after=stale_after, moment=moment)
+    return VerificationPlan(stats=stats, chosen=[row.id for row in chosen])
+
+
+def _notify_unverified(
+    session: Session,
+    stale: list,
+    *,
+    stale_after: timedelta,
+    moment: datetime,  # type: ignore[type-arg]
+) -> None:
+    """Say (once a day) that restrictions in force have gone unverified too long."""
+    hours = stale_after.total_seconds() / 3600
+    examples = ", ".join(sorted({row.target_id for row in stale})[:5])
+    notifications.notify(
+        session,
+        category=notifications.CATEGORY_ENFORCEMENT,
+        severity=Severity.WARNING,
+        title=(
+            f"{len(stale):,} restriction(s) in force not read back from Checkmarx One for more "
+            f"than {hours:g} hours"
+        ),
+        body=(
+            "Each restriction in force is read back regularly (Settings → Enforcement, verify "
+            "each restriction every), so a change made in Checkmarx One that undoes it is "
+            f"found and re-asserted. These have not been for more than {hours:g} hours: "
+            f"{examples}{'...' if len(stale) > 5 else ''}.\n\nEither they cannot be read back "
+            "(the cycle record lists the failures: evaluate.pacing.verification), or the "
+            "rotation does not reach them within the interval at this size: raise the "
+            "read-backs per cycle, or the interval. They are still restricted as far as "
+            "CreditGuard knows; nothing was lifted."
+        ),
+        dedupe_key=f"unverified:{moment.strftime('%Y-%m-%d')}",
+    )
+    session.commit()
+
+
+def _take_out_of_rotation(session: Session, action_ids: list[int], moment: datetime) -> None:
+    """Restrictions that could not be read back go to the back of the rotation.
+
+    Their last verification is unchanged (they stay due, and count towards
+    the alert above); only their place in the queue moves, so one that keeps
+    failing never takes a slot from the others every cycle.
+    """
+    for start in range(0, len(action_ids), 1000):
+        session.execute(
+            update(EnforcementAction)
+            .where(EnforcementAction.id.in_(action_ids[start : start + 1000]))
+            .values(last_checked_at=moment)
+        )
+    session.commit()
 
 
 def _record_rollout(
@@ -535,7 +836,15 @@ def _record_rollout(
     outcome: enforcement.EnforcementOutcome,
     result: EvaluationResult,
 ) -> None:
-    """Keep a rollout's progress on the period state, and say when one starts."""
+    """Keep a rollout's progress on the period state, and say when one starts.
+
+    ``rollout_pending`` holds the users or projects still to restrict. Every
+    one of them was let through by the safety ceiling (or by an admin's
+    resume) when its turn came, so the ceiling does not count them as new
+    again; anything outside it (a project added to the group since) still is.
+    Identities, not a count: a target that leaves the plan (exempted, out of
+    the group) frees no slot for another.
+    """
     if outcome.planned_targets == 0:
         return
     remaining = outcome.deferred_targets
@@ -544,6 +853,7 @@ def _record_rollout(
     starting = state.rollout_total is None
     state.rollout_total = outcome.planned_targets
     state.rollout_done = outcome.planned_targets - remaining
+    state.rollout_pending = sorted({target.target_id for target in outcome.deferred}) or None
     noun = "users" if limit.entity_type == EntityType.USER else "projects"
     progress = {
         "limit_id": limit.id,
@@ -575,9 +885,17 @@ def _record_rollout(
         )
 
 
-def _continue_rollouts(
+def _clear_rollout(state: LimitPeriodState) -> None:
+    """The period stopped being restricted (or a lift began): no rollout runs."""
+    state.rollout_total = None
+    state.rollout_done = None
+    state.rollout_pending = None
+
+
+def _enforce_pending(
     session: Session,
     client: CheckmarxClient,
+    limit_ids: list[int],
     *,
     moment: datetime,
     actor: AuditActor,
@@ -585,13 +903,20 @@ def _continue_rollouts(
     result: EvaluationResult,
     budget: enforcement.EnforcementBudget,
 ) -> None:
-    """The second pass: large rollouts take whatever write budget is left."""
-    budget.postpone_large = None
+    """Apply the restrictions of breached limits, each in its own transaction.
+
+    Called once with ``budget.postpone_large`` set (a limit needing more writes
+    than that is postponed, so every small limit goes first), then again for
+    the postponed ones with whatever budget is left.
+    """
     by_limit = {evaluation.limit.id: evaluation for evaluation in result.evaluations}
-    for limit_id in result.postponed:
+    for position, limit_id in enumerate(limit_ids):
         if result.enforcement_paused is None:
             result.enforcement_paused = _manual_pause(session)
         if result.enforcement_paused is not None:
+            # Paused part way (an admin pressed Pause): the rest wait, and
+            # those that would have started restricting are counted as such.
+            _count_deferred(session, limit_ids[position:], moment=moment, result=result)
             break
         limit = session.get(CreditLimit, limit_id, populate_existing=True)
         if limit is None or not limit.is_active or not limit.enforce:
@@ -616,7 +941,14 @@ def _continue_rollouts(
                 budget=budget,
             )
             result.enforced += len(outcome.applied)
-            _record_rollout(session, limit, state, outcome, result)
+            if outcome.postponed:
+                # Its writes come with the large rollouts, which record its
+                # progress (and say when a rollout starts).
+                result.postponed.append(limit.id)
+            else:
+                _record_rollout(session, limit, state, outcome, result)
+            # RESTRICTED means "a restriction from this limit is in force for
+            # this period", not "one was newly applied this cycle".
             if _has_active_enforcement(session, limit.id, window.key):
                 state.status = LimitStatus.RESTRICTED
                 state.restricted_at = state.restricted_at or moment
@@ -634,8 +966,29 @@ def _continue_rollouts(
             session.commit()
         except Exception as exc:  # noqa: BLE001 - one limit must never block the rest
             session.rollback()
-            logger.exception("Continuing the rollout of limit %s failed", limit_id)
+            logger.exception("Enforcing limit %s failed", limit_id)
             result.errors.append(f"limit {limit_id}: {error_text.public_error(exc)}")
+
+
+def _count_deferred(
+    session: Session, limit_ids: list[int], *, moment: datetime, result: EvaluationResult
+) -> None:
+    for limit_id in limit_ids:
+        limit = session.get(CreditLimit, limit_id)
+        if limit is None:
+            continue
+        try:
+            window = current_window(limit, moment)
+        except PeriodError:
+            continue
+        if _would_start_restricting(session, limit, window.key):
+            result.deferred += 1
+            evaluation = next((e for e in result.evaluations if e.limit.id == limit_id), None)
+            if evaluation is not None:
+                evaluation.note = (
+                    f"Enforcement is paused, so no restriction was applied. "
+                    f"{result.enforcement_paused}"
+                )
 
 
 def _manual_pause(session: Session) -> str | None:
@@ -787,15 +1140,18 @@ def _about_to_start_restricting(session: Session, moment: datetime) -> tuple[lis
     limits_starting: list[str] = []
     targets_starting: set[str] = set()
     # A rollout spread over several cycles passed the ceiling (or an admin let
-    # it through) when it started: what it still has to restrict is not new.
-    # Anything beyond that (projects added to the group since) still is.
-    rollouts = {
-        (state.limit_id, state.period_key): max(
-            0, (state.rollout_total or 0) - (state.rollout_done or 0)
-        )
+    # it through) target by target: the users and projects it still has to
+    # restrict are not new. Anything else (projects added to the group since,
+    # or a whole new breach after the period was lifted) still is. Kept as
+    # identities (_record_rollout), never as a count.
+    rollouts: dict[tuple[int, str], set[str]] = {
+        (state.limit_id, state.period_key): {
+            str(target_id) for target_id in (state.rollout_pending or [])
+        }
         for state in session.scalars(
-            select(LimitPeriodState).where(LimitPeriodState.rollout_total.is_not(None))
+            select(LimitPeriodState).where(LimitPeriodState.rollout_pending.is_not(None))
         )
+        if state.status in (LimitStatus.BREACHED, LimitStatus.RESTRICTED)
     }
     for row in preview_service.dry_run(session, now=moment, light=True).rows:
         if not row.would_enforce or row.blast is None or row.period_key is None:
@@ -806,8 +1162,12 @@ def _about_to_start_restricting(session: Session, moment: datetime) -> tuple[lis
             row.period_key,
             [(target.kind, target.target_id) for target in row.blast.targets],
         )
-        ids = list(dict.fromkeys(target_id for _kind, target_id in starting))
-        ids = ids[rollouts.get((row.limit_id, row.period_key), 0) :]
+        let_through = rollouts.get((row.limit_id, row.period_key), set())
+        ids = [
+            target_id
+            for target_id in dict.fromkeys(target_id for _kind, target_id in starting)
+            if target_id not in let_through
+        ]
         if ids:
             limits_starting.append(row.entity_label or row.entity_id)
             targets_starting.update(ids)
@@ -925,12 +1285,8 @@ def _lift_unjustified_restrictions(
         if action is None or not enforcement.may_be_in_force(action):
             continue
         action_id = action.id
-        if budget is not None:
-            if not budget.may_write():
-                # Lifted by the next cycle, which finds it the same way.
-                budget.defer_write()
-                continue
-            budget.spend_write()
+        if budget is not None and not budget.take_write(enforcement.WRITE_LIFT):
+            continue  # lifted by the next cycle, which finds it the same way
         try:
             if enforcement.restore_action(
                 session, client, action=action, actor=actor, reason=reason, resolver=resolver
@@ -961,11 +1317,17 @@ def _evaluate_one(
     moment: datetime,
     client: CheckmarxClient | None,
     actor: AuditActor,
-    resolver: enforcement.RoleResolver | None,
     result: EvaluationResult,
     hold: str | None = None,
     budget: enforcement.EnforcementBudget | None = None,
+    to_enforce: list[int] | None = None,
 ) -> LimitEvaluation:
+    """Evaluate one limit and give back what its period no longer justifies.
+
+    A breached, enforcing limit is not restricted here: its id is added to
+    ``to_enforce`` and the cycle applies the restrictions once every lift of
+    the cycle has had its turn (``evaluate_all``).
+    """
     window = current_window(limit, moment)
     reported_total, available = index.reported_total(limit)
 
@@ -1018,6 +1380,7 @@ def _evaluate_one(
     if not available:
         result.unavailable += 1
         state.status = LimitStatus.OK
+        _clear_rollout(state)
         session.flush()
         return LimitEvaluation(
             limit=limit,
@@ -1035,6 +1398,7 @@ def _evaluate_one(
 
     if not window.is_active:
         state.status = LimitStatus.OK
+        _clear_rollout(state)
         session.flush()
         return LimitEvaluation(
             limit=limit,
@@ -1086,25 +1450,9 @@ def _evaluate_one(
             evaluation.note = f"Enforcement is paused, so no restriction was applied. {hold}"
             if _would_start_restricting(session, limit, window.key):
                 result.deferred += 1
-        else:
-            outcome = enforcement.apply_enforcement(
-                session,
-                client,
-                limit=limit,
-                period_key=window.key,
-                actor=actor,
-                resolver=resolver,
-                budget=budget,
-            )
-            evaluation.enforced = outcome
-            if outcome.applied:
-                result.enforced += len(outcome.applied)
-            if outcome.postponed:
-                # Its writes come in the second pass, which records its progress
-                # (and says when a rollout starts).
-                result.postponed.append(limit.id)
-            else:
-                _record_rollout(session, limit, state, outcome, result)
+        elif to_enforce is not None:
+            # Applied after every lift of the cycle (evaluate_all).
+            to_enforce.append(limit.id)
         # RESTRICTED means "a restriction from this limit is in force for this
         # period", not "a restriction was newly applied this cycle". Deriving it
         # from the action rows keeps it true on every later cycle of the period,
@@ -1121,7 +1469,10 @@ def _evaluate_one(
             LimitStatus.BREACHED,
         } or _has_active_enforcement(session, limit.id, window.key)
         restored = 0
+        lifting = False
         if was_restricted:
+            # Whatever happens next, no rollout of this period runs any more.
+            _clear_rollout(state)
             if client is not None:
                 restored = enforcement.restore_for_limit(
                     session,
@@ -1132,14 +1483,26 @@ def _evaluate_one(
                     reason="credit_increased",
                     budget=budget,
                 )
-                if restored > 0:
-                    result.restored += restored
+                result.restored += restored
+                left = _in_force_count(session, limit.id, window.key)
+                if left:
+                    # More to lift than this cycle's write budget: the period
+                    # stays restricted (the truth: restrictions are in force)
+                    # and the next cycles lift the rest, first thing. Only
+                    # then is it restored. The Budgets page shows "Lifting".
+                    lifting = True
+                    state.status = LimitStatus.RESTRICTED
+                    evaluation.note = (
+                        f"Within budget again: {restored:,} restriction(s) lifted this cycle, "
+                        f"{left:,} left for the next cycles."
+                    )
+                elif restored > 0:
                     state.restored_at = moment
                     state.status = LimitStatus.RESTORED
             else:
                 evaluation.note = "No Checkmarx connection available, restoration deferred."
 
-        if restored == 0 and state.status != LimitStatus.RESTORED:
+        if not lifting and restored == 0 and state.status != LimitStatus.RESTORED:
             if state.credits_used >= threshold_credits:
                 state.status = LimitStatus.WARNED
                 if state.warned_at is None:
@@ -1150,9 +1513,26 @@ def _evaluate_one(
             else:
                 state.status = LimitStatus.OK
 
+    if state.status not in (LimitStatus.BREACHED, LimitStatus.RESTRICTED):
+        _clear_rollout(state)
     evaluation.status = state.status
     session.flush()
     return evaluation
+
+
+def _in_force_count(session: Session, limit_id: int, period_key: str) -> int:
+    """How many of this limit's restrictions for the period are, or may be, in force."""
+    return sum(
+        1
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.limit_id == limit_id,
+                EnforcementAction.period_key == period_key,
+                EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES),
+            )
+        )
+        if enforcement.may_be_in_force(action)
+    )
 
 
 def _has_active_enforcement(session: Session, limit_id: int, period_key: str) -> bool:
@@ -1372,6 +1752,7 @@ def _close_stale_periods(
         if state is not None:
             state.restored_at = utcnow()
             state.status = LimitStatus.RESTORED
+            _clear_rollout(state)
     session.flush()
 
 
@@ -1514,7 +1895,11 @@ def restore_on_limit_change(
     )
     if budget is not None and budget.writes_deferred > deferred_before:
         # The rest are lifted by the next cycle; the period stays restricted
-        # until they are.
+        # until they are. No rollout of the limit runs any more.
+        for st in session.scalars(
+            select(LimitPeriodState).where(LimitPeriodState.limit_id == limit.id)
+        ):
+            _clear_rollout(st)
         if restored:
             record_audit(
                 session,
@@ -1542,6 +1927,7 @@ def restore_on_limit_change(
         for st in states:
             st.status = LimitStatus.RESTORED
             st.restored_at = utcnow()
+            _clear_rollout(st)
         session.flush()
 
         record_audit(

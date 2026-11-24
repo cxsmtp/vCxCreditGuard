@@ -145,6 +145,10 @@ class LimitPeriodStateResponse(BaseModel):
     # and how many have been dealt with so far.
     rollout_total: int | None = None
     rollout_done: int | None = None
+    # Set while the period's restrictions are being lifted over several cycles
+    # (the budget covers the usage again, or the limit no longer enforces, and
+    # more are in force than one cycle lifts): how many are still in force.
+    lifting_remaining: int | None = None
 
 
 class LimitResponse(BaseModel):

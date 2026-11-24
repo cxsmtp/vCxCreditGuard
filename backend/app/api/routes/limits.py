@@ -138,6 +138,24 @@ class _ListContext:
         }
 
 
+def _lifting_remaining(
+    limit: CreditLimit, state: LimitPeriodState, active_restrictions: int
+) -> int | None:
+    """Restrictions still in force while the cycles lift them, or None.
+
+    The period stays "restricted" until the last one is lifted: what the
+    tenant holds, not what the cycle intends.
+    """
+    if state.status != LimitStatus.RESTRICTED or active_restrictions <= 0:
+        return None
+    no_longer_justified = (
+        not limit.enforce
+        or not limit.is_active
+        or (state.usage_available and state.credits_used < Decimal(limit.credit_limit))
+    )
+    return active_restrictions if no_longer_justified else None
+
+
 def _to_response(
     db: Session,
     limit: CreditLimit,
@@ -205,6 +223,7 @@ def _to_response(
                 restricted_at=state.restricted_at,
                 rollout_total=state.rollout_total,
                 rollout_done=state.rollout_done,
+                lifting_remaining=_lifting_remaining(limit, state, active_restrictions),
             )
             if index is None and limit.entity_type in {EntityType.USER, EntityType.GROUP}:
                 index = _attribution_index(db)

@@ -363,6 +363,7 @@ export interface LimitPeriodState {
    * projects it restricts, and how many have been dealt with so far. */
   rollout_total?: number | null;
   rollout_done?: number | null;
+  lifting_remaining?: number | null;
 }
 
 export type AttributionBasis = "observed" | "estimated" | "unattributed";

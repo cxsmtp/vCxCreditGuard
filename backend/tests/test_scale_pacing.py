@@ -331,18 +331,35 @@ class TestVerificationRotation:
         client = connected(tenant)
         limit = group_limit(db)
         evaluation.evaluate_all(db, client=client, actor=ACTOR)
+
+        def verified() -> list:  # type: ignore[type-arg]
+            db.expire_all()
+            return db.scalars(
+                select(EnforcementAction.last_verified_at).where(
+                    EnforcementAction.limit_id == limit.id
+                )
+            ).all()
+
+        # A change that leaves what is applied as it is: the rotation is unchanged.
         limits_service.update_limit(
             db,
             limit=db.get(CreditLimit, limit.id),
-            changes={"notes": "checked"},
+            changes={"notes": "checked", "credit_limit": 2},
             actor=ACTOR,
             client=client,
         )
         db.commit()
-        db.expire_all()
-        assert db.scalars(
-            select(EnforcementAction.last_verified_at).where(EnforcementAction.limit_id == limit.id)
-        ).all() == [None, None, None]
+        assert None not in verified()
+        # A change to what it applies: read back first on the next cycle.
+        limits_service.update_limit(
+            db,
+            limit=db.get(CreditLimit, limit.id),
+            changes={"project_actions": ["auto_triage", "fusion"]},
+            actor=ACTOR,
+            client=client,
+        )
+        db.commit()
+        assert verified() == [None, None, None]
 
     def test_interval_zero_verifies_every_one_every_cycle(self, db: Session, connected) -> None:
         tenant = tenant_with_projects(4)

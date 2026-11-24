@@ -31,9 +31,9 @@ Each budget set to 0 means "no budget": the behaviour before pacing existed.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
-import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -111,28 +111,28 @@ def pacing(session: Session) -> Pacing:
 # ------------------------------------------------------------- time budget
 
 # The monotonic moment by which the running cycle should stop starting new
-# per-target work. One cycle runs at a time (the cycle lock), so one value.
-_deadline: float | None = None
-_deadline_guard = threading.Lock()
+# per-target work. A context variable, not a process global: it belongs to the
+# cycle that set it (its thread, and the read workers it starts through
+# parallel_map), never to an API request served meanwhile - switching a limit
+# off in the GUI while a cycle is past its budget still lifts at once.
+_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "cxcg_cycle_deadline", default=None
+)
 
 
 @contextmanager
 def cycle_deadline(seconds: float | None) -> Iterator[None]:
     """Give the steps inside a time budget; None or 0: no budget."""
-    global _deadline
-    with _deadline_guard:
-        previous = _deadline
-        _deadline = time.monotonic() + seconds if seconds else None
+    token = _deadline.set(time.monotonic() + seconds if seconds else None)
     try:
         yield
     finally:
-        with _deadline_guard:
-            _deadline = previous
+        _deadline.reset(token)
 
 
 def seconds_left() -> float | None:
     """Time left in the cycle's budget, or None when there is no budget."""
-    deadline = _deadline
+    deadline = _deadline.get()
     return None if deadline is None else deadline - time.monotonic()
 
 
@@ -161,6 +161,8 @@ def parallel_map(
     returned with it, never raised, so one failure stops nothing else.
     """
     items = list(items)
+    # The workers see the caller's context (its cycle deadline among it).
+    context = contextvars.copy_context()
 
     def run(item: T) -> tuple[T, R | None, Exception | None]:
         try:
@@ -171,7 +173,7 @@ def parallel_map(
     if workers <= 1 or len(items) <= 1:
         return [run(item) for item in items]
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cx-read") as pool:
-        return list(pool.map(run, items))
+        return list(pool.map(lambda item: context.copy().run(run, item), items))
 
 
 def describe(config: Pacing, **extra: Any) -> dict[str, Any]:

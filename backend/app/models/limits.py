@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     ForeignKey,
@@ -215,6 +216,11 @@ class LimitPeriodState(Base):
     # ("Restricting 1,240 of 2,000 projects"). Null when it never needed it.
     rollout_total: Mapped[int | None] = mapped_column(Integer)
     rollout_done: Mapped[int | None] = mapped_column(Integer)
+    # The users or projects (ids) such a rollout still has to restrict. Each was
+    # let through by the safety ceiling (or an admin's resume) when its turn
+    # came, so the ceiling does not count it as new again. Null: no rollout
+    # under way. Cleared whenever the period stops being restricted.
+    rollout_pending: Mapped[list | None] = mapped_column(JSON(none_as_null=True))
 
     limit: Mapped[CreditLimit] = relationship(back_populates="period_states")
 
@@ -277,6 +283,17 @@ class EnforcementAction(Base):
     # oldest first, not all of them every cycle. Null: never verified since
     # this column was added (verified first).
     last_verified_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # When the verification rotation last chose this restriction and could not
+    # read it back. Only its place in the rotation (behind the others), never
+    # whether it is due: that is last_verified_at.
+    last_checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # The usage snapshot (user view for a user restriction, project view for a
+    # project one) that was the latest reading when the restriction was
+    # applied: what a rise in usage since is measured from (policy violations).
+    # Pinned against the retention job's thinning. Not a foreign key: snapshots
+    # are pruned on their own schedule. Null on restrictions applied before it
+    # existed (the newest snapshot at or before applied_at is used instead).
+    baseline_snapshot_id: Mapped[int | None] = mapped_column(Integer)
 
     __table_args__ = (
         Index("ix_enforcement_action_target_status", "target_type", "target_id", "status"),

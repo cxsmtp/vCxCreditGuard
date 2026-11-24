@@ -69,6 +69,10 @@ class LimitError(ValueError):
 # group's limit can be switched off without a request that runs for minutes.
 API_RESTORE_BATCH = 200
 
+# The fields whose change alters what a limit applies in Checkmarx One: its
+# restrictions in force are then read back first on the next cycle.
+REVERIFY_FIELDS = ("enforce", "is_active", "project_actions")
+
 
 class LimitRestoreError(LimitError):
     """The change needs a restriction lifted first, and Checkmarx refused."""
@@ -310,21 +314,25 @@ def update_limit(
         ),
     )
 
-    # An admin changed the limit: what it restricts is read back first on the
-    # next cycle, ahead of the usual rotation (pacing.py).
-    from sqlalchemy import update
+    # An admin changed what the limit applies: what it restricts is read back
+    # first on the next cycle, ahead of the usual rotation (pacing.py). A
+    # change that leaves the restrictions as they are (a note, the budget, the
+    # period) leaves the rotation alone.
+    after = _snapshot(limit)
+    if any(before[field] != after[field] for field in REVERIFY_FIELDS):
+        from sqlalchemy import update
 
-    from app.models.enums import EnforcementStatus
-    from app.models.limits import EnforcementAction
+        from app.models.enums import EnforcementStatus
+        from app.models.limits import EnforcementAction
 
-    session.execute(
-        update(EnforcementAction)
-        .where(
-            EnforcementAction.limit_id == limit.id,
-            EnforcementAction.status == EnforcementStatus.APPLIED,
+        session.execute(
+            update(EnforcementAction)
+            .where(
+                EnforcementAction.limit_id == limit.id,
+                EnforcementAction.status == EnforcementStatus.APPLIED,
+            )
+            .values(last_verified_at=None, last_checked_at=None)
         )
-        .values(last_verified_at=None)
-    )
     if lift:
         lift_unjustified_restrictions(session, client, limit=limit, actor=actor)
     return limit
@@ -352,8 +360,10 @@ def lift_unjustified_restrictions(
         return 0
     from app.services import enforcement
 
-    # At most API_RESTORE_BATCH now; the next cycles lift the rest.
-    budget = enforcement.EnforcementBudget(writes=API_RESTORE_BATCH)
+    # At most API_RESTORE_BATCH now; the next cycles lift the rest. The
+    # request is not the cycle's: a cycle running past its own time budget
+    # meanwhile does not stop it (respect_deadline).
+    budget = enforcement.EnforcementBudget(writes=API_RESTORE_BATCH, respect_deadline=False)
     lifted = 0
     if limit.is_active and limit.enforce:
         # What the limit no longer turns off is put back now, whatever its usage.
@@ -411,20 +421,11 @@ def delete_limit(
     limit with more restrictions in force than one request lifts deleted: it
     is to be switched off first (the cycles then lift them, a batch at a time).
     """
-    from sqlalchemy import func
+    from app.services import enforcement
 
-    from app.models.enums import EnforcementStatus
-    from app.models.limits import EnforcementAction
-
-    in_force = int(
-        session.scalar(
-            select(func.count()).where(
-                EnforcementAction.limit_id == limit.id,
-                EnforcementAction.status == EnforcementStatus.APPLIED,
-            )
-        )
-        or 0
-    )
+    # Everything that is, or may be, in force: applied, and any attempt whose
+    # outcome is unknown and may have taken something (it is lifted the same way).
+    in_force = len(enforcement.active_actions_for_limit(session, limit_id=limit.id))
     if client is not None and in_force > API_RESTORE_BATCH:
         raise LimitRestoreError(
             f"This limit has {in_force:,} restrictions in force, more than are lifted while you "
