@@ -21,13 +21,45 @@ SEE_THE_LOG = "see the server log"
 
 
 def _domain_errors() -> tuple[type[BaseException], ...]:
-    # Imported here: periods imports nothing of ours, but keeping this module
-    # import-light lets anything (models included) use it.
+    """Every error class whose messages are written for the people who read them.
+
+    Each was reviewed: its messages say what went wrong and what to do, for
+    an admin (Checkmarx One, mail and webhook delivery, configuration and the
+    master key, updates and the release registry, backups) or for whoever made
+    the request (limits, credit requests, policy violations, passwords). None
+    quotes a payload, a query or a secret; they are redacted all the same.
+    Not here: ``AuthError`` (sign-in failures are answered by the auth routes
+    on purpose, never echoed), and anything not raised by the app itself.
+    """
+    # Imported here, so this module stays import-light (anything may use it).
+    from app.core.config import ConfigError
+    from app.core.crypto import DecryptionError
+    from app.core.passwords import PasswordPolicyError
+    from app.services.delivery import DeliveryError
+    from app.services.limits_service import LimitError
+    from app.services.ops_hardening import BackupError
     from app.services.periods import PeriodError
-    from app.services.requests_service import GrantExpiryError
+    from app.services.requests_service import GrantExpiryError, RequestError
+    from app.services.violations import ViolationError
+    from app.updates.registry import RegistryError
+    from app.updates.service import UpdateError
 
     # GrantExpiryError is composed of public_error() texts of its own causes.
-    return (CheckmarxError, PeriodError, GrantExpiryError)
+    return (
+        CheckmarxError,
+        PeriodError,
+        GrantExpiryError,
+        DeliveryError,
+        ConfigError,
+        DecryptionError,
+        LimitError,
+        RequestError,
+        ViolationError,
+        BackupError,
+        PasswordPolicyError,
+        UpdateError,
+        RegistryError,
+    )
 
 
 def is_domain_error(exc: BaseException) -> bool:
