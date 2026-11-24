@@ -1529,7 +1529,7 @@ function AttributionCard({
                   {subject.is_bot && (
                     <span
                       className="ml-1.5"
-                      title="A bot or an integration identity (one handle, no email): automation, not a person. Map it if it is a person after all."
+                      title="Looks like automation, not a person: a [bot] account, or a handle with no email that names a CI or SCM integration (such as -bot, -ci, svc-, github-actions or jenkins). It counts towards no user. Map it if it is a person after all."
                     >
                       <Badge tone="info">Automation</Badge>
                     </span>

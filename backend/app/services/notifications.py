@@ -102,6 +102,11 @@ def already_raised(session: Session, dedupe_key: str) -> bool:
     return session.scalar(select(Notification.id).where(Notification.dedupe_key == key)) is not None
 
 
+def bounded_key(key: str | None) -> str | None:
+    """The dedupe key ``notify`` stores for ``key``: match stored rows with it."""
+    return _bounded_key(key)
+
+
 def _bounded_key(key: str | None) -> str | None:
     """A dedupe key that fits its column, without two long keys colliding.
 

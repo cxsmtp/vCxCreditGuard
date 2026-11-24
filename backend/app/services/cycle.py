@@ -55,6 +55,7 @@ from app.services import (
 )
 from app.services import connection as connection_service
 from app.services.audit import AuditActor, record_audit
+from app.services.usage_mix import format_credits
 
 logger = logging.getLogger(__name__)
 
@@ -804,7 +805,7 @@ def _notify_unresolved(session: Session) -> None:
                 f"{row.subject_name or row.subject_key}"
             ),
             body=(
-                f"{row.credits_used} credits are reported against "
+                f"{format_credits(row.credits_used)} credits are reported against "
                 f"{row.subject_name or row.subject_key}"
                 f"{f' ({row.subject_email})' if row.subject_email else ''}, which does not "
                 "match any synced Checkmarx user. That usage is not counted towards any "
@@ -817,11 +818,15 @@ def _notify_unresolved(session: Session) -> None:
     from app.models.audit import Notification
 
     # Automation is never chased as a person, but a new automation identity is
-    # still said once, so a person wrongly taken for one is not silent.
+    # still said once, so a person wrongly taken for one is not silent. Once
+    # per subject ever: the subject row keeps the mark, so a notice read and
+    # cleared away is not raised again (and subjects that were automation
+    # before the upgrade were marked by the migration, without a burst).
     for row in session.scalars(
         select(UnresolvedSubject).where(
             UnresolvedSubject.mapped_user_id.is_(None),
             UnresolvedSubject.is_bot.is_(True),
+            UnresolvedSubject.automation_noticed_at.is_(None),
             UnresolvedSubject.view_by != auto_triage_attribution.SOURCE_SCAN_INITIATOR,
         )
     ):
@@ -832,19 +837,20 @@ def _notify_unresolved(session: Session) -> None:
             severity=Severity.INFO,
             title=f"New automation identity found: {name}",
             body=(
-                f"{row.credits_used} credits are reported against {name}, which looks like "
-                "automation (a bot, or an integration with no email) rather than a person, so "
-                "it is shown as automation and counts towards no user limit. If it is a person, "
-                "map it to their user under Settings → Attribution."
+                f"{format_credits(row.credits_used)} credits are reported against {name}, "
+                "which looks like automation (a bot, or a CI or SCM integration with no email) "
+                "rather than a person, so it is shown as automation and counts towards no user "
+                "limit. If it is a person, map it to their user under Settings → Attribution."
             ),
-            dedupe_key=f"automation:{row.subject_key}"[:160],
+            dedupe_key=f"automation:{row.subject_key}",
         )
+        row.automation_noticed_at = utcnow()
 
     # "Could not be matched" notices raised before a subject was found to be
     # automation, auto-matched or mapped (including by earlier versions) no
     # longer stand: marked read, once.
     settled = [
-        notifications.attribution_key(key)
+        notifications.bounded_key(notifications.attribution_key(key))
         for key in session.scalars(
             select(UnresolvedSubject.subject_key).where(
                 UnresolvedSubject.mapped_user_id.is_not(None)

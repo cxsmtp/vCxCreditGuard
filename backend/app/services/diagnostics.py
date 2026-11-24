@@ -333,7 +333,7 @@ def _coverage_check(session: Session) -> Check | None:
     from app.models.limits import CreditLimit
     from app.services import coverage
 
-    report = coverage.cached(session)
+    report = coverage.cached_for_key(session)
     has_user_limits = session.scalar(
         select(CreditLimit.id)
         .where(CreditLimit.entity_type == EntityType.USER, CreditLimit.is_active.is_(True))

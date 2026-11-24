@@ -30,6 +30,25 @@ SETTING = "attribution.entity_mappings"
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    # Re-runnable: SQLite DDL is not transactional, so a run that stopped half
+    # way may have left the table behind (with rows, and the setting gone).
+    # Its rows are kept, and merged with whatever the setting still holds.
+    rows: dict[tuple[str, str], dict] = {}
+    if "entity_mapping" in sa.inspect(bind).get_table_names():
+        for view, key, entity_id, mapped_at, mapped_by in bind.execute(
+            sa.text(
+                "SELECT view_by, subject_key, entity_id, mapped_at, mapped_by FROM entity_mapping"
+            )
+        ):
+            rows[(view, key)] = {
+                "view_by": view,
+                "subject_key": key,
+                "entity_id": entity_id,
+                "mapped_at": mapped_at if isinstance(mapped_at, datetime) else datetime.now(UTC),
+                "mapped_by": mapped_by,
+            }
+        op.drop_table("entity_mapping")
     table = op.create_table(
         "entity_mapping",
         sa.Column("id", sa.Integer(), primary_key=True),
@@ -40,35 +59,32 @@ def upgrade() -> None:
         sa.Column("mapped_by", sa.String(128), nullable=True),
         sa.UniqueConstraint("view_by", "subject_key", name="entity_mapping_subject"),
     )
-    bind = op.get_bind()
     row = bind.execute(
         sa.text("SELECT value FROM app_setting WHERE key = :key"), {"key": SETTING}
     ).first()
-    if row is None or not row[0]:
-        return
-    try:
-        stored = json.loads(row[0])
-    except ValueError:
-        stored = None
-    rows = []
+    stored = None
+    if row is not None and row[0]:
+        try:
+            stored = json.loads(row[0])
+        except ValueError:
+            stored = None
     now = datetime.now(UTC)
     for view, mapping in (stored or {}).items() if isinstance(stored, dict) else []:
         if view not in ("project", "application") or not isinstance(mapping, dict):
             continue
         for name, entity_id in mapping.items():
             key = str(name).strip().lower()[:320]
-            if key and isinstance(entity_id, str) and entity_id:
-                rows.append(
-                    {
-                        "view_by": view,
-                        "subject_key": key,
-                        "entity_id": entity_id[:64],
-                        "mapped_at": now,
-                        "mapped_by": None,
-                    }
-                )
+            if key and isinstance(entity_id, str) and entity_id and (view, key) not in rows:
+                # Names that normalise to the same key: inserted once.
+                rows[(view, key)] = {
+                    "view_by": view,
+                    "subject_key": key,
+                    "entity_id": entity_id[:64],
+                    "mapped_at": now,
+                    "mapped_by": None,
+                }
     if rows:
-        op.bulk_insert(table, rows)
+        op.bulk_insert(table, list(rows.values()))
     bind.execute(sa.text("DELETE FROM app_setting WHERE key = :key"), {"key": SETTING})
 
 

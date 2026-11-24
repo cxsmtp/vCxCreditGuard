@@ -228,6 +228,14 @@ def cached(session: Session) -> dict[str, Any] | None:
     return value if isinstance(value, dict) and value.get("computed_at") else None
 
 
+def cached_for_key(session: Session) -> dict[str, Any] | None:
+    """The last computed report, only if it was computed with the current key."""
+    report = cached(session)
+    if report is not None and report.get("key_fingerprint") != _fingerprint(session):
+        return None
+    return report
+
+
 def _age(report: dict[str, Any] | None, now: datetime) -> timedelta | None:
     if report is None:
         return None
@@ -259,10 +267,16 @@ def current(
     session: Session, client: CheckmarxClient | None, *, refresh: bool = False
 ) -> dict[str, Any] | None:
     """The cached report, computed again when it is older than MAX_AGE (or
-    ``refresh``) and a client is given. Without a client only the cache is used."""
-    report = cached(session)
-    now = utcnow()
+    ``refresh``) and a client is given. Without a client only the cache is used.
+
+    A report computed with another API key is never returned: it described
+    another key's view of the tenant. None means "not available": nothing
+    usable is cached and it cannot be computed now (no client, another request
+    is computing it, or computing failed). This never waits.
+    """
     fingerprint = _fingerprint(session)
+    report = cached_for_key(session)
+    now = utcnow()
     if client is None:
         return report
     fresh = _fresh(report, now, fingerprint)
@@ -287,6 +301,15 @@ def current(
     finally:
         _computing.release()
     return cached(session)
+
+
+def from_synced_data(session: Session) -> dict[str, Any]:
+    """Computed from the synced roles alone (no tenant to read), and cached."""
+    computed = compute(session, None)
+    computed.key_fingerprint = _fingerprint(session)
+    settings_store.set_value(session, settings_store.KEY_ENFORCEMENT_COVERAGE, computed.as_dict())
+    session.commit()
+    return cached(session) or computed.as_dict()
 
 
 def compute(session: Session, client: CheckmarxClient | None) -> Coverage:

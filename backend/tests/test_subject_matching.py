@@ -27,7 +27,7 @@ class TestTokenize:
         assert sm.tokenize("j-green") == frozenset({"green"})
 
     def test_multiple_identities_union_into_one_set(self) -> None:
-        assert sm.tokenize("Carol", "carol.chen@x.com") == frozenset({"carol", "chen"})
+        assert sm.tokenize("Carol", "carol.chen@example.com") == frozenset({"carol", "chen"})
 
 
 class TestBotDetection:
@@ -98,8 +98,8 @@ class TestClassify:
     def test_two_people_with_the_same_name_are_disputed_not_guessed(self) -> None:
         # A perfect score against two different users must never silently pick one.
         twins = (
-            profile("u-a", "Gus Green", "gus.green@a.com"),
-            profile("u-b", "Gus Green", "gus.green@b.com"),
+            profile("u-a", "Gus Green", "gus.green@example.com"),
+            profile("u-b", "Gus Green", "gus.green@example.org"),
         )
         outcome = sm.classify(
             subject_key="cx-gus-green", name="cx-gus-green", email=None, profiles=twins

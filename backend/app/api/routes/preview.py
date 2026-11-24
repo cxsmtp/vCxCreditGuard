@@ -225,10 +225,9 @@ def get_enforcement_coverage(
         except Exception:  # noqa: BLE001 - a page must render without the tenant
             logger.warning("No Checkmarx client for the coverage check", exc_info=True)
     report = coverage.current(db, client, refresh=refresh)
-    if report is None:
-        # Never computed and no tenant to read: from the synced data alone.
-        computed = coverage.compute(db, None)
-        settings_store.set_value(db, settings_store.KEY_ENFORCEMENT_COVERAGE, computed.as_dict())
-        db.commit()
-        report = coverage.cached(db)
+    if report is None and client is None:
+        # Nothing usable cached and no tenant to read: from the synced data alone.
+        report = coverage.from_synced_data(db)
+    # None: being computed by another request (or it failed); the page says
+    # it is not available yet rather than waiting or showing another key's.
     return EnforcementCoverageResponse(**report) if report else None

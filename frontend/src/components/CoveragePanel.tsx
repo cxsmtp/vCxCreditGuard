@@ -53,7 +53,7 @@ export function CoveragePanel({ isAdmin }: { isAdmin: boolean }) {
         <Spinner />
       ) : !data ? (
         <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
-          Not checked yet.
+          Not available yet: it has not been checked with this API key, or a check is running. Try “Check again” in a minute.
         </p>
       ) : (
         <>

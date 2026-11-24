@@ -171,26 +171,44 @@ def is_bot_subject(*values: str | None) -> bool:
     return False
 
 
-# Words that mark a handle as an integration or service account rather than a
-# person, matched as whole tokens of the handle.
-_INTEGRATION_WORDS = frozenset(
+# Tokens that mark a handle as an integration or service account rather than a
+# person. Matched only as a whole token between separators ("-", "_", "."), so
+# "example-ci-bot" and "svc-scanner" are automation while "tokenaga",
+# "jenkinson" or "mary_ann" are not.
+_AUTOMATION_TOKENS = frozenset(
+    {
+        "bot",
+        "bots",
+        "ci",
+        "cd",
+        "cicd",
+        "svc",
+        "srv",
+        "service",
+        "integration",
+        "automation",
+        "pipeline",
+        "pipelines",
+        "connector",
+        "scm",
+    }
+)
+# CI/SCM products, which name their integration identities after themselves.
+# Matched as a whole token of an all-lowercase handle: "jenkins" or
+# "jenkins-scan" is the server, "Jenkins" is someone's display name.
+_PRODUCT_TOKENS = frozenset(
     {
         "github",
         "gitlab",
-        "azure",
-        "jenkins",
         "bitbucket",
-        "ci",
-        "bot",
-        "service",
-        "svc",
-        "integration",
-        "app",
-        "token",
-        "scm",
-        "pipeline",
-        "automation",
-        "connector",
+        "jenkins",
+        "azure",
+        "azuredevops",
+        "circleci",
+        "teamcity",
+        "buildkite",
+        "travis",
+        "argocd",
     }
 )
 
@@ -200,11 +218,15 @@ def is_integration_identity(name: str | None, email: str | None) -> bool:
 
     On a live tenant the largest consumer (62% of credits) was reported under a
     single handle with no email anywhere: an SCM or CI integration's identity.
-    A bare name with no email is not enough ("Priya", "José", "张伟" or a
-    departed person's login are people): the handle must also look like one,
-    with "[bot]", a "-" or "_", a digit, or a CI/SCM word (github, jenkins,
-    svc, integration, ...). It is applied only once nothing matched (see
-    ``classify``), and stays mappable to a person under Settings → Attribution.
+    A bare name with no email is not enough ("Priya", "José", "jsmith2",
+    "Jean-Luc", "mary_ann" or a departed person's login are people). With no
+    email, the handle must also carry "[bot]", a CI/SCM token as a whole part
+    of it ("-bot", "_bot", "-ci", "svc-", "-svc", "github-actions",
+    "gitlab-ci", "azure-pipelines", ...), or be a CI/SCM product's own
+    lowercase name ("jenkins"). Digits, hyphens and underscores alone say
+    nothing, and a token is never matched inside a word. It is applied only
+    once nothing matched (see ``classify``), and stays mappable to a person
+    under Settings → Attribution.
     """
     if email and email.strip():
         return False
@@ -216,12 +238,12 @@ def is_integration_identity(name: str | None, email: str | None) -> bool:
         return True
     if not text.isascii():
         return False
-    if "-" in text or "_" in text or any(char.isdigit() for char in text):
+    tokens = [token for token in re.split(r"[-_.]+", low) if token]
+    if len(tokens) > 1 and any(token in _AUTOMATION_TOKENS for token in tokens):
         return True
-    words = {word for word in re.split(r"[^a-z]+", low) if word}
-    return bool(words & _INTEGRATION_WORDS) or any(
-        low.startswith(word) or low.endswith(word) for word in _INTEGRATION_WORDS if len(word) >= 4
-    )
+    # A product's own name, as a whole token, only in a handle written in
+    # lowercase (an identity, not a person's display name).
+    return text == low and any(token in _PRODUCT_TOKENS for token in tokens)
 
 
 def similarity(a: frozenset[str], b: frozenset[str]) -> float:
