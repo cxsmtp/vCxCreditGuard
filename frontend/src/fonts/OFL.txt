@@ -1,4 +1,8 @@
-IBM Plex Sans and IBM Plex Mono (latin subsets, from @fontsource), used by both looks of CxCreditGuard.
+IBM Plex Sans and IBM Plex Mono (latin subsets, from @fontsource), used by both looks of CxCreditGuard;
+Fraunces (variable weight, latin and latin-ext subsets, from @fontsource-variable/fraunces 5.3.0), the
+Standard look's headings and figures.
+
+Copyright 2020 The Fraunces Project Authors (https://github.com/undercasetype/Fraunces)
 
 Copyright 2019 IBM Corp. All rights reserved. IBMPlexSans-Italic[wdth,wght].ttf: Copyright 2019 IBM Corp. All rights reserved.
 

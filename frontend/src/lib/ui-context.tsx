@@ -14,7 +14,7 @@ import {
   Three independent choices, each remembered on this device:
 
   * mode: light, dark, or follow the system;
-  * look: Standard (calm, one accent) or Command Center (the operations room);
+  * look: Standard (paper or night, one earth accent) or Command Center (the operations room);
   * phosphor: Command Center's colour.
 
   The organisation's accent (an admin's choice, from /api/me) colours Standard
@@ -27,7 +27,11 @@ export type Look = "standard" | "command";
 export type Phosphor = "green" | "cyan" | "blue" | "amber" | "red" | "violet";
 
 export const LOOKS: { id: Look; name: string; blurb: string }[] = [
-  { id: "standard", name: "Standard", blurb: "Calm and plain: one accent colour, plain surfaces." },
+  {
+    id: "standard",
+    name: "Standard",
+    blurb: "Warm paper or night ink, a dark console menu and one earth accent colour.",
+  },
   {
     id: "command",
     name: "Command Center",
