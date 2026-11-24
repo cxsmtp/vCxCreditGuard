@@ -32,6 +32,7 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
+from app.models.violations import INFO_KINDS, STATUS_RESOLVED, PolicyViolation
 from app.services import audit_chain, settings_store
 from app.services import auth as auth_service
 from app.services.audit import AuditActor, record_audit
@@ -58,6 +59,7 @@ class RetentionResult:
     login_attempts: int = 0
     enforcement_actions: int = 0
     auto_triage_charges: int = 0
+    policy_violations: int = 0
     skipped: list[str] = field(default_factory=list)
 
     @property
@@ -72,6 +74,7 @@ class RetentionResult:
             + self.login_attempts
             + self.enforcement_actions
             + self.auto_triage_charges
+            + self.policy_violations
         )
 
     def as_stats(self) -> dict[str, object]:
@@ -86,6 +89,7 @@ class RetentionResult:
             "login_attempts": self.login_attempts,
             "enforcement_actions": self.enforcement_actions,
             "auto_triage_charges": self.auto_triage_charges,
+            "policy_violations": self.policy_violations,
             "skipped": self.skipped,
         }
 
@@ -115,6 +119,7 @@ def prune(
     result.login_attempts = _prune_login_attempts(session)
     _prune_period_states(session, cutoff)
     result.auto_triage_charges = _prune_auto_triage_charges(session, cutoff)
+    result.policy_violations = _prune_policy_violations(session, cutoff)
 
     # Audited last, and only if something was removed, so the entry can state the
     # counts. This is the single place that deletes audit rows.
@@ -233,6 +238,25 @@ def _prune_enforcement(session: Session, cutoff) -> int:
         EnforcementAction,
         (EnforcementAction.created_at < cutoff)
         & EnforcementAction.status.in_([EnforcementStatus.REVERSED, EnforcementStatus.FAILED]),
+    )
+
+
+def _prune_policy_violations(session: Session, cutoff) -> int:
+    """Policy violations older than the window, like reversed actions.
+
+    An open or acknowledged violation is still an admin's to-do and is kept,
+    however old, just as an applied restriction is. A resolved one goes once
+    both its last finding and its resolution are older than the window. The
+    information rows (the AI-scan daily count, scans not checked: nothing to
+    act on) go once they are older than the window, whatever their status,
+    like notifications.
+    """
+    old = func.coalesce(PolicyViolation.updated_at, PolicyViolation.detected_at) < cutoff
+    resolved = (PolicyViolation.status == STATUS_RESOLVED) & (PolicyViolation.resolved_at < cutoff)
+    return _delete_where(
+        session,
+        PolicyViolation,
+        old & (resolved | PolicyViolation.kind.in_(INFO_KINDS)),
     )
 
 

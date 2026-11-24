@@ -10,6 +10,7 @@ import type {
   Limit,
   OrgEntity,
   PeriodType,
+  ProjectAction,
 } from "../api/types";
 import { BlastSummary } from "./PreviewPage";
 import { EntityPicker } from "../components/EntityPicker";
@@ -39,7 +40,15 @@ import {
   Toggle,
 } from "../components/ui";
 import { useResource } from "../hooks/useResource";
-import { entityLabel, formatCredits, formatDate, formatPercent, periodLabel } from "../lib/format";
+import {
+  PROJECT_ACTIONS,
+  entityLabel,
+  projectActionsLabel,
+  formatCredits,
+  formatDate,
+  formatPercent,
+  periodLabel,
+} from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
 const ENTITY_TABS: { id: EntityType | "all"; label: string }[] = [
@@ -58,6 +67,12 @@ const LIMIT_EXPORT_COLUMNS: ExportColumn<Limit>[] = [
   { key: "period", header: "Period", value: (l) => l.period_type },
   { key: "warning", header: "Warning %", value: (l) => l.warning_threshold_pct },
   { key: "enforce", header: "Enforce", value: (l) => (l.enforce ? "yes" : "no") },
+  {
+    key: "turns_off",
+    header: "Turns off",
+    value: (l) =>
+      l.entity_type === "user" ? "AI roles" : projectActionsLabel(l.effective_project_actions ?? []),
+  },
   { key: "active", header: "Active", value: (l) => (l.is_active ? "yes" : "no") },
   { key: "exempt", header: "Exempt", value: (l) => (l.exempt ? "yes" : "no") },
   {
@@ -83,6 +98,14 @@ interface LimitForm {
   custom_period_end: string;
   notes: string;
   business_unit: string;
+  /** What a project, group or application limit turns off on its projects. */
+  project_actions: ProjectAction[];
+}
+
+const ALL_PROJECT_ACTIONS: ProjectAction[] = PROJECT_ACTIONS.map((action) => action.id);
+
+function sameActions(a: ProjectAction[], b: ProjectAction[]): boolean {
+  return a.length === b.length && a.every((action) => b.includes(action));
 }
 
 const EMPTY_FORM: LimitForm = {
@@ -98,6 +121,9 @@ const EMPTY_FORM: LimitForm = {
   custom_period_end: "",
   notes: "",
   business_unit: "",
+  // New limits turn off all three; a limit saved before the choice existed
+  // keeps Auto Triage and PR triage and remediation only.
+  project_actions: ALL_PROJECT_ACTIONS,
 };
 
 function statusOf(limit: Limit): [BadgeTone, string] {
@@ -750,9 +776,13 @@ function LimitDialog({
           custom_period_end: limit.custom_period_end?.slice(0, 10) ?? "",
           notes: limit.notes ?? "",
           business_unit: limit.business_unit ?? "",
+          project_actions: limit.effective_project_actions?.length
+            ? limit.effective_project_actions
+            : ALL_PROJECT_ACTIONS,
         }
       : EMPTY_FORM,
   );
+  const initialActions = limit?.effective_project_actions ?? ALL_PROJECT_ACTIONS;
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [blast, setBlast] = useState<BlastRadius | null>(null);
@@ -763,6 +793,8 @@ function LimitDialog({
   const targetType = entity?.entity_type ?? limit?.entity_type;
   const targetId = entity?.entity_id ?? limit?.entity_id;
   const wasEnforcing = editing && limit?.enforce === true;
+  const projectLevel = (targetType ?? entityType) !== "user";
+  const actionsKey = projectLevel ? form.project_actions.join(",") : "";
 
   // Fetch the blast radius whenever enforcement is on and we know the entity, so
   // the admin sees exactly what enabling it would restrict before saving.
@@ -778,9 +810,11 @@ function LimitDialog({
     setBlastError(false);
     void (async () => {
       try {
+        const params: Record<string, string> = { entity_type: targetType, entity_id: targetId };
+        if (actionsKey) params.project_actions = actionsKey;
         const result = await api.get<BlastRadius>(
           "/api/preview/blast-radius",
-          { entity_type: targetType, entity_id: targetId },
+          params,
           controller.signal,
         );
         setBlast(result);
@@ -794,7 +828,7 @@ function LimitDialog({
       }
     })();
     return () => controller.abort();
-  }, [form.enforce, targetType, targetId]);
+  }, [form.enforce, targetType, targetId, actionsKey]);
 
   // A fresh acknowledgement is required when turning enforcement on (a new
   // enforced limit, or editing one that was monitor only) and it would actually
@@ -826,6 +860,9 @@ function LimitDialog({
         notes: form.notes.trim() || null,
         business_unit: form.business_unit.trim() || null,
       };
+      if (projectLevel && (!editing || !sameActions(form.project_actions, initialActions))) {
+        payload.project_actions = form.project_actions;
+      }
       if (form.period_type === "custom") {
         payload.custom_period_start = form.custom_period_start
           ? new Date(`${form.custom_period_start}T00:00:00Z`).toISOString()
@@ -886,6 +923,7 @@ function LimitDialog({
             disabled={
               !form.credit_limit ||
               (!editing && !entity) ||
+              (projectLevel && form.project_actions.length === 0) ||
               (needsAck && !ackEnforce) ||
               // Don't let a new enforced limit be saved before its blast radius
               // has loaded, so the confirmation can't be skipped by a fast save.
@@ -975,6 +1013,14 @@ function LimitDialog({
                 : "Monitor only. Warnings and breaches are recorded, and nothing is restricted."
             }
           />
+
+          {projectLevel && (
+            <ProjectActionsChoice
+              value={form.project_actions}
+              onChange={(next) => update("project_actions", next)}
+              enforcing={form.enforce}
+            />
+          )}
 
           {(entity?.entity_type ?? limit?.entity_type) === "group" && (
             <Toggle
@@ -1107,6 +1153,60 @@ function LimitDialog({
         )}
       </div>
     </Modal>
+  );
+}
+
+/** "What to turn off for projects": the project actions a limit applies. */
+function ProjectActionsChoice({
+  value,
+  onChange,
+  enforcing,
+}: {
+  value: ProjectAction[];
+  onChange: (next: ProjectAction[]) => void;
+  enforcing: boolean;
+}) {
+  return (
+    <fieldset className="rounded-md border border-hairline px-3 py-3">
+      <legend className="px-1 text-sm font-medium">What to turn off for projects</legend>
+      <p className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+        {enforcing
+          ? "When this limit is reached, these are turned off on every project it covers, and put back when the restriction is lifted."
+          : "Used once the limit enforces. Nothing is turned off while it is monitor only."}
+      </p>
+      <div className="mt-2 flex flex-col gap-2">
+        {PROJECT_ACTIONS.map((action) => {
+          const checked = value.includes(action.id);
+          return (
+            <label key={action.id} className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={checked}
+                onChange={(event) =>
+                  onChange(
+                    event.target.checked
+                      ? ALL_PROJECT_ACTIONS.filter((id) => id === action.id || value.includes(id))
+                      : value.filter((id) => id !== action.id),
+                  )
+                }
+              />
+              <span>
+                <span className="font-medium">Turn off {action.label}</span>
+                <span className="block text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                  {action.help}
+                </span>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+      {value.length === 0 && (
+        <p className="mt-2 text-xs" style={{ color: "var(--status-critical)" }}>
+          Choose at least one, or make the limit monitor only.
+        </p>
+      )}
+    </fieldset>
   );
 }
 

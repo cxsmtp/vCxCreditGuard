@@ -77,14 +77,42 @@ class LimitStatus(StrEnum):
 class EnforcementKind(StrEnum):
     """The restrictive changes the utility knows how to make, and undo.
 
-    A project level breach fans out to both project actions: Auto Triage is a
-    project configuration, while PR triage and remediation is a repository
-    setting that only exists for projects wired to a supported SCM integration.
+    A project level breach fans out to the project actions its limit selects
+    (``CreditLimit.project_actions``): Auto Triage is a project configuration,
+    PR triage and remediation is a repository setting that only exists for
+    projects wired to a supported SCM integration, and Fusion has two halves -
+    the project's scan setting ``scan.config.ai.fusionEnabled`` and, for a
+    project with a repository, the repository's ``fusionScanConfig``. One kind
+    per write, so each half succeeds, fails and is restored on its own.
     """
 
     REMOVE_USER_ROLES = "remove_user_roles"
     DISABLE_AUTO_TRIAGE = "disable_auto_triage"
     DISABLE_PR_REMEDIATION = "disable_pr_remediation"
+    DISABLE_FUSION = "disable_fusion"
+    DISABLE_REPO_FUSION = "disable_repo_fusion"
+
+
+class ProjectAction(StrEnum):
+    """What a project, group or application limit turns off on its projects.
+
+    Stored per limit in ``CreditLimit.project_actions``. A limit whose list is
+    null predates the choice and keeps the original behaviour (``LEGACY``).
+    """
+
+    AUTO_TRIAGE = "auto_triage"
+    PR_REMEDIATION = "pr_remediation"
+    FUSION = "fusion"
+
+
+# What a limit with no stored choice turns off: the two actions there were
+# before the choice existed, so an upgrade changes nothing.
+LEGACY_PROJECT_ACTIONS: tuple[str, ...] = (
+    ProjectAction.AUTO_TRIAGE.value,
+    ProjectAction.PR_REMEDIATION.value,
+)
+# The order they are stored, listed and applied in.
+PROJECT_ACTION_ORDER: tuple[str, ...] = tuple(action.value for action in ProjectAction)
 
 
 class EnforcementStatus(StrEnum):

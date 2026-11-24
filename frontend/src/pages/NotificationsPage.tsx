@@ -37,6 +37,7 @@ const CATEGORIES = [
   { value: "sync_error", label: "Sync errors" },
   { value: "auth_failure", label: "Authentication" },
   { value: "permissions", label: "API key permissions" },
+  { value: "policy", label: "Policy violations" },
 ];
 
 const RESTRICTION_VIEW: ViewColumn<EnforcementActionItem>[] = [
@@ -296,7 +297,7 @@ export function NotificationsPage({
         busy={busy}
         message={
           restoring
-            ? `${restoring.title}\n\nThis re-applies the exact state recorded before the restriction: the roles the user held, or the project's previous Auto Triage and PR remediation settings.\n\nThe limit itself is not changed, so the next cycle can restrict again. Switch the limit to monitor only, or add an exemption, if that is not what you want.`
+            ? `${restoring.title}\n\nThis re-applies the exact state recorded before the restriction: the roles the user held, or the project's previous Auto Triage, PR remediation or Fusion setting.\n\nThe limit itself is not changed, so the next cycle can restrict again. Switch the limit to monitor only, or add an exemption, if that is not what you want.`
             : ""
         }
         onConfirm={() => restoring?.enforcement_action_id && restore(restoring.enforcement_action_id)}

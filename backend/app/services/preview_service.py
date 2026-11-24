@@ -21,8 +21,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
-from app.models.enums import EnforcementKind, LimitStatus
-from app.models.limits import CreditLimit
+from app.models.enums import (
+    LEGACY_PROJECT_ACTIONS,
+    PROJECT_ACTION_ORDER,
+    EnforcementKind,
+    EntityType,
+    LimitStatus,
+)
+from app.models.limits import CreditLimit, effective_project_actions
 from app.services import enforcement, evaluation
 from app.services.periods import PeriodError, current_window
 
@@ -48,20 +54,46 @@ class BlastRadius:
     disable_pr_remediation: int
     total_actions: int
     targets: list[TargetPreview] = field(default_factory=list)
+    # Fusion turned off in the project's scan settings, and in the repository's
+    # settings (projects with a repository; skipped when it has no such setting).
+    disable_fusion: int = 0
+    disable_repo_fusion: int = 0
+    # What the limit turns off on its projects ([] for a user limit).
+    project_actions: list[str] = field(default_factory=list)
 
 
-def blast_radius(session: Session, *, entity_type: str, entity_id: str) -> BlastRadius:
-    """What enforcing this entity's limit would change, computed read-only."""
+def blast_radius(
+    session: Session,
+    *,
+    entity_type: str,
+    entity_id: str,
+    project_actions: list[str] | None = None,
+) -> BlastRadius:
+    """What enforcing this entity's limit would change, computed read-only.
+
+    ``project_actions`` previews a choice that is not saved yet (the limit
+    form); without it the entity's limit's own choice is used, or the legacy
+    pair when it has no limit.
+    """
     exempt = enforcement.is_exempt(session, entity_type=entity_type, entity_id=entity_id)
-    targets = enforcement.plan_targets(session, entity_type=entity_type, entity_id=entity_id)
+    if entity_type == EntityType.USER:
+        actions: tuple[str, ...] = ()
+    elif project_actions is not None:
+        actions = tuple(a for a in PROJECT_ACTION_ORDER if a in set(project_actions))
+    else:
+        limit = session.scalar(
+            select(CreditLimit).where(
+                CreditLimit.entity_type == entity_type, CreditLimit.entity_id == entity_id
+            )
+        )
+        actions = effective_project_actions(limit) if limit is not None else LEGACY_PROJECT_ACTIONS
+    targets = enforcement.plan_targets(
+        session, entity_type=entity_type, entity_id=entity_id, project_actions=actions
+    )
 
     projects: set[str] = set()
     users: set[str] = set()
-    counts = {
-        EnforcementKind.REMOVE_USER_ROLES: 0,
-        EnforcementKind.DISABLE_AUTO_TRIAGE: 0,
-        EnforcementKind.DISABLE_PR_REMEDIATION: 0,
-    }
+    counts = dict.fromkeys(EnforcementKind, 0)
     previews: list[TargetPreview] = []
     for target in targets:
         counts[target.kind] = counts.get(target.kind, 0) + 1
@@ -89,8 +121,11 @@ def blast_radius(session: Session, *, entity_type: str, entity_id: str) -> Blast
         remove_user_roles=counts[EnforcementKind.REMOVE_USER_ROLES],
         disable_auto_triage=counts[EnforcementKind.DISABLE_AUTO_TRIAGE],
         disable_pr_remediation=counts[EnforcementKind.DISABLE_PR_REMEDIATION],
+        disable_fusion=counts[EnforcementKind.DISABLE_FUSION],
+        disable_repo_fusion=counts[EnforcementKind.DISABLE_REPO_FUSION],
         total_actions=len(previews),
         targets=previews,
+        project_actions=list(actions),
     )
 
 
@@ -264,7 +299,12 @@ def _project_one(
         elif not limit.enforce:
             note = "Would breach, but the limit is monitor only."
         else:
-            blast = blast_radius(session, entity_type=limit.entity_type, entity_id=limit.entity_id)
+            blast = blast_radius(
+                session,
+                entity_type=limit.entity_type,
+                entity_id=limit.entity_id,
+                project_actions=list(effective_project_actions(limit)),
+            )
             would_enforce = blast.total_actions > 0
             if not would_enforce:
                 protected = (

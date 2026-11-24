@@ -44,7 +44,7 @@ from app.schemas.dashboard import (
     TrendPoint,
     UnresolvedSubjectResponse,
 )
-from app.services import auto_triage_attribution, key_permissions, settings_store
+from app.services import auto_triage_attribution, key_permissions, settings_store, violations
 from app.services import dashboard as dashboard_service
 from app.services import notifications as notification_service
 from app.services.audit import record_audit
@@ -87,6 +87,7 @@ def me(ctx: CurrentUser, db: DbSession) -> MeResponse:
         demo_mode=settings_store.demo_mode(db),
         enforcement_paused=_pause_reason(db),
         key_permissions=key_permissions.summary(db) if connection is not None else None,
+        open_violations=violations.open_count(db) if ctx.is_admin else None,
     )
 
 

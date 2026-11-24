@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,12 +42,19 @@ from app.checkmarx.errors import (
 from app.db.base import utcnow
 from app.models.audit import AuditLogEntry
 from app.models.enums import (
+    LEGACY_PROJECT_ACTIONS,
     EnforcementKind,
     EnforcementStatus,
     EntityType,
+    ProjectAction,
     Severity,
 )
-from app.models.limits import CreditLimit, EnforcementAction, Exemption
+from app.models.limits import (
+    CreditLimit,
+    EnforcementAction,
+    Exemption,
+    effective_project_actions,
+)
 from app.models.org import CxApplicationProject, CxProject, CxProjectGroup, CxUser
 from app.services import key_permissions, notifications, settings_store, usage_mix
 from app.services.audit import AuditActor, record_audit
@@ -67,10 +74,29 @@ EXEMPTED_REASON = "exempted"
 # An administrator pressed Restore. The one reversal that is not conditional: the
 # cycle does not re-apply the restriction for the rest of the period.
 ADMIN_REASON = "admin"
+# The limit no longer turns this off (an admin changed what it turns off).
+DESELECTED_REASON = "action_deselected"
+
+# Which project action each project kind belongs to.
+PROJECT_ACTION_OF_KIND: dict[str, str] = {
+    EnforcementKind.DISABLE_AUTO_TRIAGE.value: ProjectAction.AUTO_TRIAGE.value,
+    EnforcementKind.DISABLE_PR_REMEDIATION.value: ProjectAction.PR_REMEDIATION.value,
+    EnforcementKind.DISABLE_FUSION.value: ProjectAction.FUSION.value,
+    EnforcementKind.DISABLE_REPO_FUSION.value: ProjectAction.FUSION.value,
+}
+
+# Audited once per target when a restriction has nothing to act on there.
+AUDIT_NOT_APPLICABLE = "enforcement.not_applicable"
 
 # Snapshot key: True from the moment a tenant write is about to be attempted
 # until its result is recorded. See may_be_in_force.
 OUTCOME_UNKNOWN = "outcome_unknown"
+# Snapshot key: the last attempt's write was accepted but read back unchanged.
+_UNCHANGED_ON_READ_BACK = "read_back_unchanged"
+# Snapshot key: read back unchanged on two consecutive attempts, so this tenant
+# is taken not to keep the write. It is not sent again for the rest of the
+# period; what was there before stays on the row for Restore.
+_NOT_KEPT = "not_kept"
 # Answers that mean Checkmarx did not make the change. Anything else (a timeout,
 # a dropped connection, a 5xx) leaves the outcome in doubt.
 _DEFINITE_REJECTIONS = (
@@ -176,12 +202,42 @@ def is_exempt(session: Session, *, entity_type: str, entity_id: str) -> bool:
 class NotRestricted(Exception):  # noqa: N818 - a decision, not an error
     """This target is deliberately left alone. Nothing was changed.
 
-    ``title`` is what the admin is told, once; the message says why.
+    ``title`` is what the admin is told, once; the message says why. A
+    ``quiet`` one is recorded on the action and audited, but raises no
+    notification: there was simply nothing there to change.
     """
 
-    def __init__(self, message: str, *, title: str) -> None:
+    def __init__(self, message: str, *, title: str, quiet: bool = False) -> None:
         super().__init__(message)
         self.title = title
+        self.quiet = quiet
+
+
+class _NotKept(NotRestricted):
+    """The tenant accepted the write and, read back on two consecutive attempts,
+    did not keep it. Not certain: what was there before is kept for Restore."""
+
+
+class _ReadBackUnchanged(CheckmarxError):
+    """A write was accepted, but the read straight after still shows the old value.
+
+    Not a definite rejection: the write may have landed and the read be stale (a
+    propagation delay, a cache), so the outcome stays in doubt and what was there
+    before is kept. The first time is a quiet retry; only an attempt that finds
+    it unchanged again is reported. ``conclusion``, when set, is what a second
+    consecutive time means instead of an error (the tenant does not keep it).
+    """
+
+    def __init__(self, message: str, *, conclusion: NotRestricted | None = None) -> None:
+        super().__init__(message)
+        self.conclusion = conclusion
+
+
+class _NotApplicable(NotRestricted):
+    """There is nothing there to turn off. Audited once per target, not per period."""
+
+    def __init__(self, message: str, *, title: str) -> None:
+        super().__init__(message, title=title, quiet=True)
 
 
 class ProtectedTarget(NotRestricted):
@@ -276,8 +332,20 @@ def project_ids_for(session: Session, *, entity_type: str, entity_id: str) -> li
     return []
 
 
-def plan_targets(session: Session, *, entity_type: str, entity_id: str) -> list[Target]:
-    """Every concrete change a breach of this limit implies, exemptions removed."""
+def plan_targets(
+    session: Session,
+    *,
+    entity_type: str,
+    entity_id: str,
+    project_actions: Iterable[str] | None = None,
+) -> list[Target]:
+    """Every concrete change a breach of this limit implies, exemptions removed.
+
+    ``project_actions`` is what a project, group or application limit turns off
+    (``effective_project_actions``); None means the legacy pair, Auto Triage and
+    PR triage and remediation.
+    """
+    chosen = set(LEGACY_PROJECT_ACTIONS if project_actions is None else project_actions)
     if entity_type == EntityType.USER:
         if is_exempt(session, entity_type=EntityType.USER, entity_id=entity_id):
             return []
@@ -303,24 +371,27 @@ def plan_targets(session: Session, *, entity_type: str, entity_id: str) -> list[
         if project is not None and project.is_deleted:
             continue
         label = project.name if project else project_id
-        targets.append(
+        has_repo = project is not None and bool(project.repo_id)
+        kinds: list[EnforcementKind] = []
+        if ProjectAction.AUTO_TRIAGE in chosen:
+            kinds.append(EnforcementKind.DISABLE_AUTO_TRIAGE)
+        # The repository settings are only meaningful for projects with a
+        # supported SCM integration.
+        if ProjectAction.PR_REMEDIATION in chosen and has_repo:
+            kinds.append(EnforcementKind.DISABLE_PR_REMEDIATION)
+        if ProjectAction.FUSION in chosen:
+            kinds.append(EnforcementKind.DISABLE_FUSION)
+            if has_repo:
+                kinds.append(EnforcementKind.DISABLE_REPO_FUSION)
+        targets.extend(
             Target(
-                kind=EnforcementKind.DISABLE_AUTO_TRIAGE,
+                kind=kind,
                 target_type=TARGET_PROJECT,
                 target_id=project_id,
                 target_label=label,
             )
+            for kind in kinds
         )
-        # Only meaningful for projects with a supported SCM integration.
-        if project is not None and project.repo_id:
-            targets.append(
-                Target(
-                    kind=EnforcementKind.DISABLE_PR_REMEDIATION,
-                    target_type=TARGET_PROJECT,
-                    target_id=project_id,
-                    target_label=label,
-                )
-            )
     return targets
 
 
@@ -406,7 +477,12 @@ def apply_enforcement(
                     detail=f"Over budget in {period_key}, not restricted: {why}.",
                 )
             return outcome
-    targets = plan_targets(session, entity_type=limit.entity_type, entity_id=limit.entity_id)
+    targets = plan_targets(
+        session,
+        entity_type=limit.entity_type,
+        entity_id=limit.entity_id,
+        project_actions=effective_project_actions(limit),
+    )
     if not targets:
         outcome.skipped.append("no targets to restrict (exempt, or no projects linked)")
         return outcome
@@ -465,6 +541,19 @@ def _enforce_target(
         # A manual Restore may have committed a change to this row while we
         # waited for the target lock; never act on the stale copy.
         session.refresh(action)
+
+    if (
+        action is not None
+        and action.status == EnforcementStatus.FAILED
+        and (action.undo_snapshot or {}).get(_NOT_KEPT)
+    ):
+        # Read back unchanged on two consecutive attempts: this tenant does not
+        # keep the write. Said once; not sent again for the rest of the period.
+        outcome.skipped.append(
+            f"{target.kind} on {target.target_label} is not sent again this period: "
+            "Checkmarx One did not keep it"
+        )
+        return
 
     if action is not None and action.status == EnforcementStatus.APPLIED:
         _verify_applied(
@@ -532,6 +621,8 @@ def _enforce_target(
     # What the last attempt failed with, if it failed: a retry that fails the
     # same way is not news.
     previous_error = action.error if action.status == EnforcementStatus.FAILED else None
+    # The last attempt's write was accepted but read back unchanged.
+    unchanged_before = bool(earlier and earlier.get(_UNCHANGED_ON_READ_BACK))
     write_attempted = False
     try:
         # Phase 1: read the tenant's current state. Nothing is changed yet.
@@ -547,42 +638,78 @@ def _enforce_target(
         # back is what was there before either. The snapshot is marked "outcome
         # unknown" until the write's result is recorded, so a process that stops
         # in between leaves a row that can still be undone.
-        snapshot = captured.snapshot
-        for sibling in _siblings_in_force(session, action):
-            snapshot = _merge_snapshots(_settled(sibling.undo_snapshot), snapshot)
-        snapshot = _merge_snapshots(earlier, snapshot)
+        # What the siblings and the earlier attempt know is kept aside: the
+        # outcome of the write below is merged with it again (Phase 4), so a
+        # later attempt that takes nothing itself can never erase the evidence
+        # that an earlier one (or another limit) took something.
+        known = [_settled(sibling.undo_snapshot) for sibling in _siblings_in_force(session, action)]
+        known.append(earlier)
+        snapshot = _combine(known, captured.snapshot)
         snapshot[OUTCOME_UNKNOWN] = True
         action.undo_snapshot = snapshot
         action.status = EnforcementStatus.PENDING
         session.commit()
         # Phase 3: change the tenant. No transaction is open during this call.
         write_attempted = True
-        captured.apply()
+        try:
+            captured.apply()
+        except _ReadBackUnchanged as exc:
+            if unchanged_before and exc.conclusion is not None:
+                # Unchanged on the last attempt's read-back and on this one's.
+                raise exc.conclusion from exc
+            raise
     except NotRestricted as exc:
         # A decision, not a failure: nothing is changed, the admin is told once,
         # and the cycle is not marked as degraded for honouring its own rule.
         message = str(exc)[:2000]
         first_report = previous_error != message
+        if isinstance(exc, _NotKept) and action.undo_snapshot is not None:
+            # Concluded from two read-backs, yet still not certain: the write
+            # may have landed after all. The outcome stays in doubt and what was
+            # there before stays on the row, so Restore (or the end of the
+            # restriction) puts it back - which changes nothing if it was never
+            # taken. It is not sent again this period.
+            held = dict(action.undo_snapshot)
+            held[_NOT_KEPT] = True
+            action.undo_snapshot = held
         action.status = EnforcementStatus.FAILED
         action.error = message
         session.flush()
         outcome.skipped.append(f"{target.kind} on {target.target_label}: {exc}")
-        notifications.notify(
-            session,
-            category=notifications.CATEGORY_ENFORCEMENT,
-            severity=Severity.WARNING,
-            title=exc.title,
-            body=str(exc),
-            entity_type=limit.entity_type,
-            entity_id=limit.entity_id,
-            entity_label=limit.entity_label,
-            dedupe_key=notifications.not_restricted_key(action.id),
-            enforcement_action_id=action.id,
-        )
+        if not exc.quiet:
+            notifications.notify(
+                session,
+                category=notifications.CATEGORY_ENFORCEMENT,
+                severity=Severity.WARNING,
+                title=exc.title,
+                body=str(exc),
+                entity_type=limit.entity_type,
+                entity_id=limit.entity_id,
+                entity_label=limit.entity_label,
+                dedupe_key=notifications.not_restricted_key(action.id),
+                enforcement_action_id=action.id,
+            )
+        audit_action = "enforcement.not_restricted"
+        if isinstance(exc, _NotApplicable):
+            # Nothing to do there, and likely the same every period: said once
+            # per target, ever (it is still looked at again every cycle).
+            audit_action = AUDIT_NOT_APPLICABLE
+            first_report = (
+                session.scalar(
+                    select(AuditLogEntry.id)
+                    .where(
+                        AuditLogEntry.action == AUDIT_NOT_APPLICABLE,
+                        AuditLogEntry.target_type == target.target_type,
+                        AuditLogEntry.target_id == target.target_id,
+                    )
+                    .limit(1)
+                )
+                is None
+            )
         if first_report:
             record_audit(
                 session,
-                action="enforcement.not_restricted",
+                action=audit_action,
                 actor=actor,
                 target_type=target.target_type,
                 target_id=target.target_id,
@@ -602,6 +729,31 @@ def _enforce_target(
             settled = dict(action.undo_snapshot)
             settled[OUTCOME_UNKNOWN] = earlier is not None
             action.undo_snapshot = settled
+        if isinstance(exc, _ReadBackUnchanged) and action.undo_snapshot is not None:
+            # In doubt (the read may be stale): the outcome stays unknown and the
+            # "before" values stay, so the next attempt merges them.
+            marked = dict(action.undo_snapshot)
+            marked[_UNCHANGED_ON_READ_BACK] = True
+            action.undo_snapshot = marked
+            if not unchanged_before:
+                # The first time is a quiet retry: the write was accepted and
+                # the read straight after may simply be behind. Reported only if
+                # the next attempt still reads it unchanged.
+                logger.warning(
+                    "%s on %s read back unchanged straight after the write; checked again "
+                    "on the next cycle: %s",
+                    target.kind,
+                    target.target_label,
+                    exc,
+                )
+                action.status = EnforcementStatus.FAILED
+                action.error = f"{exc} It is checked again on the next cycle."[:2000]
+                outcome.skipped.append(
+                    f"{target.kind} on {target.target_label} read back unchanged straight after "
+                    "the write; checked again on the next cycle"
+                )
+                session.commit()
+                return
         message = str(exc)[:2000]
         first_report = previous_error != message
         action.status = EnforcementStatus.FAILED
@@ -640,7 +792,10 @@ def _enforce_target(
         return
 
     # Phase 4: record the outcome, and commit before anything else happens.
-    snapshot = {k: v for k, v in (action.undo_snapshot or {}).items() if k != OUTCOME_UNKNOWN}
+    # What the write itself found out (Fusion: whether the lock was accepted and
+    # kept) belongs to this attempt's read; it is merged with what was known
+    # before exactly as the read was, never laid over the merged result.
+    snapshot = _combine(known, {**captured.snapshot, **captured.outcome})
     action.undo_snapshot = snapshot
     captured.mirror()
     action.status = EnforcementStatus.APPLIED
@@ -728,8 +883,11 @@ def _verify_applied(
         outcome.skipped.append(f"{target.target_label} is now protected; restriction lifted")
         return
     session.commit()  # nothing held open while we wait on Checkmarx
+    found: dict[str, Any] = {}
     try:
-        verdict = _reconcile(session, client, action=action, target=target, resolver=resolver)
+        verdict = _reconcile(
+            session, client, action=action, target=target, resolver=resolver, found=found
+        )
     except CheckmarxError as exc:
         logger.warning(
             "Could not verify %s on %s this cycle: %s", target.kind, target.target_label, exc
@@ -773,6 +931,49 @@ def _verify_applied(
         outcome.skipped.append(
             f"{target.kind} on {target.target_label} already applied and verified in Checkmarx"
         )
+        session.commit()  # a lock seen to hold is no longer in doubt
+        return
+    if verdict == RECONCILE_LOCK_NOT_KEPT:
+        label = target.target_label or target.target_id
+        outcome.skipped.append(
+            f"{target.kind} on {target.target_label}: Fusion is off; the lock against per-scan "
+            "override is not kept by this tenant and is no longer sent or checked"
+        )
+        record_audit(
+            session,
+            action=AUDIT_LOCK_NOT_KEPT,
+            actor=actor,
+            target_type=target.target_type,
+            target_id=target.target_id,
+            target_label=target.target_label,
+            after={"kind": str(target.kind), "lock_not_kept": True},
+            detail=(
+                f"The lock against per-scan override on {label}'s Fusion setting was read back "
+                "absent straight after it was written and again on the next check, so this "
+                "tenant is taken not to keep it. Fusion stays off and is still checked."
+            ),
+        )
+        notifications.notify(
+            session,
+            category=notifications.CATEGORY_ENFORCEMENT,
+            severity=Severity.WARNING,
+            title=f"{label}: Fusion lock not kept",
+            body=(
+                "Checkmarx One accepted locking the project's Fusion setting against per-scan "
+                "override but did not keep it (read back on two consecutive checks), so this "
+                "tenant does not appear to support the lock and a scan started with its own "
+                "settings can still turn Fusion on for that one scan. The lock is not sent or "
+                "checked again; Fusion being off still is. Any scan that runs Fusion is "
+                "recorded as a policy violation. Restore puts the setting back as it was."
+            ),
+            entity_type=limit.entity_type,
+            entity_id=limit.entity_id,
+            entity_label=limit.entity_label,
+            # Once per project and period, however many limits restrict it.
+            dedupe_key=notifications.lock_not_kept_key(target.target_id, period_key),
+            enforcement_action_id=action.id,
+        )
+        session.commit()
         return
 
     outcome.reconciled.append(action)
@@ -789,18 +990,39 @@ def _verify_applied(
             "drifted back on in Checkmarx One and was re-asserted."
         ),
     )
-    notifications.notify(
-        session,
-        category=notifications.CATEGORY_ENFORCEMENT,
-        severity=Severity.WARNING,
-        title=_reconciled_title(action),
-        body=_reconciled_body(action),
-        entity_type=limit.entity_type,
-        entity_id=limit.entity_id,
-        entity_label=limit.entity_label,
-        dedupe_key=notifications.reconcile_key(action.id, period_key),
-        enforcement_action_id=action.id,
-    )
+    # Someone undid a restriction in force: a policy violation to follow up.
+    # Its own notification (category "policy") is the one alert for it; the
+    # enforcement "re-asserted" notification is raised only if the violation
+    # could not be recorded, so the admin always hears of it exactly once.
+    from app.services import violations
+
+    recorded = False
+    try:
+        with session.begin_nested():
+            violations.record_reenabled(
+                session,
+                action=action,
+                limit=limit,
+                found=found,
+                title=_reconciled_title(action),
+                body=_reconciled_body(action),
+            )
+        recorded = True
+    except Exception:  # noqa: BLE001 - recording it must never undo the re-assert
+        logger.warning("Could not record the policy violation for %s", action.id, exc_info=True)
+    if not recorded:
+        notifications.notify(
+            session,
+            category=notifications.CATEGORY_ENFORCEMENT,
+            severity=Severity.WARNING,
+            title=_reconciled_title(action),
+            body=_reconciled_body(action),
+            entity_type=limit.entity_type,
+            entity_id=limit.entity_id,
+            entity_label=limit.entity_label,
+            dedupe_key=notifications.reconcile_key(action.id, period_key),
+            enforcement_action_id=action.id,
+        )
     session.commit()
 
 
@@ -810,12 +1032,15 @@ class _Captured:
 
     ``snapshot`` is what Restore needs. ``apply`` performs the tenant write and
     touches no database state; ``mirror`` updates the local copy of the project's
-    AI settings once the write has succeeded.
+    AI settings once the write has succeeded. ``outcome`` is filled by ``apply``
+    with what only the write can tell (whether Checkmarx accepted the Fusion
+    lock) and is added to the snapshot once the write has succeeded.
     """
 
     snapshot: dict[str, Any]
     apply: Callable[[], None]
     mirror: Callable[[], None]
+    outcome: dict[str, Any] = field(default_factory=dict)
 
 
 def _capture(
@@ -944,7 +1169,288 @@ def _capture(
             mirror=mirror_pr_remediation,
         )
 
+    if target.kind == EnforcementKind.DISABLE_FUSION:
+        return _capture_fusion(session, client, target=target)
+
+    if target.kind == EnforcementKind.DISABLE_REPO_FUSION:
+        return _capture_repo_fusion(client, target=target, project=project)
+
     raise CheckmarxError(f"Unknown enforcement kind {target.kind!r}")
+
+
+# Checkmarx answers a body it will not accept with one of these.
+_LOCK_REJECTED_STATUSES = (400, 422)
+
+
+def _off_value(value: Any) -> Any:
+    """The "off" value in the type the setting was reported in ("false" for a string)."""
+    return False if isinstance(value, bool) else "false"
+
+
+def _fusion_entry(
+    base: dict[str, Any], *, value: Any, allow_override: bool | None
+) -> dict[str, Any]:
+    entry = dict(base)
+    entry["key"] = platform.FUSION_SETTING_KEY
+    entry["value"] = value
+    if allow_override is not None:
+        entry["allowOverride"] = allow_override
+    return entry
+
+
+def _write_fusion_off(
+    client: CheckmarxClient,
+    *,
+    project_id: str,
+    base: dict[str, Any],
+    value_type: Any,
+    lock: bool,
+    allow_override: bool | None,
+    outcome: dict[str, Any],
+    fallback: bool = True,
+) -> None:
+    """Turn the project's Fusion setting off, locked against per-scan override
+    when ``lock`` is set and Checkmarx accepts it.
+
+    Whether a lock (``allowOverride: false``) stops a scan started with its own
+    settings from turning Fusion back on is not verified. A tenant that refuses
+    the locked entry (400 or 422) gets the value written without the lock, and
+    ``outcome["lock_applied"]`` records which happened. With ``fallback`` off a
+    refused lock is an error instead: used where writing the entry without the
+    lock could unlock a setting that is meant to stay locked.
+    """
+    off = _off_value(value_type)
+    if lock:
+        try:
+            platform.set_project_setting(
+                client,
+                project_id=project_id,
+                entry=_fusion_entry(base, value=off, allow_override=False),
+            )
+        except CheckmarxResponseError as exc:
+            if exc.status_code not in _LOCK_REJECTED_STATUSES or not fallback:
+                raise
+            logger.info(
+                "Checkmarx did not accept locking Fusion on project %s (%s); "
+                "turning it off without the lock",
+                project_id,
+                exc.status_code,
+            )
+            outcome["lock_applied"] = False
+            outcome["lock_rejected"] = f"Checkmarx One answered {exc.status_code}."
+        else:
+            outcome["lock_applied"] = True
+            return
+    platform.set_project_setting(
+        client,
+        project_id=project_id,
+        entry=_fusion_entry(base, value=off, allow_override=allow_override),
+    )
+
+
+def _confirm_fusion_off(
+    client: CheckmarxClient, *, project_id: str, label: str, outcome: dict[str, Any]
+) -> None:
+    """Read the Fusion setting back once after turning it off.
+
+    A tenant can answer 2xx and not keep what it was sent - or the read straight
+    after can be behind the write. Neither is certain, so nothing here is
+    concluded from one read. The value must read back as off, or the write is
+    not counted: the outcome stays in doubt and it is retried next cycle (the
+    first time quietly). A lock that does not read back, or cannot be read, is
+    kept as sent but marked unconfirmed: its absence is then re-applied without
+    an alarm, and only a later read decides (see ``_reconcile``): holding, it
+    is confirmed; still absent, the tenant is taken not to keep it.
+    """
+    try:
+        after = platform.get_fusion_setting(client, project_id=project_id)
+    except CheckmarxAuthError:
+        raise
+    except CheckmarxError as exc:
+        logger.info("Could not read Fusion back on project %s: %s", project_id, exc)
+        if outcome.get("lock_applied"):
+            outcome["lock_unconfirmed"] = True
+        return
+    if after is None:
+        if outcome.get("lock_applied"):
+            outcome["lock_unconfirmed"] = True
+        return
+    if after.enabled:
+        # Not a definite rejection: it (or part of it, the lock) may have landed
+        # and the read be behind, so the outcome stays in doubt and Restore
+        # still considers it.
+        raise _ReadBackUnchanged(
+            f"Checkmarx One accepted turning Fusion off for {label}, but the setting still "
+            "reads as on, so it is not counted as turned off."
+        )
+    if outcome.get("lock_applied") and after.allow_override is not False:
+        # Possibly a stale read: kept as sent, unconfirmed, and decided later.
+        outcome["lock_unconfirmed"] = True
+        outcome["lock_seen_unlocked"] = True
+
+
+def _capture_fusion(session: Session, client: CheckmarxClient, *, target: Target) -> _Captured:
+    label = target.target_label or target.target_id
+    setting = platform.get_fusion_setting(client, project_id=target.target_id)
+    if setting is None:
+        raise NotRestricted(
+            f"{label}'s scan settings in Checkmarx One have no Fusion setting "
+            f"({platform.FUSION_SETTING_KEY}), so Fusion was left unchanged for this project. "
+            "The project's other restrictions are applied as normal.",
+            title=f"{label}: Fusion left unchanged",
+        )
+    if not isinstance(setting.value, str | bool):
+        raise NotRestricted(
+            f"{label}'s Fusion setting in Checkmarx One has no readable value, so it was left "
+            "unchanged: it could not have been restored to what it was.",
+            title=f"{label}: Fusion left unchanged",
+        )
+    lock = settings_store.fusion_lock_enabled(session)
+    enabled_before = setting.enabled
+    # The lock is only worth writing when the setting is not locked already.
+    wants_lock = lock and setting.allow_override is not False
+    write = enabled_before or wants_lock
+    outcome: dict[str, Any] = {}
+
+    def disable_fusion() -> None:
+        if not write:
+            return
+        _write_fusion_off(
+            client,
+            project_id=target.target_id,
+            base=setting.entry,
+            value_type=setting.value,
+            lock=wants_lock,
+            allow_override=setting.allow_override,
+            outcome=outcome,
+        )
+        _confirm_fusion_off(client, project_id=target.target_id, label=label, outcome=outcome)
+        if outcome.get("lock_applied") is False and not enabled_before:
+            # Only the lock was to be written, and it was refused (or not kept):
+            # what is there now is what was there. This attempt took nothing;
+            # what an earlier attempt or another limit took is merged back in
+            # by the caller.
+            outcome["fusion_write"] = False
+
+    return _Captured(
+        snapshot={
+            "kind": str(target.kind),
+            "setting_key": platform.FUSION_SETTING_KEY,
+            # False here means it was already off, so restore leaves it off.
+            "fusion_enabled_before": enabled_before,
+            "value_before": setting.value,
+            "allow_override_before": setting.allow_override,
+            # "Project" when the project set it itself; "Tenant" (or another
+            # level) when it was inherited. Writing it back sets it on the project.
+            "origin_level_before": setting.origin_level,
+            "entry_before": setting.entry,
+            "lock_requested": wants_lock,
+            # Whether anything is written at all (and so put back on restore).
+            "fusion_write": write,
+        },
+        apply=disable_fusion,
+        mirror=lambda: None,
+        outcome=outcome,
+    )
+
+
+def _capture_repo_fusion(
+    client: CheckmarxClient, *, target: Target, project: CxProject | None
+) -> _Captured:
+    label = target.target_label or target.target_id
+    if project is None or not project.repo_id:
+        raise CheckmarxError(
+            "No repository id is known for this project, so its repository Fusion setting "
+            "cannot be changed."
+        )
+    repo_id = project.repo_id
+    read = platform.get_repo_fusion(client, repo_id=repo_id, project_id=target.target_id)
+    if not read.readable:
+        raise NotRestricted(
+            f"The settings of {label}'s repository cannot be read from Checkmarx One, so its "
+            "repository Fusion setting was left unchanged: it could not have been restored "
+            "to what it was. Fusion in the project's scan settings is handled separately.",
+            title=f"{label}: repository Fusion setting left unchanged",
+        )
+    if read.config is None:
+        # Not verified that the repos-manager read carries it at all. Nothing
+        # is invented: this half is skipped and the record says why.
+        raise _NotApplicable(
+            f"Checkmarx One's settings for {label}'s repository do not include a Fusion "
+            f"setting ({platform.REPO_FUSION_FIELD}), so there was nothing to turn off there "
+            "(not applicable). Fusion in the project's scan settings is handled separately.",
+            title=f"{label}: no repository Fusion setting",
+        )
+    before = dict(read.config)
+    enabled_before = read.enabled
+
+    def disable_repo_fusion() -> None:
+        if not enabled_before:
+            return
+        platform.set_repo_fusion(
+            client,
+            repo_id=repo_id,
+            project_id=target.target_id,
+            config={**before, "enabled": False},
+        )
+        # Read back once: that this write takes effect is not verified. Read
+        # back still on, the write may yet have landed (the read may be behind),
+        # so the outcome stays in doubt and the next cycle tries again, quietly.
+        # Still on after that attempt too, the tenant is taken not to support
+        # it: said once (not as a failure, and never later as drift), and not
+        # sent again this period.
+        after = platform.get_repo_fusion(client, repo_id=repo_id, project_id=target.target_id)
+        if after.readable and after.config is not None and after.enabled:
+            raise _ReadBackUnchanged(
+                f"Checkmarx One accepted turning Fusion off in {label}'s repository settings "
+                f"({platform.REPO_FUSION_FIELD}), but it still reads as on.",
+                conclusion=_NotKept(
+                    f"Checkmarx One accepted turning Fusion off in {label}'s repository "
+                    f"settings ({platform.REPO_FUSION_FIELD}) but did not keep it (read back "
+                    "on two consecutive attempts), so this tenant does not appear to support "
+                    "changing it. It is not sent again this period. What was there before is "
+                    "kept, so Restore puts it back, which changes nothing if it was never "
+                    "taken. Fusion in the project's scan settings is handled separately.",
+                    title=f"{label}: repository Fusion setting not supported",
+                ),
+            )
+
+    return _Captured(
+        snapshot={
+            "kind": str(target.kind),
+            "repo_id": repo_id,
+            "repo_fusion_enabled_before": enabled_before,
+            "repo_fusion_before": before,
+        },
+        apply=disable_repo_fusion,
+        mirror=lambda: None,
+    )
+
+
+def _combine(known: list[dict[str, Any] | None], fresh: dict[str, Any]) -> dict[str, Any]:
+    """``fresh`` merged with each of ``known`` in turn (see ``_merge_snapshots``).
+
+    Always a new dict without the bookkeeping marker: ``fresh`` is never changed.
+    """
+    snapshot = _settled(fresh) or {}
+    for previous in known:
+        snapshot = _merge_snapshots(previous, snapshot)
+    return dict(snapshot)
+
+
+# Bookkeeping about the Fusion lock that a later snapshot without its own word
+# on it inherits (a sibling limit that found the lock already in place).
+_FUSION_LOCK_KEYS = (
+    "lock_applied",
+    "lock_rejected",
+    "lock_not_kept",
+    # The doubt goes with the lock: a sibling that inherits a lock never seen to
+    # hold must not report its absence as someone removing it.
+    "lock_unconfirmed",
+    "lock_seen_unlocked",
+)
+# Cleared once a read shows the lock holding.
+_LOCK_DOUBT_KEYS = ("lock_unconfirmed", "lock_seen_unlocked")
 
 
 def _merge_snapshots(previous: dict[str, Any] | None, fresh: dict[str, Any]) -> dict[str, Any]:
@@ -989,6 +1495,47 @@ def _merge_snapshots(previous: dict[str, Any] | None, fresh: dict[str, Any]) -> 
             return merged
         return fresh
 
+    if kind == EnforcementKind.DISABLE_FUSION:
+        merged = dict(fresh)
+        if "lock_applied" not in fresh:
+            # This read wrote no lock (it found one in place, or wrote nothing):
+            # whatever the earlier one learned about the lock still holds, so
+            # the lock is still verified after the earlier limit lets go.
+            for key in _FUSION_LOCK_KEYS:
+                if key in previous:
+                    merged[key] = previous[key]
+        if previous.get("fusion_write"):
+            # The earlier read came before any write of this chain: it is the
+            # true "before" (value, lock and the level it was set at).
+            for key in (
+                "fusion_enabled_before",
+                "value_before",
+                "allow_override_before",
+                "origin_level_before",
+                "entry_before",
+            ):
+                if key in previous:
+                    merged[key] = previous[key]
+            merged["fusion_write"] = True
+            merged["fusion_enabled_before"] = bool(
+                previous.get("fusion_enabled_before") or fresh.get("fusion_enabled_before")
+            )
+            if merged["fusion_enabled_before"] and not platform.setting_is_true(
+                merged.get("value_before")
+            ):
+                merged["value_before"] = fresh.get("value_before")
+        return merged
+
+    if kind == EnforcementKind.DISABLE_REPO_FUSION:
+        if previous.get("repo_fusion_enabled_before") and not fresh.get(
+            "repo_fusion_enabled_before"
+        ):
+            merged = dict(fresh)
+            merged["repo_fusion_enabled_before"] = True
+            merged["repo_fusion_before"] = previous.get("repo_fusion_before") or {}
+            return merged
+        return fresh
+
     return fresh
 
 
@@ -1018,6 +1565,15 @@ def _unverified_reapply_audited(session: Session, action: EnforcementAction) -> 
 RECONCILE_HELD = "held"  # read back, still in force
 RECONCILE_REASSERTED = "reasserted"  # read back, had drifted, re-applied
 RECONCILE_UNVERIFIED = "unverified"  # could not be read back, re-applied anyway
+# Fusion is off, but the lock was read back absent twice after it was written:
+# this tenant does not keep it. Said once; the lock is no longer checked.
+RECONCILE_LOCK_NOT_KEPT = "lock_not_kept"
+
+AUDIT_LOCK_NOT_KEPT = "enforcement.lock_not_kept"
+
+
+def _lock_in_doubt(snapshot: dict[str, Any]) -> bool:
+    return any(snapshot.get(key) for key in _LOCK_DOUBT_KEYS)
 
 
 def _reconcile(
@@ -1027,9 +1583,13 @@ def _reconcile(
     action: EnforcementAction,
     target: Target,
     resolver: RoleResolver,
+    found: dict[str, Any] | None = None,
 ) -> str:
     """Verify an already-applied restriction is still in force, re-asserting it if
     it drifted back on in Checkmarx One.
+
+    ``found`` is filled with what was read back when it had drifted, for the
+    policy violation record.
 
     Only a state actually read back and found switched on again is drift
     (``RECONCILE_REASSERTED``). A state that cannot be read is not evidence of
@@ -1040,6 +1600,8 @@ def _reconcile(
     """
     snapshot = action.undo_snapshot or {}
     kind = action.kind
+    if found is None:
+        found = {}
 
     if kind == EnforcementKind.REMOVE_USER_ROLES:
         client_uuid = snapshot.get("client_uuid") or resolver.client_uuid
@@ -1049,6 +1611,7 @@ def _reconcile(
         to_remove = [role for role in current if role.name in iam.AI_ROLE_NAMES]
         if not to_remove:
             return RECONCILE_HELD
+        found.update({"found": {"roles": sorted(role.name for role in to_remove)}})
         iam.remove_user_client_roles(
             client, user_id=target.target_id, client_uuid=client_uuid, roles=to_remove
         )
@@ -1063,6 +1626,7 @@ def _reconcile(
         state = platform.get_auto_triage(client, project_id=target.target_id)
         if not state.enabled:
             return RECONCILE_HELD
+        found.update({"found": {"enabled": True}})
         config = snapshot.get("config_before")
         platform.set_auto_triage(
             client,
@@ -1085,6 +1649,8 @@ def _reconcile(
         )
         if current is not None and not current:
             return RECONCILE_HELD  # read back as disabled
+        if current is not None:
+            found.update({"found": {"remediationSeverities": current}})
         # Either severities were read back re-enabled (drift), or the setting
         # could not be read at all. Both re-apply the restriction; only the
         # first is drift.
@@ -1099,6 +1665,111 @@ def _reconcile(
             project.ai_state_checked_at = utcnow()
         return RECONCILE_UNVERIFIED if current is None else RECONCILE_REASSERTED
 
+    if kind == EnforcementKind.DISABLE_FUSION:
+        lock = bool(snapshot.get("lock_applied"))
+        try:
+            setting = platform.get_fusion_setting(client, project_id=target.target_id)
+        except CheckmarxError as exc:
+            if isinstance(exc, CheckmarxAuthError):
+                raise
+            # Unreadable is not evidence of drift: written again from the entry
+            # read before the restriction, which changes nothing if it holds.
+            base = snapshot.get("entry_before")
+            if not isinstance(base, dict) or not base:
+                raise
+            # A setting that is locked (by this restriction, or already before
+            # it) is written locked, with no unlocked fallback: falling back to
+            # the value as it was before could unlock it.
+            locked = lock or snapshot.get("allow_override_before") is False
+            _write_fusion_off(
+                client,
+                project_id=target.target_id,
+                base=base,
+                value_type=snapshot.get("value_before"),
+                lock=locked,
+                allow_override=snapshot.get("allow_override_before"),
+                outcome={},
+                fallback=not locked,
+            )
+            return RECONCILE_UNVERIFIED
+        if setting is None:
+            return RECONCILE_HELD
+        unlocked = lock and setting.allow_override is True
+        if not setting.enabled and not unlocked:
+            if lock and setting.allow_override is False and _lock_in_doubt(snapshot):
+                # Seen to hold at last: from now on its removal is drift.
+                action.undo_snapshot = {
+                    key: value for key, value in snapshot.items() if key not in _LOCK_DOUBT_KEYS
+                }
+            return RECONCILE_HELD
+        if not setting.enabled and snapshot.get("lock_unconfirmed"):
+            if snapshot.get("lock_seen_unlocked"):
+                # Read back without the lock after it was written, and again
+                # now: this tenant does not keep it. Said once; from now on the
+                # lock is neither sent nor checked, Fusion being off still is.
+                # What was there before stays for Restore.
+                concluded = {
+                    key: value for key, value in snapshot.items() if key not in _LOCK_DOUBT_KEYS
+                }
+                concluded["lock_applied"] = False
+                concluded["lock_not_kept"] = True
+                concluded["lock_rejected"] = (
+                    "Checkmarx One accepted the lock but did not keep it (read back on two "
+                    "consecutive checks); this tenant does not appear to support it."
+                )
+                action.undo_snapshot = concluded
+                return RECONCILE_LOCK_NOT_KEPT
+            # The lock was never seen to hold, so its absence is not evidence
+            # that anyone removed it: it is written again, without an alarm, and
+            # the next read decides.
+            _write_fusion_off(
+                client,
+                project_id=target.target_id,
+                base=setting.entry,
+                value_type=setting.value,
+                lock=True,
+                allow_override=setting.allow_override,
+                outcome={},
+            )
+            action.undo_snapshot = {**snapshot, "lock_seen_unlocked": True}
+            return RECONCILE_UNVERIFIED
+        found.update(
+            {
+                "found": {"value": setting.value, "allowOverride": setting.allow_override},
+                "origin_level": setting.origin_level,
+            }
+        )
+        _write_fusion_off(
+            client,
+            project_id=target.target_id,
+            base=setting.entry,
+            value_type=setting.value,
+            lock=lock,
+            allow_override=setting.allow_override,
+            outcome={},
+        )
+        return RECONCILE_REASSERTED
+
+    if kind == EnforcementKind.DISABLE_REPO_FUSION:
+        repo_id = snapshot.get("repo_id") or (project.repo_id if project else None)
+        if not repo_id:
+            return RECONCILE_HELD
+        read = platform.get_repo_fusion(client, repo_id=repo_id, project_id=target.target_id)
+        if read.readable and (read.config is None or not read.enabled):
+            return RECONCILE_HELD
+        base = read.config if read.config is not None else snapshot.get("repo_fusion_before")
+        if not isinstance(base, dict):
+            return RECONCILE_HELD
+        if read.readable:
+            found.update({"found": dict(base)})
+        platform.set_repo_fusion(
+            client,
+            repo_id=repo_id,
+            project_id=target.target_id,
+            config={**base, "enabled": False},
+        )
+        return RECONCILE_REASSERTED if read.readable else RECONCILE_UNVERIFIED
+
     return RECONCILE_HELD
 
 
@@ -1107,6 +1778,10 @@ def _reconciled_title(action: EnforcementAction) -> str:
         return f"User {action.target_label}: AI roles re-removed"
     if action.kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
         return f"Project {action.target_label}: Auto Triage re-disabled"
+    if action.kind == EnforcementKind.DISABLE_FUSION:
+        return f"Project {action.target_label}: Fusion turned off again"
+    if action.kind == EnforcementKind.DISABLE_REPO_FUSION:
+        return f"Project {action.target_label}: repository Fusion setting turned off again"
     return f"Project {action.target_label}: PR triage and remediation re-disabled"
 
 
@@ -1120,6 +1795,17 @@ def _reconciled_body(action: EnforcementAction) -> str:
         return (
             "Auto Triage was found enabled again after it had been disabled, so it "
             "was turned back off with its previous configuration preserved."
+        )
+    if action.kind == EnforcementKind.DISABLE_FUSION:
+        return (
+            "Fusion was found switched on again in the project's scan settings (or its lock "
+            "against per-scan override was removed) after it had been turned off, so it was "
+            "turned off again."
+        )
+    if action.kind == EnforcementKind.DISABLE_REPO_FUSION:
+        return (
+            "Fusion was found enabled again in the repository's settings after it had been "
+            "turned off, so it was turned off again."
         )
     return (
         "PR triage and remediation severities were re-asserted to none, keeping "
@@ -1152,6 +1838,8 @@ def _took_something(snapshot: dict[str, Any] | None) -> bool:
         snapshot.get("removed_roles")
         or snapshot.get("enabled_before")
         or snapshot.get("severities_before")
+        or snapshot.get("fusion_write")
+        or snapshot.get("repo_fusion_enabled_before")
     )
 
 
@@ -1564,6 +2252,45 @@ def _undo(
             project.ai_state_checked_at = utcnow()
         return
 
+    if action.kind == EnforcementKind.DISABLE_FUSION:
+        if not snapshot.get("fusion_write"):
+            return
+        value = snapshot.get("value_before")
+        if not isinstance(value, str | bool):
+            raise CheckmarxError(
+                "The Fusion setting recorded for this action is missing, so Fusion cannot be "
+                "restored automatically."
+            )
+        base = snapshot.get("entry_before")
+        platform.set_project_setting(
+            client,
+            project_id=action.target_id,
+            entry=_fusion_entry(
+                base if isinstance(base, dict) else {},
+                value=value,
+                allow_override=snapshot.get("allow_override_before"),
+            ),
+        )
+        return
+
+    if action.kind == EnforcementKind.DISABLE_REPO_FUSION:
+        if not snapshot.get("repo_fusion_enabled_before"):
+            return
+        before = snapshot.get("repo_fusion_before")
+        repo_id = snapshot.get("repo_id")
+        if not repo_id:
+            project = session.get(CxProject, action.target_id)
+            repo_id = project.repo_id if project is not None else None
+        if not isinstance(before, dict) or not repo_id:
+            raise CheckmarxError(
+                "The repository Fusion setting recorded for this action is missing, so it "
+                "cannot be restored automatically."
+            )
+        platform.set_repo_fusion(
+            client, repo_id=repo_id, project_id=action.target_id, config=before
+        )
+        return
+
     raise CheckmarxError(f"Unknown enforcement kind {action.kind!r}")
 
 
@@ -1602,6 +2329,83 @@ def restore_for_limit(
     return restored
 
 
+def deselected(action: EnforcementAction, limit: CreditLimit | None) -> bool:
+    """True when this project action's limit no longer turns its kind off."""
+    if limit is None or action.target_type != TARGET_PROJECT:
+        return False
+    wanted = PROJECT_ACTION_OF_KIND.get(str(action.kind))
+    return wanted is not None and wanted not in effective_project_actions(limit)
+
+
+def restore_deselected(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    limit: CreditLimit,
+    actor: AuditActor,
+) -> int:
+    """Put back what this limit turned off and no longer turns off.
+
+    An admin who takes Fusion (say) off a limit's list expects Fusion to come
+    back now, not at the end of the period. Other limits restricting the same
+    project keep their hold, exactly as with any other automatic lift.
+    """
+    rows = [
+        action
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.limit_id == limit.id,
+                EnforcementAction.status.in_(RESTORABLE_STATUSES),
+            )
+        )
+        if may_be_in_force(action) and deselected(action, limit)
+    ]
+    restored = 0
+    first_error: CheckmarxError | None = None
+    resolver = RoleResolver(client)
+    for action in rows:
+        try:
+            if restore_action(
+                session,
+                client,
+                action=action,
+                actor=actor,
+                reason=DESELECTED_REASON,
+                resolver=resolver,
+            ):
+                restored += 1
+        except CheckmarxError as exc:
+            first_error = first_error or exc
+    if first_error is not None:
+        raise first_error
+    return restored
+
+
+def active_actions(session: Session, *, limit: int) -> list[EnforcementAction]:
+    """The newest ``limit`` actions that are, or may be, in force.
+
+    Rows that can never be in force (a FAILED attempt that took nothing, a
+    "not applicable" one retried every cycle) do not count towards ``limit``:
+    the rows are read in batches until enough in force are found, so however
+    many of those pile up they never push an applied restriction off the list.
+    """
+    batch = max(limit, 200)
+    query = (
+        select(EnforcementAction)
+        .where(EnforcementAction.status.in_(RESTORABLE_STATUSES))
+        .order_by(EnforcementAction.created_at.desc(), EnforcementAction.id.desc())
+    )
+    found: list[EnforcementAction] = []
+    offset = 0
+    while len(found) < limit:
+        rows = list(session.scalars(query.offset(offset).limit(batch)))
+        found.extend(row for row in rows if may_be_in_force(row))
+        if len(rows) < batch:
+            break
+        offset += batch
+    return found[:limit]
+
+
 def active_actions_for(
     session: Session, *, entity_type: str, entity_id: str
 ) -> list[EnforcementAction]:
@@ -1627,7 +2431,63 @@ def _enforcement_title(target: Target) -> str:
         return f"User {target.target_label} restricted"
     if target.kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
         return f"Project {target.target_label}: Auto Triage disabled"
+    if target.kind == EnforcementKind.DISABLE_FUSION:
+        return f"Project {target.target_label}: Fusion turned off"
+    if target.kind == EnforcementKind.DISABLE_REPO_FUSION:
+        return f"Project {target.target_label}: repository Fusion setting turned off"
     return f"Project {target.target_label}: PR triage and remediation disabled"
+
+
+def _fusion_lines(snapshot: dict[str, Any]) -> list[str]:
+    """What turning Fusion off did to the project's scan setting, plainly."""
+    lines: list[str] = []
+    if snapshot.get("fusion_enabled_before"):
+        lines.append(f"Fusion was turned off for this project ({platform.FUSION_SETTING_KEY}).")
+        origin = snapshot.get("origin_level_before")
+        if origin and str(origin).lower() != "project":
+            lines.append(
+                f"It was inherited from the {str(origin).lower()} level; it is now set on the "
+                "project itself."
+            )
+    else:
+        lines.append("Fusion was already off for this project.")
+    if snapshot.get("lock_applied") is True:
+        lines.append(
+            "Its setting was also locked against per-scan override (allowOverride off). "
+            "Whether Checkmarx One honours that lock for a scan started with its own settings "
+            "is not verified; CreditGuard checks the setting every cycle and records any scan "
+            "that ran Fusion anyway as a policy violation."
+        )
+        if snapshot.get("lock_unconfirmed"):
+            lines.append(
+                "The lock could not be confirmed when it was read back straight after; it is "
+                "checked again on the next cycle. If it is still not there then, this tenant "
+                "is taken not to keep it, and that is said once."
+            )
+    elif snapshot.get("lock_not_kept"):
+        lines.append(
+            "Checkmarx One accepted locking the setting against per-scan override but did not "
+            "keep it (read back on two consecutive checks), so this tenant does not appear to "
+            "support the lock and a scan started with its own settings can still turn Fusion "
+            "on for that one scan. The lock is not checked again; Fusion being off still is. "
+            "Any scan that runs Fusion is recorded as a policy violation."
+        )
+    elif snapshot.get("lock_applied") is False:
+        lines.append(
+            "Checkmarx One did not accept locking the setting against per-scan override "
+            f"({snapshot.get('lock_rejected') or 'refused'}), so a scan started with its own "
+            "settings can still turn Fusion on for that one scan. Any scan that does is "
+            "recorded as a policy violation."
+        )
+    elif snapshot.get("allow_override_before") is False:
+        lines.append("Its setting was already locked against per-scan override.")
+    else:
+        lines.append(
+            "Its setting was not locked against per-scan override (switched off in Settings → "
+            "Enforcement), so a scan started with its own settings can still turn Fusion on "
+            "for that one scan. Any scan that does is recorded as a policy violation."
+        )
+    return lines
 
 
 def _enforcement_body(
@@ -1660,10 +2520,23 @@ def _enforcement_body(
             if not snapshot.get("enabled_before")
             else "Auto Triage was turned off for this project."
         )
+    elif target.kind == EnforcementKind.DISABLE_FUSION:
+        lines.extend(_fusion_lines(snapshot))
+    elif target.kind == EnforcementKind.DISABLE_REPO_FUSION:
+        before = snapshot.get("repo_fusion_before") or {}
+        model = before.get("llmModel") if isinstance(before, dict) else None
+        lines.append(
+            "Fusion was turned off in the repository's settings"
+            + (f" (it was on, model {model})." if model else ".")
+            if snapshot.get("repo_fusion_enabled_before")
+            else "Fusion was already off in the repository's settings."
+        )
     else:
         before = snapshot.get("severities_before") or []
         lines.append(f"PR remediation severities cleared (were: {', '.join(before) or 'none'}).")
-    lines.append(usage_mix.does_not_stop(target.kind, mix))
+    lines.append(
+        usage_mix.does_not_stop(target.kind, mix, actions=effective_project_actions(limit))
+    )
     lines.append("Use Restore access to reverse this.")
     return "\n".join(lines)
 
@@ -1673,6 +2546,10 @@ def _restoration_title(action: EnforcementAction) -> str:
         return f"User {action.target_label} restored"
     if action.kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
         return f"Project {action.target_label}: Auto Triage re-enabled"
+    if action.kind == EnforcementKind.DISABLE_FUSION:
+        return f"Project {action.target_label}: Fusion setting restored"
+    if action.kind == EnforcementKind.DISABLE_REPO_FUSION:
+        return f"Project {action.target_label}: repository Fusion setting restored"
     return f"Project {action.target_label}: PR triage and remediation re-enabled"
 
 
@@ -1686,6 +2563,10 @@ def _restoration_body(action: EnforcementAction, snapshot: dict[str, Any], reaso
             "so the restriction was lifted."
         ),
         EXEMPTED_REASON: "An exemption was granted for this entity, so the restriction was lifted.",
+        DESELECTED_REASON: (
+            "The limit no longer turns this off (its choice of what to turn off was changed), "
+            "so it was put back."
+        ),
     }.get(reason, reason)
     if action.kind == EnforcementKind.REMOVE_USER_ROLES:
         restored = [entry.get("name") for entry in snapshot.get("removed_roles") or []]
@@ -1700,7 +2581,39 @@ def _restoration_body(action: EnforcementAction, snapshot: dict[str, Any], reaso
             if snapshot.get("enabled_before")
             else "Auto Triage was off before the restriction, so it was left off."
         )
+    elif action.kind == EnforcementKind.DISABLE_FUSION:
+        detail = _fusion_restore_detail(snapshot)
+    elif action.kind == EnforcementKind.DISABLE_REPO_FUSION:
+        detail = (
+            "The repository's Fusion setting was put back to what it was."
+            if snapshot.get("repo_fusion_enabled_before")
+            else "Fusion was off in the repository's settings before the restriction, so it "
+            "was left off."
+        )
     else:
         severities = snapshot.get("severities_before") or []
         detail = f"PR remediation severities restored to: {', '.join(severities) or 'none'}."
     return f"{explanation}\n{detail}"
+
+
+def _fusion_restore_detail(snapshot: dict[str, Any]) -> str:
+    if not snapshot.get("fusion_write"):
+        return "Fusion was off (and locked) before the restriction, so nothing was changed."
+    value = snapshot.get("value_before")
+    state = "on" if platform.setting_is_true(value) else "off"
+    lock = snapshot.get("allow_override_before")
+    detail = f"Fusion was put back {state}"
+    if lock is not None:
+        detail += (
+            ", with per-scan override allowed" if lock else ", locked against per-scan override"
+        )
+    detail += ", as it was before the restriction."
+    origin = snapshot.get("origin_level_before")
+    if origin and str(origin).lower() != "project":
+        detail += (
+            f" Before the restriction it was inherited from the {str(origin).lower()} level. "
+            "Checkmarx One offers no known way to remove a project's own value, so it is now "
+            "set on the project with the same value, and a later change at the "
+            f"{str(origin).lower()} level no longer reaches this project."
+        )
+    return detail

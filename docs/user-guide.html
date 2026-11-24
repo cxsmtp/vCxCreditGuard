@@ -262,6 +262,7 @@
     <a href="#measurement">How usage is measured</a>
     <a href="#attribution">Attribution &amp; disputes</a>
     <a href="#enforcement">Enforcement</a>
+    <a href="#violations">Policy violations</a>
     <a href="#notifications">Notifications</a>
     <a href="#settings">Settings</a>
     <div class="group">Operating it</div>
@@ -511,15 +512,38 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
         <thead><tr><th>Level breached</th><th>What changes</th></tr></thead>
         <tbody>
           <tr><td>User</td><td>The AI roles are unmapped from the user on the <code>ast-app</code> client. Scan viewing is left as their Checkmarx permission has it.</td></tr>
-          <tr><td>Project</td><td>Auto Triage is disabled, and PR triage &amp; remediation is disabled by clearing the remediation severities.</td></tr>
-          <tr><td>Group</td><td>Both project actions, on every project in the group.</td></tr>
-          <tr><td>Application</td><td>Both project actions, on every project in the application.</td></tr>
+          <tr><td>Project</td><td>What the limit's <strong>What to turn off for projects</strong> choice says: Auto Triage is disabled; PR triage &amp; remediation is disabled by clearing the remediation severities; Fusion is turned off in the project's scan settings (and in its repository's settings where Checkmarx reports one).</td></tr>
+          <tr><td>Group</td><td>The chosen project actions, on every project in the group.</td></tr>
+          <tr><td>Application</td><td>The chosen project actions, on every project in the application.</td></tr>
         </tbody>
       </table></div>
+      <p><strong>What to turn off for projects.</strong> Each project, group and application limit has three checkboxes: <em>Turn off Auto Triage</em>, <em>Turn off PR triage and remediation</em> and <em>Turn off Fusion</em>. New limits start with all three. A limit made before the choice existed keeps turning off Auto Triage and PR triage and remediation only, until you change it. Taking an action off a limit that is restricting now puts that setting back straight away. The Simulation page and the blast radius in the limit form count what the choice would turn off.</p>
+      <div class="callout warn">
+        <span class="ico">!</span>
+        <div><span class="h">What turning Fusion off does not stop.</span><p style="margin-top:0.2rem;">A scan started with its own settings can turn Fusion on for that one scan. CreditGuard also tries to lock the project's setting against that (Settings → Enforcement, <em>Lock Fusion against per-scan override</em>, on by default); whether Checkmarx One honours the lock is <strong>not verified</strong>, and a tenant that refuses the lock gets Fusion turned off without it. The AI engine can still run without Fusion (LLM-based scanning); whether that costs credits is not known. Turning Fusion off in a repository's settings is <strong>not verified</strong> either: it is skipped when Checkmarx does not report the setting, and a setting (or lock) that Checkmarx accepts but does not keep is noticed by reading it back on two consecutive checks (one read straight after a write can be behind it) and said once; a repository setting not kept is then not sent again that period. What was there before is always kept, so Restore puts it back. CreditGuard re-applies every restriction each cycle and records anything done against it under <a href="#violations">Policy violations</a>.</p></div>
+      </div>
       <div class="callout tip">
         <span class="ico">↺</span>
         <div><span class="h">Everything is reversible.</span><p style="margin-top:0.2rem;">Before any change, the exact prior state is snapshotted onto the enforcement record — which roles the user held, the project's Auto Triage config, the prior severity list. <strong>Restore access</strong> replays that snapshot. A feature that was already off beforehand stays off on restore.</p></div>
       </div>
+    </section>
+
+    <!-- VIOLATIONS -->
+    <section id="violations">
+      <p class="section-kicker">09b — Daily use</p>
+      <h2>Policy violations</h2>
+      <p>CreditGuard does not rely on Checkmarx One keeping a restricted setting off: every cycle it reads each restriction back and applies it again if it was undone. The <strong>Violations</strong> page (admins only; <em>Policy violations</em> in Jump to) is the record of what it found, so someone can follow it up:</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>What happened</th><th>What is recorded</th></tr></thead>
+        <tbody>
+          <tr><td>Setting switched back on</td><td>Auto Triage, PR triage and remediation, Fusion (or its lock), the repository's Fusion setting, or a user's AI roles found back on, and turned off again. Checkmarx One does not say who changed it. One record per restriction per budget period, counting how often it was found and when last.</td></tr>
+          <tr><td>Fusion scan during a restriction</td><td>A scan on a project whose Fusion is turned off, started after the restriction, that ran Fusion anyway: who started it, from where (web app, PR webhook), the branch, the model and, when the price is known, what it costs.</td></tr>
+          <tr><td>AI scans without Fusion</td><td>The same, but the AI engine ran without Fusion: the restriction working. Counted quietly, one information row per project per day, with no notification. Its cost is not known.</td></tr>
+          <tr><td>Scans not checked</td><td>More scans were made on a restricted project since the last look than one cycle lists, so the older ones in between were not checked. Said once per restriction, as information.</td></tr>
+          <tr><td>Usage kept rising</td><td>What the restriction is meant to stop (a user's AI Triage and AI Remediation, a project's Auto Triage or Fusion) kept rising in the consumption feed after it was applied (each one measured from its own restriction). Credits can be billed a little after the action, so a small rise straight after a restriction may predate it.</td></tr>
+        </tbody>
+      </table></div>
+      <p>The AI-scan counts and scans not checked are <em>Information</em>: nothing to follow up, no notification, not counted on the top-bar light or the menu, and listed under the <em>Information</em> filter (the page opens on <em>All violations</em>). Each new violation raises one notification and lights a top-bar light and a count on the menu. A setting switched back on is notified in the <em>Enforcement</em> category, as a re-applied restriction always was: once per restriction per budget period for a user's roles, Auto Triage and PR triage and remediation, once a day for Fusion. Scans and usage are notified under <em>Policy violations</em>. Notifications and the audit log name the project, never the person: who started a scan is shown only here, to admins. Open one to see its evidence, add a note, and <strong>Acknowledge</strong> or <strong>Resolve</strong> it; both are audited.</p>
     </section>
 
     <!-- NOTIFICATIONS -->
@@ -565,12 +589,14 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
           <tr><td>Credit usage</td><td>Read credit consumption</td></tr>
           <tr><td>Role mapping <span class="chip crit">enforce</span></td><td>IAM admin, enough to manage role mappings</td></tr>
           <tr><td>Project AI toggles <span class="chip crit">enforce</span></td><td>Manage project configuration</td></tr>
+          <tr><td>Project scan settings (Fusion) <span class="chip crit">enforce</span></td><td>Read and change project configuration (<code>/api/configuration/project</code>), only for limits that turn Fusion off</td></tr>
+          <tr><td>Credits per action <span class="chip">optional</span></td><td>Read <code>/api/v1/credits/action-rates</code>, to price Fusion scans per model</td></tr>
         </tbody>
       </table></div>
       <p>Enforcement fails with a clear 403 naming the missing permission rather than silently doing nothing. Projects the key cannot see are reported as a warning rather than undercounted quietly.</p>
       <p><strong>An admin's own key can still be refused.</strong> A Checkmarx One API key most likely carries only the roles chosen when it was created, not everything its owner holds, so a key made under a tenant administrator's account can lack permissions the administrator has in the browser. Use a dedicated service account with a key created for CreditGuard.</p>
       <p><strong>Key permissions check.</strong> CreditGuard checks the key with read-only calls when the connection is saved or tested, every few hours, and when an admin presses <em>Check again</em> (Settings → Connection → <em>Key permissions</em>). Changes (role mapping, Auto Triage, PR triage and remediation) cannot be tried without changing the tenant, so they show as <em>not tested</em>, or <em>will fail</em> when the matching read was refused; any 403 met at run time is added to the same report at once. A refused read is cleared by the next check that reads it successfully; a refused change is cleared only when CreditGuard next makes that same change successfully (<em>Check again</em> cannot test a change). While something needed with the current setup is confirmed missing, every page shows a banner, the top bar shows a <em>Key permissions</em> light, and admins get a pop-up once per sign-in explaining what is missing, what stops working, the roles the key has, and what to do. Gaps in things not in use (the credit pool, groups or applications while no such limit exists, enforce-mode calls while no limit enforces) and changes that are only <em>probably refused</em> are shown on the <em>Key permissions</em> card only.</p>
-      <p><strong>Breach messages</strong> say what the period's credits went on (for example <em>4 credits used in 2026-11: Fusion scan 4</em>) and what the restriction does not stop: turning off Auto Triage and PR triage and remediation, or removing a user's AI roles, does not stop Fusion scans.</p>
+      <p><strong>Breach messages</strong> say what the period's credits went on (for example <em>4 of 3 credits used in November 2026: Fusion scan (Opus 5.5) 2 scans = 4 credits</em>, priced from Checkmarx's credits per action when the period's counts can be trusted) and what the restriction does not stop: a limit that does not turn Fusion off says so, and removing a user's AI roles changes no project setting.</p>
     </section>
 
     <!-- SECURITY -->

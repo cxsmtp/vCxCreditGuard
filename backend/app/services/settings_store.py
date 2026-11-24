@@ -103,6 +103,11 @@ KEY_MAX_NEW_TARGETS = "enforcement.max_new_targets_per_cycle"
 # let through once, and the ceilings apply again from the following cycle.
 KEY_CEILING_WAIVED_ONCE = "enforcement.ceiling_waived_once"
 KEY_PROTECTED_ROLES = "enforcement.protected_roles"
+# Turning Fusion off for a project also tries to lock the project's setting
+# (allowOverride false), so that a single scan cannot switch it back on. Whether
+# Checkmarx One honours that lock for ad hoc scans is not verified, and a
+# tenant that rejects the lock still gets Fusion turned off without it.
+KEY_FUSION_LOCK = "enforcement.fusion_lock_override"
 
 # Attribution: when on, the Auto Triage credits a project reports are also
 # charged to the person (a synced Checkmarx user) whose scan triggered the auto
@@ -123,8 +128,15 @@ KEY_AUTO_TRIAGE_OBSERVATION_EPOCH = "attribution.auto_triage_observation_epoch"
 # JSON. Bookkeeping, not configuration: it is never shown on the Settings page,
 # never part of a configuration backup and never part of the attestation digest.
 KEY_KEY_PERMISSIONS = "connection.key_permissions"
+# The latest price per action from GET /api/v1/credits/action-rates, read once
+# per cycle, best effort. Bookkeeping like the report above: never a setting.
+KEY_ACTION_RATES = "credits.action_rates"
+# Newest scan the policy violation check has looked at, per restricted project.
+KEY_VIOLATION_SCAN_CURSORS = "violations.scan_cursors"
 # Rows kept in app_setting that are state rather than settings.
-INTERNAL_KEYS: frozenset[str] = frozenset({KEY_KEY_PERMISSIONS})
+INTERNAL_KEYS: frozenset[str] = frozenset(
+    {KEY_KEY_PERMISSIONS, KEY_ACTION_RATES, KEY_VIOLATION_SCAN_CURSORS}
+)
 
 # Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
 # so it can never collide with a real Checkmarx lookback window, and so the read
@@ -168,6 +180,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_MAX_NEW_TARGETS: 100,
     KEY_CEILING_WAIVED_ONCE: False,
     KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
+    KEY_FUSION_LOCK: True,
     KEY_AUTO_TRIAGE_TO_INITIATOR: False,
 }
 
@@ -299,6 +312,19 @@ def enforcement_guard(session: Session) -> EnforcementGuard:
             if name.strip()
         ),
     )
+
+
+def fusion_lock_enabled(session: Session) -> bool:
+    """Whether turning Fusion off also tries to lock it against per-scan override."""
+    return get_value(session, KEY_FUSION_LOCK, DEFAULTS[KEY_FUSION_LOCK]) is not False
+
+
+def action_rates(session: Session) -> dict[str, Any] | None:
+    """The stored action rates ({"read_at", "rates": [...]}) or None if never read."""
+    value = get_value(session, KEY_ACTION_RATES)
+    if not isinstance(value, dict) or not isinstance(value.get("rates"), list):
+        return None
+    return value
 
 
 def credit_unit_cost(session: Session) -> float:

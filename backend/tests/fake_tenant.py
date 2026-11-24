@@ -65,6 +65,46 @@ class FakeTenant:
     scans: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     # Every GET /api/scans/ query, as parsed parameters, for assertions.
     scan_queries: list[dict[str, list[str]]] = field(default_factory=list)
+    # project id -> entries of GET /api/configuration/project?project-id=...
+    project_config: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Every PATCH /api/configuration/project body, as (project id, entries).
+    config_patches: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
+    # Answer a PATCH that locks an entry (allowOverride false) with 400, like a
+    # tenant that does not accept the lock.
+    reject_config_lock: bool = False
+    # Answer 2xx to a lock (allowOverride false) but keep allowOverride as it
+    # was, like a tenant that does not support the lock.
+    drop_config_lock: bool = False
+    # Answer 2xx to a project configuration PATCH but keep nothing.
+    drop_config_writes: bool = False
+    # Answer 2xx to a fusionScanConfig PATCH but keep nothing.
+    drop_repo_fusion_writes: bool = False
+    # repo id -> fusionScanConfig. A repo absent here has no fusionScanConfig
+    # in its settings (the read does not include it).
+    repo_fusion: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # GET /api/v1/credits/action-rates. None: the endpoint answers 404.
+    action_rates: list[dict[str, Any]] | None = field(
+        default_factory=lambda: [
+            {
+                "action_type": "fusion_scan_-_haiku_4.5",
+                "credits_per_action": "1.5",
+                "display_name": "Fusion Scan - Haiku 4.5",
+                "is_active": True,
+            },
+            {
+                "action_type": "fusion_scan_-_opus_4.7",
+                "credits_per_action": "2.5",
+                "display_name": "Fusion Scan - Opus 4.7",
+                "is_active": True,
+            },
+            {
+                "action_type": "fusion_scan_-_opus_5.5",
+                "credits_per_action": "2",
+                "display_name": "Fusion Scan - Opus 5.5",
+                "is_active": True,
+            },
+        ]
+    )
 
     # Test controls
     unsupported_views: set[str] = field(default_factory=set)
@@ -159,6 +199,66 @@ class FakeTenant:
                 "severityLevels": ["CRITICAL", "HIGH"],
             },
         }
+        self.set_fusion_setting(project_id, value="true", origin="Project", allow_override=True)
+
+    def set_fusion_setting(
+        self,
+        project_id: str,
+        *,
+        value: str | None,
+        origin: str = "Project",
+        allow_override: bool = True,
+    ) -> None:
+        """The project's scan settings, as GET /api/configuration/project lists them.
+
+        ``value`` None leaves the Fusion entry out altogether.
+        """
+        entries: list[dict[str, Any]] = [
+            {
+                "key": "scan.config.ai.llmModel",
+                "name": "LLM Model",
+                "category": "ai",
+                "originLevel": "Tenant",
+                "value": "opus-5.5",
+                "valuetype": "String",
+                "allowOverride": True,
+                "isPersisted": True,
+            },
+            {
+                "key": "scan.config.ai.allowAiUsage",
+                "name": "Allow AI Usage",
+                "category": "ai",
+                "originLevel": "Tenant",
+                "value": "true",
+                "valuetype": "Bool",
+                "allowOverride": True,
+                "isPersisted": True,
+            },
+        ]
+        if value is not None:
+            entries.append(
+                {
+                    "key": "scan.config.ai.fusionEnabled",
+                    "name": "Fusion Scan",
+                    "category": "ai",
+                    "originLevel": origin,
+                    "value": value,
+                    "valuetype": "Bool",
+                    "allowOverride": allow_override,
+                    "isPersisted": True,
+                }
+            )
+        self.project_config[project_id] = entries
+
+    def fusion_setting(self, project_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                entry
+                for entry in self.project_config.get(project_id, [])
+                if entry["key"] == "scan.config.ai.fusionEnabled"
+            ),
+            None,
+        )
 
     def add_application(
         self, *, application_id: str, name: str, project_ids: list[str] | None = None
@@ -254,27 +354,40 @@ class FakeTenant:
         status: str = "Completed",
         created_at: datetime | None = None,
         source_origin: str = "webapp",
+        engines: list[str] | None = None,
+        ai: dict[str, Any] | None = None,
+        metadata_in_listing: bool = True,
     ) -> None:
-        """A scan in the shape of GET /api/scans/ (synthetic data only)."""
+        """A scan in the shape of GET /api/scans/ (synthetic data only).
+
+        ``ai`` is the scan's ``metadata.configs[type=ai].value`` (for example
+        ``{"fusionEnabled": "true", "llmModel": "opus-5.5"}``). With
+        ``metadata_in_listing`` False only the scan's own read carries it.
+        """
         created = created_at or completed_at - timedelta(minutes=10)
-        self.scans.setdefault(project_id, []).append(
-            {
-                "id": scan_id,
-                "status": status,
-                "statusDetails": [{"name": "general", "status": status, "details": ""}],
-                "branch": branch,
-                "createdAt": _iso(created),
-                "updatedAt": _iso(completed_at),
-                "projectId": project_id,
-                "projectName": project_id,
-                "userAgent": "test-agent",
-                "initiator": initiator,
-                "tags": {},
-                "engines": ["sast", "sca"],
-                "sourceType": "github",
-                "sourceOrigin": source_origin,
-            }
-        )
+        payload: dict[str, Any] = {
+            "id": scan_id,
+            "status": status,
+            "statusDetails": [{"name": "general", "status": status, "details": ""}],
+            "branch": branch,
+            "createdAt": _iso(created),
+            "updatedAt": _iso(completed_at),
+            "projectId": project_id,
+            "projectName": project_id,
+            "userAgent": "test-agent",
+            "initiator": initiator,
+            "tags": {},
+            "engines": engines or ["sast", "sca"],
+            "sourceType": "github",
+            "sourceOrigin": source_origin,
+        }
+        configs: list[dict[str, Any]] = [{"type": "sast", "value": {"incremental": "false"}}]
+        if ai is not None:
+            configs.append({"type": "ai", "value": dict(ai)})
+        payload["metadata"] = {"id": scan_id, "type": "upload", "configs": configs}
+        if not metadata_in_listing:
+            payload["_metadata_only_in_detail"] = True
+        self.scans.setdefault(project_id, []).append(payload)
 
     # ----------------------------------------------------------------- routing
 
@@ -343,6 +456,24 @@ class FakeTenant:
 
         if path.rstrip("/").endswith("/api/scans") and request.method == "GET":
             return self._scans_response(params)
+
+        if "/api/scans/" in path and request.method == "GET":
+            scan_id = path.rstrip("/").rsplit("/", 1)[1]
+            for rows in self.scans.values():
+                for row in rows:
+                    if row["id"] == scan_id:
+                        return httpx.Response(200, json=_public_scan(row, detail=True))
+            return httpx.Response(404, json={"message": "no such scan"})
+
+        if path.rstrip("/").endswith("/api/configuration/project"):
+            return self._project_config_response(request, params)
+
+        if path.rstrip("/").endswith("/api/v1/credits/action-rates"):
+            if self.action_rates is None:
+                return httpx.Response(404, json={"message": "not found"})
+            return httpx.Response(
+                200, json={"count": len(self.action_rates), "rates": self.action_rates}
+            )
 
         return httpx.Response(404, json={"message": f"no fake route for {path}"})
 
@@ -430,9 +561,42 @@ class FakeTenant:
             json={
                 "totalCount": total,
                 "filteredTotalCount": len(rows),
-                "scans": rows[offset : offset + limit],
+                "scans": [_public_scan(row) for row in rows[offset : offset + limit]],
             },
         )
+
+    def _project_config_response(
+        self, request: httpx.Request, params: dict[str, list[str]]
+    ) -> httpx.Response:
+        project_id = params.get("project-id", [""])[0]
+        if not project_id:
+            return httpx.Response(400, json={"message": "project-id is required"})
+        if request.method == "GET":
+            return httpx.Response(200, json=self.project_config.get(project_id, []))
+        if request.method != "PATCH":
+            return httpx.Response(405, json={"message": "only GET and PATCH"})
+        body = json.loads(request.content or b"[]")
+        if not isinstance(body, list):
+            return httpx.Response(400, json={"message": "expected a list"})
+        if self.reject_config_lock and any(
+            isinstance(entry, dict) and entry.get("allowOverride") is False for entry in body
+        ):
+            return httpx.Response(400, json={"message": "allowOverride cannot be changed"})
+        self.config_patches.append((project_id, body))
+        if self.drop_config_writes:
+            return httpx.Response(204)
+        entries = self.project_config.setdefault(project_id, [])
+        for update in body:
+            for index, entry in enumerate(entries):
+                if entry["key"] == update.get("key"):
+                    kept = dict(update)
+                    if self.drop_config_lock and kept.get("allowOverride") is False:
+                        kept["allowOverride"] = entry.get("allowOverride")
+                    entries[index] = {**entry, **kept}
+                    break
+            else:
+                entries.append(dict(update))
+        return httpx.Response(204)
 
     def _role_mapping_response(self, request: httpx.Request, path: str) -> httpx.Response:
         user_id = path.split("/users/")[1].split("/role-mappings")[0]
@@ -490,19 +654,22 @@ class FakeTenant:
         if request.method == "GET":
             if "projectId" not in params:
                 return httpx.Response(400, json={"message": "projectId is required"})
-            return httpx.Response(
-                200,
-                json={
-                    "id": repo_id,
-                    "remediationSeverities": self.repo_severities.get(repo_id, []),
-                },
-            )
+            settings: dict[str, Any] = {
+                "id": repo_id,
+                "remediationSeverities": self.repo_severities.get(repo_id, []),
+            }
+            if repo_id in self.repo_fusion:
+                settings["fusionScanConfig"] = dict(self.repo_fusion[repo_id])
+            return httpx.Response(200, json=settings)
         if request.method != "PATCH":
             return httpx.Response(405, json={"message": "only PATCH is implemented"})
         if "projectId" not in params:
             return httpx.Response(400, json={"message": "projectId is required"})
         body = json.loads(request.content or b"{}")
-        self.repo_severities[repo_id] = list(body.get("remediationSeverities", []))
+        if "remediationSeverities" in body:
+            self.repo_severities[repo_id] = list(body.get("remediationSeverities", []))
+        if isinstance(body.get("fusionScanConfig"), dict) and not self.drop_repo_fusion_writes:
+            self.repo_fusion[repo_id] = dict(body["fusionScanConfig"])
         return httpx.Response(200, json={"status": "ok"})
 
     # ------------------------------------------------------------------ client
@@ -545,6 +712,15 @@ def access_token_with(
         payload["groups"] = groups
     header = b64url({"alg": "RS256", "typ": "JWT"})
     return f"{header}.{b64url(payload)}.c2lnbmF0dXJl"
+
+
+def _public_scan(row: dict[str, Any], *, detail: bool = False) -> dict[str, Any]:
+    """A stored scan as the API returns it: the listing may leave metadata out."""
+    hidden = row.get("_metadata_only_in_detail")
+    out = {key: value for key, value in row.items() if not key.startswith("_")}
+    if hidden and not detail:
+        out.pop("metadata", None)
+    return out
 
 
 def _iso(moment: datetime) -> str:

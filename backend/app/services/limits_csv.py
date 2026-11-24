@@ -47,6 +47,10 @@ COLUMNS = (
     "custom_period_start",
     "custom_period_end",
     "notes",
+    # What a project, group or application limit turns off, separated by ";"
+    # (auto_triage;pr_remediation;fusion). Empty: Auto Triage and PR triage and
+    # remediation, what limits did before the choice existed.
+    "project_actions",
 )
 
 # Columns produced by the export for context. They are ignored on import, because
@@ -141,6 +145,7 @@ def export_limits(session: Session) -> str:
                     limit.custom_period_start.isoformat() if limit.custom_period_start else "",
                     limit.custom_period_end.isoformat() if limit.custom_period_end else "",
                     limit.notes or "",
+                    ";".join(limit.project_actions) if limit.project_actions is not None else "",
                     credits_used,
                     period_key,
                     status,
@@ -207,6 +212,8 @@ def import_limits(
         return result
 
     headers = {name.strip().lower() for name in reader.fieldnames if name}
+    # Without the column, an import leaves each existing limit's choice alone.
+    has_project_actions = "project_actions" in headers
     missing = {"entity_type", "entity_id", "credit_limit"} - headers
     if missing:
         result.errors.append(
@@ -316,20 +323,23 @@ def import_limits(
         if existing is None:
             limits_service.create_limit(session, data=data, actor=actor)
         else:
+            changes: dict[str, object] = {
+                "credit_limit": data.credit_limit,
+                "period_type": data.period_type,
+                "warning_threshold_pct": data.warning_threshold_pct,
+                "enforce": data.enforce,
+                "include_member_usage": data.include_member_usage,
+                "hold_until_released": data.hold_until_released,
+                "custom_period_start": data.custom_period_start,
+                "custom_period_end": data.custom_period_end,
+                "notes": data.notes,
+            }
+            if has_project_actions:
+                changes["project_actions"] = data.project_actions
             limits_service.update_limit(
                 session,
                 limit=existing,
-                changes={
-                    "credit_limit": data.credit_limit,
-                    "period_type": data.period_type,
-                    "warning_threshold_pct": data.warning_threshold_pct,
-                    "enforce": data.enforce,
-                    "include_member_usage": data.include_member_usage,
-                    "hold_until_released": data.hold_until_released,
-                    "custom_period_start": data.custom_period_start,
-                    "custom_period_end": data.custom_period_end,
-                    "notes": data.notes,
-                },
+                changes=changes,
                 actor=actor,
                 client=client,
                 # Lifted after every row is applied, so the import stays all or
@@ -414,6 +424,18 @@ def _row_to_input(row: dict[str, str]) -> limits_service.LimitInput:
     if start and end and end <= start:
         raise ValueError("custom_period_end must be after custom_period_start")
 
+    raw_actions = (row.get("project_actions") or "").strip()
+    project_actions: list[str] | None = None
+    if raw_actions:
+        if entity_type == EntityType.USER:
+            raise ValueError(
+                "project_actions is only valid for project, group and application limits"
+            )
+        try:
+            project_actions = limits_service.normalise_project_actions(raw_actions)
+        except limits_service.LimitError as exc:
+            raise ValueError(str(exc)) from exc
+
     return limits_service.LimitInput(
         entity_type=entity_type,
         entity_id=entity_id,
@@ -428,4 +450,5 @@ def _row_to_input(row: dict[str, str]) -> limits_service.LimitInput:
         custom_period_start=start,
         custom_period_end=end,
         notes=_unneutralise((row.get("notes") or "").strip()) or None,
+        project_actions=project_actions,
     )

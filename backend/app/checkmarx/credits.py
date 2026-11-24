@@ -117,3 +117,72 @@ def fetch_credit_balance(client: CheckmarxClient) -> CreditBalance | None:
         logger.info("Could not read the tenant credit balance: %s", exc)
         return None
     return parse_credit_balance(payload)
+
+
+# ------------------------------------------------------------- action rates
+
+# What each billed action costs, per action. Under the same /api base as every
+# other platform call: GET /api/v1/credits/action-rates. Observed shape:
+#   {"count": 3, "rates": [{"action_type": "fusion_scan_-_opus_5.5",
+#    "credits_per_action": "2", "display_name": "Fusion Scan - Opus 5.5",
+#    "is_active": true, ...}, ...]}
+ACTION_RATES_PATH = "/v1/credits/action-rates"
+
+
+@dataclass(frozen=True, slots=True)
+class ActionRate:
+    action_type: str
+    display_name: str | None
+    credits_per_action: Decimal
+    is_active: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type,
+            "display_name": self.display_name,
+            # A string, so the stored JSON keeps the exact decimal.
+            "credits_per_action": str(self.credits_per_action),
+            "is_active": self.is_active,
+        }
+
+
+def parse_action_rates(payload: Any) -> list[ActionRate] | None:
+    """The rates in an action-rates body, or None when it is not readable.
+
+    A rate whose price cannot be read is left out rather than read as 0: a
+    price of nothing would make every Fusion scan look free.
+    """
+    if isinstance(payload, dict):
+        entries = payload.get("rates")
+    elif isinstance(payload, list):
+        entries = payload
+    else:
+        entries = None
+    if not isinstance(entries, list):
+        logger.info("The action-rates response carries no list of rates")
+        return None
+    rates: list[ActionRate] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        action_type = entry.get("action_type") or entry.get("actionType")
+        price = _coerce(entry.get("credits_per_action", entry.get("creditsPerAction")))
+        if not isinstance(action_type, str) or not action_type.strip() or price is None:
+            continue
+        display = entry.get("display_name") or entry.get("displayName")
+        active = entry.get("is_active", entry.get("isActive", True))
+        rates.append(
+            ActionRate(
+                action_type=action_type.strip()[:128],
+                display_name=display.strip()[:128] if isinstance(display, str) else None,
+                credits_per_action=price,
+                is_active=active is not False,
+            )
+        )
+    return rates
+
+
+def fetch_action_rates(client: CheckmarxClient) -> list[ActionRate] | None:
+    """Read the price of each action. Raises CheckmarxError when the call fails;
+    returns None when it answers with something that is not a list of rates."""
+    return parse_action_rates(client.get_json(ACTION_RATES_PATH, base="api"))

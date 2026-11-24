@@ -49,6 +49,7 @@ from app.services import (
     requests_service,
     retention,
     settings_store,
+    violations,
 )
 from app.services import connection as connection_service
 from app.services.audit import AuditActor, record_audit
@@ -486,6 +487,29 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
 
     _run_step(session, result, "credits", read_pool, degrades_run=False)
 
+    # Step 2b': the price of each action (Fusion is billed per model), used to
+    # say what a limit's credits went on. Best effort: a refusal or a tenant
+    # without the endpoint leaves the last prices read (or none) and never
+    # degrades the cycle.
+    def read_rates() -> None:
+        try:
+            rates = credits_api.fetch_action_rates(client)
+        except CheckmarxError as exc:
+            result.steps["action_rates"] = {"ok": False, "reason": str(exc)[:300]}
+            return
+        if rates is None:
+            result.steps["action_rates"] = {"ok": False, "reason": "unreadable response"}
+            return
+        settings_store.set_value(
+            session,
+            settings_store.KEY_ACTION_RATES,
+            {"read_at": utcnow().isoformat(), "rates": [rate.as_dict() for rate in rates]},
+            description="Latest credits per action from Checkmarx One (bookkeeping).",
+        )
+        result.steps["action_rates"] = {"ok": True, "rates": len(rates)}
+
+    _run_step(session, result, "action_rates", read_rates, degrades_run=False)
+
     # Step 2c: roll back temporary credit grants whose expiry has passed, before
     # evaluation so a re-tightened budget is judged against this cycle's usage. The
     # client is passed so that removing an enforced grant also lifts any
@@ -529,6 +553,17 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
             result.errors.extend(evaluation_result.errors)
 
     _run_step(session, result, "evaluate", evaluate)
+
+    # Step 3b: policy violations. Restrictions in force are re-applied by the
+    # evaluation above; this records what was done against them (scans that
+    # ran Fusion anyway, usage that kept rising). Bounded, and never fatal.
+    def detect_violations() -> None:
+        found = violations.detect(session, client)
+        result.steps["violations"] = found.as_stats()
+        if found.errors:
+            _warn(session, "violations", "; ".join(found.errors[:5]))
+
+    _run_step(session, result, "violations", detect_violations, degrades_run=False)
 
     # Step 4: push notifications out. A delivery failure is never allowed to affect
     # the cycle's own status: the Notification Center already has the record, and an

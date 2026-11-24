@@ -13,7 +13,13 @@ from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.checkmarx.client import CheckmarxClient
 from app.db.base import utcnow
 from app.models.enums import EnforcementStatus, EntityType, LimitStatus
-from app.models.limits import CreditLimit, EnforcementAction, Exemption, LimitPeriodState
+from app.models.limits import (
+    CreditLimit,
+    EnforcementAction,
+    Exemption,
+    LimitPeriodState,
+    effective_project_actions,
+)
 from app.models.org import CxProject, CxUser
 from app.schemas.dashboard import (
     BulkLimitResultResponse,
@@ -182,6 +188,8 @@ def _to_response(
         exempt=exempt,
         notes=limit.notes,
         business_unit=limit.business_unit,
+        project_actions=list(limit.project_actions) if limit.project_actions is not None else None,
+        effective_project_actions=list(effective_project_actions(limit)),
         created_at=limit.created_at,
         updated_at=limit.updated_at,
         current_period=period_response,
@@ -232,6 +240,11 @@ def create_limit(payload: LimitCreateRequest, ctx: AdminUser, db: DbSession) -> 
                 custom_period_end=payload.custom_period_end,
                 notes=payload.notes,
                 business_unit=payload.business_unit,
+                project_actions=(
+                    [str(action) for action in payload.project_actions]
+                    if payload.project_actions is not None
+                    else None
+                ),
             ),
             actor=ctx.actor,
         )
@@ -254,6 +267,8 @@ def update_limit(
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
         return _to_response(db, limit)
+    if changes.get("project_actions") is not None:
+        changes["project_actions"] = [str(action) for action in changes["project_actions"]]
     try:
         limits_service.update_limit(
             db, limit=limit, changes=changes, actor=ctx.actor, client=_optional_client(db)

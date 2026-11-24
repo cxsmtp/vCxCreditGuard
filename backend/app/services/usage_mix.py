@@ -40,7 +40,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx import usage as usage_api
-from app.models.enums import ActionType, EnforcementKind, EntityType, PeriodType, UsageView
+from app.models.enums import (
+    LEGACY_PROJECT_ACTIONS,
+    ActionType,
+    EnforcementKind,
+    EntityType,
+    PeriodType,
+    ProjectAction,
+    UsageView,
+)
 from app.models.limits import CreditLimit, LimitPeriodState
 from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
 from app.models.usage import UsageRecord, UsageSnapshot
@@ -88,8 +96,21 @@ class UsageMix:
     # The most transactions such a slide could hide: no more can have left the
     # window than were in it when the period's baseline was read.
     may_hide: int = 0
+    # Fusion priced per model from GET /api/v1/credits/action-rates, when the
+    # period's rise of every Fusion model is known and priced:
+    # [(model label, scans, credits per scan, credits)]. None otherwise.
+    fusion_priced: list[tuple[str, int, Decimal, Decimal]] | None = None
+
+    @property
+    def fusion_credits(self) -> Decimal | None:
+        if not self.fusion_priced:
+            return None
+        return sum((credits for _m, _n, _r, credits in self.fusion_priced), Decimal("0"))
 
     def fusion_share(self) -> float:
+        priced = self.fusion_credits
+        if priced is not None and self.credits_used > 0:
+            return float(priced / self.credits_used)
         if self.credits_by_action:
             total = sum(self.credits_by_action.values(), Decimal("0"))
             fusion = self.credits_by_action.get(FUSION, Decimal("0"))
@@ -105,7 +126,7 @@ class UsageMix:
         """
         if not self.has_fusion():
             return False
-        if self.credits_by_action:
+        if self.fusion_credits is not None or self.credits_by_action:
             return self.fusion_share() >= LARGE_SHARE
         if self.from_window:
             return False
@@ -219,6 +240,107 @@ def _actions(session: Session, snapshot: UsageSnapshot | None, ids: list[str]) -
     return totals
 
 
+def _fusion_models(
+    session: Session, snapshot: UsageSnapshot | None, ids: list[str]
+) -> dict[str, int]:
+    """Fusion transactions per raw action type (one per model), from the raw rows.
+
+    The stored breakdown files every Fusion model under "fusion"; the model is
+    kept in the raw row the feed sent, which is what a price needs.
+    """
+    totals: dict[str, int] = {}
+    if snapshot is None or not ids:
+        return totals
+    for raw in session.scalars(
+        select(UsageRecord.raw).where(
+            UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.in_(ids)
+        )
+    ):
+        performed = raw.get("actionsPerformed") if isinstance(raw, dict) else None
+        entries = performed.get("actions") if isinstance(performed, dict) else None
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            action = entry.get("actionType")
+            count = entry.get("transactionCount")
+            if (
+                not isinstance(action, str)
+                or usage_api.normalise_action_type(action) != FUSION
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+            ):
+                continue
+            key = usage_api.action_key(action)
+            totals[key] = totals.get(key, 0) + count
+    return totals
+
+
+def rate_table(session: Session) -> dict[str, tuple[Decimal, str | None]]:
+    """Credits per action by comparable action key, from the stored action rates.
+
+    Indexed by the rate's ``action_type`` and by its ``display_name``, both as
+    :func:`usage_api.action_key`, so either spelling the feed uses matches.
+    A rate marked inactive (``is_active`` false) is not a current price and is
+    left out, so it can never shadow the active one for the same action.
+    """
+    stored = settings_store.action_rates(session)
+    table: dict[str, tuple[Decimal, str | None]] = {}
+    for entry in (stored or {}).get("rates") or []:
+        if not isinstance(entry, dict) or entry.get("is_active") is False:
+            continue
+        try:
+            price = Decimal(str(entry.get("credits_per_action")))
+        except (ArithmeticError, ValueError):
+            continue
+        if not price.is_finite() or price < 0:
+            continue
+        display = entry.get("display_name") if isinstance(entry.get("display_name"), str) else None
+        for name in (entry.get("action_type"), display):
+            if isinstance(name, str) and name.strip():
+                table.setdefault(usage_api.action_key(name), (price, display))
+    return table
+
+
+def _price_fusion(
+    session: Session,
+    *,
+    latest: dict[str, int],
+    baseline: dict[str, int],
+    fusion_rise: int,
+    own: Decimal,
+) -> list[tuple[str, int, Decimal, Decimal]] | None:
+    """The period's Fusion scans per model at their price, or None when unsure.
+
+    Only when every model's count is known not to have fallen, the per-model
+    rises add up to the Fusion rise, each rising model has a price, and the
+    priced credits fit in the period's own credits.
+    """
+    if fusion_rise <= 0:
+        return None
+    rises = {key: latest.get(key, 0) - baseline.get(key, 0) for key in set(latest) | set(baseline)}
+    if any(rise < 0 for rise in rises.values()):
+        return None
+    rising = {key: rise for key, rise in rises.items() if rise > 0}
+    if sum(rising.values()) != fusion_rise:
+        return None
+    rates = rate_table(session)
+    priced: list[tuple[str, int, Decimal, Decimal]] = []
+    for key in sorted(rising):
+        rate = rates.get(key)
+        if rate is None:
+            return None
+        price, display = rate
+        model = usage_api.fusion_model(display) or usage_api.fusion_model(key)
+        if model is None:
+            return None
+        priced.append((model, rising[key], price, price * rising[key]))
+    if sum((credits for *_rest, credits in priced), Decimal("0")) > own:
+        # The prices do not fit the credits the feed reports (a price changed,
+        # say): say nothing rather than something wrong.
+        return None
+    return priced
+
+
 def _counts_everything(limit: CreditLimit) -> bool:
     return limit.period_type in {PeriodType.LIFETIME, PeriodType.CUSTOM} or bool(
         limit.count_existing_usage
@@ -231,14 +353,17 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
         return None
     latest: dict[str, int] = {}
     baseline: dict[str, int] = {}
+    latest_models: dict[str, int] = {}
+    baseline_models: dict[str, int] = {}
     from_window = False
     since = state.baseline_at or state.period_start
     everything = _counts_everything(limit)
     for view, ids in _sources(session, limit):
-        for action, count in _actions(
-            session, ingestion.latest_snapshot(session, view), ids
-        ).items():
+        newest = ingestion.latest_snapshot(session, view)
+        for action, count in _actions(session, newest, ids).items():
             latest[action] = latest.get(action, 0) + count
+        for key, count in _fusion_models(session, newest, ids).items():
+            latest_models[key] = latest_models.get(key, 0) + count
         if everything:
             continue
         earlier = _snapshot_at(session, view, since)
@@ -247,6 +372,8 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
             continue
         for action, count in _actions(session, earlier, ids).items():
             baseline[action] = baseline.get(action, 0) + count
+        for key, count in _fusion_models(session, earlier, ids).items():
+            baseline_models[key] = baseline_models.get(key, 0) + count
     if from_window:
         baseline = {}
     deltas = {
@@ -277,6 +404,17 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
     if credits_by_action is not None and attributed > 0:
         auto = ActionType.AUTO_TRIAGE.value
         credits_by_action[auto] = credits_by_action.get(auto, Decimal("0")) + attributed
+    fusion_priced = None
+    if not from_window and not masked and transactions.get(FUSION, 0) > 0:
+        # Exact only where the counts are: the period's own rise, nothing in the
+        # window that a slide could have hidden behind it.
+        fusion_priced = _price_fusion(
+            session,
+            latest=latest_models,
+            baseline={} if everything else baseline_models,
+            fusion_rise=transactions[FUSION],
+            own=own,
+        )
     return UsageMix(
         credits_used=state.credits_used,
         attributed=attributed,
@@ -285,6 +423,7 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
         from_window=from_window,
         masked=masked,
         may_hide=sum(count for count in baseline.values() if count > 0) if masked else 0,
+        fusion_priced=fusion_priced,
     )
 
 
@@ -351,6 +490,8 @@ def describe(
     of = f" of {_number(credit_limit)}" if credit_limit is not None else ""
     used = f"{_number(mix.credits_used)}{of} credits used {when or period_phrase(period_key)}"
     charged = " (charged from scans they started)"
+    if mix.fusion_priced:
+        return _describe_priced(mix, used=used)
     if mix.credits_by_action:
         parts = []
         for action in _ordered(mix.credits_by_action):
@@ -394,32 +535,104 @@ def describe(
     return f"{used}."
 
 
-def does_not_stop(kind: str, mix: UsageMix | None) -> str:
+def _describe_priced(mix: UsageMix, *, used: str) -> str:
+    """Fusion scans priced per model, and whatever else the credits went on."""
+    priced = mix.fusion_priced or []
+    parts = [
+        f"Fusion scan ({model}) {count} scan{'s' if count != 1 else ''} = "
+        f"{_number(credits)} credit{'s' if credits != 1 else ''}"
+        for model, count, _rate, credits in priced
+    ]
+    own = max(Decimal("0"), mix.credits_used - mix.attributed)
+    rest = own - (mix.fusion_credits or Decimal("0"))
+    others = {action: count for action, count in mix.transactions.items() if action != FUSION}
+    text = f"{used}: {', '.join(parts)}"
+    if others:
+        listed = ", ".join(
+            f"{ACTION_LABELS[action]} {count} transaction{'s' if count != 1 else ''}"
+            for action in _ordered(others)
+            for count in [others[action]]
+        )
+        text += (
+            f"; the other {_number(rest)} credits went on {listed}"
+            if rest > 0
+            else f"; also {listed}"
+        )
+    elif rest > 0:
+        text += (
+            f"; the other {_number(rest)} credit{'s' if rest != 1 else ''} cannot be placed "
+            "on an action"
+        )
+    text += "."
+    if mix.attributed > 0:
+        text += f" Auto Triage charged from scans they started: {_number(mix.attributed)} credits."
+    return text
+
+
+_ACTION_NAMES: dict[str, str] = {
+    ProjectAction.AUTO_TRIAGE.value: "Auto Triage",
+    ProjectAction.PR_REMEDIATION.value: "PR triage and remediation",
+    ProjectAction.FUSION.value: "Fusion",
+}
+
+
+def actions_phrase(actions: tuple[str, ...] | list[str]) -> str:
+    """ "Auto Triage, PR triage and remediation and Fusion" for a limit's actions."""
+    names = [_ACTION_NAMES[action] for action in _ACTION_NAMES if action in actions]
+    if len(names) <= 1:
+        return "".join(names) or "nothing"
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def does_not_stop(
+    kind: str, mix: UsageMix | None, *, actions: tuple[str, ...] | list[str] | None = None
+) -> str:
     """What the restriction leaves running, in plain words.
 
     Only what the README states about the enforcement actions: a user
     restriction removes the AI roles and nothing else; a project restriction
-    turns off Auto Triage and PR triage and remediation and nothing else.
+    turns off what its limit chose (``actions``; the legacy pair when None).
     """
     fusion_first = ""
     if mix is not None and mix.fusion_is_most():
         fusion_first = (
             "Most of these credits were Fusion scans. "
-            if mix.credits_by_action
+            if mix.credits_by_action or mix.fusion_priced
             else "Most of the actions behind them were Fusion scans. "
         )
     if kind == EnforcementKind.REMOVE_USER_ROLES:
         return (
-            f"{fusion_first}Removing the AI roles changes no project setting, so Auto Triage "
-            "and PR triage and remediation keep running on projects, and it does not stop "
-            "Fusion scans; CreditGuard cannot switch Fusion off yet."
+            f"{fusion_first}Removing the AI roles changes no project setting, so Auto Triage, "
+            "PR triage and remediation and Fusion scans keep running on projects; a project, "
+            "group or application limit can turn those off."
         )
-    return (
-        f"{fusion_first}Turning off Auto Triage and PR triage and remediation does not stop "
-        "Fusion scans; CreditGuard cannot switch Fusion off yet. It leaves people's AI roles "
-        "alone, so AI Triage and AI Remediation they start themselves keep working (and keep "
-        "counting here); only a user limit can stop those."
+    chosen = tuple(actions) if actions is not None else LEGACY_PROJECT_ACTIONS
+    sentences = [fusion_first.strip()] if fusion_first else []
+    if ProjectAction.FUSION.value not in chosen:
+        sentences.append(
+            f"Turning off {actions_phrase(chosen)} does not stop Fusion scans: this limit does "
+            "not turn Fusion off (edit the limit and choose Turn off Fusion to add it)."
+        )
+    else:
+        sentences.append(
+            "Turning Fusion off in the project's settings may not stop a scan started with its "
+            "own settings from turning Fusion on for that one scan (the lock against that is "
+            "not verified), and the AI engine can still run without Fusion (LLM-based "
+            "scanning, whose credit cost is not known). CreditGuard re-applies the setting "
+            "every cycle and records any scan that ran Fusion as a policy violation."
+        )
+    left = [
+        _ACTION_NAMES[action]
+        for action in (ProjectAction.AUTO_TRIAGE.value, ProjectAction.PR_REMEDIATION.value)
+        if action not in chosen
+    ]
+    if left:
+        sentences.append(f"This limit leaves {' and '.join(left)} running.")
+    sentences.append(
+        "It leaves people's AI roles alone, so AI Triage and AI Remediation they start "
+        "themselves keep working (and keep counting here); only a user limit can stop those."
     )
+    return " ".join(sentences)
 
 
 def restriction_kind_for(entity_type: str) -> str:

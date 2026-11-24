@@ -12,7 +12,7 @@ from app.schemas.preview import (
     DryRunRowResponse,
     TargetPreviewResponse,
 )
-from app.services import preview_service
+from app.services import limits_service, preview_service
 
 router = APIRouter(prefix="/preview", tags=["preview"])
 
@@ -28,7 +28,10 @@ def _blast_to_response(blast: preview_service.BlastRadius) -> BlastRadiusRespons
         remove_user_roles=blast.remove_user_roles,
         disable_auto_triage=blast.disable_auto_triage,
         disable_pr_remediation=blast.disable_pr_remediation,
+        disable_fusion=blast.disable_fusion,
+        disable_repo_fusion=blast.disable_repo_fusion,
         total_actions=blast.total_actions,
+        project_actions=blast.project_actions,
         targets=[
             TargetPreviewResponse(
                 kind=target.kind,
@@ -47,14 +50,30 @@ def get_blast_radius(
     db: DbSession,
     entity_type: EntityType = Query(...),
     entity_id: str = Query(..., min_length=1, max_length=64),
+    project_actions: str | None = Query(default=None, max_length=128),
 ) -> BlastRadiusResponse:
-    """What enforcing this entity's limit would restrict, computed read-only."""
+    """What enforcing this entity's limit would restrict, computed read-only.
+
+    ``project_actions`` (comma separated: auto_triage, pr_remediation, fusion)
+    previews a choice the limit form has not saved yet.
+    """
     if not entity_id.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_entity", "message": "An entity id is required."},
         )
-    blast = preview_service.blast_radius(db, entity_type=str(entity_type), entity_id=entity_id)
+    actions: list[str] | None = None
+    if project_actions is not None:
+        try:
+            actions = limits_service.normalise_project_actions(project_actions)
+        except limits_service.LimitError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "invalid_project_actions", "message": str(exc)},
+            ) from exc
+    blast = preview_service.blast_radius(
+        db, entity_type=str(entity_type), entity_id=entity_id, project_actions=actions
+    )
     return _blast_to_response(blast)
 
 

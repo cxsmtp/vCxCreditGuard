@@ -27,6 +27,7 @@ from app.api.routes import (
     preview,
     reports,
     requests,
+    violations,
 )
 from app.api.routes import (
     settings as settings_routes,
@@ -136,6 +137,7 @@ def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) 
     api.include_router(ops.router)
     api.include_router(settings_routes.router)
     api.include_router(dashboard.router)
+    api.include_router(violations.router)
     app.include_router(api)
     app.include_router(health.router)
 

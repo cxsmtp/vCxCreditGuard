@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from app.checkmarx.client import CheckmarxClient
 from app.checkmarx.errors import CheckmarxError
 from app.db.base import utcnow
-from app.models.enums import EntityType
+from app.models.enums import PROJECT_ACTION_ORDER, EntityType
 from app.models.limits import CreditLimit, Exemption, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
 from app.services import evaluation
@@ -51,6 +51,7 @@ AUDITED_FIELDS = (
     "count_existing_usage",
     "notes",
     "business_unit",
+    "project_actions",
 )
 
 
@@ -86,6 +87,36 @@ class LimitInput:
     custom_period_end: datetime | None = None
     notes: str | None = None
     business_unit: str | None = None
+    # What a project, group or application limit turns off; None = the legacy
+    # pair (Auto Triage, PR triage and remediation). Must be None for users.
+    project_actions: list[str] | None = None
+
+
+def normalise_project_actions(value: object) -> list[str] | None:
+    """A stored, ordered, de-duplicated list of project actions, or None.
+
+    Raises LimitError for anything that is not a list of known actions, and
+    for an empty list (a limit that enforces must turn something off).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [part for part in value.replace(";", ",").split(",") if part.strip()]
+    if not isinstance(value, list | tuple | set | frozenset):
+        raise LimitError("project_actions must be a list.")
+    names = {str(item).strip().lower() for item in value}
+    unknown = sorted(names - set(PROJECT_ACTION_ORDER))
+    if unknown:
+        raise LimitError(
+            f"Unknown project action(s): {', '.join(unknown)}. "
+            f"Choose from: {', '.join(PROJECT_ACTION_ORDER)}."
+        )
+    if not names:
+        raise LimitError(
+            "Choose at least one thing for this limit to turn off on its projects, or make the "
+            "limit monitor only."
+        )
+    return [action for action in PROJECT_ACTION_ORDER if action in names]
 
 
 def resolve_entity_label(session: Session, *, entity_type: str, entity_id: str) -> str | None:
@@ -116,6 +147,13 @@ def _validate(session: Session, data: LimitInput) -> None:
             raise LimitError("The custom period's end date must be after its start date.")
     if data.include_member_usage and data.entity_type != EntityType.GROUP:
         raise LimitError("Member usage can only be counted for group limits.")
+    if data.project_actions is not None:
+        if data.entity_type == EntityType.USER:
+            raise LimitError(
+                "What to turn off for projects can only be chosen for project, group and "
+                "application limits."
+            )
+        normalise_project_actions(data.project_actions)
     if (
         resolve_entity_label(session, entity_type=data.entity_type, entity_id=data.entity_id)
         is None
@@ -158,6 +196,7 @@ def create_limit(session: Session, *, data: LimitInput, actor: AuditActor) -> Cr
         count_existing_usage=data.count_existing_usage,
         notes=data.notes,
         business_unit=data.business_unit,
+        project_actions=normalise_project_actions(data.project_actions),
         created_by_id=actor.actor_id,
     )
     session.add(limit)
@@ -201,6 +240,12 @@ def update_limit(
     for field, value in changes.items():
         if field not in AUDITED_FIELDS:
             raise LimitError(f"{field} cannot be changed.")
+        if field == "project_actions":
+            try:
+                value = normalise_project_actions(value)
+            except LimitError:
+                session.expire(limit)
+                raise
         setattr(limit, field, value)
 
     # Any change to the budget makes this a deliberate value, so it is no longer
@@ -224,6 +269,7 @@ def update_limit(
                 count_existing_usage=limit.count_existing_usage,
                 custom_period_start=limit.custom_period_start,
                 custom_period_end=limit.custom_period_end,
+                project_actions=limit.project_actions,
             ),
         )
     except LimitError:
@@ -283,6 +329,20 @@ def lift_unjustified_restrictions(
     """
     if client is None:
         return 0
+    lifted = 0
+    if limit.is_active and limit.enforce:
+        # What the limit no longer turns off is put back now, whatever its usage.
+        from app.services import enforcement
+
+        limit_id = limit.id
+        try:
+            lifted = enforcement.restore_deselected(session, client, limit=limit, actor=actor)
+        except CheckmarxError as exc:
+            logger.warning(
+                "Limit %s no longer turns some things off, but they could not be put back yet: %s",
+                limit_id,
+                exc,
+            )
     if not limit.is_active or not limit.enforce:
         reason = "limit_removed"
     else:
@@ -295,12 +355,12 @@ def lift_unjustified_restrictions(
             )
         )
         if not any(state.credits_used < Decimal(limit.credit_limit) for state in states):
-            return 0
+            return lifted
         reason = "credit_increased"
 
     limit_id = limit.id
     try:
-        return evaluation.restore_on_limit_change(
+        return lifted + evaluation.restore_on_limit_change(
             session, client, limit=limit, actor=actor, reason=reason
         )
     except CheckmarxError as exc:
@@ -309,7 +369,7 @@ def lift_unjustified_restrictions(
             limit_id,
             exc,
         )
-        return 0
+        return lifted
 
 
 def delete_limit(
@@ -369,6 +429,9 @@ def _snapshot(limit: CreditLimit) -> dict[str, Any]:
         "count_existing_usage": limit.count_existing_usage,
         "notes": limit.notes,
         "business_unit": limit.business_unit,
+        "project_actions": list(limit.project_actions)
+        if limit.project_actions is not None
+        else None,
     }
 
 

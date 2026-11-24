@@ -28,6 +28,8 @@ CATEGORY_AUTH_FAILURE = "auth_failure"
 CATEGORY_ATTRIBUTION = "attribution"
 # The stored Checkmarx API key lacks a permission CreditGuard needs.
 CATEGORY_PERMISSIONS = "permissions"
+# Someone acted against a restriction in force ("Policy violations").
+CATEGORY_POLICY = "policy"
 
 
 def notify(
@@ -170,6 +172,12 @@ def reconcile_key(action_id: int, period_key: str) -> str:
     run would raise the same "re-applied" alert hundreds of times a day.
     """
     return f"reconciled:{action_id}:{period_key}"
+
+
+def lock_not_kept_key(project_id: str, period_key: str) -> str:
+    """One "Fusion lock not kept" notice per project and period, however many
+    limits restrict it."""
+    return f"locknotkept:{project_id}:{period_key}"
 
 
 def restoration_key(action_id: int) -> str:

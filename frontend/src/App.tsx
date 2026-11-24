@@ -20,6 +20,7 @@ import { RequestsPage } from "./pages/RequestsPage";
 import { SettingsPage, type SettingsSection } from "./pages/SettingsPage";
 import { AboutPage } from "./pages/AboutPage";
 import { SetupPage } from "./pages/SetupPage";
+import { ViolationsPage } from "./pages/ViolationsPage";
 
 type AuthState = "checking" | "signedOut" | "signedIn";
 
@@ -225,6 +226,9 @@ export function App() {
           path="/notifications"
           element={<NotificationsPage isAdmin={isAdmin} onUnreadChange={setUnread} />}
         />
+        {isAdmin && (
+          <Route path="/violations" element={<ViolationsPage onChanged={refreshMe} />} />
+        )}
         <Route path="/audit" element={<AuditPage isAdmin={isAdmin} />} />
         <Route path="/settings" element={<SettingsIndex />} />
         <Route path="/settings/about" element={<AboutPage me={me} />} />

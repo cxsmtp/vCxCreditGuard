@@ -57,7 +57,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -83,8 +83,14 @@ from app.checkmarx.errors import (
 )
 from app.db.base import utcnow
 from app.models.connection import AppSetting
-from app.models.enums import EntityType, Severity
-from app.models.limits import CreditLimit
+from app.models.enums import (
+    EnforcementKind,
+    EnforcementStatus,
+    EntityType,
+    ProjectAction,
+    Severity,
+)
+from app.models.limits import CreditLimit, EnforcementAction, effective_project_actions
 from app.models.org import CxProject, CxUser
 from app.services import notifications, settings_store
 from app.services.audit import AuditActor, record_audit
@@ -112,6 +118,13 @@ NEED_GROUP_LIMITS = "group_limits"
 NEED_APPLICATION_LIMITS = "application_limits"
 NEED_ENFORCE_USERS = "enforce_users"
 NEED_ENFORCE_PROJECTS = "enforce_projects"
+NEED_ENFORCE_FUSION = "enforce_fusion"
+# An enforcing limit turns Fusion off and at least one project has a repository
+# (the repository half of turning Fusion off reads and writes its settings).
+NEED_REPO_FUSION = "enforce_repo_fusion"
+# Policy violation detection reads the scans of projects whose Fusion is
+# turned off (a Fusion restriction in force, or a limit that turns Fusion off).
+NEED_VIOLATIONS = "policy_violations"
 NEED_AUTO_TRIAGE = "auto_triage_charging"
 NEED_OPTIONAL = "optional"
 
@@ -161,6 +174,10 @@ class CheckSpec:
     # For a write: the reads on the same service. If one of them is refused,
     # the write will be refused too.
     reads: tuple[str, ...] = ()
+    # Another check making the same call (same method and path, a different
+    # body): a refusal of that call at run time cannot be told apart, so it
+    # counts for both.
+    shares_refusals_with: str | None = None
 
 
 SPECS: tuple[CheckSpec, ...] = (
@@ -245,15 +262,19 @@ SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(
         id="scans",
         label="Scans",
-        purpose="Read scans to charge auto triage to the person who started the scan",
-        cant="read scans to charge auto triage to the person who started the scan",
+        purpose=(
+            "Read scans to charge auto triage to the person who started the scan, and to "
+            "find scans that ran Fusion while it is turned off"
+        ),
+        cant="read scans",
         method="GET",
         path="/api/scans/",
         kind="read",
-        needed_for=(NEED_AUTO_TRIAGE,),
+        needed_for=(NEED_AUTO_TRIAGE, NEED_VIOLATIONS),
         breaks=(
             "Auto-triage credits cannot be charged to the person who started the scan; "
-            "they stay estimated."
+            "they stay estimated. Scans that ran Fusion on a project whose Fusion is turned "
+            "off are not found, so they are not recorded as policy violations."
         ),
     ),
     CheckSpec(
@@ -274,16 +295,46 @@ SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(
         id="repo_read",
         label="Repository settings (read)",
-        purpose="Read a repository's PR triage and remediation setting",
-        cant="read repositories' PR triage and remediation setting",
+        purpose="Read a repository's PR triage and remediation and Fusion settings",
+        cant="read repositories' settings",
         method="GET",
         path="/api/repos-manager/repo/{repoId}?projectId={projectId}",
         kind="read",
-        needed_for=(NEED_ENFORCE_PROJECTS,),
+        needed_for=(NEED_ENFORCE_PROJECTS, NEED_REPO_FUSION),
         breaks=(
             "The PR triage and remediation setting cannot be read before it is changed; "
             "without a value recorded earlier, that half of a project restriction is left "
-            "unchanged, and restrictions in force cannot be verified."
+            "unchanged, and restrictions in force cannot be verified. The repository's "
+            "Fusion setting cannot be read, so it is left unchanged."
+        ),
+    ),
+    CheckSpec(
+        id="project_config_read",
+        label="Project scan settings (read)",
+        purpose="Read a project's Fusion setting",
+        cant="read projects' Fusion setting",
+        method="GET",
+        path="/api/configuration/project?project-id={projectId}",
+        kind="read",
+        needed_for=(NEED_ENFORCE_FUSION,),
+        breaks=(
+            "A project's Fusion setting cannot be read before it is changed, so limits that "
+            "turn Fusion off cannot (or put it back exactly as it was), and Fusion turned off "
+            "cannot be verified."
+        ),
+    ),
+    CheckSpec(
+        id="action_rates",
+        label="Credits per action",
+        purpose="Read the price of each action (Fusion is priced per model)",
+        cant="read the price of each action",
+        method="GET",
+        path="/api/v1/credits/action-rates",
+        kind="read",
+        needed_for=(NEED_OPTIONAL,),
+        breaks=(
+            "Messages give Fusion scans as transaction counts instead of credits per model. "
+            "Nothing else changes."
         ),
     ),
     CheckSpec(
@@ -350,6 +401,21 @@ SPECS: tuple[CheckSpec, ...] = (
         reads=("ai_config_read",),
     ),
     CheckSpec(
+        id="project_config_write",
+        label="Project scan settings (change)",
+        purpose="Turn a project's Fusion off, and back on",
+        cant="turn projects' Fusion off",
+        method="PATCH",
+        path="/api/configuration/project?project-id={projectId}",
+        kind="write",
+        needed_for=(NEED_ENFORCE_FUSION,),
+        breaks=(
+            "Limits that turn Fusion off cannot change the project's Fusion setting, or put "
+            "it back when a restriction is lifted."
+        ),
+        reads=("project_config_read",),
+    ),
+    CheckSpec(
         id="repo_write",
         label="Repository settings (change)",
         purpose="Restrict a project's PR triage and remediation, and turn it back on",
@@ -364,6 +430,23 @@ SPECS: tuple[CheckSpec, ...] = (
         ),
         reads=("repo_read",),
     ),
+    CheckSpec(
+        id="repo_fusion_write",
+        label="Repository Fusion setting (change)",
+        purpose="Turn Fusion off in a project's repository settings, and back on (unverified)",
+        cant="turn Fusion off in repository settings",
+        method="PATCH",
+        path="/api/repos-manager/repo/{repoId}?projectId={projectId}",
+        kind="write",
+        needed_for=(NEED_REPO_FUSION,),
+        breaks=(
+            "Limits that turn Fusion off cannot change the repository's fusionScanConfig; "
+            "the project's own Fusion setting is still turned off. That this repository "
+            "setting can be changed this way is not verified."
+        ),
+        reads=("repo_read",),
+        shares_refusals_with="repo_write",
+    ),
 )
 SPEC_BY_ID: dict[str, CheckSpec] = {spec.id: spec for spec in SPECS}
 _SEVERE_NEEDS = frozenset(
@@ -373,6 +456,8 @@ _SEVERE_NEEDS = frozenset(
         NEED_APPLICATION_LIMITS,
         NEED_ENFORCE_USERS,
         NEED_ENFORCE_PROJECTS,
+        NEED_ENFORCE_FUSION,
+        NEED_REPO_FUSION,
     }
 )
 
@@ -387,12 +472,16 @@ _RUNTIME_ROUTES: tuple[tuple[frozenset[str], re.Pattern[str], str], ...] = tuple
         ("GET", r"/api/credits/consumption/?$", "consumption"),
         ("GET", r"/api/credits/info/?$", "credit_pool"),
         ("GET POST", r"/api/scans(/byFilters)?/?$", "scans"),
+        ("GET", r"/api/scans/[^/]+/?$", "scans"),
         ("GET", r"/ai-agents-coordinator/projects/[^/]+/configuration/?$", "ai_config_read"),
         (
             "PUT POST PATCH",
             r"/ai-agents-coordinator/projects/[^/]+/configuration/?$",
             "ai_config_write",
         ),
+        ("GET", r"/api/configuration/project/?$", "project_config_read"),
+        ("PATCH PUT POST", r"/api/configuration/project/?$", "project_config_write"),
+        ("GET", r"/api/v1/credits/action-rates/?$", "action_rates"),
         ("GET", r"/repos-manager/repo/[^/]+/?$", "repo_read"),
         ("PATCH PUT", r"/repos-manager/repo/[^/]+/?$", "repo_write"),
         ("GET", r"/auth/admin/realms/[^/]+/clients/?$", "iam_clients"),
@@ -412,6 +501,8 @@ _RESOURCE_PATTERNS: dict[str, re.Pattern[str]] = {
     "repo_read": re.compile(r"/repos-manager/repo/([^/]+)/?$"),
     "iam_user_roles": re.compile(r"/users/([^/]+)/role-mappings/clients/([^/]+)/?$"),
 }
+# The same, for reads that name the project in the query instead of the path.
+_RESOURCE_QUERY: dict[str, str] = {"project_config_read": "project-id"}
 
 
 # ------------------------------------------------------------ token claims
@@ -566,6 +657,10 @@ def _entry_resources(entry: dict[str, Any]) -> list[dict[str, str]]:
 
 def _resource(check_id: str | None, url: str) -> str | None:
     """The project, repository or user (\"user/client\") a read was made on."""
+    query_key = _RESOURCE_QUERY.get(check_id or "")
+    if query_key is not None:
+        values = parse_qs(urlparse(url).query).get(query_key) or []
+        return values[0][:300] if values and values[0] else None
     pattern = _RESOURCE_PATTERNS.get(check_id or "")
     if pattern is None:
         return None
@@ -626,6 +721,7 @@ _RESOURCE_NOUNS = {
     "ai_config_read": ("project", "projects"),
     "repo_read": ("repository", "repositories"),
     "iam_user_roles": ("user", "users"),
+    "project_config_read": ("project", "projects"),
 }
 
 
@@ -709,6 +805,7 @@ def _run_probes(
             ),
         ),
         ("credit_pool", lambda: client.get_json(credits_api.CREDITS_INFO_PATH)),
+        ("action_rates", lambda: client.get_json(credits_api.ACTION_RATES_PATH)),
     ]
     for check_id, call in probes:
         if check_id in skip:
@@ -740,7 +837,20 @@ def _run_probes(
             "No project is known yet (none synced, and the projects read returned none), so "
             "there was nothing to read the Auto Triage setting of.",
         )
+        results["project_config_read"] = (
+            STATUS_SKIPPED,
+            "No project is known yet (none synced, and the projects read returned none), so "
+            "there was nothing to read the Fusion setting of.",
+        )
     else:
+        results["project_config_read"] = _outcome(
+            lambda: client.get_json(
+                platform.PROJECT_CONFIGURATION_PATH, params={"project-id": project_id}
+            )
+        )
+        targets.resource_results[("project_config_read", project_id)] = results[
+            "project_config_read"
+        ][0]
         results["ai_config_read"] = _outcome(
             lambda: client.get_json(platform.AUTO_TRIAGE_PATH.format(project_id=project_id))
         )
@@ -805,6 +915,12 @@ def _read_resource(
         return _outcome(
             lambda: client.get_json(platform.AUTO_TRIAGE_PATH.format(project_id=resource))
         )[0]
+    if check_id == "project_config_read":
+        return _outcome(
+            lambda: client.get_json(
+                platform.PROJECT_CONFIGURATION_PATH, params={"project-id": resource}
+            )
+        )[0]
     if check_id == "repo_read":
         project_id = repo_projects.get(resource)
         if project_id is None:
@@ -837,6 +953,12 @@ class Context:
     auto_triage_charging: bool
     group_limits: bool = False
     application_limits: bool = False
+    # An enforcing project, group or application limit turns Fusion off.
+    enforce_fusion: bool = False
+    # ... and at least one project has a repository.
+    repo_fusion: bool = False
+    # Policy violation detection reads scans (see NEED_VIOLATIONS).
+    violations: bool = False
 
     def active(self, need: str) -> bool:
         if need == NEED_CORE:
@@ -849,6 +971,12 @@ class Context:
             return self.enforce_users
         if need == NEED_ENFORCE_PROJECTS:
             return self.enforce_projects
+        if need == NEED_ENFORCE_FUSION:
+            return self.enforce_fusion
+        if need == NEED_REPO_FUSION:
+            return self.repo_fusion
+        if need == NEED_VIOLATIONS:
+            return self.violations
         if need == NEED_AUTO_TRIAGE:
             return self.auto_triage_charging
         return False
@@ -862,9 +990,56 @@ def current_context(session: Session) -> Context:
     ).all()
     present = {str(entity_type) for entity_type, _enforce in rows}
     enforcing = {str(entity_type) for entity_type, enforce in rows if enforce}
+    # What the enforcing project, group and application limits turn off.
+    project_actions: set[str] = set()
+    if enforcing - {EntityType.USER.value}:
+        for limit in session.scalars(
+            select(CreditLimit).where(
+                CreditLimit.is_active.is_(True),
+                CreditLimit.enforce.is_(True),
+                CreditLimit.entity_type != EntityType.USER.value,
+            )
+        ):
+            project_actions.update(effective_project_actions(limit))
+    enforce_fusion = ProjectAction.FUSION.value in project_actions
+    repo_fusion = enforce_fusion and (
+        session.scalar(
+            select(CxProject.id)
+            .where(
+                CxProject.repo_id.is_not(None),
+                CxProject.repo_id != "",
+                CxProject.is_deleted.is_(False),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+    # Detection reads the scans of every project whose Fusion restriction is in
+    # force, even after the limit stopped turning Fusion off.
+    fusion_in_force = (
+        session.scalar(
+            select(EnforcementAction.id)
+            .where(
+                EnforcementAction.kind.in_(
+                    (
+                        EnforcementKind.DISABLE_FUSION.value,
+                        EnforcementKind.DISABLE_REPO_FUSION.value,
+                    )
+                ),
+                EnforcementAction.status == EnforcementStatus.APPLIED,
+            )
+            .limit(1)
+        )
+        is not None
+    )
     return Context(
         enforce_users=EntityType.USER.value in enforcing,
-        enforce_projects=bool(enforcing - {EntityType.USER.value}),
+        enforce_projects=bool(
+            project_actions & {ProjectAction.AUTO_TRIAGE.value, ProjectAction.PR_REMEDIATION.value}
+        ),
+        enforce_fusion=enforce_fusion,
+        repo_fusion=repo_fusion,
+        violations=enforce_fusion or fusion_in_force,
         auto_triage_charging=settings_store.auto_triage_to_initiator(session),
         group_limits=EntityType.GROUP.value in present,
         application_limits=EntityType.APPLICATION.value in present,
@@ -887,8 +1062,26 @@ _NEED_REASONS: dict[str, tuple[str, str]] = {
         "Only needed once a user limit enforces.",
     ),
     NEED_ENFORCE_PROJECTS: (
-        "Needed now: at least one project, group or application limit enforces.",
-        "Only needed once a project, group or application limit enforces.",
+        "Needed now: at least one project, group or application limit enforces and turns off "
+        "Auto Triage or PR triage and remediation.",
+        "Only needed once a project, group or application limit enforces and turns off Auto "
+        "Triage or PR triage and remediation.",
+    ),
+    NEED_ENFORCE_FUSION: (
+        "Needed now: at least one project, group or application limit enforces and turns "
+        "Fusion off.",
+        "Only needed once a project, group or application limit enforces and turns Fusion off.",
+    ),
+    NEED_REPO_FUSION: (
+        "Needed now: at least one project, group or application limit enforces and turns "
+        "Fusion off, and at least one project has a repository.",
+        "Only needed once a project, group or application limit enforces and turns Fusion off "
+        "for a project with a repository.",
+    ),
+    NEED_VIOLATIONS: (
+        "Needed now: Fusion is turned off on at least one project, and scans that run it "
+        "anyway are recorded as policy violations.",
+        "Only needed once a limit turns Fusion off (to record scans that run it anyway).",
     ),
     NEED_AUTO_TRIAGE: (
         "Needed now: auto-triage charging is on.",
@@ -1023,6 +1216,10 @@ def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None
     checks: list[dict[str, Any]] = []
     for spec in SPECS:
         stored = by_id.get(spec.id) or _empty_check(spec)
+        sibling = by_id.get(spec.shares_refusals_with) if spec.shares_refusals_with else None
+        if sibling and sibling.get("runtime_denied_at") and not stored.get("runtime_denied_at"):
+            # The same call, refused at run time: it is refused for this too.
+            stored = {**stored, "runtime_denied_at": sibling["runtime_denied_at"]}
         required, reason = _required(spec, ctx)
         active_needs = [need for need in spec.needed_for if ctx.active(need)]
         problem = _is_problem(stored)
@@ -1108,6 +1305,7 @@ def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None
         "key_fingerprint": report.get("key_fingerprint"),
         "enforce_users": ctx.enforce_users,
         "enforce_projects": ctx.enforce_projects,
+        "enforce_fusion": ctx.enforce_fusion,
         "auto_triage_charging": ctx.auto_triage_charging,
         "checks": checks,
         "missing": cant,
@@ -1371,12 +1569,13 @@ def _run_check(
     _refused_resources(session, targets, fingerprint)
 
     skip: dict[str, str] = {}
-    if trigger == TRIGGER_CYCLE and not ctx.auto_triage_charging:
-        # With auto-triage charging off nothing in a cycle reads scans, and the
-        # automatic re-check keeps it that way. Explicit checks still try it.
+    if trigger == TRIGGER_CYCLE and not (ctx.auto_triage_charging or ctx.violations):
+        # With auto-triage charging off and no Fusion turned off, nothing in a
+        # cycle reads scans, and the automatic re-check keeps it that way.
+        # Explicit checks still try it.
         skip["scans"] = (
-            "Not read by the automatic check while auto-triage charging is off; "
-            "press Check again to test it."
+            "Not read by the automatic check while auto-triage charging is off and no limit "
+            "turns Fusion off; press Check again to test it."
         )
 
     # Nothing may be held open in the database while Checkmarx is called.
@@ -1457,7 +1656,7 @@ def _refused_resources(session: Session, targets: _ProbeTargets, fingerprint: st
         if not isinstance(entry, dict) or entry.get("method") != "GET":
             continue
         check_id = entry.get("check_id")
-        if check_id not in _RESOURCE_PATTERNS:
+        if check_id not in _RESOURCE_PATTERNS and check_id not in _RESOURCE_QUERY:
             continue
         items = sorted(
             _entry_resources(entry), key=lambda item: str(item.get("last_seen")), reverse=True
@@ -1806,8 +2005,9 @@ def _finish(
                 body=(
                     "Every read CreditGuard checks is allowed, and no change CreditGuard "
                     "makes is known to be refused. Changes (removing AI roles, turning Auto "
-                    "Triage or PR triage and remediation off and on) cannot be tested without "
-                    "making them, so each is confirmed the first time CreditGuard makes it."
+                    "Triage, PR triage and remediation or Fusion off and on) cannot be "
+                    "tested without making them, so each is confirmed the first time "
+                    "CreditGuard makes it."
                 ),
                 dedupe_key=notifications.key_permissions_ok_key(fingerprint, now.isoformat()),
             )

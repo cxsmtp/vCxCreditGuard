@@ -115,6 +115,15 @@ def _notify(
             logger.debug("A call listener failed", exc_info=True)
 
 
+def _full_url(response: httpx.Response, fallback: str) -> str:
+    """The URL a response answered, query included (a read that names its
+    project in the query, such as the project configuration, needs it)."""
+    try:
+        return str(response.request.url)
+    except RuntimeError:  # a response built without a request
+        return fallback
+
+
 class CheckmarxClient:
     def __init__(
         self,
@@ -274,7 +283,12 @@ class CheckmarxClient:
 
             if response.is_success:
                 if _success_listeners:
-                    _notify(_success_listeners, method.upper(), url, self.key_fingerprint)
+                    _notify(
+                        _success_listeners,
+                        method.upper(),
+                        _full_url(response, url),
+                        self.key_fingerprint,
+                    )
                 return response
 
             status = response.status_code
@@ -287,7 +301,12 @@ class CheckmarxClient:
                 continue
 
             if status == httpx.codes.FORBIDDEN:
-                _notify(_forbidden_listeners, method.upper(), url, self.key_fingerprint)
+                _notify(
+                    _forbidden_listeners,
+                    method.upper(),
+                    _full_url(response, url),
+                    self.key_fingerprint,
+                )
                 raise CheckmarxPermissionError(
                     f"Checkmarx denied {method.upper()} {url} with 403. The API key's "
                     "service account is missing a required permission.",
