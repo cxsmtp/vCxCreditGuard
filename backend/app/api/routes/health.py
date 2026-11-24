@@ -13,7 +13,7 @@ import logging
 from fastapi import APIRouter, Response, status
 from sqlalchemy import select, text
 
-from app import __version__
+from app import __version__, scheduler
 from app.db.session import session_scope
 from app.models.connection import CxConnection
 from app.services import ops_hardening
@@ -26,7 +26,8 @@ router = APIRouter(tags=["health"])
 def healthz(response: Response) -> dict[str, object]:
     database_ok = False
     connection_configured = False
-    scheduler_ok = True
+    # Never alive when this process's scheduler did not start.
+    scheduler_ok = scheduler.is_running()
     try:
         with session_scope() as db:
             db.execute(text("SELECT 1"))
@@ -37,10 +38,11 @@ def healthz(response: Response) -> dict[str, object]:
             # up), but an external monitor can alert on this flag. Isolated so a
             # watchdog bug is not misreported as a database failure, and defaults
             # to alive (fail-open) so it never makes a healthy process look down.
-            try:
-                scheduler_ok = ops_hardening.scheduler_alive(db)
-            except Exception:
-                logger.exception("Watchdog check failed")
+            if scheduler_ok:
+                try:
+                    scheduler_ok = ops_hardening.scheduler_alive(db)
+                except Exception:
+                    logger.exception("Watchdog check failed")
     except Exception:
         logger.exception("Health check could not reach the database")
 

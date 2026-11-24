@@ -170,6 +170,25 @@ def is_bot_subject(*values: str | None) -> bool:
     return False
 
 
+def is_integration_identity(name: str | None, email: str | None) -> bool:
+    """True for a consumption subject that looks like an integration, not a person.
+
+    On a live tenant the largest consumer (62% of credits) was reported under a
+    single handle with no email anywhere: an SCM or CI integration's identity.
+    A row with no email, no address in its name and no space in its name is
+    taken as one, but only once nothing matched it (see ``classify``): a
+    person's display name has a space, and a person's login matches the synced
+    user it belongs to. It stays mappable to a person under Settings →
+    Attribution if this is wrong.
+    """
+    if email and email.strip():
+        return False
+    text = (name or "").strip()
+    if not text or "@" in text:
+        return False
+    return not any(char.isspace() for char in text)
+
+
 def similarity(a: frozenset[str], b: frozenset[str]) -> float:
     """Similarity of two token sets in ``[0, 1]``.
 
@@ -215,18 +234,28 @@ def classify(
     name: str | None,
     email: str | None,
     profiles: tuple[UserProfile, ...],
+    integrations: bool = False,
 ) -> MatchOutcome:
-    """Decide how a still-unresolved subject should be attributed."""
+    """Decide how a still-unresolved subject should be attributed.
+
+    ``integrations``: an unmatched handle with no email is automation (see
+    :func:`is_integration_identity`). Used for consumption rows, which name a
+    person by email or display name; not for scan initiators, which are often a
+    bare login.
+    """
     if is_bot_subject(subject_key, name, email):
         return MatchOutcome(MatchMethod.UNMATCHED, None, (), is_bot=True)
 
+    integration = integrations and is_integration_identity(name or subject_key, email)
     subject_tokens = tokenize(subject_key, name, email)
     if not subject_tokens:
-        return MatchOutcome(MatchMethod.UNMATCHED, None, ())
+        return MatchOutcome(MatchMethod.UNMATCHED, None, (), is_bot=integration)
 
     candidates = tuple(rank_candidates(subject_tokens, profiles))
     if not candidates:
-        return MatchOutcome(MatchMethod.UNMATCHED, None, ())
+        # Nobody comes close: a handle with no email is automation (an
+        # integration identity), not a person to chase.
+        return MatchOutcome(MatchMethod.UNMATCHED, None, (), is_bot=integration)
 
     top = candidates[0]
     if top.score < AUTO_MATCH_THRESHOLD:

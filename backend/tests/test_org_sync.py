@@ -80,7 +80,11 @@ def test_duplicate_group_names_are_reported_not_guessed(db: Session) -> None:
     result = org_sync.sync_org_model(db, tenant.client())
     db.commit()
 
-    assert any("not unique" in warning for warning in result.warnings)
+    # A property of the tenant, not a failed read: reported, not a warning that
+    # degrades the cycle (see test_cycle: raised once, as a warning notice).
+    assert result.duplicate_group_names == ["platform"]
+    assert not any("not unique" in warning for warning in result.warnings)
+    assert "not unique" in org_sync.duplicate_groups_message(result.duplicate_group_names)
     # The ambiguous membership is not invented.
     assert db.scalar(select(CxGroupMembership)) is None
 

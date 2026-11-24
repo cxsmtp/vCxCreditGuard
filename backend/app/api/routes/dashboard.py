@@ -25,6 +25,7 @@ from app.models.usage import (
 )
 from app.schemas.dashboard import (
     ActionBreakdownItem,
+    AttributionSummaryInfo,
     AuditEntryResponse,
     AuditListResponse,
     AutoTriageAttributionOverview,
@@ -35,6 +36,7 @@ from app.schemas.dashboard import (
     AutoTriageUserPart,
     CreditPoolInfo,
     DashboardResponse,
+    MapEntityRequest,
     MapSubjectRequest,
     MeResponse,
     OrgEntity,
@@ -42,9 +44,17 @@ from app.schemas.dashboard import (
     SubjectSuggestion,
     TopConsumerItem,
     TrendPoint,
+    UnmatchedEntitiesInfo,
+    UnmatchedEntityResponse,
     UnresolvedSubjectResponse,
 )
-from app.services import auto_triage_attribution, key_permissions, settings_store, violations
+from app.services import (
+    auto_triage_attribution,
+    ingestion,
+    key_permissions,
+    settings_store,
+    violations,
+)
 from app.services import dashboard as dashboard_service
 from app.services import notifications as notification_service
 from app.services.audit import record_audit
@@ -115,10 +125,11 @@ def _to_consumer(consumer) -> TopConsumerItem:  # type: ignore[no-untyped-def]
         status=consumer.status,
         resolved=consumer.resolved,
         auto_triage_attributed=consumer.auto_triage_attributed,
+        automation=consumer.automation,
     )
 
 
-def _pool_info(pool) -> CreditPoolInfo:  # type: ignore[no-untyped-def]
+def _pool_info(pool, enforcement=None) -> CreditPoolInfo:  # type: ignore[no-untyped-def]
     return CreditPoolInfo(
         total=pool.total,
         used=pool.used,
@@ -126,6 +137,28 @@ def _pool_info(pool) -> CreditPoolInfo:  # type: ignore[no-untyped-def]
         collected_at=pool.collected_at,
         assigned=pool.assigned,
         over_allocation=pool.over_allocation,
+        checkmarx_enforcement=enforcement,
+    )
+
+
+def _unmatched_info(found) -> UnmatchedEntitiesInfo:  # type: ignore[no-untyped-def]
+    return UnmatchedEntitiesInfo(
+        count=found.count,
+        credits=found.credits,
+        total_credits=found.total_credits,
+        top=[{"name": name, "credits": str(credits)} for name, credits in found.top],
+    )
+
+
+def _attribution_info(summary) -> AttributionSummaryInfo:  # type: ignore[no-untyped-def]
+    return AttributionSummaryInfo(
+        unmatched_people=summary.unmatched_people,
+        unmatched_people_credits=summary.unmatched_people_credits,
+        automation=summary.automation,
+        automation_credits=summary.automation_credits,
+        user_total_credits=summary.user_total_credits,
+        projects=_unmatched_info(summary.projects),
+        applications=_unmatched_info(summary.applications),
     )
 
 
@@ -170,12 +203,7 @@ def get_dashboard(
         db.scalar(
             select(func.count())
             .select_from(UnresolvedSubject)
-            .where(
-                UnresolvedSubject.mapped_user_id.is_(None),
-                UnresolvedSubject.status != "auto_matched",
-                UnresolvedSubject.is_bot.is_(False),
-                UnresolvedSubject.view_by != auto_triage_attribution.SOURCE_SCAN_INITIATOR,
-            )
+            .where(*ingestion.unresolved_person_filter())
         )
         or 0
     )
@@ -209,6 +237,10 @@ def get_dashboard(
                 credits=item.credits,
                 transactions=item.transactions,
                 percent_of_total=item.percent_of_total,
+                action_bucket=item.action_bucket,
+                credits_per_transaction=item.credits_per_transaction,
+                listed_rate=item.listed_rate,
+                price_source=item.price_source,
             )
             for item in dashboard_service.action_breakdown(db)
         ],
@@ -237,7 +269,10 @@ def get_dashboard(
             unresolved_scan_initiators=unresolved_initiators,
         ),
         unavailable_dimensions=dashboard_service.unavailable_dimensions(db),
-        credit_pool=_pool_info(dashboard_service.credit_pool(db)),
+        credit_pool=_pool_info(
+            dashboard_service.credit_pool(db), dashboard_service.credit_enforcement(db)
+        ),
+        attribution=_attribution_info(dashboard_service.attribution_summary(db)),
     )
 
 
@@ -530,6 +565,123 @@ def map_unresolved(
     return _subject_response(db, row)
 
 
+_ENTITY_VIEWS = {
+    str(UsageView.PROJECT): (EntityType.PROJECT, CxProject),
+    str(UsageView.APPLICATION): (EntityType.APPLICATION, CxApplication),
+}
+
+
+@router.get("/usage/unmatched-entities", response_model=list[UnmatchedEntityResponse])
+def list_unmatched_entities(ctx: AdminUser, db: DbSession) -> list[UnmatchedEntityResponse]:
+    """Project and application names in the latest readings that match no synced
+    project or application, and the names an admin has mapped. Largest first."""
+    mappings = settings_store.entity_mappings(db)
+    rows: list[UnmatchedEntityResponse] = []
+    for view, (_entity_type, model) in _ENTITY_VIEWS.items():
+        snapshot = ingestion.latest_snapshot(db, view)
+        if snapshot is None:
+            continue
+        mapped = mappings.get(view, {})
+        records = db.scalars(
+            select(UsageRecord).where(
+                UsageRecord.snapshot_id == snapshot.id,
+                or_(
+                    UsageRecord.entity_id.is_(None),
+                    UsageRecord.subject_key.in_(list(mapped)[:1000] or [""]),
+                ),
+            )
+        )
+        for record in records:
+            entity_id = mapped.get(record.subject_key)
+            entity = db.get(model, entity_id) if entity_id else None
+            rows.append(
+                UnmatchedEntityResponse(
+                    view=view,
+                    subject_key=record.subject_key,
+                    name=record.subject_name or record.subject_key,
+                    credits=record.credits_used,
+                    mapped_entity_id=entity_id,
+                    mapped_label=entity.name if entity is not None else None,
+                )
+            )
+    rows.sort(key=lambda row: (-row.credits, row.view, row.subject_key))
+    return rows
+
+
+@router.post("/usage/unmatched-entities/map", response_model=UnmatchedEntityResponse)
+def map_unmatched_entity(
+    payload: MapEntityRequest, ctx: AdminUser, db: DbSession
+) -> UnmatchedEntityResponse:
+    """Count usage reported under a name that matches no project (or application)
+    towards the one it belongs to; a null ``entity_id`` clears the mapping.
+
+    Takes effect at once on the latest reading, and every later reading honours
+    it. A real name match always wins over a mapping.
+    """
+    entity_type, model = _ENTITY_VIEWS[payload.view]
+    key = payload.subject_key.strip().lower()
+    entity = None
+    if payload.entity_id:
+        entity = db.get(model, payload.entity_id)
+        if entity is None or entity.is_deleted:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "unknown_entity",
+                    "message": f"That {payload.view} is not in the synced organisation model.",
+                },
+            )
+    mappings = settings_store.entity_mappings(db)
+    view_map = dict(mappings.get(payload.view, {}))
+    before = view_map.get(key)
+    if payload.entity_id:
+        view_map[key] = payload.entity_id
+    else:
+        view_map.pop(key, None)
+    mappings[payload.view] = view_map
+    settings_store.set_value(db, settings_store.KEY_ENTITY_MAPPINGS, mappings)
+
+    name = key
+    credits = Decimal("0")
+    snapshot = ingestion.latest_snapshot(db, payload.view)
+    if snapshot is not None:
+        for record in db.scalars(
+            select(UsageRecord).where(
+                UsageRecord.snapshot_id == snapshot.id, UsageRecord.subject_key == key
+            )
+        ):
+            name = record.subject_name or record.subject_key
+            credits = record.credits_used
+            # Only a record no real name matched follows the mapping.
+            if record.entity_id is None or record.entity_id == before:
+                record.entity_type = entity_type
+                record.entity_id = payload.entity_id
+    db.flush()
+    record_audit(
+        db,
+        action="usage.entity_mapped",
+        actor=ctx.actor,
+        target_type=f"unmatched_{payload.view}",
+        target_id=key[:64],
+        target_label=name,
+        before={"entity_id": before},
+        after={"entity_id": payload.entity_id},
+        detail=(
+            f"Credit usage reported under the {payload.view} name {name} now counts towards "
+            f"{entity.name if entity is not None else f'no {payload.view}'}."
+        ),
+    )
+    db.commit()
+    return UnmatchedEntityResponse(
+        view=payload.view,
+        subject_key=key,
+        name=name,
+        credits=credits,
+        mapped_entity_id=payload.entity_id,
+        mapped_label=entity.name if entity is not None else None,
+    )
+
+
 @router.get("/usage/dimensions")
 def usage_dimensions(ctx: CurrentUser, db: DbSession) -> dict[str, object]:
     """Which consumption dimensions this tenant supports, and why not."""
@@ -542,7 +694,13 @@ def usage_dimensions(ctx: CurrentUser, db: DbSession) -> dict[str, object]:
             "last_checked_at": states[str(view)].last_checked_at if str(view) in states else None,
             "last_error": states[str(view)].last_error if str(view) in states else None,
         }
-        for view in (UsageView.USER, UsageView.ACTION, UsageView.APPLICATION, UsageView.PROJECT)
+        for view in (
+            UsageView.USER,
+            UsageView.ACTION,
+            UsageView.APPLICATION,
+            UsageView.PROJECT,
+            UsageView.GROUP,
+        )
     }
 
 

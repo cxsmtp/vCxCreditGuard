@@ -462,6 +462,7 @@ def _execute_tenant_steps(
     def sync_org() -> None:
         org_result = org_sync.sync_org_model(session, client, actor=actor)
         result.steps["org_sync"] = org_result.as_stats()
+        _note_duplicate_groups(session, org_result.duplicate_group_names)
         if org_result.warnings:
             _warn(session, "org_sync", "; ".join(org_result.warnings))
             result.status = RunStatus.PARTIAL
@@ -526,6 +527,9 @@ def _execute_tenant_steps(
             latest.total_credits == balance.total
             and latest.used_credits == balance.used
             and latest.available_credits == balance.available
+            # Checkmarx's own enforcement block (state, thresholds) is shown on
+            # the dashboard, so a change there is a new reading too.
+            and _enforcement_block(latest.raw) == _enforcement_block(balance.raw)
         )
         if not unchanged:
             session.add(
@@ -749,18 +753,46 @@ def _warn(session: Session, step: str, message: str) -> None:
     )
 
 
+def _enforcement_block(raw: Any) -> Any:
+    return raw.get("enforcement") if isinstance(raw, dict) else None
+
+
+def _note_duplicate_groups(session: Session, names: list[str]) -> None:
+    """Repeated group names: a warning raised once per distinct set.
+
+    A property of the tenant rather than a failed step, so it neither marks
+    the run partial nor raises an error every cycle. The set is kept for
+    Diagnostics, and a new notice is raised only when the set changes.
+    """
+    import hashlib
+
+    names = sorted(set(names))
+    if names == settings_store.duplicate_group_names(session):
+        return
+    settings_store.set_value(session, settings_store.KEY_DUPLICATE_GROUP_NAMES, names)
+    if not names:
+        return
+    digest = hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
+    notifications.notify(
+        session,
+        category=notifications.CATEGORY_SYNC_ERROR,
+        severity=Severity.WARNING,
+        title="Some group names are not unique",
+        body=org_sync.duplicate_groups_message(names),
+        dedupe_key=f"org_sync:duplicate_groups:{digest}",
+    )
+
+
 def _notify_unresolved(session: Session) -> None:
     """Tell the admin about consumption that could not be attributed to a user."""
     from app.models.usage import UnresolvedSubject
 
+    # The same rows every page counts as unmatched people: an auto-matched
+    # subject's credits do count towards a user, and automation (a bot, an
+    # integration identity) is not a person to chase. Scan initiators are
+    # raised by the auto-triage step, in its own words.
     rows = list(
-        session.scalars(
-            select(UnresolvedSubject).where(
-                UnresolvedSubject.mapped_user_id.is_(None),
-                # Scan initiators are raised by the auto-triage step, in its own words.
-                UnresolvedSubject.view_by != auto_triage_attribution.SOURCE_SCAN_INITIATOR,
-            )
-        )
+        session.scalars(select(UnresolvedSubject).where(*ingestion.unresolved_person_filter()))
     )
     for row in rows:
         notifications.notify(

@@ -23,11 +23,9 @@ from app.models.usage import (
     AutoTriageProjectState,
     DimensionState,
     SchedulerRun,
-    UnresolvedSubject,
     UsageSnapshot,
 )
 from app.services import settings_store
-from app.services.auto_triage_attribution import SOURCE_SCAN_INITIATOR
 
 OK = "ok"
 WARN = "warn"
@@ -64,6 +62,15 @@ _REMEDIATION: dict[tuple[str, str], str] = {
     ("attribution", WARN): (
         "Open Settings and map each unresolved consumer to a user so their usage counts "
         "towards that user's limit."
+    ),
+    ("unmatched_entities", WARN): (
+        "Open Settings → Attribution and map each repository name to the project (or "
+        "application) it belongs to. A name that is no project at all (an SCM repository "
+        "scanned outside a project) can be left: it is counted tenant wide."
+    ),
+    ("group_names", WARN): (
+        "Rename the groups in Checkmarx One so each name is unique, or set group limits only "
+        "on groups whose name is unique."
     ),
     ("auto_triage_attribution", WARN): (
         "Map each scan initiator listed as unmatched under Settings → Attribution to the person it "
@@ -120,9 +127,13 @@ def run_diagnostics(
         _scheduler_check(session, moment, include_detail=include_detail),
         _usage_check(session, moment),
         _attribution_check(session),
+        _unmatched_entities_check(session),
         _pending_enforcement_check(session),
         _dimensions_check(session),
     ]
+    group_names = _group_names_check(session)
+    if group_names is not None:
+        checks.append(group_names)
     if settings_store.auto_triage_to_initiator(session):
         # Only while charging auto triage to scan initiators is on, so the
         # report is unchanged for everyone who has not turned it on.
@@ -236,27 +247,83 @@ def _usage_check(session: Session, moment: datetime) -> Check:
 
 
 def _attribution_check(session: Session) -> Check:
-    count = int(
-        session.scalar(
-            select(func.count())
-            .select_from(UnresolvedSubject)
-            .where(
-                UnresolvedSubject.mapped_user_id.is_(None),
-                # Scan initiators have their own check (auto-triage attribution).
-                UnresolvedSubject.view_by != SOURCE_SCAN_INITIATOR,
-            )
+    from app.services import dashboard as dashboard_service
+
+    summary = dashboard_service.attribution_summary(session)
+    count = summary.unmatched_people
+    automation = ""
+    if summary.automation:
+        automation = (
+            f" {summary.automation} automation identit{'y' if summary.automation == 1 else 'ies'}"
+            f" (Auto Triage, bots, integrations without an email) used "
+            f"{_credits(summary.automation_credits)} credits; that usage is shown as "
+            "automation and counts towards no user limit."
         )
-        or 0
-    )
     if count == 0:
-        return Check("attribution", "Usage attribution", OK, "All usage is matched to a user.")
+        return Check(
+            "attribution",
+            "Usage attribution",
+            OK,
+            f"Every person's usage is matched to a user.{automation}",
+        )
     return Check(
         "attribution",
         "Usage attribution",
         WARN,
         f"{count} consumer(s) could not be matched to a user, so that usage counts "
-        "towards no user limit. Resolve them under Settings → Attribution.",
+        f"towards no user limit. Resolve them under Settings → Attribution.{automation}",
     )
+
+
+def _credits(value: Decimal) -> str:
+    text = f"{Decimal(value).normalize():f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _unmatched_entities_check(session: Session) -> Check:
+    """Project and application usage reported under a name that is no project."""
+    from app.services import dashboard as dashboard_service
+
+    summary = dashboard_service.attribution_summary(session)
+    parts: list[str] = []
+    for label, found in (("project", summary.projects), ("application", summary.applications)):
+        if not found.count:
+            continue
+        share = (
+            f" ({round(float(found.credits) / float(found.total_credits) * 100)}% of "
+            f"{_credits(found.total_credits)})"
+            if found.total_credits > 0
+            else ""
+        )
+        names = ", ".join(name for name, _credits_used in found.top[:3])
+        parts.append(
+            f"{_credits(found.credits)} {label} credits{share} under {found.count} name(s) that "
+            f"match no {label}, such as {names}"
+        )
+    if not parts:
+        return Check(
+            "unmatched_entities",
+            "Project and application usage",
+            OK,
+            "All project and application usage matches a synced project or application.",
+        )
+    return Check(
+        "unmatched_entities",
+        "Project and application usage",
+        WARN,
+        "Checkmarx reports usage under a repository name that matches no project in "
+        f"/api/projects: {'; '.join(parts)}. That usage counts towards no project, group or "
+        "application limit. Map each name under Settings → Attribution.",
+    )
+
+
+def _group_names_check(session: Session) -> Check | None:
+    from app.services import org_sync
+
+    names = settings_store.duplicate_group_names(session)
+    if not names:
+        return None
+    return Check("group_names", "Group names", WARN, org_sync.duplicate_groups_message(names))
 
 
 def _auto_triage_check(session: Session) -> Check:

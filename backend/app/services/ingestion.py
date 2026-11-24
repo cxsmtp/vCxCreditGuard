@@ -112,8 +112,17 @@ class DimensionResult:
     auto_matched: int = 0
     # Plausible matches left for a human to confirm.
     disputed: int = 0
-    # Rows attributed to automation rather than to a person, such as Auto Triage.
+    # Rows attributed to automation rather than to a person: Auto Triage and
+    # other synthetic subjects, bots ("[bot]") and integration identities (a
+    # handle with no email that matches nobody). Counted tenant wide, towards
+    # no user limit, and never raised as an unmatched person.
     automated: int = 0
+    automated_credits: Decimal = Decimal("0")
+    # Project/application/group rows that matched no synced entity (by id, by
+    # name, or by an admin's mapping), and their credits. On a live tenant most
+    # project credits were reported under "org/repo" names that are no project.
+    unmatched_entities: int = 0
+    unmatched_credits: Decimal = Decimal("0")
     snapshot_id: int | None = None
     error: str | None = None
     # True when the read was stored as evidence but not believed (see
@@ -161,6 +170,9 @@ class IngestResult:
                 "auto_matched": dimension.auto_matched,
                 "disputed": dimension.disputed,
                 "automated": dimension.automated,
+                "automated_credits": str(dimension.automated_credits),
+                "unmatched_entities": dimension.unmatched_entities,
+                "unmatched_credits": str(dimension.unmatched_credits),
                 "error": dimension.error,
                 "held": dimension.held,
             }
@@ -208,9 +220,18 @@ class UserIndex:
         return None
 
     def resolve_detailed(
-        self, *, subject_key: str, name: str | None, email: str | None
+        self,
+        *,
+        subject_key: str,
+        name: str | None,
+        email: str | None,
+        integrations: bool = False,
     ) -> MatchOutcome:
-        """Full attribution decision: pin, then exact ladder, then fuzzy triage."""
+        """Full attribution decision: pin, then exact ladder, then fuzzy triage.
+
+        ``integrations``: an unmatched handle with no email is automation (a
+        consumption row; see subject_matching.is_integration_identity).
+        """
         pinned = self.pinned.get(subject_key)
         if pinned:
             return MatchOutcome(MatchMethod.PINNED, pinned)
@@ -218,7 +239,11 @@ class UserIndex:
         if exact:
             return MatchOutcome(MatchMethod.EXACT, exact)
         return subject_matching.classify(
-            subject_key=subject_key, name=name, email=email, profiles=self.profiles
+            subject_key=subject_key,
+            name=name,
+            email=email,
+            profiles=self.profiles,
+            integrations=integrations,
         )
 
 
@@ -272,15 +297,43 @@ def build_user_index(session: Session) -> UserIndex:
     )
 
 
-def _named_index(session: Session, model) -> tuple[dict[str, str], dict[str, str]]:
-    """(by id, by lowercased name) for projects or applications."""
+def _named_index(
+    session: Session, model, mappings: dict[str, str] | None = None
+) -> tuple[dict[str, str], dict[str, str]]:
+    """(by id, by lowercased name) for projects or applications.
+
+    ``mappings`` are an admin's (reported name -> entity id) for names that
+    match no entity, from Settings → Attribution; a real name match wins, and
+    a mapping to an entity that is gone is ignored.
+    """
     by_id: dict[str, str] = {}
     by_name: dict[str, str] = {}
     for row in session.scalars(select(model).where(model.is_deleted.is_(False))):
         by_id[row.id] = row.id
         if row.name:
             by_name.setdefault(row.name.strip().lower(), row.id)
+    for reported, entity_id in (mappings or {}).items():
+        if entity_id in by_id:
+            by_name.setdefault(reported.strip().lower(), entity_id)
     return by_id, by_name
+
+
+def unresolved_person_filter() -> tuple:
+    """The rows of ``unresolved_subject`` that are an unmatched *person*.
+
+    One definition for every page and message: not mapped by an admin, not
+    auto-matched (those credits count towards a user), not automation (a bot,
+    an integration identity), and not a scan initiator (the auto-triage step
+    raises those in its own words).
+    """
+    from app.services.auto_triage_attribution import SOURCE_SCAN_INITIATOR
+
+    return (
+        UnresolvedSubject.mapped_user_id.is_(None),
+        UnresolvedSubject.status != MatchMethod.FUZZY_AUTO,
+        UnresolvedSubject.is_bot.is_(False),
+        UnresolvedSubject.view_by != SOURCE_SCAN_INITIATOR,
+    )
 
 
 # -------------------------------------------------------------------- ingestion
@@ -296,8 +349,15 @@ def ingest_usage(
 ) -> IngestResult:
     result = IngestResult()
     user_index = build_user_index(session)
-    projects_by_id, projects_by_name = _named_index(session, CxProject)
-    apps_by_id, apps_by_name = _named_index(session, CxApplication)
+    from app.services import settings_store
+
+    mappings = settings_store.entity_mappings(session)
+    projects_by_id, projects_by_name = _named_index(
+        session, CxProject, mappings.get(str(UsageView.PROJECT))
+    )
+    apps_by_id, apps_by_name = _named_index(
+        session, CxApplication, mappings.get(str(UsageView.APPLICATION))
+    )
     groups_by_id, groups_by_name = _named_index(session, CxGroup)
 
     # Fetched at most once per run, and only if a dimension's support is still
@@ -476,6 +536,9 @@ class _Fetched:
     merged: dict[str, usage_api.ParsedUsageItem]
     total_items: int | None
     pages: int
+    # Rows read across every page, before rows for the same subject (the same
+    # email or name, reported more than once) were merged.
+    rows: int = 0
 
     @property
     def total_credits(self) -> Decimal:
@@ -501,6 +564,7 @@ def _fetch_dimension(
     total_items: int | None = None
     total_pages: int | None = None
     pages = 0
+    rows = 0
     last_page_size = 0
 
     for page in usage_api.fetch_usage(
@@ -508,6 +572,8 @@ def _fetch_dimension(
     ):
         pages += 1
         last_page_size = len(page.items)
+        raw_items = page.raw.get("items") if isinstance(page.raw, dict) else None
+        rows += len(raw_items) if isinstance(raw_items, list) else len(page.items)
         if page.raw is not None:
             raw_pages.append(page.raw)
         if page.total_items is not None:
@@ -546,7 +612,9 @@ def _fetch_dimension(
             "value, so the endpoint silently fell back to the user dimension."
         )
 
-    return _Fetched(raw_pages=raw_pages, merged=merged, total_items=total_items, pages=pages)
+    return _Fetched(
+        raw_pages=raw_pages, merged=merged, total_items=total_items, pages=pages, rows=rows
+    )
 
 
 def _hold_reason(
@@ -671,12 +739,23 @@ def _store_dimension(
             held=True,
         )
 
-    if fetched.total_items is not None and len(merged) < fetched.total_items:
+    # The feed lists one subject more than once (on a live tenant, 119 user rows
+    # for 87 people: the same person under their email and their name), and
+    # those rows are merged. That is expected; only fewer rows than the feed
+    # says it has is a shortfall worth a warning.
+    if fetched.total_items is not None and fetched.rows < fetched.total_items:
         logger.warning(
-            "Consumption by %s returned %d distinct subjects but reports %d items",
+            "Consumption by %s returned %d rows but reports %d items",
             view,
-            len(merged),
+            fetched.rows,
             fetched.total_items,
+        )
+    elif fetched.rows > len(merged):
+        logger.info(
+            "Consumption by %s: %d rows merged into %d subjects reported more than once",
+            view,
+            fetched.rows,
+            len(merged),
         )
 
     result = DimensionResult(view_by=str(view), supported=True, snapshot_id=snapshot.id)
@@ -686,7 +765,10 @@ def _store_dimension(
         outcome: MatchOutcome | None = None
         if view == UsageView.USER:
             outcome = user_index.resolve_detailed(
-                subject_key=item.subject_key, name=item.subject_name, email=item.subject_email
+                subject_key=item.subject_key,
+                name=item.subject_name,
+                email=item.subject_email,
+                integrations=True,
             )
             entity_type, entity_id = EntityType.USER, outcome.counted_user_id
         else:
@@ -700,6 +782,11 @@ def _store_dimension(
                 groups_by_id=groups_by_id or {},
                 groups_by_name=groups_by_name or {},
             )
+            if entity_type is not None and entity_id is None:
+                # Reported under a name (or id) that is no synced entity: it
+                # counts towards no limit. Counted, so it is never silent.
+                result.unmatched_entities += 1
+                result.unmatched_credits += item.credits_used
         session.add(
             UsageRecord(
                 snapshot_id=snapshot.id,
@@ -725,6 +812,7 @@ def _store_dimension(
             # an unmatched user and never attributed to a user limit.
             if is_synthetic_subject(item.subject_key):
                 result.automated += 1
+                result.automated_credits += item.credits_used
             else:
                 _apply_user_outcome(session, item, outcome, now, result)
 
@@ -821,8 +909,12 @@ def _apply_user_outcome(
     elif outcome.method == MatchMethod.DISPUTED:
         result.disputed += 1
         result.unresolved += 1
-    elif not outcome.is_bot:
-        # A plain miss still counts towards the unmatched banner; a bot does not.
+    elif outcome.is_bot:
+        # Automation (a bot, an integration identity): visible, never a person.
+        result.automated += 1
+        result.automated_credits += item.credits_used
+    else:
+        # A plain miss still counts towards the unmatched banner.
         result.unresolved += 1
 
     top = outcome.candidates[0] if outcome.candidates else None

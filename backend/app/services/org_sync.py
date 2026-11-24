@@ -54,6 +54,10 @@ class OrgSyncResult:
     application_projects: int = 0
     soft_deleted: int = 0
     warnings: list[str] = field(default_factory=list)
+    # Group names more than one group carries. A property of the tenant, not a
+    # failed read: reported once as a warning (and in Diagnostics), never as a
+    # degraded cycle. Lowercased, sorted.
+    duplicate_group_names: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -68,7 +72,18 @@ class OrgSyncResult:
             "applications": self.applications,
             "soft_deleted": self.soft_deleted,
             "warnings": self.warnings,
+            "duplicate_group_names": self.duplicate_group_names,
         }
+
+
+def duplicate_groups_message(names: list[str]) -> str:
+    """What repeated group names mean, for the notice and Diagnostics."""
+    shown = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
+    return (
+        f"{len(names)} group name(s) are not unique in this tenant ({shown}). Memberships "
+        "reported by name alone cannot be attributed for those groups, so their group "
+        "limits may undercount. Rename the groups in Checkmarx One to make them unique."
+    )
 
 
 def sync_org_model(
@@ -224,12 +239,7 @@ def _sync_groups(
 
     for name in duplicates:
         by_name.pop(name, None)
-    if duplicates:
-        result.warnings.append(
-            f"{len(duplicates)} group name(s) are not unique in this tenant "
-            f"({', '.join(sorted(duplicates)[:5])}). Memberships reported by name alone "
-            "cannot be attributed for those groups, so their group limits may undercount."
-        )
+    result.duplicate_group_names = sorted(duplicates)
 
     result.soft_deleted += _soft_delete_missing(session, existing, seen, now)
     session.flush()

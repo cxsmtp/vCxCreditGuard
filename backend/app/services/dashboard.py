@@ -19,7 +19,12 @@ from sqlalchemy.orm import Session
 from app.models.enums import EntityType, LimitStatus, UsageView
 from app.models.limits import CreditLimit, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxProjectGroup, CxUser
-from app.models.usage import CreditBalanceSnapshot, UsageRecord, UsageSnapshot
+from app.models.usage import (
+    CreditBalanceSnapshot,
+    UnresolvedSubject,
+    UsageRecord,
+    UsageSnapshot,
+)
 from app.services import auto_triage_attribution, ingestion, settings_store
 from app.services.periods import PeriodError, current_window, describe_window
 
@@ -61,14 +66,58 @@ class Consumer:
     percent_of_total: float | None = None
     # Users only, while auto-triage credits are charged to scan initiators.
     auto_triage_attributed: Decimal | None = None
+    # Users only: automation (Auto Triage, a bot, an integration identity)
+    # rather than an unmatched person.
+    automation: bool = False
 
 
 @dataclass
 class ActionBreakdown:
+    # As Checkmarx reports it ("Fusion Scan - Opus 5.5"), or the normalised
+    # type when the breakdown is derived from per-user counts.
     action_type: str
     credits: Decimal
     transactions: int | None = None
     percent_of_total: float | None = None
+    # The normalised type ("fusion", "triage"), for a stable colour.
+    action_bucket: str | None = None
+    # Credits per transaction as the feed reports it (credits / transactions).
+    credits_per_transaction: Decimal | None = None
+    # The listed rate (GET /api/v1/credits/action-rates), when there is one.
+    listed_rate: Decimal | None = None
+    # Which figure CreditGuard prices this action at: "rate" or "observed"
+    # (see usage_mix.price_table).
+    price_source: str | None = None
+
+
+@dataclass
+class UnmatchedEntities:
+    """One non-user dimension's rows that matched no synced entity."""
+
+    count: int = 0
+    credits: Decimal = Decimal("0")
+    total_credits: Decimal = Decimal("0")
+    # The largest few, for the explanation: (reported name, credits).
+    top: list[tuple[str, Decimal]] = field(default_factory=list)
+
+
+@dataclass
+class AttributionSummary:
+    """Usage that counts towards no limit, by why, from the latest readings.
+
+    ``unmatched_people`` is the same number every page shows (see
+    ingestion.unresolved_person_filter). Automation and unmatched projects or
+    applications are shown next to it so their usage is never silently
+    dropped.
+    """
+
+    unmatched_people: int = 0
+    unmatched_people_credits: Decimal = Decimal("0")
+    automation: int = 0
+    automation_credits: Decimal = Decimal("0")
+    user_total_credits: Decimal = Decimal("0")
+    projects: UnmatchedEntities = field(default_factory=UnmatchedEntities)
+    applications: UnmatchedEntities = field(default_factory=UnmatchedEntities)
 
 
 @dataclass
@@ -133,18 +182,36 @@ def action_breakdown(session: Session) -> list[ActionBreakdown]:
         # Derive it from the per user action counts if the action view is absent.
         return _breakdown_from_user_actions(session)
 
+    from app.checkmarx import usage as usage_api
+    from app.services import usage_mix
+
+    prices = usage_mix.price_table(session)
     total = sum((record.credits_used for record in records), Decimal("0"))
     breakdown: list[ActionBreakdown] = []
     for record in records:
         transactions = record.transactions
         if transactions is None and record.actions:
             transactions = sum(record.actions.values())
+        name = record.subject_name or record.subject_key
+        buckets = {usage_mix.bucket(action) for action in (record.actions or {})}
+        price = prices.get(usage_api.action_key(name))
         breakdown.append(
             ActionBreakdown(
-                action_type=record.subject_key,
+                # As Checkmarx reports it, not lowercased.
+                action_type=name,
                 credits=record.credits_used,
                 transactions=transactions,
                 percent_of_total=_percent(record.credits_used, total),
+                action_bucket=(
+                    next(iter(buckets)) if len(buckets) == 1 else usage_mix.bucket(name)
+                ),
+                credits_per_transaction=(
+                    (record.credits_used / transactions).quantize(Decimal("0.01"))
+                    if transactions
+                    else None
+                ),
+                listed_rate=price.rate if price is not None else None,
+                price_source=price.source if price is not None else None,
             )
         )
     return breakdown
@@ -196,11 +263,35 @@ def trend(session: Session, *, points: int = DEFAULT_TREND_POINTS) -> list[tuple
     return result
 
 
+def automation_keys(session: Session, keys: list[str]) -> set[str]:
+    """Which of these user subject keys are automation rather than a person:
+    a synthetic subject (Auto Triage) or a subject classified as a bot or an
+    integration identity, and not mapped to a person by an admin."""
+    found = {key for key in keys if ingestion.is_synthetic_subject(key)}
+    rest = [key for key in keys if key not in found]
+    for start in range(0, len(rest), 500):
+        chunk = rest[start : start + 500]
+        found.update(
+            session.scalars(
+                select(UnresolvedSubject.subject_key).where(
+                    UnresolvedSubject.subject_key.in_(chunk),
+                    UnresolvedSubject.is_bot.is_(True),
+                    UnresolvedSubject.mapped_user_id.is_(None),
+                )
+            )
+        )
+    return found
+
+
 def top_users(session: Session, *, limit: int = DEFAULT_TOP_N) -> list[Consumer]:
     records = latest_snapshot_records(session, UsageView.USER)
     total = sum((record.credits_used for record in records), Decimal("0"))
+    shown = records[:limit]
+    automated = automation_keys(
+        session, [record.subject_key for record in shown if record.entity_id is None]
+    )
     consumers: list[Consumer] = []
-    for record in records[:limit]:
+    for record in shown:
         label = record.subject_name or record.subject_key
         if record.entity_id:
             user = session.get(CxUser, record.entity_id)
@@ -214,6 +305,7 @@ def top_users(session: Session, *, limit: int = DEFAULT_TOP_N) -> list[Consumer]
                 credits=record.credits_used,
                 resolved=record.entity_id is not None,
                 percent_of_total=_percent(record.credits_used, total),
+                automation=record.subject_key in automated,
             )
         )
     if settings_store.auto_triage_to_initiator(session):
@@ -286,6 +378,85 @@ def top_groups(session: Session, *, limit: int = DEFAULT_TOP_N) -> list[Consumer
             )
         )
     return _attach_limits(session, consumers)
+
+
+def _unmatched_entities(session: Session, view: UsageView) -> UnmatchedEntities:
+    found = UnmatchedEntities()
+    snapshot = ingestion.latest_snapshot(session, view)
+    if snapshot is None:
+        return found
+    found.total_credits = Decimal(snapshot.total_credits or 0)
+    count, credits = session.execute(
+        select(func.count(), func.coalesce(func.sum(UsageRecord.credits_used), 0)).where(
+            UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.is_(None)
+        )
+    ).one()
+    found.count = int(count or 0)
+    found.credits = Decimal(str(credits or 0))
+    found.top = [
+        (record.subject_name or record.subject_key, record.credits_used)
+        for record in session.scalars(
+            select(UsageRecord)
+            .where(UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.is_(None))
+            .order_by(UsageRecord.credits_used.desc())
+            .limit(5)
+        )
+    ]
+    return found
+
+
+def attribution_summary(session: Session) -> AttributionSummary:
+    """What counts towards no limit, and why. Read only, from stored readings."""
+    summary = AttributionSummary()
+    people = ingestion.unresolved_person_filter()
+    count, credits = session.execute(
+        select(func.count(), func.coalesce(func.sum(UnresolvedSubject.credits_used), 0)).where(
+            *people
+        )
+    ).one()
+    summary.unmatched_people = int(count or 0)
+    summary.unmatched_people_credits = Decimal(str(credits or 0))
+
+    snapshot = ingestion.latest_snapshot(session, UsageView.USER)
+    if snapshot is not None:
+        summary.user_total_credits = Decimal(snapshot.total_credits or 0)
+        unattributed = list(
+            session.execute(
+                select(UsageRecord.subject_key, UsageRecord.credits_used).where(
+                    UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.is_(None)
+                )
+            )
+        )
+        automated = automation_keys(session, [key for key, _credits in unattributed])
+        for key, row_credits in unattributed:
+            if key in automated:
+                summary.automation += 1
+                summary.automation_credits += Decimal(row_credits or 0)
+
+    summary.projects = _unmatched_entities(session, UsageView.PROJECT)
+    summary.applications = _unmatched_entities(session, UsageView.APPLICATION)
+    return summary
+
+
+def credit_enforcement(session: Session) -> dict[str, object] | None:
+    """Checkmarx's own ``enforcement`` block from the last /credits/info read
+    (state and thresholds), verbatim and read only; None when it carried none."""
+    snapshot = session.scalar(
+        select(CreditBalanceSnapshot).order_by(
+            CreditBalanceSnapshot.collected_at.desc(), CreditBalanceSnapshot.id.desc()
+        )
+    )
+    raw = getattr(snapshot, "raw", None) if snapshot is not None else None
+    block = raw.get("enforcement") if isinstance(raw, dict) else None
+    if not isinstance(block, dict):
+        return None
+    allowed = ("state", "consumptionPct", "warningThresholdPct", "cutoffThresholdPct")
+    picked = {
+        key: block[key]
+        for key in allowed
+        if isinstance(block.get(key), str | int | float) and not isinstance(block.get(key), bool)
+    }
+    return picked or None
 
 
 def unavailable_dimensions(session: Session) -> list[str]:

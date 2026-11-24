@@ -24,7 +24,7 @@ from app.schemas.limits import (
     UpdateStatusResponse,
     WatchdogResponse,
 )
-from app.services import audit_chain, demo_service, ops_hardening, settings_store
+from app.services import audit_chain, demo_service, ingestion, ops_hardening, settings_store
 from app.services import delivery as delivery_service
 from app.services import diagnostics as diagnostics_service
 from app.services import notifications as notification_service
@@ -111,11 +111,12 @@ def scheduler_status(ctx: CurrentUser, db: DbSession) -> SchedulerStatusResponse
         )
         or 0
     )
+    # The same number the dashboard and Diagnostics show (unmatched people).
     unresolved = int(
         db.scalar(
             select(func.count())
             .select_from(UnresolvedSubject)
-            .where(UnresolvedSubject.mapped_user_id.is_(None))
+            .where(*ingestion.unresolved_person_filter())
         )
         or 0
     )

@@ -62,8 +62,11 @@ class TestDashboard:
         body = admin_client.get("/api/dashboard").json()
         assert float(body["tenant_total_credits"]) == 15.0
         actions = {item["action_type"]: item for item in body["breakdown"]}
-        assert set(actions) == {"triage", "remediation"}
-        assert float(actions["triage"]["credits"]) == 9.0
+        # As Checkmarx reports the names, not lowercased.
+        assert set(actions) == {"Triage", "Remediation"}
+        assert float(actions["Triage"]["credits"]) == 9.0
+        assert actions["Triage"]["action_bucket"] == "triage"
+        assert float(actions["Remediation"]["credits_per_transaction"]) == 3.0
 
     def test_top_consumers_per_dimension(
         self, admin_client: TestClient, tenant: FakeTenant
