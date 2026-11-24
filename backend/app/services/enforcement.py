@@ -56,7 +56,14 @@ from app.models.limits import (
     effective_project_actions,
 )
 from app.models.org import CxApplicationProject, CxProject, CxProjectGroup, CxUser
-from app.services import key_permissions, notifications, role_sources, settings_store, usage_mix
+from app.services import (
+    key_permissions,
+    notifications,
+    pacing,
+    role_sources,
+    settings_store,
+    usage_mix,
+)
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -148,10 +155,24 @@ class EnforcementOutcome:
     # still hold is unknown. They were re-applied (harmless if they still hold),
     # but this is not drift and nobody is told it was.
     unverified: list[EnforcementAction] = field(default_factory=list)
+    # With a budget (see EnforcementBudget): the targets left for a later cycle
+    # because this cycle's write budget (or time) ran out, how many users or
+    # projects the limit restricts in all, the restrictions in force that were
+    # not due to be read back this cycle, and whether the whole limit was left
+    # for the second pass because it is a large rollout.
+    deferred: list[Target] = field(default_factory=list)
+    planned_targets: int = 0
+    not_due: int = 0
+    postponed: bool = False
 
     @property
     def ok(self) -> bool:
         return not self.failed
+
+    @property
+    def deferred_targets(self) -> int:
+        """Users or projects with at least one restriction still to apply."""
+        return len({target.target_id for target in self.deferred})
 
     def as_stats(self) -> dict[str, Any]:
         return {
@@ -161,6 +182,87 @@ class EnforcementOutcome:
             "skipped": self.skipped,
             "failed": self.failed,
         }
+
+
+@dataclass
+class EnforcementBudget:
+    """What one cycle may still do to the tenant, shared by all its limits.
+
+    ``writes``: restriction attempts (apply or lift) left this cycle; None
+    means no budget. ``verify_ids``: the restrictions in force chosen to be
+    read back this cycle (oldest-verified first); None means every one met, as
+    before pacing. ``postpone_large``: during the first pass of a cycle, a
+    limit that needs more writes than this waits for the second pass, so small
+    limits are never held up by a large rollout.
+
+    Without a budget (``apply_enforcement(budget=None)``) nothing changes:
+    every target is worked on and every restriction in force is read back.
+    """
+
+    writes: int | None = None
+    verify_ids: frozenset[int] | None = None
+    postpone_large: int | None = None
+    writes_used: int = 0
+    writes_deferred: int = 0
+    verified: int = 0
+    stopped_for_time: bool = False
+    _verified_ids: set[int] = field(default_factory=set)
+
+    def may_write(self) -> bool:
+        if pacing.out_of_time():
+            self.stopped_for_time = True
+            return False
+        return self.writes is None or self.writes > 0
+
+    def spend_write(self) -> None:
+        self.writes_used += 1
+        if self.writes is not None:
+            self.writes -= 1
+
+    def defer_write(self) -> None:
+        self.writes_deferred += 1
+
+    def may_verify(self, action_id: int) -> bool:
+        if action_id in self._verified_ids:
+            return False  # once a cycle, whichever pass met it first
+        if self.verify_ids is not None and action_id not in self.verify_ids:
+            return False
+        if pacing.out_of_time():
+            self.stopped_for_time = True
+            return False
+        return True
+
+    def mark_verified(self, action_id: int) -> None:
+        self._verified_ids.add(action_id)
+        self.verified += 1
+
+    def as_stats(self) -> dict[str, Any]:
+        return {
+            "writes_budget": None if self.writes is None else self.writes + self.writes_used,
+            "writes_used": self.writes_used,
+            "writes_deferred": self.writes_deferred,
+            "verified": self.verified,
+            "stopped_for_time": self.stopped_for_time,
+        }
+
+
+def needs_write(action: EnforcementAction | None) -> bool:
+    """Whether working on this target would (try to) change the tenant.
+
+    Mirrors ``_enforce_target``: a new target, a pending or failed attempt, and
+    a restriction lifted automatically are (re)applied; one in force is only
+    verified; one an admin restored, or one the tenant does not keep, is left.
+    """
+    if action is None:
+        return True
+    if action.status == EnforcementStatus.APPLIED:
+        return False
+    if action.status == EnforcementStatus.REVERSED:
+        return action.reversal_reason != ADMIN_REASON
+    # A failed write the tenant did not keep is not sent again this period.
+    return not (
+        action.status == EnforcementStatus.FAILED and (action.undo_snapshot or {}).get(_NOT_KEPT)
+    )
 
 
 def _permission_hint(exc: Exception) -> str:
@@ -298,6 +400,23 @@ def protection_reason(
     return None
 
 
+def protected_users(session: Session, user_ids: Iterable[str]) -> set[str]:
+    """Which of these users ``protection_reason`` protects, in two reads."""
+    ids = sorted(set(user_ids))
+    if not ids:
+        return set()
+    found = set(protected_user_ids(session)) & set(ids)
+    roles = settings_store.enforcement_guard(session).protected_roles
+    if roles:
+        for chunk in _chunks(ids):
+            for user_id, names in session.execute(
+                select(CxUser.id, CxUser.role_names).where(CxUser.id.in_(chunk))
+            ):
+                if {str(name).lower() for name in (names or [])} & roles:
+                    found.add(user_id)
+    return found
+
+
 def target_released(session: Session, action: EnforcementAction) -> str | None:
     """A reason this action's *target* should not be restricted by anyone.
 
@@ -369,12 +488,28 @@ def plan_targets(
         ]
 
     targets: list[Target] = []
-    for project_id in dict.fromkeys(
-        project_ids_for(session, entity_type=entity_type, entity_id=entity_id)
-    ):
-        if is_exempt(session, entity_type=EntityType.PROJECT, entity_id=project_id):
+    project_ids = list(
+        dict.fromkeys(project_ids_for(session, entity_type=entity_type, entity_id=entity_id))
+    )
+    # Two set-based reads, not two per project: a group can hold thousands.
+    exempt: set[str] = set()
+    projects: dict[str, CxProject] = {}
+    for chunk in _chunks(project_ids):
+        exempt.update(
+            session.scalars(
+                select(Exemption.entity_id).where(
+                    Exemption.entity_type == EntityType.PROJECT, Exemption.entity_id.in_(chunk)
+                )
+            )
+        )
+        projects.update(
+            (row.id, row)
+            for row in session.scalars(select(CxProject).where(CxProject.id.in_(chunk)))
+        )
+    for project_id in project_ids:
+        if project_id in exempt:
             continue
-        project = session.get(CxProject, project_id)
+        project = projects.get(project_id)
         if project is not None and project.is_deleted:
             continue
         label = project.name if project else project_id
@@ -402,6 +537,11 @@ def plan_targets(
     return targets
 
 
+def _chunks(values: list[str], size: int = 1000) -> Iterable[list[str]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
 # --------------------------------------------------------------- role resolution
 
 
@@ -413,6 +553,28 @@ class RoleResolver:
         self._client_uuid: str | None = None
         self._roles: dict[str, iam.RoleRef] | None = None
         self._sources: role_sources.RoleSourceReader | None = None
+        # Read-backs made ahead of time, in parallel (prefetch_verification):
+        # key -> (value, error). Each is used once, by the next read of it.
+        self.read_ahead: dict[tuple[str, ...], tuple[Any, Exception | None]] = {}
+        # A limit's usage breakdown for its restriction messages, worked out
+        # once per run rather than once per project it restricts.
+        self.mixes: dict[tuple[int, str], Any] = {}
+
+    def mix(self, session: Session, limit: CreditLimit, period_key: str) -> Any:
+        key = (limit.id, period_key)
+        if key not in self.mixes:
+            self.mixes[key] = usage_mix.mix_for(session, limit, period_key=period_key)
+        return self.mixes[key]
+
+    def read(self, key: tuple[str, ...], fetch: Callable[[], Any]) -> Any:
+        """The tenant's answer to this read: the one made ahead, or a fresh one."""
+        ahead = self.read_ahead.pop(key, None)
+        if ahead is None:
+            return fetch()
+        value, error = ahead
+        if error is not None:
+            raise error
+        return value
 
     @property
     def client_uuid(self) -> str:
@@ -462,8 +624,16 @@ def apply_enforcement(
     period_key: str,
     actor: AuditActor,
     resolver: RoleResolver | None = None,
+    budget: EnforcementBudget | None = None,
 ) -> EnforcementOutcome:
-    """Enforce one breached limit. Safe to call repeatedly for the same period."""
+    """Enforce one breached limit. Safe to call repeatedly for the same period.
+
+    With a ``budget`` (the cycle's), only the restrictions in force chosen for
+    verification this cycle are read back, and new restrictions stop when the
+    cycle's write budget runs out: the rest are in ``outcome.deferred`` and are
+    applied by the next cycles, in the same order, resuming where this one
+    stopped (every target is idempotent).
+    """
     outcome = EnforcementOutcome(applied=[], skipped=[], failed=[])
     if is_exempt(session, entity_type=limit.entity_type, entity_id=limit.entity_id):
         outcome.skipped.append(f"{limit.entity_type} {limit.entity_id} is exempt")
@@ -511,8 +681,51 @@ def apply_enforcement(
     if not targets:
         outcome.skipped.append("no targets to restrict (exempt, or no projects linked)")
         return outcome
+    outcome.planned_targets = len({target.target_id for target in targets})
+
+    existing: dict[str, EnforcementAction] = {}
+    only_verify = False
+    if budget is not None:
+        # One read for every action of this limit and period, not one per target.
+        existing = {
+            action.idempotency_key: action
+            for action in session.scalars(
+                select(EnforcementAction).where(
+                    EnforcementAction.limit_id == limit.id,
+                    EnforcementAction.period_key == period_key,
+                )
+            )
+        }
+        if budget.postpone_large is not None:
+            wanting = sum(
+                1
+                for target in targets
+                if needs_write(existing.get(_key(limit, period_key, target)))
+            )
+            if wanting > budget.postpone_large:
+                # A large rollout: its writes wait for the second pass, after
+                # every small limit has had its turn. What is in force is still
+                # verified now.
+                only_verify = True
+                outcome.postponed = True
 
     for target in targets:
+        if budget is not None:
+            action = existing.get(_key(limit, period_key, target))
+            if action is not None and action.status == EnforcementStatus.APPLIED:
+                if not budget.may_verify(action.id):
+                    outcome.not_due += 1
+                    continue
+                budget.mark_verified(action.id)
+            elif needs_write(action):
+                if only_verify:
+                    outcome.deferred.append(target)
+                    continue
+                if not budget.may_write():
+                    outcome.deferred.append(target)
+                    budget.defer_write()
+                    continue
+                budget.spend_write()
         # Lock order: never wait on a target lock while holding anything in the
         # database. Whoever holds the target lock needs the database to record
         # its outcome, so waiting on it with a write open would stall both.
@@ -530,6 +743,12 @@ def apply_enforcement(
                 protected_roles=protected_roles,
             )
     return outcome
+
+
+def _key(limit: CreditLimit, period_key: str, target: Target) -> str:
+    return idempotency_key(
+        limit_id=limit.id, period_key=period_key, kind=str(target.kind), target_id=target.target_id
+    )
 
 
 def _enforce_target(
@@ -831,6 +1050,8 @@ def _enforce_target(
     captured.mirror()
     action.status = EnforcementStatus.APPLIED
     action.applied_at = utcnow()
+    # Read back straight after the write (every kind is): verified at once.
+    action.last_verified_at = action.applied_at
     action.error = None
     if target.kind == EnforcementKind.DISABLE_AUTO_TRIAGE and captured.outcome.get(
         "auto_triage_seen_off"
@@ -863,7 +1084,7 @@ def _enforce_target(
             target,
             period_key,
             snapshot,
-            mix=usage_mix.mix_for(session, limit, period_key=period_key),
+            mix=resolver.mix(session, limit, period_key),
         ),
         entity_type=limit.entity_type,
         entity_id=limit.entity_id,
@@ -1054,6 +1275,10 @@ def _verify_applied(
             )
         session.commit()
         return
+    if verdict != RECONCILE_UNVERIFIED:
+        # Read back and found in force, or re-asserted: verified now. One that
+        # could not be read stays due and is tried again next cycle.
+        action.last_verified_at = utcnow()
     if verdict == RECONCILE_HELD:
         outcome.skipped.append(
             f"{target.kind} on {target.target_label} already applied and verified in Checkmarx"
@@ -2026,8 +2251,11 @@ def _reconcile(
 
     if kind == EnforcementKind.REMOVE_USER_ROLES:
         client_uuid = snapshot.get("client_uuid") or resolver.client_uuid
-        current = iam.fetch_user_client_roles(
-            client, user_id=target.target_id, client_uuid=client_uuid
+        current = resolver.read(
+            ("user_roles", target.target_id, client_uuid),
+            lambda: iam.fetch_user_client_roles(
+                client, user_id=target.target_id, client_uuid=client_uuid
+            ),
         )
         # Only a role mapped to the user directly again is drift. One held
         # through a group or a composite role was reported when the restriction
@@ -2050,7 +2278,10 @@ def _reconcile(
         # A read that fails raises (the caller reports "could not be verified");
         # a read that succeeds but has no Auto Triage entry, or one that is off,
         # is not drift. Only an entry read back as enabled is.
-        state = platform.get_auto_triage(client, project_id=target.target_id)
+        state = resolver.read(
+            ("auto_triage", target.target_id),
+            lambda: platform.get_auto_triage(client, project_id=target.target_id),
+        )
         if not state.enabled:
             return RECONCILE_HELD
         found.update({"found": {"enabled": True}})
@@ -2071,8 +2302,11 @@ def _reconcile(
         repo_id = snapshot.get("repo_id") or (project.repo_id if project else None)
         if not repo_id:
             return RECONCILE_HELD
-        current = platform.get_pr_remediation_severities(
-            client, repo_id=repo_id, project_id=target.target_id
+        current = resolver.read(
+            ("pr_remediation", str(repo_id), target.target_id),
+            lambda: platform.get_pr_remediation_severities(
+                client, repo_id=repo_id, project_id=target.target_id
+            ),
         )
         if current is not None and not current:
             return RECONCILE_HELD  # read back as disabled
@@ -2095,7 +2329,10 @@ def _reconcile(
     if kind == EnforcementKind.DISABLE_FUSION:
         lock = bool(snapshot.get("lock_applied"))
         try:
-            setting = platform.get_fusion_setting(client, project_id=target.target_id)
+            setting = resolver.read(
+                ("fusion", target.target_id),
+                lambda: platform.get_fusion_setting(client, project_id=target.target_id),
+            )
         except CheckmarxError as exc:
             if isinstance(exc, CheckmarxAuthError):
                 raise
@@ -2181,7 +2418,10 @@ def _reconcile(
         repo_id = snapshot.get("repo_id") or (project.repo_id if project else None)
         if not repo_id:
             return RECONCILE_HELD
-        read = platform.get_repo_fusion(client, repo_id=repo_id, project_id=target.target_id)
+        read = resolver.read(
+            ("repo_fusion", str(repo_id), target.target_id),
+            lambda: platform.get_repo_fusion(client, repo_id=repo_id, project_id=target.target_id),
+        )
         if read.readable and (read.config is None or not read.enabled):
             return RECONCILE_HELD
         base = read.config if read.config is not None else snapshot.get("repo_fusion_before")
@@ -2734,8 +2974,13 @@ def restore_for_limit(
     period_key: str | None = None,
     actor: AuditActor,
     reason: str,
+    budget: EnforcementBudget | None = None,
 ) -> int:
-    """Restore every applied action for a limit, optionally for one period only."""
+    """Restore every applied action for a limit, optionally for one period only.
+
+    With a ``budget``, stops when its writes run out; what is left stays in
+    force and is lifted by the next cycle (which finds it the same way).
+    """
     query = select(EnforcementAction).where(
         EnforcementAction.limit_id == limit_id,
         EnforcementAction.status.in_(RESTORABLE_STATUSES),
@@ -2746,7 +2991,14 @@ def restore_for_limit(
     resolver = RoleResolver(client)
     restored = 0
     first_error: CheckmarxError | None = None
-    for action in [row for row in session.scalars(query) if may_be_in_force(row)]:
+    for action in [
+        row for row in session.scalars(query.order_by(EnforcementAction.id)) if may_be_in_force(row)
+    ]:
+        if budget is not None:
+            if not budget.may_write():
+                budget.defer_write()
+                continue
+            budget.spend_write()
         # Attempt every action before reporting a failure: one target Checkmarx
         # rejects (a deleted user, say) must not leave the others restricted.
         try:
@@ -2761,11 +3013,108 @@ def restore_for_limit(
     return restored
 
 
+def prefetch_verification(
+    session: Session,
+    client: CheckmarxClient,
+    *,
+    action_ids: Iterable[int],
+    resolver: RoleResolver,
+    workers: int,
+) -> int:
+    """Read back these restrictions in force ahead of time, ``workers`` at a time.
+
+    The drift check (``_reconcile``) then uses each answer instead of making
+    the read itself, so the reads of a cycle's verifications overlap rather
+    than queue. Read only: nothing is written here, and nothing is decided.
+    No database transaction is open while the reads are made. Returns how
+    many reads were made.
+    """
+    ids = sorted(set(action_ids))
+    if workers <= 1 or not ids:
+        return 0
+    actions: list[EnforcementAction] = []
+    for start in range(0, len(ids), 1000):
+        actions.extend(
+            session.scalars(
+                select(EnforcementAction).where(
+                    EnforcementAction.id.in_(ids[start : start + 1000]),
+                    EnforcementAction.status == EnforcementStatus.APPLIED,
+                )
+            )
+        )
+    project_ids = [a.target_id for a in actions if a.target_type == TARGET_PROJECT]
+    repos: dict[str, str | None] = {}
+    for chunk in _chunks(sorted(set(project_ids))):
+        repos.update(
+            (project_id, repo_id)
+            for project_id, repo_id in session.execute(
+                select(CxProject.id, CxProject.repo_id).where(CxProject.id.in_(chunk))
+            )
+        )
+    reads: dict[tuple[str, ...], Callable[[], Any]] = {}
+    for action in actions:
+        snapshot = action.undo_snapshot or {}
+        target_id = action.target_id
+        kind = action.kind
+        if action.reversal_reason == ADMIN_REASON:
+            continue
+        if kind == EnforcementKind.REMOVE_USER_ROLES:
+            try:
+                client_uuid = snapshot.get("client_uuid") or resolver.client_uuid
+            except CheckmarxError:
+                continue
+            reads.setdefault(
+                ("user_roles", target_id, client_uuid),
+                lambda t=target_id, c=client_uuid: iam.fetch_user_client_roles(
+                    client, user_id=t, client_uuid=c
+                ),
+            )
+        elif kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
+            reads.setdefault(
+                ("auto_triage", target_id),
+                lambda t=target_id: platform.get_auto_triage(client, project_id=t),
+            )
+        elif kind == EnforcementKind.DISABLE_FUSION:
+            reads.setdefault(
+                ("fusion", target_id),
+                lambda t=target_id: platform.get_fusion_setting(client, project_id=t),
+            )
+        elif kind in (EnforcementKind.DISABLE_PR_REMEDIATION, EnforcementKind.DISABLE_REPO_FUSION):
+            repo_id = snapshot.get("repo_id") or repos.get(target_id)
+            if not repo_id:
+                continue
+            if kind == EnforcementKind.DISABLE_PR_REMEDIATION:
+                reads.setdefault(
+                    ("pr_remediation", str(repo_id), target_id),
+                    lambda r=repo_id, t=target_id: platform.get_pr_remediation_severities(
+                        client, repo_id=r, project_id=t
+                    ),
+                )
+            else:
+                reads.setdefault(
+                    ("repo_fusion", str(repo_id), target_id),
+                    lambda r=repo_id, t=target_id: platform.get_repo_fusion(
+                        client, repo_id=r, project_id=t
+                    ),
+                )
+    session.commit()  # nothing held open while Checkmarx is read
+    for (key, _fetch), value, error in pacing.parallel_map(
+        lambda item: item[1](), list(reads.items()), workers=workers
+    ):
+        resolver.read_ahead[key] = (value, error)
+    return len(reads)
+
+
 def deselected(action: EnforcementAction, limit: CreditLimit | None) -> bool:
     """True when this project action's limit no longer turns its kind off."""
-    if limit is None or action.target_type != TARGET_PROJECT:
+    return deselected_kind(str(action.kind), action.target_type, limit)
+
+
+def deselected_kind(kind: str, target_type: str, limit: CreditLimit | None) -> bool:
+    """``deselected`` from the action's kind and target type alone."""
+    if limit is None or target_type != TARGET_PROJECT:
         return False
-    wanted = PROJECT_ACTION_OF_KIND.get(str(action.kind))
+    wanted = PROJECT_ACTION_OF_KIND.get(str(kind))
     return wanted is not None and wanted not in effective_project_actions(limit)
 
 
@@ -2775,6 +3124,7 @@ def restore_deselected(
     *,
     limit: CreditLimit,
     actor: AuditActor,
+    budget: EnforcementBudget | None = None,
 ) -> int:
     """Put back what this limit turned off and no longer turns off.
 
@@ -2796,6 +3146,11 @@ def restore_deselected(
     first_error: CheckmarxError | None = None
     resolver = RoleResolver(client)
     for action in rows:
+        if budget is not None:
+            if not budget.may_write():
+                budget.defer_write()
+                continue
+            budget.spend_write()
         try:
             if restore_action(
                 session,

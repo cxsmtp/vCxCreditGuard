@@ -525,7 +525,8 @@ class TestFailuresAndCaps:
         set_project(tenant, "proj-web", "payments/web", 6)
         scan(tenant, "scan-h1", HARSH)
         scan(tenant, "scan-a1", AKASH, project_id="proj-web")
-        monkeypatch.setattr(auto_triage_attribution, "MAX_PROJECTS_PER_CYCLE", 1)
+        settings_store.set_value(db, settings_store.KEY_ATTRIBUTION_PROJECTS, 1)
+        db.commit()
         capped = run()
 
         stats = capped.steps["auto_triage_attribution"]
@@ -537,7 +538,8 @@ class TestFailuresAndCaps:
         assert parts(db, "user-akash") == {}
         assert model(db).projects["proj-web"].unattributed == Decimal("2")
 
-        monkeypatch.setattr(auto_triage_attribution, "MAX_PROJECTS_PER_CYCLE", 50)
+        settings_store.set_value(db, settings_store.KEY_ATTRIBUTION_PROJECTS, 50)
+        db.commit()
         run()
         assert parts(db, "user-akash") == {("proj-web", "observed"): Decimal("2")}
         assert parts(db, "user-sean") == {("proj-web", "estimated"): Decimal("4")}

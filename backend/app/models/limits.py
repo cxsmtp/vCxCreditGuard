@@ -209,6 +209,12 @@ class LimitPeriodState(Base):
     breached_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     restricted_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     restored_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # A first enforcement larger than one cycle's write budget is spread over
+    # several cycles. While (and after) it is, these say how many users or
+    # projects the limit restricts and how many have been dealt with so far
+    # ("Restricting 1,240 of 2,000 projects"). Null when it never needed it.
+    rollout_total: Mapped[int | None] = mapped_column(Integer)
+    rollout_done: Mapped[int | None] = mapped_column(Integer)
 
     limit: Mapped[CreditLimit] = relationship(back_populates="period_states")
 
@@ -266,9 +272,15 @@ class EnforcementAction(Base):
     )
     # "admin", "exempted", "period_rollover" or "limit_removed".
     reversal_reason: Mapped[str | None] = mapped_column(String(64))
+    # When the restriction was last read back from Checkmarx One and found in
+    # force (or re-asserted). Restrictions in force are verified in rotation,
+    # oldest first, not all of them every cycle. Null: never verified since
+    # this column was added (verified first).
+    last_verified_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     __table_args__ = (
         Index("ix_enforcement_action_target_status", "target_type", "target_id", "status"),
+        Index("ix_enforcement_action_status_verified", "status", "last_verified_at"),
     )
 
 

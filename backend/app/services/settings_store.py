@@ -136,6 +136,37 @@ KEY_AUTO_TRIAGE_TO_INITIATOR = "attribution.auto_triage_to_scan_initiator"
 # a single "observed" rise. Not part of the configuration backup.
 KEY_AUTO_TRIAGE_OBSERVATION_EPOCH = "attribution.auto_triage_observation_epoch"
 
+# Pacing for large tenants (app/services/pacing.py). Each is a per-cycle budget;
+# 0 means no budget, the behaviour before pacing existed.
+# How often each restriction in force is read back from Checkmarx One, at most
+# (minutes). 0: every restriction, every cycle.
+KEY_VERIFY_INTERVAL_MINUTES = "enforcement.verify_interval_minutes"
+# At most this many restrictions read back in one cycle.
+KEY_MAX_VERIFICATIONS = "enforcement.max_verifications_per_cycle"
+# At most this many restrictions applied or lifted in one cycle; a larger
+# first enforcement (or restore) carries on over the next cycles.
+KEY_MAX_WRITES = "enforcement.max_writes_per_cycle"
+# Restricted projects whose scans the policy violation check lists per cycle.
+KEY_VIOLATION_PROJECTS = "violations.max_projects_per_cycle"
+# Projects and scan requests auto-triage attribution works through per cycle.
+KEY_ATTRIBUTION_PROJECTS = "attribution.max_projects_per_cycle"
+KEY_ATTRIBUTION_REQUESTS = "attribution.max_requests_per_cycle"
+# Independent read-only Checkmarx calls made at the same time (1: one by one).
+KEY_READ_CONCURRENCY = "cycle.read_concurrency"
+# Share of the interval a cycle may spend before it stops starting new
+# per-target work and leaves the rest to the next cycle (0: no time budget).
+KEY_CYCLE_TIME_BUDGET_PCT = "cycle.time_budget_pct"
+PACING_KEYS: tuple[str, ...] = (
+    KEY_VERIFY_INTERVAL_MINUTES,
+    KEY_MAX_VERIFICATIONS,
+    KEY_MAX_WRITES,
+    KEY_VIOLATION_PROJECTS,
+    KEY_ATTRIBUTION_PROJECTS,
+    KEY_ATTRIBUTION_REQUESTS,
+    KEY_READ_CONCURRENCY,
+    KEY_CYCLE_TIME_BUDGET_PCT,
+)
+
 # The latest API key permission report (app/services/key_permissions.py), as
 # JSON. Bookkeeping, not configuration: it is never shown on the Settings page,
 # never part of a configuration backup and never part of the attestation digest.
@@ -195,6 +226,14 @@ DEFAULTS: dict[str, Any] = {
     KEY_FUSION_LOCK: True,
     KEY_AI_ROLES: list(DEFAULT_AI_ROLE_NAMES),
     KEY_AUTO_TRIAGE_TO_INITIATOR: False,
+    KEY_VERIFY_INTERVAL_MINUTES: 60,
+    KEY_MAX_VERIFICATIONS: 2000,
+    KEY_MAX_WRITES: 1000,
+    KEY_VIOLATION_PROJECTS: 150,
+    KEY_ATTRIBUTION_PROJECTS: 150,
+    KEY_ATTRIBUTION_REQUESTS: 600,
+    KEY_READ_CONCURRENCY: 4,
+    KEY_CYCLE_TIME_BUDGET_PCT: 80,
 }
 
 
