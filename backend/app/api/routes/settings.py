@@ -192,8 +192,27 @@ def update_settings(
                 },
             )
 
+    confirm_admin_roles = bool(changes.pop("confirm_admin_roles", None))
     if "ai_roles" in changes:
-        changes["ai_roles"] = _validated_ai_roles(db, changes["ai_roles"])
+        protected = (
+            settings_store.parse_protected_roles(changes["protected_roles"])
+            if changes.get("protected_roles") is not None
+            else settings_store.enforcement_guard(db).protected_roles
+        )
+        changes["ai_roles"] = _validated_ai_roles(
+            db,
+            changes["ai_roles"],
+            protected=protected,
+            confirm_admin_roles=confirm_admin_roles,
+        )
+    elif changes.get("protected_roles") is not None:
+        # The other way round: protecting a role the list already names.
+        _refuse_protected_ai_roles(
+            list(settings_store.ai_role_names(db)),
+            settings_store.parse_protected_roles(changes["protected_roles"]),
+        )
+    if not changes:
+        return _read(db)
 
     before = _read(db).model_dump(exclude={"current_schedule_description"})
     audited_changes: dict[str, object] = {}
@@ -270,6 +289,7 @@ def client_roles(ctx: AdminUser, db: DbSession) -> ClientRolesResponse:
     Cached briefly; a failed read is reported in the answer, never as an error.
     """
     listing = role_sources.tenant_client_roles(db)
+    protected = settings_store.enforcement_guard(db).protected_roles
     return ClientRolesResponse(
         available=listing.available,
         message=listing.message,
@@ -279,6 +299,8 @@ def client_roles(ctx: AdminUser, db: DbSession) -> ClientRolesResponse:
                 description=role.description,
                 composite=role.composite,
                 known_description=iam.ROLE_DESCRIPTIONS.get(role.name),
+                admin_like=settings_store.admin_like_role(role.name),
+                protected=role.name.lower() in protected,
             )
             for role in listing.roles
         ],
@@ -287,11 +309,42 @@ def client_roles(ctx: AdminUser, db: DbSession) -> ClientRolesResponse:
     )
 
 
-def _validated_ai_roles(db, value: object) -> list[str]:  # type: ignore[no-untyped-def]
+def _refuse_protected_ai_roles(names: list[str], protected: frozenset[str]) -> None:
+    """An AI role may not be a protected role: a person holding a protected
+    role is never restricted, so the restriction would silently do nothing."""
+    clashing = [name for name in names if name.lower() in protected]
+    if clashing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "protected_ai_roles",
+                "message": (
+                    f"{', '.join(clashing)} "
+                    + ("is a protected role" if len(clashing) == 1 else "are protected roles")
+                    + " (Settings → Enforcement): a person holding a protected role is never "
+                    "restricted, so naming it here would make a user restriction do nothing for "
+                    "everyone who holds it. Remove it from this list, or from the protected "
+                    "roles."
+                ),
+            },
+        )
+
+
+def _validated_ai_roles(  # type: ignore[no-untyped-def]
+    db,
+    value: object,
+    *,
+    protected: frozenset[str] = frozenset(),
+    confirm_admin_roles: bool = False,
+) -> list[str]:
     """The AI role list, checked against the roles the tenant actually has.
 
-    When the tenant's roles cannot be read, only names already trusted (the
-    current list or the default one) are accepted: nothing unknown gets in.
+    A protected role is refused: its holders are never restricted, so a list
+    that names it would silently restrict nobody who holds it. A role that looks
+    like an administration role (settings_store.ADMIN_ROLE_PATTERNS) is refused
+    unless the request confirms it (``confirm_admin_roles``). When the tenant's
+    roles cannot be read, only names already trusted (the current list or the
+    default one) are accepted: nothing unknown gets in.
     """
     names = settings_store.normalise_role_names(value)
     if not names:
@@ -301,6 +354,26 @@ def _validated_ai_roles(db, value: object) -> list[str]:  # type: ignore[no-unty
                 "code": "invalid_ai_roles",
                 "message": "Name at least one role: with none, a user restriction would "
                 "remove nothing.",
+            },
+        )
+    _refuse_protected_ai_roles(names, protected)
+    admin_like = [name for name in names if settings_store.admin_like_role(name)]
+    if admin_like and not confirm_admin_roles:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "admin_ai_roles_unconfirmed",
+                "message": (
+                    f"{', '.join(admin_like)} "
+                    + (
+                        "looks like an administration role"
+                        if len(admin_like) == 1
+                        else "look like administration roles"
+                    )
+                    + ": a user restriction would take it from anyone over a budget, along "
+                    "with everything it allows besides AI features. Confirm to save it anyway."
+                ),
+                "roles": admin_like,
             },
         )
     listing = role_sources.tenant_client_roles(db, fresh=True)

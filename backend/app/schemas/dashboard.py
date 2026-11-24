@@ -267,6 +267,9 @@ class SettingsUpdateRequest(StrictModel):
     protected_roles: str | None = Field(default=None, max_length=1024)
     fusion_lock_override: bool | None = None
     ai_roles: list[str] | None = Field(default=None, max_length=50)
+    # Not a setting: says the admin confirmed that ai_roles may include roles
+    # that look like administration roles (settings_store.ADMIN_ROLE_PATTERNS).
+    confirm_admin_roles: bool | None = None
     charge_auto_triage_to_scan_initiator: bool | None = None
 
     @field_validator("schedule_mode")
@@ -444,6 +447,10 @@ class ClientRoleResponse(BaseModel):
     composite: bool = False
     # A short description CreditGuard knows for this role (the default AI roles).
     known_description: str | None = None
+    # Looks like an administration role: choosing it needs a confirmation.
+    admin_like: bool = False
+    # A protected role (Settings -> Enforcement): it cannot be an AI role.
+    protected: bool = False
 
 
 class ClientRolesResponse(BaseModel):

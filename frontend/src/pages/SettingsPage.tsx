@@ -123,6 +123,8 @@ export function SettingsPage({
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [testing, setTesting] = useState(false);
+  // Administration-like AI roles the admin confirmed in the picker's dialog.
+  const [confirmedAdminRoles, setConfirmedAdminRoles] = useState<string[]>([]);
   const [testResult, setTestResult] = useState<{
     ok: boolean;
     channels: Record<string, string>;
@@ -154,10 +156,22 @@ export function SettingsPage({
     setBusy(true);
     setError(null);
     try {
-      const updated = await api.put<AppSettings>("/api/settings", changes);
+      // An administration-like AI role is saved only with an explicit
+      // confirmation: one given in the picker's dialog, or one already saved.
+      const adminLike = (changes.ai_roles ?? []).filter(isAdminLikeRole);
+      const confirmed =
+        adminLike.length > 0 &&
+        adminLike.every(
+          (name) => confirmedAdminRoles.includes(name) || (current?.ai_roles ?? []).includes(name),
+        );
+      const updated = await api.put<AppSettings>(
+        "/api/settings",
+        confirmed ? { ...changes, confirm_admin_roles: true } : changes,
+      );
       settings.setData(updated);
       applyAccent(updated.ui_accent);
       settingsDraft.clear();
+      setConfirmedAdminRoles([]);
       toast.success(`Settings saved. Schedule is now ${updated.current_schedule_description}.`);
       await status.reload();
       // Refresh the bootstrap profile so shell-level state (the demo banner,
@@ -681,7 +695,14 @@ export function SettingsPage({
                   isAdmin={isAdmin}
                   value={value("ai_roles") ?? current.ai_roles ?? []}
                   defaults={current.default_ai_roles ?? []}
+                  protectedRoles={(value("protected_roles") ?? "")
+                    .split(/[,;]/)
+                    .map((name) => name.trim().toLowerCase())
+                    .filter(Boolean)}
                   onChange={(next) => set({ ai_roles: next })}
+                  onConfirmAdmin={(name) =>
+                    setConfirmedAdminRoles((previous) => [...previous, name])
+                  }
                 />
               </div>
               <div className="mt-4 border-t border-hairline pt-4">
@@ -2040,17 +2061,34 @@ function DemoCard({
   );
 }
 
+/** Role names that look like administration roles (as the server checks:
+ * `*admin*`, `manage-*`, `realm-*`, `iam-*`). */
+function isAdminLikeRole(name: string): boolean {
+  const lowered = name.trim().toLowerCase();
+  return (
+    lowered.includes("admin") ||
+    lowered.startsWith("manage-") ||
+    lowered.startsWith("realm-") ||
+    lowered.startsWith("iam-")
+  );
+}
+
 /** The client roles a user restriction removes, picked from the tenant's own roles. */
 function AiRolesPicker({
   isAdmin,
   value,
   defaults,
+  protectedRoles,
   onChange,
+  onConfirmAdmin,
 }: {
   isAdmin: boolean;
   value: string[];
   defaults: string[];
+  /** Protected role names, lowercase: they cannot be AI roles. */
+  protectedRoles: string[];
   onChange: (next: string[]) => void;
+  onConfirmAdmin: (name: string) => void;
 }) {
   const roles = useResource<ClientRoles | null>(
     (signal) =>
@@ -2058,7 +2096,19 @@ function AiRolesPicker({
     [isAdmin],
   );
   const [choice, setChoice] = useState("");
+  const [confirming, setConfirming] = useState<string | null>(null);
   const listing = roles.data;
+  const isProtected = (name: string) => protectedRoles.includes(name.toLowerCase());
+  const adminLike = (name: string) => byName.get(name)?.admin_like ?? isAdminLikeRole(name);
+
+  function add(name: string) {
+    if (isProtected(name)) return;
+    if (adminLike(name)) {
+      setConfirming(name);
+      return;
+    }
+    onChange([...value, name]);
+  }
   const byName = new Map((listing?.roles ?? []).map((role) => [role.name, role]));
   const addable = (listing?.roles ?? []).filter((role) => !value.includes(role.name));
   const isDefault =
@@ -2094,6 +2144,8 @@ function AiRolesPicker({
             >
               <code>{name}</code>
               {role?.composite && <Badge tone="neutral">composite</Badge>}
+              {adminLike(name) && <Badge tone="warning">admin role</Badge>}
+              {isProtected(name) && <Badge tone="warning">protected</Badge>}
               {listing?.available && !role && <Badge tone="warning">not on the tenant</Badge>}
               {isAdmin && value.length > 1 && (
                 <button
@@ -2126,9 +2178,18 @@ function AiRolesPicker({
               >
                 <option value="">Add a role…</option>
                 {addable.map((role) => (
-                  <option key={role.name} value={role.name}>
+                  <option
+                    key={role.name}
+                    value={role.name}
+                    disabled={isProtected(role.name)}
+                  >
                     {role.name}
                     {role.composite ? " (composite)" : ""}
+                    {isProtected(role.name)
+                      ? " (protected: cannot be an AI role)"
+                      : adminLike(role.name)
+                        ? " ⚠ admin role"
+                        : ""}
                   </option>
                 ))}
               </Select>
@@ -2136,7 +2197,7 @@ function AiRolesPicker({
                 size="sm"
                 disabled={!choice}
                 onClick={() => {
-                  if (choice) onChange([...value, choice]);
+                  if (choice) add(choice);
                   setChoice("");
                 }}
               >
@@ -2156,6 +2217,25 @@ function AiRolesPicker({
           )}
         </div>
       )}
+      <ConfirmDialog
+        open={confirming !== null}
+        title="Remove an administration role from people over budget?"
+        destructive
+        confirmLabel="Add it anyway"
+        message={
+          confirming
+            ? `${confirming} looks like an administration role. A user restriction would take it from anyone who goes over a user budget, along with everything it allows besides AI features (managing users, the tenant or its settings). Add it only if that is what you want.`
+            : ""
+        }
+        onConfirm={() => {
+          if (confirming) {
+            onConfirmAdmin(confirming);
+            onChange([...value, confirming]);
+          }
+          setConfirming(null);
+        }}
+        onCancel={() => setConfirming(null)}
+      />
     </div>
   );
 }

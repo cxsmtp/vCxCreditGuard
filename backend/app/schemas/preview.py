@@ -38,6 +38,8 @@ class UserRolesPreviewResponse(BaseModel):
     not_held: list[str] = []
     unread: list[str] = []
     note: str | None = None
+    # A restriction already holds, so the roles were not read again.
+    already_restricted: bool = False
 
 
 class ProjectWarningResponse(BaseModel):

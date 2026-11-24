@@ -24,6 +24,10 @@ restrict, and is not reported on the API key permission check (these reads are
 not part of what the key needs). Nothing here changes a group or a role:
 removing a role from a group or a composite role would take it from everyone
 else too.
+
+Not traversed: realm-level composite roles (such as a realm's default roles)
+that contain an ``ast-app`` client role. A role held that way shows as held
+through a source CreditGuard cannot see ("source unknown").
 """
 
 from __future__ import annotations
@@ -32,14 +36,19 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from sqlalchemy.orm import Session
 
 from app.checkmarx import iam
-from app.checkmarx.client import CheckmarxClient, listeners_paused
-from app.checkmarx.errors import CheckmarxError
+from app.checkmarx.client import CheckmarxClient, listeners_paused, single_attempt
+from app.checkmarx.errors import (
+    CheckmarxError,
+    CheckmarxRateLimitError,
+    CheckmarxUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +62,36 @@ MAX_COMPOSITE_DEPTH = 4
 MAX_COMPOSITE_READS = 100
 
 T = TypeVar("T")
+
+# Why reads stopped under a ReadBudget, in words.
+STOPPED_UNAVAILABLE = "Checkmarx IAM did not answer"
+
+
+@dataclass(slots=True)
+class ReadBudget:
+    """Bounds on optional reads made while someone waits on a page.
+
+    Each read is tried once with a short timeout (no retry or backoff); the
+    first sign that IAM is not answering (unavailable, rate limited, timed out)
+    stops every read after it, and so does running out of time. Enforcement
+    reads without a budget, with the client's full retry policy.
+    """
+
+    seconds: float = 10.0
+    call_timeout_seconds: float = 5.0
+    # When the first read was made (the clock starts there).
+    started: float | None = None
+    # Set once reads have stopped: why, in words.
+    stopped: str | None = None
+
+    def check(self) -> bool:
+        """True while reads may go on."""
+        now = time.monotonic()
+        if self.started is None:
+            self.started = now
+        if self.stopped is None and now - self.started >= self.seconds:
+            self.stopped = f"the {self.seconds:g} s allowed for reading roles ran out"
+        return self.stopped is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,17 +148,31 @@ class UserRoles:
     indirect: dict[str, list[RoleSource]] = field(default_factory=dict)
     # The reads that failed, in words: what is not known.
     unread: list[str] = field(default_factory=list)
+    # Every client role the directly mapped AI roles contain (composites): they
+    # go with those roles when the restriction removes them.
+    removed_contains: set[str] = field(default_factory=set)
 
     def direct_ai(self) -> list[iam.RoleRef]:
         return [role for role in self.direct if role.name in self.ai_roles]
 
     def stays_effective(self) -> dict[str, list[RoleSource]]:
-        """AI roles the user would still hold once their direct mappings are gone."""
+        """AI roles the user would still hold once their direct mappings are gone.
+
+        One held through a group or a composite role that is not removed is
+        kept. One that is only effective (no source seen) is kept with its
+        source unknown, unless a directly mapped AI role contains it: that one
+        goes with the composite that is removed.
+        """
         kept = {name: list(sources) for name, sources in self.indirect.items() if sources}
         if self.effective is not None:
             direct = {role.name for role in self.direct}
             for name in self.ai_roles:
-                if name in self.effective and name not in direct and name not in kept:
+                if (
+                    name in self.effective
+                    and name not in direct
+                    and name not in kept
+                    and name not in self.removed_contains
+                ):
                     kept[name] = [RoleSource(SOURCE_UNKNOWN)]
         return {name: kept[name] for name in self.ai_roles if name in kept}
 
@@ -164,33 +217,84 @@ class RoleSourceReader:
         *,
         client_uuid: Callable[[], str],
         client_roles: Callable[[], dict[str, iam.RoleRef]],
+        budget: ReadBudget | None = None,
     ) -> None:
         self._client = client
         self._client_uuid = client_uuid
         self._client_roles = client_roles
+        self.budget = budget
+        self._uuid: str | None = None
+        self._uuid_read = False
+        self._roles: dict[str, iam.RoleRef] | None = None
         self._groups_by_path: dict[str, iam.IamGroup] | None = None
         self._groups_read = False
         self._group_roles: dict[str, list[iam.RoleRef] | None] = {}
         self._children: dict[str, list[iam.RoleRef] | None] = {}
+        self._contained: dict[str, set[str] | None] = {}
+        # Composite roles whose nesting went deeper than MAX_COMPOSITE_DEPTH.
+        self._too_deep: set[str] = set()
         self._composite_reads = 0
 
     # ------------------------------------------------------------- plumbing
 
-    def _quiet(self, what: str, call: Callable[[], T]) -> T | None:
-        """Run one optional read. Any failure is "not known", logged, and kept
-        off the API key permission report."""
+    @property
+    def stopped(self) -> str | None:
+        """Why reads stopped (under a budget), or None."""
+        return self.budget.stopped if self.budget is not None else None
+
+    def _quiet(self, what: str, call: Callable[[], T], *, pause: bool = True) -> T | None:
+        """Run one read. Any failure is "not known" and logged.
+
+        ``pause`` keeps an optional read off the API key permission report; a
+        read the key is checked for (the platform client, its roles) is left
+        on it. Under a budget the read is tried once with a short timeout, and
+        nothing is read any more once IAM stopped answering or time ran out.
+        """
+        budget = self.budget
+        if budget is not None and not budget.check():
+            return None
         try:
-            with listeners_paused():
+            with ExitStack() as stack:
+                if budget is not None:
+                    stack.enter_context(single_attempt(budget.call_timeout_seconds))
+                if pause:
+                    stack.enter_context(listeners_paused())
                 return call()
+        except (CheckmarxUnavailableError, CheckmarxRateLimitError) as exc:
+            logger.info("IAM read failed (%s): %s", what, exc)
+            if budget is not None and budget.stopped is None:
+                budget.stopped = STOPPED_UNAVAILABLE
+            return None
         except CheckmarxError as exc:
-            logger.info("Optional IAM read failed (%s): %s", what, exc)
+            logger.info("IAM read failed (%s): %s", what, exc)
             return None
 
     def uuid(self) -> str | None:
-        return self._quiet("platform client", self._client_uuid)
+        """The platform client's uuid; a failed lookup is not tried again."""
+        if not self._uuid_read:
+            self._uuid = self._quiet("platform client", self._client_uuid, pause=False)
+            # Not read because reads had stopped: nothing was tried, nothing to cache.
+            self._uuid_read = self._uuid is not None or self.stopped is None
+        return self._uuid
 
     def roles(self) -> dict[str, iam.RoleRef]:
-        return self._quiet("client roles", self._client_roles) or {}
+        """The platform client's roles; a failed read is not tried again."""
+        if self._roles is None:
+            found = self._quiet("client roles", self._client_roles, pause=False)
+            if found is not None or self.stopped is None:
+                self._roles = found or {}
+            return found or {}
+        return self._roles
+
+    def _ours(self, role: iam.RoleRef, uuid: str) -> bool:
+        """Whether a composite's child is a role of the platform client (by the
+        client it belongs to, or by its id; never by its name alone)."""
+        if not role.client_role:
+            return False
+        if role.container_id is not None:
+            return role.container_id == uuid
+        known = self.roles().get(role.name)
+        return known is not None and known.id == role.id
 
     # ---------------------------------------------------------------- reads
 
@@ -253,7 +357,12 @@ class RoleSourceReader:
         return found
 
     def contained(self, role_name: str) -> set[str] | None:
-        """Every client role a composite role contains, however deep (bounded)."""
+        """Every platform client role a composite role contains, however deep
+        (bounded by MAX_COMPOSITE_DEPTH: deeper nesting is noted, see
+        ``too_deep``). Roles of other clients and realm roles are left out."""
+        if role_name in self._contained:
+            return self._contained[role_name]
+        uuid = self.uuid()
         found: set[str] = set()
         frontier = [role_name]
         complete = True
@@ -265,16 +374,24 @@ class RoleSourceReader:
                     complete = False
                     continue
                 for child in children:
-                    if child.client_role and child.name not in found:
-                        found.add(child.name)
-                        if child.composite:
-                            next_frontier.append(child.name)
+                    if uuid is None or not self._ours(child, uuid) or child.name in found:
+                        continue
+                    found.add(child.name)
+                    if child.composite:
+                        next_frontier.append(child.name)
             if not next_frontier:
                 break
             frontier = next_frontier
-        if not found and not complete:
-            return None
-        return found
+        else:
+            # Every level was used and there was still more below.
+            self._too_deep.add(role_name)
+        result = None if not found and not complete else found
+        self._contained[role_name] = result
+        return result
+
+    def too_deep(self, role_name: str) -> bool:
+        """Whether ``contained`` stopped at MAX_COMPOSITE_DEPTH for this role."""
+        return role_name in self._too_deep
 
     # ------------------------------------------------------------- analysis
 
@@ -314,20 +431,31 @@ class RoleSourceReader:
             if source not in sources:
                 sources.append(source)
 
-        def through_composites(held: list[iam.RoleRef], group: str | None) -> None:
+        removed_contains: set[str] = set()
+
+        def inside_of(role: iam.RoleRef) -> set[str] | None:
             known = self.roles()
+            if not (role.composite or known.get(role.name, role).composite):
+                return set()
+            inside = self.contained(role.name)
+            if inside is None:
+                unread.append(f"what role {role.name} contains")
+            elif self.too_deep(role.name):
+                unread.append(
+                    f"roles nested more than {MAX_COMPOSITE_DEPTH} levels deep inside role "
+                    f"{role.name}"
+                )
+            return inside
+
+        def through_composites(held: list[iam.RoleRef], group: str | None) -> None:
             for role in held:
                 if group is None and role.name in wanted:
                     # Mapped directly and an AI role itself: removed along with
-                    # the others, so what it contains does not stay.
+                    # the others, so what it contains goes with it.
+                    removed_contains.update(inside_of(role) or set())
                     continue
-                if not (role.composite or known.get(role.name, role).composite):
-                    continue
-                inside = self.contained(role.name)
-                if inside is None:
-                    unread.append(f"what role {role.name} contains")
-                    continue
-                for name in sorted(inside & wanted):
+                inside = inside_of(role)
+                for name in sorted((inside or set()) & wanted):
                     add(name, RoleSource(SOURCE_COMPOSITE, group=group, role=role.name))
 
         through_composites(direct, None)
@@ -349,6 +477,7 @@ class RoleSourceReader:
             effective=effective,
             indirect={name: indirect[name] for name in ai_roles if name in indirect},
             unread=list(dict.fromkeys(unread)),
+            removed_contains=removed_contains,
         )
 
     def _user_groups(self, user_id: str, unread: list[str]) -> list[tuple[str, str]]:
@@ -361,6 +490,11 @@ class RoleSourceReader:
             return []
         found: dict[str, str] = {}
         by_path = None
+        if len(groups) > MAX_GROUPS_PER_USER:
+            unread.append(
+                f"the roles of the user's groups beyond the first {MAX_GROUPS_PER_USER} "
+                f"(the user is in {len(groups)} groups)"
+            )
         for group in groups[:MAX_GROUPS_PER_USER]:
             label = group.path or group.name
             found.setdefault(group.id, label)

@@ -404,8 +404,13 @@ restore never resets branches, severity levels or the Fusion model.
   checked against the roles the tenant actually has on `ast-app`
   (`GET /api/settings/client-roles`, admins only, cached for a minute, never an
   error when IAM cannot be read; while it cannot, only names already in the
-  list or the defaults are accepted). An empty list is refused. An upgrade
-  changes nothing: the default is the three roles above.
+  list or the defaults are accepted). An empty list is refused, and so is a
+  protected role (its holders are never restricted, so naming it would make a
+  restriction do nothing for them; protecting a role the list names is refused
+  the same way). A role that looks like an administration role (`*admin*`,
+  `manage-*`, `realm-*`, `iam-*`) is saved only with an explicit confirmation
+  (API field `confirm_admin_roles: true`; the picker marks such roles and asks
+  first). An upgrade changes nothing: the default is the three roles above.
 * **10 January.** Checkmarx One is to ship dedicated AI Triage and AI
   Remediation permissions and roles on 10 January. When they are on your
   tenant, add them to the list and remove the general ones: no code change is
@@ -429,7 +434,13 @@ restore never resets branches, severity levels or the Fusion model.
   **not verified on a real Checkmarx One tenant**: any refusal (403), 404 or
   other failure only means *source unknown*, is listed on the record
   (`role_sources_unread`), never stops the restriction and is not reported on
-  the key permission check.
+  the key permission check (the platform client and its role list, which the
+  key is checked for, still are). The reads are bounded: at most 50 of a
+  user's groups (the rest are listed as not read), composite roles followed 4
+  levels deep (deeper nesting is listed as not read), and only the composite
+  children that belong to `ast-app` (matched by client id, never by name).
+  Realm-level composite roles (a realm's default roles, for example) are not
+  traversed: an AI role held through one shows as *source unknown*.
 * **What is removed.** Only the AI roles mapped to the user directly. A role
   still held through a group or a composite role stays effective however the
   direct mapping is changed, so for that role the restriction **is not
@@ -441,7 +452,8 @@ restore never resets branches, severity levels or the Fusion model.
   group or a composite role: that would take the role from everyone else who
   holds it that way. It is not re-notified each cycle.
 * **Read back.** After the direct mappings are removed, the effective roles are
-  read back once (the direct mappings when the effective ones cannot be read).
+  read back once (the direct mappings when the effective ones cannot be read;
+  nothing is then reported as kept, and the unread read-back is listed).
   A removed role still read as held for no reason that can be seen is in doubt,
   as with Fusion: the first time is a quiet retry on the next cycle; the second
   time it is recorded as kept through a source that cannot be seen. A role still
@@ -450,15 +462,22 @@ restore never resets branches, severity levels or the Fusion model.
   period, still restorable.
 * **Drift.** A role of the recorded list mapped to the user directly again is
   drift, as before. A role effective only through a group or a composite role is
-  not drift: it was reported when the restriction was applied.
+  not drift: it was reported when the restriction was applied. Nor is usage by
+  a person who keeps an AI role that way a *usage kept rising after a
+  restriction* violation.
 * **Simulation.** The Simulation page and the blast radius in the limit form
   show, for each user who would be restricted, the roles that would be removed
   (with what each grants: its composite children, and for the default three
   *Risk Management pages and dashboard; AI Triage/Remediation are reached from
   here*), the roles that would stay effective and where from, and what could
-  not be read. The tenant is read best effort for the request, at most 50 users
-  per preview (the page says when it stopped there), not at all in demo mode or
-  without a connection.
+  not be read. Admins only: a viewer sees which roles a restriction removes,
+  and no IAM read is made for them. The tenant is read best effort for the
+  request: at most 50 users per preview (the page says when it stopped there),
+  each read tried once with a 5 s timeout, 10 s in all, and nothing more once
+  IAM does not answer (the remaining users say *not read: Checkmarx IAM did not
+  answer*). A user already restricted is not read again (*already
+  restricted*). A user's reading is reused for a minute (dropped when the
+  connection changes). Not read at all in demo mode or without a connection.
 
 **Auto Triage and PR triage and remediation are read back.** Both writes are
 read back once, like Fusion's: what was there before always stays on the
@@ -476,8 +495,14 @@ too:
   is recorded verbatim on the action (`auto_triage_allow_override`, and
   `auto_triage_allow_override_read_back`); its meaning is not documented and is
   not interpreted. The Simulation page says that turning Auto Triage off *may
-  not hold* for a project an earlier restriction found set account-wide, or
-  whose configuration was last read with `allowOverride.projects` false.
+  not hold* for a project whose latest restriction (in its limit's current
+  period, else the latest one) found it set account-wide; or, softly (*not
+  verified yet*), for one whose latest restriction is not applied, was not read
+  back, and was read with `allowOverride.projects` false. That shape is the
+  ordinary one, so an applied restriction never warns because of it. A later
+  read that shows Auto Triage off on the project (a restriction applied and
+  read back off, or one verified to hold) withdraws an earlier account-wide
+  conclusion.
 * PR triage and remediation is taken not to be kept by the tenant: said once
   (*PR triage and remediation change not kept*), restorable, not sent again
   this period.

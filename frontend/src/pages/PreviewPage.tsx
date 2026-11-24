@@ -256,7 +256,14 @@ function UserRolesDetail({ user, aiRoles }: { user: UserRolesPreview; aiRoles: s
   if (!user.read) {
     return (
       <p style={{ color: "var(--text-secondary)" }}>
-        {name}: {user.note ?? `would lose whichever of ${aiRoles.join(", ")} they hold directly.`}
+        {name}
+        {user.already_restricted && (
+          <>
+            {" "}
+            <Badge tone="neutral">already restricted</Badge>
+          </>
+        )}
+        : {user.note ?? `would lose whichever of ${aiRoles.join(", ")} they hold directly.`}
       </p>
     );
   }

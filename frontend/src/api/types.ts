@@ -683,6 +683,10 @@ export interface ClientRole {
   composite: boolean;
   /** A short description CreditGuard knows for this role (the default AI roles). */
   known_description: string | null;
+  /** Looks like an administration role: choosing it needs a confirmation. */
+  admin_like?: boolean;
+  /** A protected role (Settings -> Enforcement): it cannot be an AI role. */
+  protected?: boolean;
 }
 
 export interface ClientRoles {
@@ -715,6 +719,8 @@ export interface UserRolesPreview {
   not_held: string[];
   unread: string[];
   note: string | null;
+  /** A restriction already holds, so the roles were not read again. */
+  already_restricted?: boolean;
 }
 
 export interface ProjectWarning {

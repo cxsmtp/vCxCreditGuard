@@ -8,6 +8,7 @@ secret values encrypted under their own purpose and never returned unmasked.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 from dataclasses import dataclass
@@ -315,17 +316,34 @@ def enforcement_guard(session: Session) -> EnforcementGuard:
             get_value(session, KEY_MAX_NEW_TARGETS), DEFAULTS[KEY_MAX_NEW_TARGETS]
         ),
         ceiling_waived_once=bool(get_value(session, KEY_CEILING_WAIVED_ONCE, False)),
-        protected_roles=frozenset(
-            name.strip().lower()
-            for name in str(roles or "").replace(";", ",").split(",")
-            if name.strip()
-        ),
+        protected_roles=parse_protected_roles(roles),
     )
 
 
 def fusion_lock_enabled(session: Session) -> bool:
     """Whether turning Fusion off also tries to lock it against per-scan override."""
     return get_value(session, KEY_FUSION_LOCK, DEFAULTS[KEY_FUSION_LOCK]) is not False
+
+
+# Role names that look like administration roles. Taking one away from a person
+# over a budget would take away far more than AI features, so choosing one as an
+# AI role needs an explicit confirmation.
+ADMIN_ROLE_PATTERNS: tuple[str, ...] = ("*admin*", "manage-*", "realm-*", "iam-*")
+
+
+def admin_like_role(name: str) -> bool:
+    """Whether a role name matches one of ADMIN_ROLE_PATTERNS (case ignored)."""
+    lowered = name.strip().lower()
+    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in ADMIN_ROLE_PATTERNS)
+
+
+def parse_protected_roles(value: Any) -> frozenset[str]:
+    """The protected role names (lowercase) from the stored comma separated text."""
+    return frozenset(
+        name.strip().lower()
+        for name in str(value or "").replace(";", ",").split(",")
+        if name.strip()
+    )
 
 
 def normalise_role_names(value: Any) -> list[str]:

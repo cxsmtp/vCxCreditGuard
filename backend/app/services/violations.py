@@ -1091,6 +1091,16 @@ def _detect_usage(session: Session, result: DetectionResult) -> None:
         if str(action.kind) in _STOPS:
             groups.setdefault((action.target_type, action.target_id), []).append(action)
     for (target_type, target_id), actions in groups.items():
+        if any(
+            action.kind == EnforcementKind.REMOVE_USER_ROLES
+            and (action.undo_snapshot or {}).get("kept_effective")
+            for action in actions
+        ):
+            # The person still holds an AI role through a group or a composite
+            # role, which the restriction cannot take away and which was said
+            # once when it was applied ("keeps AI access through ..."). Their
+            # usage is not acting against the restriction.
+            continue
         try:
             outcome = _usage_for_target(session, target_type, target_id, actions)
             if outcome == "detected":

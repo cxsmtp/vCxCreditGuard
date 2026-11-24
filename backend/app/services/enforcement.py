@@ -832,6 +832,10 @@ def _enforce_target(
     action.status = EnforcementStatus.APPLIED
     action.applied_at = utcnow()
     action.error = None
+    if target.kind == EnforcementKind.DISABLE_AUTO_TRIAGE and captured.outcome.get(
+        "auto_triage_seen_off"
+    ):
+        _clear_account_wide(session, action)
     session.flush()
     outcome.applied.append(action)
 
@@ -1054,6 +1058,8 @@ def _verify_applied(
         outcome.skipped.append(
             f"{target.kind} on {target.target_label} already applied and verified in Checkmarx"
         )
+        if action.kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
+            _clear_account_wide(session, action)
         session.commit()  # a lock seen to hold is no longer in doubt
         return
     if verdict == RECONCILE_LOCK_NOT_KEPT:
@@ -1327,7 +1333,7 @@ def _capture_user_roles(
     outcome: dict[str, Any] = {}
 
     def remove_roles() -> None:
-        kept = dict(stays)
+        kept: dict[str, list[role_sources.RoleSource]] | None = dict(stays)
         if to_remove:
             iam.remove_user_client_roles(
                 client, user_id=target.target_id, client_uuid=client_uuid, roles=to_remove
@@ -1343,6 +1349,16 @@ def _capture_user_roles(
                 stays=stays,
                 retrying=retrying,
             )
+        if kept is None:
+            # What stays effective after the removal could not be read: the
+            # guess made before it is not reported as fact.
+            kept = {}
+            outcome["role_sources_unread"] = [
+                *before.unread,
+                "the user's effective roles after the removal",
+            ]
+        # direct_removed is settled on the merged snapshot (_merge_snapshots),
+        # where an earlier attempt's removal counts as well.
         outcome["kept_effective"] = role_sources.kept_entries(kept, removed=removed_names)
 
     return _Captured(
@@ -1372,10 +1388,11 @@ def _confirm_roles_removed(
     removed: set[str],
     stays: dict[str, list[role_sources.RoleSource]],
     retrying: bool,
-) -> dict[str, list[role_sources.RoleSource]]:
+) -> dict[str, list[role_sources.RoleSource]] | None:
     """Read the user's roles back once after removing the direct mappings.
 
-    Returns the AI roles still effective, with where they come from. One read
+    Returns the AI roles still effective, with where they come from, or None
+    when the effective roles could not be read back (nothing is known). One read
     straight after a write can be behind it, so nothing is concluded from it
     alone (the pattern Fusion uses): a removed role still read as held for no
     reason CreditGuard can see is a quiet retry the first time; the second time
@@ -1401,11 +1418,11 @@ def _confirm_roles_removed(
         # still worth checking. Unreadable as well, nothing can be said.
         direct_after = read_direct()
         if direct_after is None:
-            return dict(stays)
+            return None
         still = sorted(removed & direct_after)
         if still:
             raise _roles_not_removed(label, still)
-        return dict(stays)
+        return None
 
     kept: dict[str, list[role_sources.RoleSource]] = {}
     unexplained: list[str] = []
@@ -1461,6 +1478,7 @@ def _capture_auto_triage(
 
     def disable_auto_triage() -> None:
         if not state.enabled:
+            outcome["auto_triage_seen_off"] = True
             return
         platform.set_auto_triage(
             client, project_id=target.target_id, enabled=False, config=state.config
@@ -1480,6 +1498,8 @@ def _capture_auto_triage(
             return
         if after.allow_override is not None:
             outcome["auto_triage_allow_override_read_back"] = after.allow_override
+        if not after.enabled:
+            outcome["auto_triage_seen_off"] = True
         if after.enabled:
             seen = _allow_override_words(after.allow_override)
             raise _ReadBackUnchanged(
@@ -1523,6 +1543,29 @@ def _capture_auto_triage(
         mirror=mirror_auto_triage,
         outcome=outcome,
     )
+
+
+def _clear_account_wide(session: Session, action: EnforcementAction) -> None:
+    """A read shows Auto Triage off on this project after it was turned off: an
+    earlier conclusion that it is set account-wide no longer stands.
+
+    The concluded action keeps its "before" values (Restore still puts them
+    back); only the conclusion is withdrawn, so the Simulation stops warning.
+    Database only: called after the read, never with a Checkmarx call open.
+    """
+    for other in session.scalars(
+        select(EnforcementAction).where(
+            EnforcementAction.kind == EnforcementKind.DISABLE_AUTO_TRIAGE,
+            EnforcementAction.target_id == action.target_id,
+            EnforcementAction.id != action.id,
+        )
+    ):
+        snapshot = other.undo_snapshot or {}
+        if snapshot.get("auto_triage_account_wide"):
+            cleared = dict(snapshot)
+            cleared["auto_triage_account_wide"] = False
+            cleared["auto_triage_seen_held_by_action"] = action.id
+            other.undo_snapshot = cleared
 
 
 def _allow_override_words(value: Any) -> str:
@@ -1843,6 +1886,19 @@ def _merge_snapshots(previous: dict[str, Any] | None, fresh: dict[str, Any]) -> 
         merged["ai_roles"] = sorted(snapshot_ai_roles(previous) | snapshot_ai_roles(fresh))
         if "kept_effective" not in fresh and "kept_effective" in previous:
             merged["kept_effective"] = previous["kept_effective"]
+        if isinstance(merged.get("kept_effective"), list):
+            # Whether a direct mapping was removed goes by everything removed
+            # (an earlier attempt's removal included), not by this read alone.
+            merged["kept_effective"] = [
+                {
+                    **entry,
+                    "direct_removed": bool(entry.get("direct_removed"))
+                    or entry.get("role") in roles,
+                }
+                if isinstance(entry, dict)
+                else entry
+                for entry in merged["kept_effective"]
+            ]
         return merged
 
     if kind == EnforcementKind.DISABLE_AUTO_TRIAGE:

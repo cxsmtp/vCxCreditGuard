@@ -588,6 +588,8 @@ class TestAutoTriageReadBack:
         assert "may not hold" in warning.message and "account-wide" in warning.message
 
     def test_simulation_warns_on_a_recorded_allow_override(self, db: Session) -> None:
+        """allowOverride.projects false is the ordinary shape: applied and read
+        back off, it is no reason to warn."""
         tenant, client = setup_tenant(db)
         tenant.auto_triage_allow_override["proj-api"] = {"projects": False}
         limit = project_limit(db, ["auto_triage"])
@@ -596,9 +598,83 @@ class TestAutoTriageReadBack:
         blast = preview_service.blast_radius(
             db, entity_type=EntityType.APPLICATION, entity_id="app-payments"
         )
-        assert [w.project_id for w in blast.warnings] == ["proj-api"]
-        assert '{"projects": false}' in blast.warnings[0].message
-        assert "may not hold" in blast.warnings[0].message
+        assert blast.warnings == []
+
+    def test_simulation_warns_softly_before_anything_was_read_back(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        tenant.auto_triage_allow_override["proj-api"] = {"projects": False}
+        tenant.fail_requests[("PUT", "/ai-agents-coordinator/projects/proj-api")] = 400
+        limit = project_limit(db, ["auto_triage"])
+        apply(db, client, limit)
+        action = only_action(db, "disable_auto_triage")
+        assert action.status == EnforcementStatus.FAILED
+        assert "auto_triage_allow_override_read_back" not in action.undo_snapshot
+        blast = preview_service.blast_radius(
+            db, entity_type=EntityType.APPLICATION, entity_id="app-payments"
+        )
+        [warning] = blast.warnings
+        assert warning.project_id == "proj-api"
+        assert "not verified yet" in warning.message
+        assert '{"projects": false}' in warning.message
+
+    def test_a_later_read_that_holds_clears_the_conclusion(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        tenant.ignore_auto_triage_writes = True
+        limit = project_limit(db, ["auto_triage"])
+        for _ in range(2):
+            apply(db, client, limit)
+        concluded = only_action(db, "disable_auto_triage")
+        assert concluded.undo_snapshot["auto_triage_account_wide"] is True
+        # The next period: the account setting was changed, the switch holds.
+        tenant.ignore_auto_triage_writes = False
+        tenant.auto_triage["proj-api"]["enabled"] = True
+        outcome = enforcement.apply_enforcement(
+            db, client, limit=limit, period_key="2026-09", actor=ACTOR
+        )
+        db.commit()
+        assert len(outcome.applied) == 1
+        db.expire_all()
+        db.refresh(concluded)
+        assert concluded.undo_snapshot["auto_triage_account_wide"] is False
+        # Restore still has what was there before.
+        assert concluded.undo_snapshot["enabled_before"] is True
+        blast = preview_service.blast_radius(
+            db, entity_type=EntityType.PROJECT, entity_id="proj-api"
+        )
+        assert blast.warnings == []
+
+    def test_the_warning_goes_by_the_latest_action_in_the_current_period(self, db: Session) -> None:
+        from app.db.base import utcnow
+        from app.services.periods import current_window
+
+        tenant, client = setup_tenant(db)
+        limit = project_limit(db, ["auto_triage"])
+        current = current_window(limit, utcnow()).key
+        # This period's restriction applied and held ...
+        enforcement.apply_enforcement(db, client, limit=limit, period_key=current, actor=ACTOR)
+        db.commit()
+        # ... and a row of an older period, written later, records a conclusion.
+        db.add(
+            EnforcementAction(
+                idempotency_key="old-period-conclusion",
+                kind=EnforcementKind.DISABLE_AUTO_TRIAGE,
+                status=EnforcementStatus.FAILED,
+                entity_type=limit.entity_type,
+                entity_id=limit.entity_id,
+                target_type=enforcement.TARGET_PROJECT,
+                target_id="proj-api",
+                limit_id=limit.id,
+                period_key="2020-01",
+                created_at=utcnow(),
+                attempts=2,
+                undo_snapshot={"kind": "disable_auto_triage", "auto_triage_account_wide": True},
+            )
+        )
+        db.commit()
+        blast = preview_service.blast_radius(
+            db, entity_type=EntityType.PROJECT, entity_id="proj-api"
+        )
+        assert blast.warnings == []
 
 
 class TestPrRemediationReadBack:
@@ -730,3 +806,330 @@ class TestSettingsApi:
 
     def test_viewers_cannot_list_roles(self, viewer_client: TestClient) -> None:
         assert viewer_client.get("/api/settings/client-roles").status_code == 403
+
+    @pytest.mark.parametrize(
+        "role", ["manage-users", "ast-admin-reports", "iam-admin-x", "realm-x"]
+    )
+    def test_admin_like_roles_need_a_confirmation(
+        self, admin_client: TestClient, connected: FakeTenant, role: str
+    ) -> None:
+        connected.add_client_role(role)
+        refused = admin_client.put("/api/settings", json={"ai_roles": [role]})
+        assert refused.status_code == 400, refused.text
+        detail = refused.json()["detail"]
+        assert detail["code"] == "admin_ai_roles_unconfirmed"
+        assert "administration role" in detail["message"]
+        assert admin_client.get("/api/settings").json()["ai_roles"] == list(DEFAULT_AI_ROLE_NAMES)
+        confirmed = admin_client.put(
+            "/api/settings", json={"ai_roles": [role, RM], "confirm_admin_roles": True}
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json()["ai_roles"] == [role, RM]
+        assert "confirm_admin_roles" not in confirmed.json()
+
+    @pytest.mark.parametrize("role", ["ast-admin", "iam-admin"])
+    def test_a_protected_role_is_refused_even_when_confirmed(
+        self, admin_client: TestClient, connected: FakeTenant, role: str
+    ) -> None:
+        connected.add_client_role(role)
+        refused = admin_client.put(
+            "/api/settings", json={"ai_roles": [role, RM], "confirm_admin_roles": True}
+        )
+        assert refused.status_code == 400, refused.text
+        detail = refused.json()["detail"]
+        assert detail["code"] == "protected_ai_roles"
+        assert "never restricted" in detail["message"]
+
+    def test_protecting_an_ai_role_is_refused(
+        self, admin_client: TestClient, connected: FakeTenant
+    ) -> None:
+        both = admin_client.put(
+            "/api/settings", json={"ai_roles": ["ai-triage"], "protected_roles": "ai-triage"}
+        )
+        assert both.status_code == 400
+        assert both.json()["detail"]["code"] == "protected_ai_roles"
+        later = admin_client.put("/api/settings", json={"protected_roles": f"ast-admin, {RM}"})
+        assert later.status_code == 400
+        assert later.json()["detail"]["code"] == "protected_ai_roles"
+        fine = admin_client.put("/api/settings", json={"protected_roles": "ast-admin, owner"})
+        assert fine.status_code == 200
+
+    def test_the_listing_marks_admin_like_and_protected_roles(
+        self, admin_client: TestClient, connected: FakeTenant
+    ) -> None:
+        connected.add_client_role("manage-users")
+        connected.add_client_role("ast-admin")
+        roles = {
+            role["name"]: role
+            for role in admin_client.get("/api/settings/client-roles").json()["roles"]
+        }
+        assert roles["manage-users"]["admin_like"] is True
+        assert roles["manage-users"]["protected"] is False
+        assert roles["ast-admin"]["protected"] is True
+        assert roles[RM]["admin_like"] is False and roles[RM]["protected"] is False
+
+
+# ------------------------------------------------ review: role reads and previews
+
+
+def connect(db: Session, monkeypatch: pytest.MonkeyPatch, tenant: FakeTenant) -> None:
+    connection_service.save_connection(db, api_key=make_api_key(tenant="acme-corp"), actor=ACTOR)
+    db.commit()
+    monkeypatch.setattr(connection_service, "get_client", lambda _s: tenant.client())
+
+
+class TestPreviewAccess:
+    def test_viewer_sees_no_group_names_and_makes_no_iam_reads(
+        self, viewer_client: TestClient, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant = populated_tenant()
+        tenant.add_group(group_id="grp-secret", name="Secret Team", roles=[RM])
+        tenant.join_group("user-harsh", "grp-secret")
+        tenant, _client = setup_tenant(db, tenant)
+        connect(db, monkeypatch, tenant)
+        built: list[object] = []
+        real = connection_service.optional_client
+        monkeypatch.setattr(
+            connection_service, "optional_client", lambda s: built.append(s) or real(s)
+        )
+        before = len(tenant.requests)
+        response = viewer_client.get(
+            "/api/preview/blast-radius", params={"entity_type": "user", "entity_id": "user-harsh"}
+        )
+        assert response.status_code == 200
+        [user] = response.json()["user_roles"]
+        assert user["read"] is False
+        assert user["kept"] == [] and user["removed"] == []
+        assert "admins only" in user["note"]
+        assert "Secret Team" not in response.text
+        dry = viewer_client.get("/api/preview/dry-run")
+        assert dry.status_code == 200
+        assert len(tenant.requests) == before
+        assert built == []
+
+    def test_admin_still_gets_the_details(
+        self, admin_client: TestClient, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant = populated_tenant()
+        tenant.add_group(group_id="grp-secret", name="Secret Team", roles=[RM])
+        tenant.join_group("user-harsh", "grp-secret")
+        tenant, _client = setup_tenant(db, tenant)
+        connect(db, monkeypatch, tenant)
+        response = admin_client.get(
+            "/api/preview/blast-radius", params={"entity_type": "user", "entity_id": "user-harsh"}
+        )
+        assert response.json()["user_roles"][0]["kept"] == [
+            {"name": RM, "sources": ["group /Secret Team"]}
+        ]
+
+
+class TestPreviewBudget:
+    def test_preview_against_unavailable_iam_stops_at_once(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        slept: list[float] = []
+        client._sleep = lambda seconds: slept.append(seconds)
+        tenant.fail_requests[("GET", "/auth/admin/")] = 503
+        before = len(tenant.requests)
+        roles = preview_service.RolePreviewer(db, client)
+        users = [roles.user(uid, uid) for uid in ("user-harsh", "user-sean")]
+        assert len(tenant.requests) - before <= 1
+        assert slept == []
+        for user in users:
+            assert user.read is False
+            assert "Checkmarx IAM did not answer" in (user.note or "")
+
+    def test_a_time_budget_bounds_the_reads(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        before = len(tenant.requests)
+        roles = preview_service.RolePreviewer(db, client, budget_seconds=0)
+        user = roles.user("user-harsh", "Harsh")
+        assert user.read is False
+        assert "ran out" in (user.note or "")
+        assert len(tenant.requests) == before
+
+    def test_reads_are_tried_once_with_a_short_timeout(self, db: Session) -> None:
+        from app.checkmarx.client import single_attempt
+        from app.checkmarx.errors import CheckmarxUnavailableError
+
+        tenant, client = setup_tenant(db)
+        slept: list[float] = []
+        client._sleep = lambda seconds: slept.append(seconds)
+        tenant.fail_requests[("GET", "/users/user-harsh/groups")] = 503
+        before = requests(tenant, "GET", "/users/user-harsh/groups")
+        with single_attempt(2.0), pytest.raises(CheckmarxUnavailableError):
+            iam.fetch_user_groups(client, user_id="user-harsh")
+        assert requests(tenant, "GET", "/users/user-harsh/groups") == before + 1
+        assert slept == []
+        # Outside it (enforcement), the full retry policy is unchanged.
+        with pytest.raises(CheckmarxUnavailableError):
+            iam.fetch_user_groups(client, user_id="user-harsh")
+        assert requests(tenant, "GET", "/users/user-harsh/groups") > before + 2
+        assert slept
+
+    def test_a_failed_client_lookup_is_not_repeated_per_user(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        tenant.fail_requests[("GET", f"/auth/admin/realms/{tenant_name()}/clients")] = 403
+        roles = preview_service.RolePreviewer(db, client)
+        roles.user("user-harsh", None)
+        after_first = requests(tenant, "GET", "/clients")
+        second = roles.user("user-sean", None)
+        assert requests(tenant, "GET", "/clients") == after_first
+        assert second.read is True and "the user's effective roles" in second.unread
+
+    def test_readings_are_reused_briefly_across_requests(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        first = preview_service.RolePreviewer(db, client).user("user-harsh", "Harsh")
+        assert first.read is True
+        before = len(tenant.requests)
+        again = preview_service.RolePreviewer(db, client).user("user-harsh", "Harsh G.")
+        assert len(tenant.requests) == before
+        assert again.read is True and again.user_label == "Harsh G."
+        # A connection change drops them.
+        connection_service.reset_client_cache()
+        preview_service.RolePreviewer(db, client).user("user-harsh", "Harsh")
+        assert len(tenant.requests) > before
+
+    def test_an_already_restricted_user_is_not_read_again(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        apply(db, client, user_limit(db))
+        before = len(tenant.requests)
+        user = preview_service.RolePreviewer(db, client).user("user-harsh", "Harsh")
+        assert len(tenant.requests) == before
+        assert user.read is False and user.already_restricted is True
+        assert "Already restricted" in (user.note or "")
+        assert "holds none" not in (user.note or "")
+        assert user.not_held == []
+
+
+def tenant_name() -> str:
+    from tests.fake_tenant import TENANT
+
+    return TENANT
+
+
+class TestRoleSourceAccuracy:
+    def test_a_child_of_a_removed_composite_is_not_kept(self, db: Session) -> None:
+        tenant = FakeTenant()
+        tenant.add_client_role("ai-bundle", contains=[RM_DASH])
+        tenant.add_user(user_id="u1", username="u1@example.com", roles=["ai-bundle"])
+        tenant, client = setup_tenant(db, tenant)
+        set_ai_roles(db, [*DEFAULT_AI_ROLE_NAMES, "ai-bundle"])
+        blast = preview_service.blast_radius(
+            db, entity_type=EntityType.USER, entity_id="u1", client=client
+        )
+        [user] = blast.user_roles
+        assert user.kept == []
+        assert [role.name for role in user.removed] == ["ai-bundle"]
+        apply(db, client, user_limit(db, "u1"))
+        assert only_action(db).undo_snapshot["kept_effective"] == []
+
+    def test_an_unreadable_read_back_reports_no_kept_roles_from_the_guess(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.checkmarx.errors import CheckmarxUnavailableError
+
+        tenant = populated_tenant()
+        tenant.add_group(group_id="grp-ai", name="AI Users", roles=[RM])
+        tenant.join_group("user-harsh", "grp-ai")
+        tenant, client = setup_tenant(db, tenant)
+        real = iam.fetch_user_effective_client_roles
+        calls = {"n": 0}
+
+        def second_fails(client_, *, user_id, client_uuid):  # type: ignore[no-untyped-def]
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise CheckmarxUnavailableError("synthetic outage")
+            return real(client_, user_id=user_id, client_uuid=client_uuid)
+
+        monkeypatch.setattr(iam, "fetch_user_effective_client_roles", second_fails)
+        outcome = apply(db, client, user_limit(db))
+        assert len(outcome.applied) == 1
+        snapshot = only_action(db).undo_snapshot
+        assert snapshot["kept_effective"] == []
+        assert "the user's effective roles after the removal" in snapshot["role_sources_unread"]
+        assert count(db, Notification, Notification.title.like("%keeps AI access%")) == 0
+
+    def test_hidden_source_wording_counts_the_earlier_removal(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant, client = setup_tenant(db)
+        real = tenant.effective_roles
+
+        def with_hidden(user_id: str) -> set[str]:
+            return real(user_id) | ({RM} if user_id == "user-harsh" else set())
+
+        monkeypatch.setattr(tenant, "effective_roles", with_hidden)
+        limit = user_limit(db)
+        assert apply(db, client, limit).applied == []
+        assert len(apply(db, client, limit).applied) == 1
+        snapshot = only_action(db).undo_snapshot
+        [entry] = [e for e in snapshot["kept_effective"] if e["role"] == RM]
+        assert RM in {r["name"] for r in snapshot["removed_roles"]}
+        assert entry["direct_removed"] is True
+        note = db.scalar(select(Notification).where(Notification.title.like("%keeps AI access%")))
+        assert note is not None
+        assert "CreditGuard removed only the direct mapping" in note.body
+        assert "the user has none for it" not in note.body
+
+    def test_groups_beyond_the_cap_are_reported_unread(self, db: Session) -> None:
+        tenant = populated_tenant()
+        for i in range(role_sources.MAX_GROUPS_PER_USER + 10):
+            tenant.add_group(group_id=f"g{i}", name=f"G{i}", roles=[])
+            tenant.join_group("user-harsh", f"g{i}")
+        tenant, client = setup_tenant(db, tenant)
+        found = enforcement.RoleResolver(client).sources.read_user(
+            "user-harsh", ai_roles=DEFAULT_AI_ROLE_NAMES
+        )
+        [note] = [u for u in found.unread if "group" in u]
+        assert f"beyond the first {role_sources.MAX_GROUPS_PER_USER}" in note
+        assert f"in {role_sources.MAX_GROUPS_PER_USER + 10} groups" in note
+
+    def test_composites_nested_too_deep_are_reported_unread(self, db: Session) -> None:
+        tenant = populated_tenant()
+        depth = role_sources.MAX_COMPOSITE_DEPTH + 2
+        for level in range(depth):
+            tenant.add_client_role(f"nest-{level}", contains=[f"nest-{level + 1}"])
+        tenant.add_client_role(f"nest-{depth}", contains=[RM])
+        tenant.role_mappings["user-harsh"].append("nest-0")
+        tenant, client = setup_tenant(db, tenant)
+        found = enforcement.RoleResolver(client).sources.read_user(
+            "user-harsh", ai_roles=DEFAULT_AI_ROLE_NAMES
+        )
+        assert any("nest-0" in u and "levels deep" in u for u in found.unread), found.unread
+
+    def test_a_composite_child_of_another_client_is_not_an_ai_role(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant = populated_tenant()
+        tenant.add_client_role("ext-bundle", contains=[])
+        tenant.role_mappings["user-harsh"].append("ext-bundle")
+        tenant, client = setup_tenant(db, tenant)
+        real = iam.fetch_client_role_composites
+
+        def other_client(client_, *, client_uuid, role_name):  # type: ignore[no-untyped-def]
+            if role_name == "ext-bundle":
+                return [
+                    iam.RoleRef(id="other-id", name=RM, container_id="another-client"),
+                    iam.RoleRef(id="other-id-2", name=RM_TAB),  # no container: by id
+                ]
+            return real(client_, client_uuid=client_uuid, role_name=role_name)
+
+        monkeypatch.setattr(iam, "fetch_client_role_composites", other_client)
+        found = enforcement.RoleResolver(client).sources.read_user(
+            "user-harsh", ai_roles=DEFAULT_AI_ROLE_NAMES
+        )
+        assert found.indirect == {}
+
+    def test_tracked_reads_stay_on_the_key_permission_report(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        key_permissions.discard_pending_denials()
+        tenant.fail_requests[("GET", f"/clients/{tenant_uuid()}/roles")] = 403
+        preview_service.RolePreviewer(db, client).user("user-harsh", None)
+        assert key_permissions.pending_denials() >= 1
+        key_permissions.discard_pending_denials()
+        # The optional source reads stay off it.
+        tenant.fail_requests.clear()
+        tenant.fail_requests[("GET", "/users/user-harsh/groups")] = 403
+        preview_service.reset_role_cache()
+        preview_service.RolePreviewer(db, client).user("user-harsh", None)
+        assert key_permissions.pending_denials() == 0

@@ -101,6 +101,8 @@ class RoleRef:
     description: str | None = field(default=None, compare=False)
     # False for a realm role (or another client's) met among a composite's children.
     client_role: bool = field(default=True, compare=False)
+    # The client (its uuid) a client role belongs to, when the read said so.
+    container_id: str | None = field(default=None, compare=False)
 
     def as_payload(self) -> dict[str, str]:
         return {"id": self.id, "name": self.name}
@@ -114,12 +116,14 @@ def _role_ref(entry: Any) -> RoleRef | None:
     if not isinstance(role_id, str) or not isinstance(name, str):
         return None
     description = entry.get("description")
+    container = entry.get("containerId")
     return RoleRef(
         id=role_id,
         name=name,
         composite=entry.get("composite") is True,
         description=description if isinstance(description, str) and description else None,
         client_role=entry.get("clientRole") is not False,
+        container_id=container if isinstance(container, str) and container else None,
     )
 
 
