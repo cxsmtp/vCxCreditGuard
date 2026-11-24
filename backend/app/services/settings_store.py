@@ -188,10 +188,6 @@ KEY_KEY_PERMISSIONS = "connection.key_permissions"
 # The latest price per action from GET /api/v1/credits/action-rates, read once
 # per cycle, best effort. Bookkeeping like the report above: never a setting.
 KEY_ACTION_RATES = "credits.action_rates"
-# An admin's mappings of consumption names that match no project or
-# application: {"project": {"<reported name, lowercased>": "<project id>"},
-# "application": {...}}. Set under Settings → Attribution.
-KEY_ENTITY_MAPPINGS = "attribution.entity_mappings"
 # The last enforcement coverage report (app/services/coverage.py), cached.
 KEY_ENFORCEMENT_COVERAGE = "enforcement.coverage"
 # The group names last found not to be unique, kept for Diagnostics.
@@ -464,21 +460,6 @@ def action_rates(session: Session) -> dict[str, Any] | None:
     if not isinstance(value, dict) or not isinstance(value.get("rates"), list):
         return None
     return value
-
-
-def entity_mappings(session: Session) -> dict[str, dict[str, str]]:
-    """{"project": {reported name: id}, "application": {...}}, never None."""
-    value = get_value(session, KEY_ENTITY_MAPPINGS)
-    result: dict[str, dict[str, str]] = {}
-    if isinstance(value, dict):
-        for view, mapping in value.items():
-            if isinstance(view, str) and isinstance(mapping, dict):
-                result[view] = {
-                    str(name): str(entity_id)
-                    for name, entity_id in mapping.items()
-                    if isinstance(entity_id, str) and entity_id
-                }
-    return result
 
 
 def duplicate_group_names(session: Session) -> list[str]:

@@ -4,7 +4,20 @@ import type { OrgEntity, UnmatchedEntity } from "../api/types";
 import { useResource } from "../hooks/useResource";
 import { formatCredits } from "../lib/format";
 import { useToast } from "../lib/ui-context";
-import { Badge, Button, Card, EmptyState, Field, Input, Modal, Spinner, Table, Td, Th } from "./ui";
+import {
+  Badge,
+  Button,
+  Card,
+  EmptyState,
+  Field,
+  InfoNote,
+  Input,
+  Modal,
+  Spinner,
+  Table,
+  Td,
+  Th,
+} from "./ui";
 
 /**
  * Project and application names in the consumption feed that match no synced
@@ -22,6 +35,8 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<OrgEntity[]>([]);
   const [busy, setBusy] = useState(false);
+  // What the last mapping moved, and how budgets count it.
+  const [confirmation, setConfirmation] = useState<string | null>(null);
 
   useEffect(() => {
     if (!mapping) return;
@@ -49,11 +64,12 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
     if (!mapping) return;
     setBusy(true);
     try {
-      await api.post("/api/usage/unmatched-entities/map", {
+      const saved = await api.post<UnmatchedEntity>("/api/usage/unmatched-entities/map", {
         view: mapping.view,
         subject_key: mapping.subject_key,
         entity_id: entityId,
       });
+      setConfirmation(saved.confirmation ?? null);
       toast.success(entityId ? `Mapped. This usage now counts towards that ${mapping.view}.` : "Mapping cleared.");
       setMapping(null);
       await rows.reload();
@@ -72,6 +88,11 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
       title="Projects and applications not matched"
       description="Usage Checkmarx reports under a repository or application name that matches no project or application synced from /api/projects and /api/applications. It counts towards no project, group or application limit until it is mapped. A name that is no project at all (a repository scanned outside one) can be left: it is still counted tenant wide."
     >
+      {confirmation && (
+        <div className="mb-4">
+          <InfoNote tone="info">{confirmation}</InfoNote>
+        </div>
+      )}
       {rows.initialLoading ? (
         <Spinner />
       ) : data.length === 0 ? (
@@ -101,7 +122,11 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
                   <span className="tabular">{formatCredits(row.credits)}</span>
                 </Td>
                 <Td>
-                  {row.mapped_entity_id ? (
+                  {row.mapping_broken ? (
+                    <span title="Mapped to a project or application that is no longer synced, so the mapping is ignored. Map it again.">
+                      <Badge tone="critical">Mapping broken: {row.mapped_entity_id} is gone</Badge>
+                    </span>
+                  ) : row.mapped_entity_id ? (
                     <Badge tone="good">{row.mapped_label ?? row.mapped_entity_id}</Badge>
                   ) : (
                     <Badge tone="warning">Not counted</Badge>

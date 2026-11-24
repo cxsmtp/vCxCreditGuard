@@ -29,6 +29,7 @@ EXPECTED_TABLES = {
     "cx_project_group",
     "cx_user",
     "dimension_state",
+    "entity_mapping",
     "enforcement_action",
     "exemption",
     "limit_period_state",

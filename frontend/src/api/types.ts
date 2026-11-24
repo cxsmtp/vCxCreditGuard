@@ -373,6 +373,10 @@ export interface UnmatchedEntity {
   credits: string;
   mapped_entity_id: string | null;
   mapped_label: string | null;
+  /** Mapped to a project or application that is no longer synced: ignored. */
+  mapping_broken?: boolean;
+  /** After a mapping: what moved, and how budgets count it. */
+  confirmation?: string | null;
 }
 
 /** Whether a user restriction can bite (GET /api/preview/coverage). */
@@ -397,6 +401,9 @@ export interface EnforcementCoverage {
   available: boolean;
   low: boolean;
   warning: string | null;
+  /** False when no AI holder's roles could be read: no verdict either way. */
+  determined?: boolean;
+  undetermined?: string | null;
 }
 
 export interface CreditPoolInfo {
@@ -743,6 +750,8 @@ export interface SubjectSuggestion {
 export type SubjectStatus = "unmatched" | "disputed" | "auto_matched";
 
 export interface UnresolvedSubject {
+  /** After a mapping: what moved, and how budgets count it. */
+  confirmation?: string | null;
   id: number;
   subject_key: string;
   subject_name: string | null;

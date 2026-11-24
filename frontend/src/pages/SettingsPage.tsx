@@ -1416,11 +1416,12 @@ function AttributionCard({
   async function mapSubject(subject: UnresolvedSubject, userId: string | null) {
     setBusyId(subject.id);
     try {
-      await api.post(`/api/usage/unresolved/${subject.id}/map`, { user_id: userId });
+      const saved = await api.post<UnresolvedSubject>(`/api/usage/unresolved/${subject.id}/map`, {
+        user_id: userId,
+      });
       toast.success(
-        userId
-          ? "Confirmed. This usage now counts towards that user."
-          : "Mapping cleared.",
+        saved.confirmation ??
+          (userId ? "Confirmed. This usage now counts towards that user." : "Mapping cleared."),
       );
       await onChanged();
     } catch (caught) {
@@ -1435,11 +1436,12 @@ function AttributionCard({
     if (!mapping) return;
     setBusy(true);
     try {
-      await api.post(`/api/usage/unresolved/${mapping.id}/map`, { user_id: userId });
+      const saved = await api.post<UnresolvedSubject>(`/api/usage/unresolved/${mapping.id}/map`, {
+        user_id: userId,
+      });
       toast.success(
-        userId
-          ? "Mapped. This usage now counts towards that user."
-          : "Mapping cleared.",
+        saved.confirmation ??
+          (userId ? "Mapped. This usage now counts towards that user." : "Mapping cleared."),
       );
       setMapping(null);
       setQuery("");

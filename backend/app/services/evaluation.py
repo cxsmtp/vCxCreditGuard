@@ -2116,3 +2116,98 @@ def pending_restore_count(session: Session) -> int:
         )
         or 0
     )
+
+
+# ------------------------------------------------------------ moving usage
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineShift:
+    """Credits a mapping moved onto (or off) one budget's current period."""
+
+    limit_id: int
+    label: str
+    period_key: str
+    credits: Decimal
+    # True when the budget counts usage already reported (lifetime, custom, or
+    # count existing usage): the moved credits count against this period then,
+    # and the baseline is left as it is.
+    counts_existing: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "limit_id": self.limit_id,
+            "label": self.label,
+            "period_key": self.period_key,
+            "credits": str(self.credits),
+            "counts_existing": self.counts_existing,
+        }
+
+
+def _current_totals(
+    session: Session, moment: datetime
+) -> dict[int, tuple[CreditLimit, PeriodWindow, LimitPeriodState, Decimal]]:
+    """Each active limit whose current period has a state, with its reported total."""
+    index = UsageIndex(session)
+    found: dict[int, tuple[CreditLimit, PeriodWindow, LimitPeriodState, Decimal]] = {}
+    for limit in session.scalars(
+        select(CreditLimit).where(CreditLimit.is_active.is_(True)).order_by(CreditLimit.id)
+    ):
+        try:
+            window = current_window(limit, moment)
+        except PeriodError:
+            continue
+        state = index.period_state(limit.id, window.key)
+        if state is None:
+            continue
+        total, available = index.reported_total(limit)
+        if available:
+            found[limit.id] = (limit, window, state, total)
+    return found
+
+
+def move_reported_usage(
+    session: Session, change, *, moment: datetime | None = None
+) -> list[BaselineShift]:
+    """Apply ``change`` (a mapping that moves already-reported credits from one
+    target to another) without counting those credits as this period's usage.
+
+    The credits a mapping moves were spent somewhere in the lookback window,
+    before the mapping was made: a budget that discounts usage reported before
+    its period opened must not count them as new. So every budget's reported
+    total is read before and after the change (users, projects, applications,
+    groups through their projects, the application fallback, all through
+    ``UsageIndex``), and the difference is added to the baseline of each
+    current period that discounts existing usage. Exactly the credits moved:
+    mapping, unmapping and mapping again leave the baseline where it was.
+    Budgets that count existing usage keep their baseline (the credits count).
+    Database only; the caller commits and audits.
+    """
+    moment = moment or utcnow()
+    before = _current_totals(session, moment)
+    change()
+    session.flush()
+    after = _current_totals(session, moment)
+    shifts: list[BaselineShift] = []
+    for limit_id in sorted(set(before) | set(after)):
+        limit, window, state, total_after = after.get(limit_id) or before[limit_id]
+        total_before = before[limit_id][3] if limit_id in before else Decimal("0")
+        if limit_id not in after:
+            total_after = Decimal("0")
+        delta = total_after - total_before
+        if delta == 0:
+            continue
+        counts = counts_existing_usage(limit, window=window)
+        if not counts:
+            state.baseline_credits = max(Decimal("0"), state.baseline_credits + delta)
+        shifts.append(
+            BaselineShift(
+                limit_id=limit.id,
+                label=limit.entity_label or limit.entity_id,
+                period_key=state.period_key,
+                credits=delta,
+                counts_existing=counts,
+            )
+        )
+    session.flush()
+    return shifts

@@ -34,7 +34,13 @@ from app.checkmarx.errors import (
 from app.db.base import utcnow
 from app.models.enums import ActorType, EntityType, UsageView
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
-from app.models.usage import DimensionState, UnresolvedSubject, UsageRecord, UsageSnapshot
+from app.models.usage import (
+    DimensionState,
+    EntityMapping,
+    UnresolvedSubject,
+    UsageRecord,
+    UsageSnapshot,
+)
 from app.services import subject_matching
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome, UserProfile
@@ -318,6 +324,14 @@ def _named_index(
     return by_id, by_name
 
 
+def entity_mappings(session: Session) -> dict[str, dict[str, str]]:
+    """An admin's mappings of unmatched names: {"project": {name: id}, ...}."""
+    mappings: dict[str, dict[str, str]] = {}
+    for row in session.scalars(select(EntityMapping).order_by(EntityMapping.id)):
+        mappings.setdefault(row.view_by, {})[row.subject_key] = row.entity_id
+    return mappings
+
+
 def unresolved_person_filter() -> tuple:
     """The rows of ``unresolved_subject`` that are an unmatched *person*.
 
@@ -349,9 +363,7 @@ def ingest_usage(
 ) -> IngestResult:
     result = IngestResult()
     user_index = build_user_index(session)
-    from app.services import settings_store
-
-    mappings = settings_store.entity_mappings(session)
+    mappings = entity_mappings(session)
     projects_by_id, projects_by_name = _named_index(
         session, CxProject, mappings.get(str(UsageView.PROJECT))
     )

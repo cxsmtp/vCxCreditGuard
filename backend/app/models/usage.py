@@ -165,6 +165,29 @@ class UnresolvedSubject(Base):
     suggestions: Mapped[list | None] = mapped_column(JSONColumn)
 
 
+class EntityMapping(Base):
+    """An admin's mapping of a consumption name that matches no project or
+    application to the one it belongs to (Settings → Attribution).
+
+    One row per (dimension, reported name), so two admins mapping different
+    names at once can never overwrite each other. A real name match always
+    wins over a mapping; a mapping to an entity that is gone is ignored.
+    """
+
+    __tablename__ = "entity_mapping"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # "project" or "application".
+    view_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The reported name, lowercased and trimmed (the usage record's subject key).
+    subject_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    mapped_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    mapped_by: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (UniqueConstraint("view_by", "subject_key", name="entity_mapping_subject"),)
+
+
 class AutoTriageCharge(Base):
     """Auto Triage credits observed on a project and charged to whoever scanned.
 

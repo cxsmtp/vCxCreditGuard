@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from app import __version__, scheduler
 from app.api.deps import AdminUser, CurrentUser, DbSession
@@ -18,6 +19,7 @@ from app.models.limits import CreditLimit, EnforcementAction, Exemption
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
 from app.models.usage import (
     AutoTriageCharge,
+    EntityMapping,
     SchedulerRun,
     UnresolvedSubject,
     UsageRecord,
@@ -50,6 +52,7 @@ from app.schemas.dashboard import (
 )
 from app.services import (
     auto_triage_attribution,
+    evaluation,
     ingestion,
     key_permissions,
     settings_store,
@@ -58,6 +61,7 @@ from app.services import (
 from app.services import dashboard as dashboard_service
 from app.services import notifications as notification_service
 from app.services.audit import record_audit
+from app.services.usage_mix import format_credits
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["dashboard"])
@@ -543,9 +547,14 @@ def map_unresolved(
             )
 
     before = {"mapped_user_id": row.mapped_user_id}
-    row.mapped_user_id = payload.user_id
-    _reattribute_latest_snapshot(db, row.subject_key, payload.user_id)
-    db.flush()
+
+    def change() -> None:
+        row.mapped_user_id = payload.user_id
+        _reattribute_latest_snapshot(db, row.subject_key, payload.user_id)
+
+    # The credits already reported under this subject were spent before the
+    # mapping: budgets that discount existing usage must not count them as new.
+    shifts = evaluation.move_reported_usage(db, change)
     record_audit(
         db,
         action="usage.subject_mapped",
@@ -554,15 +563,40 @@ def map_unresolved(
         target_id=str(row.id),
         target_label=row.subject_key,
         before=before,
-        after={"mapped_user_id": row.mapped_user_id},
+        after={
+            "mapped_user_id": row.mapped_user_id,
+            "baseline_shifts": [shift.as_dict() for shift in shifts],
+        },
         detail=(
             f"Credit usage reported as {row.subject_key} now counts towards "
             f"{user.display_name if user else 'nobody'}."
+            + (
+                " Budgets whose period already started do not count the credits reported "
+                "before the mapping: "
+                + ", ".join(
+                    f"{shift.label} ({format_credits(shift.credits)})"
+                    for shift in shifts
+                    if not shift.counts_existing
+                )
+                + "."
+                if any(not shift.counts_existing for shift in shifts)
+                else ""
+            )
         ),
     )
     db.commit()
 
-    return _subject_response(db, row)
+    response = _subject_response(db, row)
+    response.confirmation = (
+        _shift_words(
+            shifts,
+            sum((shift.credits for shift in shifts if shift.credits > 0), Decimal("0")),
+            user.display_name if user else "nobody",
+        )
+        if shifts
+        else None
+    )
+    return response
 
 
 _ENTITY_VIEWS = {
@@ -574,38 +608,86 @@ _ENTITY_VIEWS = {
 @router.get("/usage/unmatched-entities", response_model=list[UnmatchedEntityResponse])
 def list_unmatched_entities(ctx: AdminUser, db: DbSession) -> list[UnmatchedEntityResponse]:
     """Project and application names in the latest readings that match no synced
-    project or application, and the names an admin has mapped. Largest first."""
-    mappings = settings_store.entity_mappings(db)
+    project or application, and every name an admin has mapped. Largest first.
+
+    A mapping whose name is not in the latest reading is listed too (with no
+    credits), and one whose entity has since gone is flagged as broken.
+    """
     rows: list[UnmatchedEntityResponse] = []
+    mappings = {
+        (row.view_by, row.subject_key): row
+        for row in db.scalars(select(EntityMapping).order_by(EntityMapping.id))
+    }
+    seen: set[tuple[str, str]] = set()
     for view, (_entity_type, model) in _ENTITY_VIEWS.items():
         snapshot = ingestion.latest_snapshot(db, view)
         if snapshot is None:
             continue
-        mapped = mappings.get(view, {})
-        records = db.scalars(
-            select(UsageRecord).where(
-                UsageRecord.snapshot_id == snapshot.id,
-                or_(
-                    UsageRecord.entity_id.is_(None),
-                    UsageRecord.subject_key.in_(list(mapped)[:1000] or [""]),
-                ),
-            )
-        )
-        for record in records:
-            entity_id = mapped.get(record.subject_key)
-            entity = db.get(model, entity_id) if entity_id else None
+        mapped_keys = {key for (v, key) in mappings if v == view}
+        query = select(UsageRecord).where(UsageRecord.snapshot_id == snapshot.id)
+        for record in db.scalars(query):
+            key = (view, record.subject_key)
+            if record.entity_id is not None and record.subject_key not in mapped_keys:
+                continue
+            seen.add(key)
             rows.append(
-                UnmatchedEntityResponse(
-                    view=view,
-                    subject_key=record.subject_key,
-                    name=record.subject_name or record.subject_key,
-                    credits=record.credits_used,
-                    mapped_entity_id=entity_id,
-                    mapped_label=entity.name if entity is not None else None,
+                _entity_row(
+                    db,
+                    view,
+                    model,
+                    record.subject_key,
+                    record.subject_name or record.subject_key,
+                    record.credits_used,
+                    mappings.get(key),
                 )
+            )
+    for (view, key), mapping in mappings.items():
+        if (view, key) not in seen and view in _ENTITY_VIEWS:
+            rows.append(
+                _entity_row(db, view, _ENTITY_VIEWS[view][1], key, key, Decimal("0"), mapping)
             )
     rows.sort(key=lambda row: (-row.credits, row.view, row.subject_key))
     return rows
+
+
+def _entity_row(db, view, model, key, name, credits, mapping) -> UnmatchedEntityResponse:  # type: ignore[no-untyped-def]
+    entity = db.get(model, mapping.entity_id) if mapping is not None else None
+    broken = mapping is not None and (entity is None or entity.is_deleted)
+    return UnmatchedEntityResponse(
+        view=view,
+        subject_key=key,
+        name=name,
+        credits=credits,
+        mapped_entity_id=mapping.entity_id if mapping is not None else None,
+        mapped_label=entity.name if entity is not None else None,
+        mapping_broken=broken,
+    )
+
+
+def _shift_words(shifts: list[evaluation.BaselineShift], moved: Decimal, target: str) -> str:
+    """The confirmation an admin reads after a mapping moves usage."""
+    if moved == 0 and not shifts:
+        return f"No credits in the latest reading moved; later readings count towards {target}."
+    text = (
+        f"{format_credits(abs(moved))} credits already reported move "
+        f"{'to' if moved >= 0 else 'away from'} {target}."
+    )
+    discounted = [shift for shift in shifts if not shift.counts_existing]
+    counted = [shift for shift in shifts if shift.counts_existing]
+    if discounted:
+        text += (
+            " They were spent before this budget period's figures were taken, so they do not "
+            "count against the current period of "
+            + ", ".join(shift.label for shift in discounted)
+            + "; usage from now on does."
+        )
+    if counted:
+        text += (
+            " They count against "
+            + ", ".join(shift.label for shift in counted)
+            + ", which count usage already reported."
+        )
+    return text
 
 
 @router.post("/usage/unmatched-entities/map", response_model=UnmatchedEntityResponse)
@@ -616,10 +698,17 @@ def map_unmatched_entity(
     towards the one it belongs to; a null ``entity_id`` clears the mapping.
 
     Takes effect at once on the latest reading, and every later reading honours
-    it. A real name match always wins over a mapping.
+    it. A real name match always wins over a mapping. The credits moved were
+    spent before the mapping, so budgets that discount usage already reported
+    shift their period's baseline by exactly that much (and back on unmapping).
     """
     entity_type, model = _ENTITY_VIEWS[payload.view]
     key = payload.subject_key.strip().lower()
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_name", "message": "A reported name is required."},
+        )
     entity = None
     if payload.entity_id:
         entity = db.get(model, payload.entity_id)
@@ -631,32 +720,63 @@ def map_unmatched_entity(
                     "message": f"That {payload.view} is not in the synced organisation model.",
                 },
             )
-    mappings = settings_store.entity_mappings(db)
-    view_map = dict(mappings.get(payload.view, {}))
-    before = view_map.get(key)
-    if payload.entity_id:
-        view_map[key] = payload.entity_id
-    else:
-        view_map.pop(key, None)
-    mappings[payload.view] = view_map
-    settings_store.set_value(db, settings_store.KEY_ENTITY_MAPPINGS, mappings)
+    existing = db.scalar(
+        select(EntityMapping)
+        .where(EntityMapping.view_by == payload.view, EntityMapping.subject_key == key)
+        .with_for_update()
+    )
+    before = existing.entity_id if existing is not None else None
 
     name = key
-    credits = Decimal("0")
-    snapshot = ingestion.latest_snapshot(db, payload.view)
-    if snapshot is not None:
+    moved = {"credits": Decimal("0")}
+
+    def change() -> None:
+        if payload.entity_id:
+            if existing is None:
+                db.add(
+                    EntityMapping(
+                        view_by=payload.view,
+                        subject_key=key,
+                        entity_id=payload.entity_id,
+                        mapped_at=utcnow(),
+                        mapped_by=ctx.actor.actor_name,
+                    )
+                )
+            else:
+                existing.entity_id = payload.entity_id
+                existing.mapped_at = utcnow()
+                existing.mapped_by = ctx.actor.actor_name
+        elif existing is not None:
+            db.delete(existing)
+        snapshot = ingestion.latest_snapshot(db, payload.view)
+        if snapshot is None:
+            return
         for record in db.scalars(
             select(UsageRecord).where(
                 UsageRecord.snapshot_id == snapshot.id, UsageRecord.subject_key == key
             )
         ):
+            nonlocal name
             name = record.subject_name or record.subject_key
-            credits = record.credits_used
             # Only a record no real name matched follows the mapping.
             if record.entity_id is None or record.entity_id == before:
+                if record.entity_id != payload.entity_id:
+                    moved["credits"] += record.credits_used
                 record.entity_type = entity_type
                 record.entity_id = payload.entity_id
-    db.flush()
+
+    try:
+        shifts = evaluation.move_reported_usage(db, change)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "conflict", "message": "Someone else changed this mapping; try again."},
+        ) from None
+    target = entity.name if entity is not None else f"no {payload.view}"
+    confirmation = _shift_words(
+        shifts, moved["credits"] if payload.entity_id else -moved["credits"], target
+    )
     record_audit(
         db,
         action="usage.entity_mapped",
@@ -665,21 +785,31 @@ def map_unmatched_entity(
         target_id=key[:64],
         target_label=name,
         before={"entity_id": before},
-        after={"entity_id": payload.entity_id},
-        detail=(
-            f"Credit usage reported under the {payload.view} name {name} now counts towards "
-            f"{entity.name if entity is not None else f'no {payload.view}'}."
-        ),
+        after={
+            "entity_id": payload.entity_id,
+            "credits_moved": str(moved["credits"]),
+            "baseline_shifts": [shift.as_dict() for shift in shifts],
+        },
+        detail=f"Credit usage reported under the {payload.view} name {name} now counts towards "
+        f"{target}. {confirmation}",
     )
     db.commit()
-    return UnmatchedEntityResponse(
-        view=payload.view,
-        subject_key=key,
-        name=name,
-        credits=credits,
-        mapped_entity_id=payload.entity_id,
-        mapped_label=entity.name if entity is not None else None,
+    row = _entity_row(
+        db,
+        payload.view,
+        model,
+        key,
+        name,
+        moved["credits"],
+        db.scalar(
+            select(EntityMapping).where(
+                EntityMapping.view_by == payload.view, EntityMapping.subject_key == key
+            )
+        ),
     )
+    row.confirmation = confirmation
+    row.baseline_shifts = [shift.as_dict() for shift in shifts]
+    return row
 
 
 @router.get("/usage/dimensions")

@@ -31,7 +31,6 @@ from app.services import (
     key_permissions,
     limits_service,
     org_sync,
-    settings_store,
     subject_matching,
     usage_mix,
     violations,
@@ -160,14 +159,19 @@ class TestPricing:
         # Opus 4.7: rate 2.5, feed ~7.65 per transaction.
         assert prices["fusion_scan___opus_4.7"].source == usage_mix.PRICE_OBSERVED
 
-    def test_without_a_feed_figure_the_rate_is_used(self, db: Session, connected) -> None:
+    def test_without_a_feed_figure_only_triage_and_remediation_use_the_rate(
+        self, db: Session, connected
+    ) -> None:
         tenant = live_tenant()
         tenant.consumption["action"] = []
         connected(tenant)
         cycle.run_cycle(trigger="manual", force_org_sync=True)
         prices = usage_mix.price_table(db)
-        assert prices["fusion_scan___opus_5.5"].source == usage_mix.PRICE_RATE
-        assert prices["fusion_scan___opus_5.5"].per_transaction == Decimal("2")
+        # Fusion and DAST: the rate is known not to be their price.
+        assert "fusion_scan___opus_5.5" not in prices
+        assert "dast_correlation" not in prices
+        assert prices["triage"].source == usage_mix.PRICE_RATE
+        assert prices["remediation"].per_transaction == Decimal("3")
 
     def test_a_breach_prices_fusion_at_what_the_feed_observed(self, db: Session, connected) -> None:
         tenant = connected(live_tenant())
@@ -401,9 +405,7 @@ class TestUnmatchedProjects:
         cycle.run_cycle(trigger="manual")
         db.expire_all()
         assert ingestion.latest_totals(db, UsageView.PROJECT)["proj-api"] == Decimal("878")
-        assert settings_store.entity_mappings(db)["project"] == {
-            "example-org/payments-api": "proj-api"
-        }
+        assert ingestion.entity_mappings(db)["project"] == {"example-org/payments-api": "proj-api"}
         assert (
             db.scalar(
                 select(func.count())
