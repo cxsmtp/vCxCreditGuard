@@ -94,17 +94,13 @@ export function BreakdownChart({ items }: Props) {
         ]
       : head;
 
-  // A colour slot per action type, used only where one row has that type
-  // (three Fusion models would otherwise share one colour).
-  const bucketCounts = new Map<string, number>();
-  for (const row of rows) {
-    const bucket = row.action_bucket ?? row.action_type;
-    bucketCounts.set(bucket, (bucketCounts.get(bucket) ?? 0) + 1);
-  }
-  const slotOf = (row: ActionBreakdownItem) => {
-    const bucket = row.action_bucket ?? row.action_type;
-    return (bucketCounts.get(bucket) ?? 0) > 1 ? `${bucket}:${row.action_type}` : bucket;
-  };
+  // A fixed colour per action type while each type has one row. When several
+  // rows share a type (one per Fusion model), every row takes the colour of its
+  // position instead, so no two rows look alike.
+  const buckets = rows.map((row) => row.action_bucket ?? row.action_type);
+  const shared = new Set(buckets).size < buckets.length;
+  const slotOf = (row: ActionBreakdownItem) =>
+    shared ? `row:${row.action_type}` : (row.action_bucket ?? row.action_type);
   const anyPrice = rows.some((row) => row.credits_per_transaction);
   const usesCredits = rows.some((row) => Number(row.credits) > 0);
   const valueOf = (row: ActionBreakdownItem) =>
