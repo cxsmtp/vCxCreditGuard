@@ -45,16 +45,14 @@ function labelOf(row: ActionBreakdownItem): string {
   return row.action_bucket ? row.action_type : actionLabel(row.action_type);
 }
 
-/** "108.86 per transaction (observed; listed rate 2)" for the table. */
+/** "108.86 (feed; rate 2)": what one action cost, and whether that is the listed rate. */
 function priceOf(row: ActionBreakdownItem): string {
   if (!row.credits_per_transaction) return "";
   const per = formatCredits(row.credits_per_transaction);
   if (row.price_source === "observed") {
-    return row.listed_rate
-      ? `${per} (feed average; listed rate ${formatCredits(row.listed_rate)} does not match)`
-      : `${per} (feed average)`;
+    return row.listed_rate ? `${per} (feed; rate ${formatCredits(row.listed_rate)})` : `${per} (feed)`;
   }
-  if (row.price_source === "rate") return `${per} (matches the listed rate)`;
+  if (row.price_source === "rate") return `${per} (rate)`;
   return per;
 }
 
@@ -133,7 +131,13 @@ export function BreakdownChart({ items }: Props) {
               <Th align="right">Credits</Th>
               <Th align="right">Actions</Th>
               <Th align="right">Share</Th>
-              {anyPrice && <Th align="right">Credits per action</Th>}
+              {anyPrice && (
+                <Th align="right">
+                  <span title="Credits per action as the feed reports them. 'rate': the listed rate matches; 'feed': it does not, and the feed's average is what CreditGuard uses.">
+                    Per action
+                  </span>
+                </Th>
+              )}
             </tr>
           </thead>
           <tbody>
@@ -143,7 +147,11 @@ export function BreakdownChart({ items }: Props) {
                 <Td align="right">{usesCredits ? formatCredits(row.credits) : ""}</Td>
                 <Td align="right">{formatNumber(row.transactions)}</Td>
                 <Td align="right">{formatPercent(row.percent_of_total, 1)}</Td>
-                {anyPrice && <Td align="right">{priceOf(row)}</Td>}
+                {anyPrice && (
+                  <Td align="right">
+                    {priceOf(row)}
+                  </Td>
+                )}
               </tr>
             ))}
           </tbody>
