@@ -428,10 +428,13 @@ def attribution_summary(session: Session) -> AttributionSummary:
             )
         )
         automated = automation_keys(session, [key for key, _credits in unattributed])
+        counted: set[str] = set()
         for key, row_credits in unattributed:
             if key in automated:
-                summary.automation += 1
                 summary.automation_credits += Decimal(row_credits or 0)
+                counted.add(key)
+        # One per distinct subject, however many rows it has.
+        summary.automation = len(counted)
 
     summary.projects = _unmatched_entities(session, UsageView.PROJECT)
     summary.applications = _unmatched_entities(session, UsageView.APPLICATION)

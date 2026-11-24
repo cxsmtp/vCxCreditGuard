@@ -813,3 +813,51 @@ def _notify_unresolved(session: Session) -> None:
             ),
             dedupe_key=notifications.attribution_key(row.subject_key),
         )
+
+    from app.models.audit import Notification
+
+    # Automation is never chased as a person, but a new automation identity is
+    # still said once, so a person wrongly taken for one is not silent.
+    for row in session.scalars(
+        select(UnresolvedSubject).where(
+            UnresolvedSubject.mapped_user_id.is_(None),
+            UnresolvedSubject.is_bot.is_(True),
+            UnresolvedSubject.view_by != auto_triage_attribution.SOURCE_SCAN_INITIATOR,
+        )
+    ):
+        name = row.subject_name or row.subject_key
+        notifications.notify(
+            session,
+            category=notifications.CATEGORY_ATTRIBUTION,
+            severity=Severity.INFO,
+            title=f"New automation identity found: {name}",
+            body=(
+                f"{row.credits_used} credits are reported against {name}, which looks like "
+                "automation (a bot, or an integration with no email) rather than a person, so "
+                "it is shown as automation and counts towards no user limit. If it is a person, "
+                "map it to their user under Settings → Attribution."
+            ),
+            dedupe_key=f"automation:{row.subject_key}"[:160],
+        )
+
+    # "Could not be matched" notices raised before a subject was found to be
+    # automation, auto-matched or mapped (including by earlier versions) no
+    # longer stand: marked read, once.
+    settled = [
+        notifications.attribution_key(key)
+        for key in session.scalars(
+            select(UnresolvedSubject.subject_key).where(
+                UnresolvedSubject.mapped_user_id.is_not(None)
+                | (UnresolvedSubject.status == "auto_matched")
+                | UnresolvedSubject.is_bot.is_(True)
+            )
+        )
+    ]
+    for start in range(0, len(settled), 500):
+        chunk = settled[start : start + 500]
+        for notice in session.scalars(
+            select(Notification).where(
+                Notification.dedupe_key.in_(chunk), Notification.read_at.is_(None)
+            )
+        ):
+            notice.read_at = utcnow()

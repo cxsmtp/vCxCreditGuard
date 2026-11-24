@@ -27,6 +27,7 @@ policy is unit-testable in isolation.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -170,23 +171,57 @@ def is_bot_subject(*values: str | None) -> bool:
     return False
 
 
+# Words that mark a handle as an integration or service account rather than a
+# person, matched as whole tokens of the handle.
+_INTEGRATION_WORDS = frozenset(
+    {
+        "github",
+        "gitlab",
+        "azure",
+        "jenkins",
+        "bitbucket",
+        "ci",
+        "bot",
+        "service",
+        "svc",
+        "integration",
+        "app",
+        "token",
+        "scm",
+        "pipeline",
+        "automation",
+        "connector",
+    }
+)
+
+
 def is_integration_identity(name: str | None, email: str | None) -> bool:
     """True for a consumption subject that looks like an integration, not a person.
 
     On a live tenant the largest consumer (62% of credits) was reported under a
     single handle with no email anywhere: an SCM or CI integration's identity.
-    A row with no email, no address in its name and no space in its name is
-    taken as one, but only once nothing matched it (see ``classify``): a
-    person's display name has a space, and a person's login matches the synced
-    user it belongs to. It stays mappable to a person under Settings →
-    Attribution if this is wrong.
+    A bare name with no email is not enough ("Priya", "José", "张伟" or a
+    departed person's login are people): the handle must also look like one,
+    with "[bot]", a "-" or "_", a digit, or a CI/SCM word (github, jenkins,
+    svc, integration, ...). It is applied only once nothing matched (see
+    ``classify``), and stays mappable to a person under Settings → Attribution.
     """
     if email and email.strip():
         return False
     text = (name or "").strip()
-    if not text or "@" in text:
+    if not text or "@" in text or any(char.isspace() for char in text):
         return False
-    return not any(char.isspace() for char in text)
+    low = text.lower()
+    if "[bot]" in low:
+        return True
+    if not text.isascii():
+        return False
+    if "-" in text or "_" in text or any(char.isdigit() for char in text):
+        return True
+    words = {word for word in re.split(r"[^a-z]+", low) if word}
+    return bool(words & _INTEGRATION_WORDS) or any(
+        low.startswith(word) or low.endswith(word) for word in _INTEGRATION_WORDS if len(word) >= 4
+    )
 
 
 def similarity(a: frozenset[str], b: frozenset[str]) -> float:
