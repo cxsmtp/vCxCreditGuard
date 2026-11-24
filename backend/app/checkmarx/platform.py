@@ -47,7 +47,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.checkmarx.client import CheckmarxClient
+from app.checkmarx.client import CheckmarxClient, Listing
 from app.checkmarx.errors import CheckmarxError, CheckmarxPermissionError, CheckmarxResponseError
 
 logger = logging.getLogger(__name__)
@@ -153,10 +153,15 @@ def parse_project(payload: dict[str, Any]) -> PlatformProject | None:
     )
 
 
-def fetch_projects(client: CheckmarxClient, *, page_size: int = 100) -> list[PlatformProject]:
+def fetch_projects(
+    client: CheckmarxClient, *, page_size: int = 100, listing: Listing | None = None
+) -> list[PlatformProject]:
+    """Every project. ``listing`` is told whether every row could be read."""
     return [
         parsed
-        for item in client.paginate(PROJECTS_PATH, items_key="projects", page_size=page_size)
+        for item in client.paginate(
+            PROJECTS_PATH, items_key="projects", page_size=page_size, listing=listing
+        )
         if (parsed := parse_project(item)) is not None
     ]
 
@@ -178,12 +183,13 @@ def parse_application(payload: dict[str, Any]) -> PlatformApplication | None:
 
 
 def fetch_applications(
-    client: CheckmarxClient, *, page_size: int = 100
+    client: CheckmarxClient, *, page_size: int = 100, listing: Listing | None = None
 ) -> list[PlatformApplication]:
+    """Every application. ``listing`` is told whether every row could be read."""
     return [
         parsed
         for item in client.paginate(
-            APPLICATIONS_PATH, items_key="applications", page_size=page_size
+            APPLICATIONS_PATH, items_key="applications", page_size=page_size, listing=listing
         )
         if (parsed := parse_application(item)) is not None
     ]

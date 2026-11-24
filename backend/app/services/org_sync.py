@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx import iam, platform
-from app.checkmarx.client import CheckmarxClient
+from app.checkmarx.client import CheckmarxClient, Listing
 from app.checkmarx.errors import CheckmarxPermissionError
 from app.db.base import utcnow
 from app.models.enums import EntityType
@@ -38,6 +39,7 @@ from app.models.org import (
     CxProjectGroup,
     CxUser,
 )
+from app.services import settings_store
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -241,7 +243,9 @@ def _sync_groups(
         by_name.pop(name, None)
     result.duplicate_group_names = sorted(duplicates)
 
-    result.soft_deleted += _soft_delete_missing(session, existing, seen, now)
+    result.soft_deleted += _soft_delete_after(
+        session, result, existing, seen, now, kind="group", complete=True
+    )
     session.flush()
     return GroupIndex(by_name=by_name, by_path=by_path, ambiguous_names=frozenset(duplicates))
 
@@ -261,15 +265,26 @@ def _sync_users(
     users, reported_total, warning = iam.fetch_users(client)
     if warning:
         result.warnings.append(warning)
+    # A user the listing did not return is gone only if the listing was whole.
+    complete = warning is None
     if reported_total is not None:
         logger.info("IAM reported %d users, read %d", reported_total, len(users))
 
     existing = {row.id: row for row in session.scalars(select(CxUser))}
     seen: set[str] = set()
 
-    # Rebuild memberships from scratch each sync: a removal has to be reflected,
-    # and the volumes here (hundreds of users) make diffing not worth the code.
-    session.query(CxGroupMembership).delete(synchronize_session=False)
+    # Rebuild the memberships of every user the listing returned: a removal
+    # has to be reflected. A user it did not return keeps theirs (see
+    # _replace_links), so a short listing or a deletion not yet confirmed
+    # takes nobody's usage out of a group.
+    _replace_links(
+        session,
+        CxGroupMembership,
+        CxGroupMembership.user_id,
+        {user.id for user in users},
+        existing,
+        complete=complete,
+    )
 
     unresolved_group_names: set[str] = set()
     # Memberships are collected and inserted after the users are flushed, because
@@ -319,7 +334,9 @@ def _sync_users(
             "are not counted towards group limits."
         )
 
-    result.soft_deleted += _soft_delete_missing(session, existing, seen, now)
+    result.soft_deleted += _soft_delete_after(
+        session, result, existing, seen, now, kind="user", complete=complete, note=warning
+    )
     session.flush()
 
 
@@ -329,11 +346,19 @@ def _sync_users(
 def _sync_projects(
     session: Session, client: CheckmarxClient, result: OrgSyncResult, now
 ) -> set[str]:
-    projects = platform.fetch_projects(client)
+    listing = Listing()
+    projects = platform.fetch_projects(client, listing=listing)
     existing = {row.id: row for row in session.scalars(select(CxProject))}
     seen: set[str] = set()
 
-    session.query(CxProjectGroup).delete(synchronize_session=False)
+    _replace_links(
+        session,
+        CxProjectGroup,
+        CxProjectGroup.project_id,
+        {project.id for project in projects},
+        existing,
+        complete=listing.complete,
+    )
 
     for project in projects:
         seen.add(project.id)
@@ -357,7 +382,9 @@ def _sync_projects(
             )
             result.project_groups += 1
 
-    result.soft_deleted += _soft_delete_missing(session, existing, seen, now)
+    result.soft_deleted += _soft_delete_after(
+        session, result, existing, seen, now, kind="project", listing=listing
+    )
     session.flush()
     return seen
 
@@ -372,11 +399,19 @@ def _sync_applications(
     now,
     known_project_ids: set[str],
 ) -> None:
-    applications = platform.fetch_applications(client)
+    listing = Listing()
+    applications = platform.fetch_applications(client, listing=listing)
     existing = {row.id: row for row in session.scalars(select(CxApplication))}
     seen: set[str] = set()
 
-    session.query(CxApplicationProject).delete(synchronize_session=False)
+    _replace_links(
+        session,
+        CxApplicationProject,
+        CxApplicationProject.application_id,
+        {application.id for application in applications},
+        existing,
+        complete=listing.complete,
+    )
 
     unknown_links = 0
     for application in applications:
@@ -411,8 +446,85 @@ def _sync_applications(
             "account's project permissions."
         )
 
-    result.soft_deleted += _soft_delete_missing(session, existing, seen, now)
+    result.soft_deleted += _soft_delete_after(
+        session, result, existing, seen, now, kind="application", listing=listing
+    )
     session.flush()
+
+
+COMPLETE_LISTINGS_KEY = "org_sync.complete_listings"
+
+
+def _replace_links(
+    session: Session, model, column, returned: set[str], existing: dict, *, complete: bool
+) -> None:  # type: ignore[no-untyped-def]
+    """Delete the links (group memberships, project groups, application
+    projects) that this sync rebuilds: those of the rows the listing returned,
+    and, after a complete listing, those of rows already deleted before it
+    (their deletion is confirmed now). A row deleted by this very sync keeps
+    its links until that confirmation, as its usage does."""
+    drop = set(returned)
+    if complete:
+        drop |= {row_id for row_id, row in existing.items() if row.is_deleted}
+    ids = sorted(drop)
+    for start in range(0, len(ids), 500):
+        session.query(model).filter(column.in_(ids[start : start + 500])).delete(
+            synchronize_session=False
+        )
+
+
+def _soft_delete_after(
+    session: Session,
+    result: OrgSyncResult,
+    existing: dict,
+    seen: set[str],
+    now,
+    *,
+    kind: str,
+    listing: Listing | None = None,
+    complete: bool | None = None,
+    note: str | None = None,
+) -> int:
+    """Soft-delete what a listing no longer returns, only if it was complete.
+
+    A listing that came back short (fewer rows than its reported total, a
+    page cap, a repeated page) says nothing about the rows it did not return:
+    deleting them would make their usage count towards nothing until the next
+    sync. Each complete listing is also remembered, which is how a deletion is
+    confirmed (``deletion_confirmed``).
+    """
+    if listing is not None:
+        complete = listing.complete
+        note = listing.note
+    if not complete:
+        result.warnings.append(
+            f"The {kind} listing was incomplete ({note or 'fewer rows than reported'}), so "
+            f"no {kind} it did not return was treated as deleted. The next complete "
+            "sync settles it."
+        )
+        return 0
+    stamps = settings_store.get_value(session, COMPLETE_LISTINGS_KEY) or {}
+    if not isinstance(stamps, dict):
+        stamps = {}
+    stamps[kind] = ([*(stamps.get(kind) or [])][-1:] + [now.isoformat()])[-2:]
+    settings_store.set_value(session, COMPLETE_LISTINGS_KEY, stamps)
+    return _soft_delete_missing(session, existing, seen, now)
+
+
+def deletion_confirmed(session: Session, kind: str, deleted_at) -> bool:  # type: ignore[no-untyped-def]
+    """True once a complete listing after the one that deleted a row (at
+    ``deleted_at``) has confirmed it is gone: two complete listings in all."""
+    stamps = (settings_store.get_value(session, COMPLETE_LISTINGS_KEY) or {}).get(kind) or []
+    if deleted_at is None:
+        return False
+    for stamp in stamps:
+        try:
+            when = datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            continue
+        if when > deleted_at:
+            return True
+    return False
 
 
 def _soft_delete_missing(session: Session, existing: dict, seen: set[str], now) -> int:
