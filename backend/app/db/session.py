@@ -8,6 +8,7 @@ unit of work is the simplest correct model here.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,6 +27,8 @@ PG_IDLE_IN_TRANSACTION_TIMEOUT_MS = 900_000
 
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
+# Re-entrant: get_session_factory() calls get_engine() while holding it.
+_engine_lock = threading.RLock()
 
 
 def _ensure_sqlite_directory(url: str) -> None:
@@ -95,18 +98,20 @@ def build_engine(url: str) -> Engine:
 
 def get_engine() -> Engine:
     global _engine
-    if _engine is None:
-        _engine = build_engine(get_settings().database_url)
-    return _engine
+    with _engine_lock:
+        if _engine is None:
+            _engine = build_engine(get_settings().database_url)
+        return _engine
 
 
 def get_session_factory() -> sessionmaker[Session]:
     global _session_factory
-    if _session_factory is None:
-        _session_factory = sessionmaker(
-            bind=get_engine(), autoflush=False, expire_on_commit=False, class_=Session
-        )
-    return _session_factory
+    with _engine_lock:
+        if _session_factory is None:
+            _session_factory = sessionmaker(
+                bind=get_engine(), autoflush=False, expire_on_commit=False, class_=Session
+            )
+        return _session_factory
 
 
 @contextmanager
@@ -135,7 +140,7 @@ def get_db() -> Iterator[Session]:
 def reset_engine() -> None:
     """Test helper: dispose the engine so the next call rebuilds from settings."""
     global _engine, _session_factory
-    if _engine is not None:
-        _engine.dispose()
-    _engine = None
-    _session_factory = None
+    with _engine_lock:
+        engine, _engine, _session_factory = _engine, None, None
+    if engine is not None:
+        engine.dispose()

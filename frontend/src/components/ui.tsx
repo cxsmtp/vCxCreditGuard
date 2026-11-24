@@ -1,8 +1,11 @@
 import {
   cloneElement,
+  createContext,
   isValidElement,
+  useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -72,6 +75,27 @@ export function HelpToggle({ open, onToggle }: { open: boolean; onToggle: () => 
   );
 }
 
+/**
+ * Where the app frame wants each page's title: the left of its top bar. The
+ * frame provides the element (null until it has mounted), the id the title
+ * takes, so the page's main landmark can be named by it, and a way for a page
+ * header to say it is there, so the frame's stand-in title steps aside.
+ * Outside the frame there is no provider, and a PageHeader renders where it
+ * stands.
+ */
+export type PageTitleSlotValue = {
+  element: HTMLElement | null;
+  titleId: string;
+  /** +1 when a PageHeader mounts, -1 when it unmounts. */
+  register: (delta: 1 | -1) => void;
+};
+export const PageTitleSlot = createContext<PageTitleSlotValue | undefined>(undefined);
+
+/**
+ * The page's title, which the frame shows left aligned in the top bar, then
+ * the page's description in full as the first line of the page, with its
+ * actions on the same row at the right (they stack on narrow screens).
+ */
 export function PageHeader({
   title,
   description,
@@ -81,14 +105,43 @@ export function PageHeader({
   description?: ReactNode;
   actions?: ReactNode;
 }) {
-  return (
-    <div className="cg-head">
-      <div className="min-w-0">
-        <h1 className="cg-title">{title}</h1>
-        {description && <p className="cg-subtitle">{description}</p>}
+  const slot = useContext(PageTitleSlot);
+  const register = slot?.register;
+
+  useLayoutEffect(() => {
+    if (!register) return;
+    register(1);
+    return () => register(-1);
+  }, [register]);
+
+  if (slot === undefined) {
+    return (
+      <div className="cg-head">
+        <div className="min-w-0">
+          <h1 className="cg-title">{title}</h1>
+          {description && <p className="cg-subtitle">{description}</p>}
+        </div>
+        {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
       </div>
-      {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
-    </div>
+    );
+  }
+
+  return (
+    <>
+      {slot.element &&
+        createPortal(
+          <h1 id={slot.titleId} className="cg-title">
+            {title}
+          </h1>,
+          slot.element,
+        )}
+      {(description || actions) && (
+        <div className="cg-page-intro">
+          {description && <p className="cg-page-desc">{description}</p>}
+          {actions && <div className="cg-page-actions">{actions}</div>}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -325,14 +378,10 @@ export function EmptyState({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-2 px-6 py-12 text-center">
-      <p className="text-sm font-medium">{title}</p>
-      {description && (
-        <p className="max-w-md text-xs" style={{ color: "var(--text-secondary)" }}>
-          {description}
-        </p>
-      )}
-      {action && <div className="mt-2">{action}</div>}
+    <div className="cg-empty">
+      <p className="cg-empty-title">{title}</p>
+      {description && <p className="cg-empty-desc">{description}</p>}
+      {action && <div className="cg-empty-action">{action}</div>}
     </div>
   );
 }
@@ -380,16 +429,20 @@ export function Table({
   children,
   className = "",
   before,
+  after,
 }: {
   children: ReactNode;
   className?: string;
   /** Shown above the table, such as how many rows a filter left. */
   before?: ReactNode;
+  /** Shown below the table, such as a pager. */
+  after?: ReactNode;
 }) {
   return (
     <div className="overflow-x-auto">
       {before}
       <table className={`cg-table ${className}`}>{children}</table>
+      {after}
     </div>
   );
 }
@@ -544,6 +597,7 @@ export function ConfirmDialog({
   confirmLabel = "Confirm",
   destructive = false,
   busy = false,
+  confirmDisabled = false,
   onConfirm,
   onCancel,
 }: {
@@ -553,6 +607,8 @@ export function ConfirmDialog({
   confirmLabel?: string;
   destructive?: boolean;
   busy?: boolean;
+  /** The confirm button stays disabled (e.g. until a required box is ticked). */
+  confirmDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -571,6 +627,7 @@ export function ConfirmDialog({
             variant={destructive ? "danger" : "primary"}
             onClick={onConfirm}
             loading={busy}
+            disabled={confirmDisabled}
           >
             {confirmLabel}
           </Button>

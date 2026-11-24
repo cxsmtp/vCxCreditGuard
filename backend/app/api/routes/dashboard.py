@@ -88,7 +88,18 @@ def me(ctx: CurrentUser, db: DbSession) -> MeResponse:
         enforcement_paused=_pause_reason(db),
         key_permissions=key_permissions.summary(db) if connection is not None else None,
         open_violations=violations.open_count(db) if ctx.is_admin else None,
+        update_notice=_update_notice(db) if ctx.is_admin else None,
     )
+
+
+def _update_notice(db) -> dict[str, str] | None:  # type: ignore[no-untyped-def]
+    from app.updates.service import get_service
+
+    try:
+        return get_service().notice(db)
+    except Exception:  # noqa: BLE001 - a light must never break the page load
+        logger.exception("Could not read the update notice")
+        return None
 
 
 def _to_consumer(consumer) -> TopConsumerItem:  # type: ignore[no-untyped-def]
@@ -260,7 +271,10 @@ def search_entities(
         else:
             query = query.where(model.name.ilike(pattern))
 
-    rows = list(db.scalars(query.limit(limit)))
+    # Ordered before the cut, so the first ``limit`` matches are always the same
+    # ones (a tenant can have thousands: the picker asks the user to type more).
+    order = CxUser.username if entity_type == EntityType.USER else model.name
+    rows = list(db.scalars(query.order_by(order, model.id).limit(limit)))
     entity_ids = [row.id for row in rows]
     limited = set(
         db.scalars(
@@ -549,16 +563,17 @@ def auto_triage_attribution_overview(
     if not model.enabled:
         return AutoTriageAttributionOverview(enabled=False, available=False)
 
-    names: dict[tuple[str, str], str | None] = {}
+    # Every name at once: the model can hold thousands of projects and people.
+    names: dict[tuple[str, str], str | None] = {
+        (CxProject.__tablename__, project_id): name
+        for project_id, name in db.execute(select(CxProject.id, CxProject.name))
+    }
+    names.update(
+        ((CxUser.__tablename__, user.id), user.display_name) for user in db.scalars(select(CxUser))
+    )
 
     def label(kind, entity_id: str) -> str | None:  # type: ignore[no-untyped-def]
-        key = (kind.__tablename__, entity_id)
-        if key not in names:
-            row = db.get(kind, entity_id)
-            names[key] = (
-                (row.display_name if isinstance(row, CxUser) else row.name) if row else None
-            )
-        return names[key]
+        return names.get((kind.__tablename__, entity_id))
 
     projects = [
         AutoTriageProjectAttribution(

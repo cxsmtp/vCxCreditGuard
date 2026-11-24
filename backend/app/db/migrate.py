@@ -25,6 +25,10 @@ def alembic_config(database_url: str | None = None) -> Config:
     config = Config(str(ALEMBIC_INI))
     config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
     config.set_main_option("sqlalchemy.url", database_url or get_settings().database_url)
+    # Never change sys.path in this process (whatever an alembic.ini says): a
+    # relative entry would be the working folder - under the launcher, the image's
+    # own copy of the app - ahead of the version that runs.
+    config.set_main_option("prepend_sys_path", "")
     # Leave logging alone. Left to itself, Alembic's env.py replaces the root
     # logger's handlers with the ones in alembic.ini - which, in a process that
     # goes on to serve the app, silently removes the handler that redacts

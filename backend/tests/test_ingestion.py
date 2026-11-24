@@ -52,8 +52,10 @@ class TestSnapshots:
 
         snapshot = ingestion.latest_snapshot(db, UsageView.USER)
         assert snapshot is not None
-        assert snapshot.raw
-        assert snapshot.raw[0]["items"]
+        # Each row as the feed sent it (kept a week, see test_snapshot_thinning);
+        # a believed read's response pages are not stored twice.
+        assert snapshot.raw is None
+        assert snapshot.records and all(record.raw for record in snapshot.records)
 
     def test_each_poll_adds_a_new_snapshot_rather_than_overwriting(self, db: Session) -> None:
         tenant = populated_tenant()

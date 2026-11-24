@@ -64,6 +64,16 @@ class LimitError(ValueError):
     """The requested limit change is not valid."""
 
 
+# A change made from the GUI lifts at most this many restrictions while the
+# admin waits; the cycle lifts the rest (it finds them the same way), so a large
+# group's limit can be switched off without a request that runs for minutes.
+API_RESTORE_BATCH = 200
+
+# The fields whose change alters what a limit applies in Checkmarx One: its
+# restrictions in force are then read back first on the next cycle.
+REVERIFY_FIELDS = ("enforce", "is_active", "project_actions")
+
+
 class LimitRestoreError(LimitError):
     """The change needs a restriction lifted first, and Checkmarx refused."""
 
@@ -304,6 +314,25 @@ def update_limit(
         ),
     )
 
+    # An admin changed what the limit applies: what it restricts is read back
+    # first on the next cycle, ahead of the usual rotation (pacing.py). A
+    # change that leaves the restrictions as they are (a note, the budget, the
+    # period) leaves the rotation alone.
+    after = _snapshot(limit)
+    if any(before[field] != after[field] for field in REVERIFY_FIELDS):
+        from sqlalchemy import update
+
+        from app.models.enums import EnforcementStatus
+        from app.models.limits import EnforcementAction
+
+        session.execute(
+            update(EnforcementAction)
+            .where(
+                EnforcementAction.limit_id == limit.id,
+                EnforcementAction.status == EnforcementStatus.APPLIED,
+            )
+            .values(last_verified_at=None, last_checked_at=None)
+        )
     if lift:
         lift_unjustified_restrictions(session, client, limit=limit, actor=actor)
     return limit
@@ -329,14 +358,20 @@ def lift_unjustified_restrictions(
     """
     if client is None:
         return 0
+    from app.services import enforcement
+
+    # At most API_RESTORE_BATCH now; the next cycles lift the rest. The
+    # request is not the cycle's: a cycle running past its own time budget
+    # meanwhile does not stop it (respect_deadline).
+    budget = enforcement.EnforcementBudget(writes=API_RESTORE_BATCH, respect_deadline=False)
     lifted = 0
     if limit.is_active and limit.enforce:
         # What the limit no longer turns off is put back now, whatever its usage.
-        from app.services import enforcement
-
         limit_id = limit.id
         try:
-            lifted = enforcement.restore_deselected(session, client, limit=limit, actor=actor)
+            lifted = enforcement.restore_deselected(
+                session, client, limit=limit, actor=actor, budget=budget
+            )
         except CheckmarxError as exc:
             logger.warning(
                 "Limit %s no longer turns some things off, but they could not be put back yet: %s",
@@ -361,7 +396,7 @@ def lift_unjustified_restrictions(
     limit_id = limit.id
     try:
         return lifted + evaluation.restore_on_limit_change(
-            session, client, limit=limit, actor=actor, reason=reason
+            session, client, limit=limit, actor=actor, reason=reason, budget=budget
         )
     except CheckmarxError as exc:
         logger.warning(
@@ -382,8 +417,21 @@ def delete_limit(
     """Remove a limit, lifting anything it restricted first.
 
     If Checkmarx will not lift a restriction the limit is kept, so the
-    restriction never outlives the only record of why it is there.
+    restriction never outlives the only record of why it is there. Nor is a
+    limit with more restrictions in force than one request lifts deleted: it
+    is to be switched off first (the cycles then lift them, a batch at a time).
     """
+    from app.services import enforcement
+
+    # Everything that is, or may be, in force: applied, and any attempt whose
+    # outcome is unknown and may have taken something (it is lifted the same way).
+    in_force = len(enforcement.active_actions_for_limit(session, limit_id=limit.id))
+    if client is not None and in_force > API_RESTORE_BATCH:
+        raise LimitRestoreError(
+            f"This limit has {in_force:,} restrictions in force, more than are lifted while you "
+            "wait. Switch it off (or to monitor only) first: they are then lifted over the next "
+            "cycles, and the limit can be deleted once they are."
+        )
     try:
         restored = evaluation.restore_on_limit_change(
             session, client, limit=limit, actor=actor, reason="limit_removed"

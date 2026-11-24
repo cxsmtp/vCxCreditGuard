@@ -18,8 +18,9 @@ somebody never had, and then fail to restore one they did.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 from app.checkmarx.client import CheckmarxClient
 from app.checkmarx.errors import CheckmarxNotFoundError, CheckmarxResponseError
@@ -35,17 +36,31 @@ MAX_PAGES = 500
 # issued for, which is why the default matches CXCG_CX_CLIENT_ID.
 PLATFORM_CLIENT_ID = "ast-app"
 
-# The roles stripped from a user when they exceed a credit limit: the AI Triage /
-# AI Remediation roles, and nothing else. Kept as a tuple in one place so the
-# enforcement service, the GUI copy and the docs cannot drift apart.
+# The roles a user restriction removes unless an admin chose others (Settings →
+# Enforcement, ``enforcement.ai_roles``). They are the general Risk Management
+# roles, through which AI Triage and AI Remediation are reached today: a person
+# restricted loses the Risk Management pages too. When Checkmarx One ships
+# dedicated AI permissions, the setting is changed to name them instead; this
+# default stays, so an upgrade never changes what a restriction removes.
 #
 # The scan-viewing role ("view-scans") is deliberately not here. A credit
 # budget governs AI features; whether someone may look at scans is decided by
 # the permission they hold in Checkmarx One, and a restriction leaves it alone.
-AI_ROLE_NAMES: tuple[str, ...] = (
+DEFAULT_AI_ROLE_NAMES: tuple[str, ...] = (
     "view-risk-management",
     "view-risk-management-dashboard",
     "view-risk-management-tab",
+)
+# The name earlier versions used. It is the default list, not the configured one:
+# what a restriction removes is ``settings_store.ai_role_names``.
+AI_ROLE_NAMES = DEFAULT_AI_ROLE_NAMES
+
+# What the default roles give a person, in words, for the Simulation page. A
+# static description (Checkmarx One's own role descriptions are shown as well
+# when the tenant provides them).
+ROLE_DESCRIPTIONS: dict[str, str] = dict.fromkeys(
+    DEFAULT_AI_ROLE_NAMES,
+    "Risk Management pages and dashboard; AI Triage/Remediation are reached from here",
 )
 
 
@@ -74,13 +89,47 @@ class IamGroup:
 
 @dataclass(frozen=True, slots=True)
 class RoleRef:
-    """The (id, name) pair the admin role mapping API expects."""
+    """The (id, name) pair the admin role mapping API expects.
+
+    ``composite`` and ``description`` are what a full role representation says
+    about it, when it was read with one; they are never sent back.
+    """
 
     id: str
     name: str
+    composite: bool = field(default=False, compare=False)
+    description: str | None = field(default=None, compare=False)
+    # False for a realm role (or another client's) met among a composite's children.
+    client_role: bool = field(default=True, compare=False)
+    # The client (its uuid) a client role belongs to, when the read said so.
+    container_id: str | None = field(default=None, compare=False)
 
     def as_payload(self) -> dict[str, str]:
         return {"id": self.id, "name": self.name}
+
+
+def _role_ref(entry: Any) -> RoleRef | None:
+    if not isinstance(entry, dict):
+        return None
+    role_id = entry.get("id")
+    name = entry.get("name")
+    if not isinstance(role_id, str) or not isinstance(name, str):
+        return None
+    description = entry.get("description")
+    container = entry.get("containerId")
+    return RoleRef(
+        id=role_id,
+        name=name,
+        composite=entry.get("composite") is True,
+        description=description if isinstance(description, str) and description else None,
+        client_role=entry.get("clientRole") is not False,
+        container_id=container if isinstance(container, str) and container else None,
+    )
+
+
+def _role_list(payload: Any) -> list[RoleRef]:
+    entries = payload if isinstance(payload, list) else []
+    return [role for entry in entries if (role := _role_ref(entry)) is not None]
 
 
 def _string_list(value: Any) -> tuple[str, ...]:
@@ -272,16 +321,7 @@ def fetch_client_roles(client: CheckmarxClient, *, client_uuid: str) -> dict[str
     payload = client.get_json(
         f"clients/{client_uuid}/roles", base="iam", params={"briefRepresentation": "false"}
     )
-    entries = payload if isinstance(payload, list) else []
-    roles: dict[str, RoleRef] = {}
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        role_id = entry.get("id")
-        name = entry.get("name")
-        if isinstance(role_id, str) and isinstance(name, str):
-            roles[name] = RoleRef(id=role_id, name=name)
-    return roles
+    return {role.name: role for role in _role_list(payload)}
 
 
 def fetch_user_client_roles(
@@ -289,14 +329,66 @@ def fetch_user_client_roles(
 ) -> list[RoleRef]:
     """The client roles currently mapped directly to one user."""
     payload = client.get_json(f"users/{user_id}/role-mappings/clients/{client_uuid}", base="iam")
+    return _role_list(payload)
+
+
+# ----------------------------------------------- where a user's roles come from
+#
+# The reads below follow Keycloak's admin REST API (Checkmarx One's IAM is
+# Keycloak based). They are NOT verified against a real Checkmarx One tenant:
+# callers treat any failure (a 403, a 404) as "source unknown" and never let it
+# stop a restriction.
+
+
+def fetch_user_effective_client_roles(
+    client: CheckmarxClient, *, user_id: str, client_uuid: str
+) -> list[RoleRef]:
+    """Every client role the user holds, however: directly, through a group, or
+    as part of a composite role (Keycloak: ``.../clients/{id}/composite``)."""
+    payload = client.get_json(
+        f"users/{user_id}/role-mappings/clients/{client_uuid}/composite", base="iam"
+    )
+    return _role_list(payload)
+
+
+def fetch_user_groups(client: CheckmarxClient, *, user_id: str) -> list[IamGroup]:
+    """The groups the user is a direct member of, with their paths
+    (``/parent/child``), from which the parent groups are worked out."""
+    payload = client.get_json(f"users/{user_id}/groups", base="iam")
     entries = payload if isinstance(payload, list) else []
-    return [
-        RoleRef(id=entry["id"], name=entry["name"])
-        for entry in entries
-        if isinstance(entry, dict)
-        and isinstance(entry.get("id"), str)
-        and isinstance(entry.get("name"), str)
-    ]
+    groups: list[IamGroup] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        group_id = entry.get("id")
+        name = entry.get("name")
+        if not isinstance(group_id, str) or not isinstance(name, str):
+            continue
+        path = entry.get("path") if isinstance(entry.get("path"), str) else None
+        groups.append(IamGroup(id=group_id, name=name, path=path, parent_id=None, raw=entry))
+    return groups
+
+
+def fetch_group_client_roles(
+    client: CheckmarxClient, *, group_id: str, client_uuid: str, composite: bool = False
+) -> list[RoleRef]:
+    """The client roles mapped to a group (with ``composite``, also those its
+    composite roles contain)."""
+    suffix = "/composite" if composite else ""
+    payload = client.get_json(
+        f"groups/{group_id}/role-mappings/clients/{client_uuid}{suffix}", base="iam"
+    )
+    return _role_list(payload)
+
+
+def fetch_client_role_composites(
+    client: CheckmarxClient, *, client_uuid: str, role_name: str
+) -> list[RoleRef]:
+    """The roles a composite client role contains (its direct children)."""
+    payload = client.get_json(
+        f"clients/{client_uuid}/roles/{quote(role_name, safe='')}/composites", base="iam"
+    )
+    return _role_list(payload)
 
 
 def remove_user_client_roles(

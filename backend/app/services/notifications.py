@@ -30,6 +30,8 @@ CATEGORY_ATTRIBUTION = "attribution"
 CATEGORY_PERMISSIONS = "permissions"
 # Someone acted against a restriction in force ("Policy violations").
 CATEGORY_POLICY = "policy"
+# In-app updates: available, installed, rolled back, needs a new image, token refused.
+CATEGORY_UPDATES = "updates"
 
 
 def notify(
@@ -178,6 +180,11 @@ def lock_not_kept_key(project_id: str, period_key: str) -> str:
     """One "Fusion lock not kept" notice per project and period, however many
     limits restrict it."""
     return f"locknotkept:{project_id}:{period_key}"
+
+
+def not_effective_key(action_id: int) -> str:
+    """One "keeps AI access through a group or role" notice per restriction."""
+    return f"noteffective:{action_id}"
 
 
 def restoration_key(action_id: int) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 
@@ -56,13 +57,25 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
+# A caller-supplied X-Request-ID is kept only when it looks like an id: it is
+# echoed in the response, in error bodies and in the log, so arbitrary text or a
+# multi-kilobyte value is replaced by a generated id rather than passed along.
+_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def request_id_from(header: str | None) -> str:
+    if header and _REQUEST_ID.fullmatch(header):
+        return header
+    return uuid.uuid4().hex[:12]
+
+
 class RequestContextMiddleware(BaseHTTPMiddleware):
     """Attaches a request id and logs slow or failing requests."""
 
     SLOW_REQUEST_MS = 2000
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+        request_id = request_id_from(request.headers.get("X-Request-ID"))
         request.state.request_id = request_id
         started = time.monotonic()
         response = await call_next(request)

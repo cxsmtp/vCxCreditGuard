@@ -37,6 +37,113 @@ export interface Me {
   key_permissions?: KeyPermissionSummary | null;
   /** Open policy violations (admins only; null for a viewer). */
   open_violations?: number | null;
+  /** The updater's top-bar light (admins only; null when nothing needs attention). */
+  update_notice?: UpdateNotice | null;
+}
+
+export interface UpdateNotice {
+  kind:
+    | "available"
+    | "needs_token"
+    | "token_invalid"
+    | "needs_image"
+    | "needs_signing_key"
+    | "image_old"
+    | "installing";
+  tone: "warn" | "bad" | "off";
+  label: string;
+  detail: string;
+}
+
+export interface UpdateRelease {
+  version: string;
+  created: string | null;
+  revision: string;
+  signed: boolean;
+  needs_image: boolean;
+  newer: boolean;
+  running: boolean;
+  installed: boolean;
+  failed: string | null;
+  /** Rolled back by an admin: auto-update does not install it again. */
+  skipped: string | null;
+  /** From the release's migrations label; null when the release does not say. */
+  schema_change: boolean | null;
+  notes: string;
+}
+
+export interface InstalledVersion {
+  version: string;
+  installed_at: string | null;
+  installed_by: string | null;
+  signed: boolean;
+  revision: string;
+  bytes: number | null;
+  running: boolean;
+  failed: string | null;
+  skipped: string | null;
+}
+
+export interface UpdateEvent {
+  id: string;
+  at: string;
+  type: string;
+  version?: string;
+  from?: string;
+  to?: string;
+  reason?: string;
+  seconds?: number;
+  restored_backup?: string | null;
+  code?: number;
+  by?: string;
+}
+
+export interface UpdatesStatus {
+  image: string;
+  egress_hosts: string[];
+  deployment: "single" | "compose" | "source";
+  supervised: boolean;
+  running: { version: string; source: "built-in" | "installed" | "source" };
+  built_in: string;
+  installed: InstalledVersion[];
+  available: UpdateRelease[];
+  latest: string | null;
+  update_available: boolean;
+  latest_needs_image: boolean;
+  /** The release auto-update would install (fits this image, not failed or skipped). */
+  latest_installable: string | null;
+  whats_new: { version: string; notes: string }[];
+  rollback: {
+    possible: boolean;
+    target: string | null;
+    target_version?: string;
+    restores_backup: boolean;
+    since: string | null;
+    reason: string;
+  };
+  selection: { version: string | null; previous: string | null; at: string | null; by: string | null };
+  settings: { auto_enabled: boolean; quiet_hour: number; timezone: string };
+  token: { configured: boolean; status: "ok" | "invalid" | "missing" | "unknown" };
+  /** invalid: a key is configured but unusable, so every install is refused. */
+  signing: { configured: boolean; invalid?: boolean; auto_waits: boolean; message: string };
+  image_age: { created: string | null; days: number | null; stale: boolean; max_days: number };
+  skipped: Record<string, { at: string; by: string; reason: string }>;
+  database: { kind: string; backups: boolean };
+  last_check: { at: string; error: string | null; count?: number } | null;
+  last_auto: { at: string; result: string } | null;
+  job: {
+    version: string;
+    by: string;
+    automatic: boolean;
+    state: "running" | "switching" | "failed";
+    step: string;
+    error: string;
+    started_at: string;
+  } | null;
+  failed: Record<string, { at: string; reason: string }>;
+  events: UpdateEvent[];
+  image_command: string;
+  notice: UpdateNotice | null;
 }
 
 export type KeyPermissionVerdict = "ok" | "limited" | "insufficient" | "unknown";
@@ -252,6 +359,11 @@ export interface LimitPeriodState {
   restricted_at: string | null;
   /** The auto-triage part of credits_used, when it is charged to the scan's initiator. */
   auto_triage_attributed?: AutoTriageAttributed | null;
+  /** Set when the limit's restriction is spread over several cycles: users or
+   * projects it restricts, and how many have been dealt with so far. */
+  rollout_total?: number | null;
+  rollout_done?: number | null;
+  lifting_remaining?: number | null;
 }
 
 export type AttributionBasis = "observed" | "estimated" | "unattributed";
@@ -430,6 +542,15 @@ export interface EnforcementActionItem {
   error: string | null;
 }
 
+/** One page of restrictions (GET /api/notifications/enforcements/page). */
+export interface EnforcementActionPage {
+  items: EnforcementActionItem[];
+  total: number;
+  offset: number;
+  limit: number;
+  by_kind: Record<string, number>;
+}
+
 export interface AuditEntry {
   id: number;
   occurred_at: string;
@@ -469,6 +590,7 @@ export interface AppSettings {
   usage_period_param: string;
   usage_page_size: number;
   retention_days: number;
+  retention_thin_snapshots?: boolean;
   notify_min_severity: Severity;
   smtp_host: string | null;
   smtp_port: number;
@@ -504,7 +626,19 @@ export interface AppSettings {
   protected_roles: string;
   /** Turning Fusion off also tries to lock it against per-scan override (unverified). */
   fusion_lock_override: boolean;
+  /** The client roles a user restriction removes (from now on), and the built-in default. */
+  ai_roles: string[];
+  default_ai_roles: string[];
   current_schedule_description: string;
+  /** Pacing for large tenants, per cycle (0 = no budget). */
+  verify_interval_minutes: number;
+  max_verifications_per_cycle: number;
+  max_writes_per_cycle: number;
+  violation_projects_per_cycle: number;
+  attribution_projects_per_cycle: number;
+  attribution_requests_per_cycle: number;
+  read_concurrency: number;
+  cycle_time_budget_pct: number;
 }
 
 export interface SchedulerStatus {
@@ -674,6 +808,58 @@ export interface TargetPreview {
   target_label: string | null;
 }
 
+export interface ClientRole {
+  name: string;
+  description: string | null;
+  composite: boolean;
+  /** A short description CreditGuard knows for this role (the default AI roles). */
+  known_description: string | null;
+  /** Looks like an administration role: choosing it needs a confirmation. */
+  admin_like?: boolean;
+  /** A protected role (Settings -> Enforcement): it cannot be an AI role. */
+  protected?: boolean;
+}
+
+export interface ClientRoles {
+  available: boolean;
+  message: string | null;
+  roles: ClientRole[];
+  ai_roles: string[];
+  default_ai_roles: string[];
+}
+
+export interface RemovedRolePreview {
+  name: string;
+  description: string | null;
+  /** The roles it contains when composite; [] when not; null when unreadable. */
+  grants: string[] | null;
+}
+
+export interface KeptRolePreview {
+  name: string;
+  sources: string[];
+}
+
+export interface UserRolesPreview {
+  user_id: string;
+  user_label: string | null;
+  /** Whether the user's roles were read from Checkmarx One at all. */
+  read: boolean;
+  removed: RemovedRolePreview[];
+  kept: KeptRolePreview[];
+  not_held: string[];
+  unread: string[];
+  note: string | null;
+  /** A restriction already holds, so the roles were not read again. */
+  already_restricted?: boolean;
+}
+
+export interface ProjectWarning {
+  project_id: string;
+  project_label: string | null;
+  message: string;
+}
+
 export interface BlastRadius {
   entity_type: EntityType;
   entity_id: string;
@@ -687,8 +873,19 @@ export interface BlastRadius {
   disable_fusion?: number;
   disable_repo_fusion?: number;
   total_actions: number;
+  /** The first targets only for a large group or application (targets_total in all). */
   targets: TargetPreview[];
+  targets_total?: number;
+  targets_truncated?: boolean;
   project_actions?: ProjectAction[];
+  /** The roles a user restriction removes, and per user what they would lose. */
+  ai_roles?: string[];
+  user_roles?: UserRolesPreview[];
+  user_roles_truncated?: boolean;
+  user_roles_note?: string | null;
+  /** Projects where turning Auto Triage off may not hold (the first ones; warnings_total in all). */
+  warnings?: ProjectWarning[];
+  warnings_total?: number;
 }
 
 export interface DryRunRow {
@@ -717,6 +914,8 @@ export interface DryRunResult {
   affected_projects: number;
   affected_users: number;
   rows: DryRunRow[];
+  user_roles_truncated?: boolean;
+  user_roles_note?: string | null;
 }
 
 export interface CsvImportResult {

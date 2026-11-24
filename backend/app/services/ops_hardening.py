@@ -6,7 +6,7 @@ service:
 * **Attestation** reports exactly what is running - the version, the applied
   migration head, and a reproducible digest over the non-secret configuration
   surface - so an operator can verify an instance and spot configuration drift,
-  plus an update-awareness check against a recorded "latest" version.
+  plus whether the updater has seen a newer release (Settings -> Updates).
 * **Watchdog** turns the scheduler's run history into a liveness verdict, so a
   dead or stuck scheduler is visible (in ``/healthz`` and in-app) rather than
   silently starving governance.
@@ -37,10 +37,6 @@ from app.services import limits_service, settings_store
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
-
-# Optional "latest available version", recorded by a deploy pipeline or an admin.
-# Update application itself is deployment-driven; this only makes staleness visible.
-KEY_LATEST_VERSION = "ops.latest_version"
 
 BACKUP_VERSION = 1
 
@@ -88,41 +84,20 @@ def attestation(session: Session) -> Attestation:
     )
 
 
-def _version_tuple(value: str) -> tuple[int, ...] | None:
-    try:
-        return tuple(int(part) for part in value.strip().split("."))
-    except (AttributeError, ValueError):
-        return None
-
-
 def update_status(session: Session) -> dict[str, Any]:
-    """Compare the running version to a recorded latest version, if any."""
-    latest = settings_store.get_value(session, KEY_LATEST_VERSION, None)
-    current = __version__
-    if not latest:
-        return {"current": current, "latest": None, "update_available": False}
-    current_t, latest_t = _version_tuple(current), _version_tuple(str(latest))
-    if current_t is not None and latest_t is not None:
-        # Pad to equal length so "1.2" and "1.2.0" compare equal, not "newer".
-        width = max(len(current_t), len(latest_t))
-        current_p = current_t + (0,) * (width - len(current_t))
-        latest_p = latest_t + (0,) * (width - len(latest_t))
-        available = latest_p > current_p
-    else:
-        # Unparseable version strings: treat any difference as an update.
-        available = str(latest) != current
-    return {"current": current, "latest": str(latest), "update_available": available}
+    """The running version against the newest release the updater has seen.
 
+    Read from the updater's last check (Settings -> Updates), never from the
+    network here, so the attestation stays fast and offline.
+    """
+    from app.updates.service import get_service
 
-def set_latest_version(session: Session, *, version: str, actor: AuditActor) -> None:
-    settings_store.set_value(session, KEY_LATEST_VERSION, version.strip())
-    record_audit(
-        session,
-        action="ops.latest_version_set",
-        actor=actor,
-        target_type="ops",
-        detail=f"Recorded latest available version as {version.strip()!r}.",
-    )
+    service = get_service()
+    return {
+        "current": __version__,
+        "latest": service.latest(),
+        "update_available": service.update_available(),
+    }
 
 
 # ------------------------------------------------------------------ watchdog
@@ -362,6 +337,17 @@ _SETTING_FIELD_BY_KEY: dict[str, str] = {
     settings_store.KEY_AUTOMATION_ENABLED: "automation_enabled",
     settings_store.KEY_AUTO_APPROVE_MAX_INCREASE: "auto_approve_max_increase",
     settings_store.KEY_AUTO_APPROVE_EXPIRY_DAYS: "auto_approve_expiry_days",
+    settings_store.KEY_RETENTION_THIN_SNAPSHOTS: "retention_thin_snapshots",
+    # Pacing for large tenants: how much a cycle does, not a guard rail (the
+    # safety ceilings are separate and stay out of the backup, see above).
+    settings_store.KEY_VERIFY_INTERVAL_MINUTES: "verify_interval_minutes",
+    settings_store.KEY_MAX_VERIFICATIONS: "max_verifications_per_cycle",
+    settings_store.KEY_MAX_WRITES: "max_writes_per_cycle",
+    settings_store.KEY_VIOLATION_PROJECTS: "violation_projects_per_cycle",
+    settings_store.KEY_ATTRIBUTION_PROJECTS: "attribution_projects_per_cycle",
+    settings_store.KEY_ATTRIBUTION_REQUESTS: "attribution_requests_per_cycle",
+    settings_store.KEY_READ_CONCURRENCY: "read_concurrency",
+    settings_store.KEY_CYCLE_TIME_BUDGET_PCT: "cycle_time_budget_pct",
 }
 
 

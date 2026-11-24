@@ -316,6 +316,41 @@ class TestUsageAfter:
         assert found[0].evidence["rise_by_action"] == {"remediation": 2}
         assert found[0].updated_at is not None
 
+    def test_a_user_who_keeps_ai_access_through_a_group_is_not_reported(
+        self, db: Session, tenant: FakeTenant
+    ) -> None:
+        """Usage by a person who still holds an AI role through a group is not
+        acting against the restriction: the restriction cannot take that role,
+        and said so once when it was applied."""
+        tenant.add_group(group_id="grp-ai", name="AI Users", roles=["view-risk-management"])
+        tenant.join_group("user-harsh", "grp-ai")
+        assert cycle.run_cycle(trigger="manual", force_org_sync=True).steps["violations"]
+        limits_service.create_limit(
+            db,
+            data=limits_service.LimitInput(
+                entity_type=EntityType.USER,
+                entity_id="user-harsh",
+                credit_limit=2,
+                period_type=PeriodType.LIFETIME,
+                enforce=True,
+            ),
+            actor=ACTOR,
+        )
+        db.commit()
+        cycle.run_cycle(trigger="manual")
+        db.expire_all()
+        action = db.scalar(select(EnforcementAction))
+        assert action.status == "applied"
+        assert action.undo_snapshot["kept_effective"]
+        tenant.set_user_credits(
+            name="Harsh Gokani",
+            email="harsh.gokani@checkmarx.com",
+            credits=6,
+            actions={"remediation": 2},
+        )
+        cycle.run_cycle(trigger="manual")
+        assert rows(db, KIND_USAGE_AFTER) == []
+
 
 class TestApi:
     def _one(self, db: Session, tenant: FakeTenant) -> PolicyViolation:

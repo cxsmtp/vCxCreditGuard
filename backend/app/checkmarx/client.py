@@ -90,6 +90,25 @@ def listeners_paused() -> Iterator[None]:
         _quiet.paused = previous
 
 
+@contextmanager
+def single_attempt(timeout_seconds: float | None = None) -> Iterator[None]:
+    """Calls made inside (on this thread) are tried once, with a short timeout.
+
+    For optional reads made while someone waits on a page (the Simulation's
+    role reads): a transient failure (a transport error, 429, 5xx) is raised at
+    once instead of being retried with backoff, and ``timeout_seconds`` replaces
+    the configured request timeout. A 401 still re-exchanges the token once.
+    Everything outside this block (enforcement included) keeps the full retry
+    policy.
+    """
+    previous = getattr(_quiet, "single_attempt", None)
+    _quiet.single_attempt = (timeout_seconds,)
+    try:
+        yield
+    finally:
+        _quiet.single_attempt = previous
+
+
 def add_forbidden_listener(listener: Callable[[str, str, str | None], None]) -> None:
     if listener not in _forbidden_listeners:
         _forbidden_listeners.append(listener)
@@ -124,6 +143,35 @@ def _full_url(response: httpx.Response, fallback: str) -> str:
         return fallback
 
 
+class CallStats:
+    """Calls made through one client, for the cycle's record. Thread safe."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.requests = 0
+        self.rate_limited = 0
+        self.retries = 0
+        self.waited_seconds = 0.0
+
+    def add(
+        self, *, requests: int = 0, rate_limited: int = 0, retries: int = 0, waited: float = 0.0
+    ) -> None:
+        with self._lock:
+            self.requests += requests
+            self.rate_limited += rate_limited
+            self.retries += retries
+            self.waited_seconds += waited
+
+    def snapshot(self) -> dict[str, float]:
+        with self._lock:
+            return {
+                "requests": self.requests,
+                "rate_limited": self.rate_limited,
+                "retries": self.retries,
+                "waited_seconds": round(self.waited_seconds, 1),
+            }
+
+
 class CheckmarxClient:
     def __init__(
         self,
@@ -147,6 +195,9 @@ class CheckmarxClient:
         self._client = client
         self._owns_client = client is None
         self._sleep = sleep
+        # Every attempt sent, every 429 met, every retry and the time spent
+        # waiting before one: what a cycle spent on the tenant.
+        self.stats = CallStats()
 
     @property
     def tokens(self) -> TokenManager:
@@ -236,6 +287,13 @@ class CheckmarxClient:
         """
         url = self._resolve(path, base)
         attempts = self._settings.cx_max_retries + 1
+        single = getattr(_quiet, "single_attempt", None)
+        # Inside ``single_attempt``: no retry of a transient failure (the second
+        # pass is only for a 401's token re-exchange), and its own timeout.
+        retry_transient = single is None
+        if single is not None:
+            attempts = 2
+        timeout = {"timeout": single[0]} if single is not None and single[0] else {}
         reauthenticated = False
         last_error: Exception | None = None
 
@@ -246,6 +304,7 @@ class CheckmarxClient:
                 **(headers or {}),
             }
             started = time.monotonic()
+            self.stats.add(requests=1, retries=1 if attempt else 0)
             try:
                 response = self._http().request(
                     method.upper(),
@@ -254,6 +313,7 @@ class CheckmarxClient:
                     json=json,
                     data=data,
                     headers=request_headers,
+                    **timeout,
                 )
             except httpx.HTTPError as exc:
                 last_error = exc
@@ -265,11 +325,14 @@ class CheckmarxClient:
                     attempt + 1,
                     attempts,
                 )
-                if attempt + 1 < attempts:
-                    self._sleep(self._backoff_seconds(attempt))
+                if retry_transient and attempt + 1 < attempts:
+                    delay = self._backoff_seconds(attempt)
+                    self.stats.add(waited=delay)
+                    self._sleep(delay)
                     continue
                 raise CheckmarxUnavailableError(
-                    f"{method.upper()} {url} failed after {attempts} attempts: {type(exc).__name__}"
+                    f"{method.upper()} {url} failed after {attempt + 1} attempt"
+                    f"{'s' if attempt else ''}: {type(exc).__name__}"
                 ) from exc
 
             elapsed_ms = (time.monotonic() - started) * 1000
@@ -322,6 +385,7 @@ class CheckmarxClient:
             if status in _RETRYABLE_STATUS:
                 retry_after = self._retry_after_seconds(response)
                 if status == httpx.codes.TOO_MANY_REQUESTS:
+                    self.stats.add(rate_limited=1)
                     if retry_after is not None and retry_after > MAX_HONOURED_RETRY_AFTER_SECONDS:
                         raise CheckmarxRateLimitError(
                             f"Checkmarx asked us to wait {retry_after:.0f}s on "
@@ -333,22 +397,26 @@ class CheckmarxClient:
                         redact(url),
                         f"{retry_after:.1f}s" if retry_after is not None else "with backoff",
                     )
-                if attempt + 1 < attempts:
+                if retry_transient and attempt + 1 < attempts:
                     delay = (
                         retry_after if retry_after is not None else self._backoff_seconds(attempt)
                     )
                     # Never sleep longer than the cap, whatever status carried the
                     # header. A 503 with "Retry-After: 3600" must not park the cycle
                     # (and its scheduler lock) for an hour.
-                    self._sleep(min(delay, MAX_HONOURED_RETRY_AFTER_SECONDS))
+                    delay = min(delay, MAX_HONOURED_RETRY_AFTER_SECONDS)
+                    self.stats.add(waited=delay)
+                    self._sleep(delay)
                     continue
                 if status == httpx.codes.TOO_MANY_REQUESTS:
                     raise CheckmarxRateLimitError(
-                        f"Still rate limited on {method.upper()} {url} after {attempts} attempts.",
+                        f"Still rate limited on {method.upper()} {url} after {attempt + 1} "
+                        f"attempt{'s' if attempt else ''}.",
                         retry_after_seconds=retry_after,
                     )
                 raise CheckmarxUnavailableError(
-                    f"{method.upper()} {url} returned {status} on all {attempts} attempts."
+                    f"{method.upper()} {url} returned {status} on all {attempt + 1} attempt"
+                    f"{'s' if attempt else ''}."
                 )
 
             raise CheckmarxResponseError(

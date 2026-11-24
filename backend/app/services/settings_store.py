@@ -8,6 +8,7 @@ secret values encrypted under their own purpose and never returned unmasked.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 from dataclasses import dataclass
@@ -16,9 +17,11 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.checkmarx.iam import DEFAULT_AI_ROLE_NAMES
 from app.checkmarx.usage import DEFAULT_PERIOD
 from app.core.crypto import (
     PURPOSE_SMTP_PASSWORD,
+    PURPOSE_UPDATE_TOKEN,
     PURPOSE_WEBHOOK_SECRET,
     PURPOSE_WEBHOOK_URL,
     get_secret_box,
@@ -40,6 +43,10 @@ KEY_USAGE_PAGE_SIZE = "usage.page_size"
 
 # Retention
 KEY_RETENTION_DAYS = "retention.days"
+# Thin old usage snapshots (app/services/retention.py): every one of the last
+# 3 days, one an hour per dimension up to 40 days, one a day after that, never
+# one anything refers to. Off: every snapshot is kept for the whole window.
+KEY_RETENTION_THIN_SNAPSHOTS = "retention.thin_snapshots"
 
 # Notifications
 KEY_SMTP_HOST = "notify.smtp.host"
@@ -56,7 +63,10 @@ KEY_NOTIFY_MIN_SEVERITY = "notify.min_severity"
 # Appearance: the organisation-wide accent theme an admin picks. Applied to
 # every signed-in browser; the chart series palette is never affected.
 KEY_UI_ACCENT = "ui.accent"
-ALLOWED_ACCENTS: tuple[str, ...] = ("default", "teal", "violet", "amber", "rose", "slate")
+# The Standard look's earth accents: default (Ink), teal (Lagoon), sage, violet
+# (Plum) and amber (Ochre). Rose and slate are kept so a saved choice stays valid;
+# the web UI shows them as Plum and Ink.
+ALLOWED_ACCENTS: tuple[str, ...] = ("default", "teal", "sage", "violet", "amber", "rose", "slate")
 
 # Credit requests: when on, a non-admin (viewer) may submit a request to raise an
 # entity's budget for an admin to approve. Off by default, so self-service is a
@@ -108,6 +118,13 @@ KEY_PROTECTED_ROLES = "enforcement.protected_roles"
 # Checkmarx One honours that lock for ad hoc scans is not verified, and a
 # tenant that rejects the lock still gets Fusion turned off without it.
 KEY_FUSION_LOCK = "enforcement.fusion_lock_override"
+# The client roles (on the platform client, ast-app) a user restriction removes.
+# The default is the three general Risk Management roles AI Triage and AI
+# Remediation are reached through, so an upgrade changes nothing. A change
+# applies to restrictions made from then on: each restriction records the list
+# it used, and its Restore and drift check go by that record.
+KEY_AI_ROLES = "enforcement.ai_roles"
+AI_ROLES_MAX = 50
 
 # Attribution: when on, the Auto Triage credits a project reports are also
 # charged to the person (a synced Checkmarx user) whose scan triggered the auto
@@ -124,6 +141,46 @@ KEY_AUTO_TRIAGE_TO_INITIATOR = "attribution.auto_triage_to_scan_initiator"
 # a single "observed" rise. Not part of the configuration backup.
 KEY_AUTO_TRIAGE_OBSERVATION_EPOCH = "attribution.auto_triage_observation_epoch"
 
+# Pacing for large tenants (app/services/pacing.py). Each is a per-cycle budget;
+# 0 means no budget: everything, every cycle (see pacing.py for how that
+# compares with before pacing).
+# How often each restriction in force is read back from Checkmarx One, at most
+# (minutes). 0: every restriction, every cycle.
+KEY_VERIFY_INTERVAL_MINUTES = "enforcement.verify_interval_minutes"
+# At most this many restrictions read back in one cycle.
+KEY_MAX_VERIFICATIONS = "enforcement.max_verifications_per_cycle"
+# At most this many restrictions applied or lifted in one cycle; a larger
+# first enforcement (or restore) carries on over the next cycles.
+KEY_MAX_WRITES = "enforcement.max_writes_per_cycle"
+# Restricted projects whose scans the policy violation check lists per cycle.
+KEY_VIOLATION_PROJECTS = "violations.max_projects_per_cycle"
+# Projects and scan requests auto-triage attribution works through per cycle.
+KEY_ATTRIBUTION_PROJECTS = "attribution.max_projects_per_cycle"
+KEY_ATTRIBUTION_REQUESTS = "attribution.max_requests_per_cycle"
+# Independent read-only Checkmarx calls made at the same time (1: one by one).
+KEY_READ_CONCURRENCY = "cycle.read_concurrency"
+# Share of the interval a cycle may spend before it stops starting new
+# per-target work and leaves the rest to the next cycle (0: no time budget).
+KEY_CYCLE_TIME_BUDGET_PCT = "cycle.time_budget_pct"
+PACING_KEYS: tuple[str, ...] = (
+    KEY_VERIFY_INTERVAL_MINUTES,
+    KEY_MAX_VERIFICATIONS,
+    KEY_MAX_WRITES,
+    KEY_VIOLATION_PROJECTS,
+    KEY_ATTRIBUTION_PROJECTS,
+    KEY_ATTRIBUTION_REQUESTS,
+    KEY_READ_CONCURRENCY,
+    KEY_CYCLE_TIME_BUDGET_PCT,
+)
+
+# Updates (app/updates). Auto-update is on by default: a newer release is
+# installed in the quiet hour (UTC). The registry token is a read-only GitHub
+# token (read:packages) for the private release images; a secret like the
+# Checkmarx API key, encrypted under its own purpose and never shown back.
+KEY_UPDATE_AUTO = "updates.auto_enabled"
+KEY_UPDATE_QUIET_HOUR = "updates.quiet_hour"
+KEY_UPDATE_TOKEN = "updates.registry_token"  # secret
+
 # The latest API key permission report (app/services/key_permissions.py), as
 # JSON. Bookkeeping, not configuration: it is never shown on the Settings page,
 # never part of a configuration backup and never part of the attestation digest.
@@ -133,9 +190,22 @@ KEY_KEY_PERMISSIONS = "connection.key_permissions"
 KEY_ACTION_RATES = "credits.action_rates"
 # Newest scan the policy violation check has looked at, per restricted project.
 KEY_VIOLATION_SCAN_CURSORS = "violations.scan_cursors"
+# The launcher events (updates) already written to the audit log. Kept in the
+# database, not beside the events, so a database restored by a rollback reports
+# again what its restored copy does not hold.
+KEY_UPDATE_REPORTED_EVENTS = "updates.reported_events"
+# How far the retention job has cleared old raw consumption rows (an ISO
+# timestamp: snapshots collected before it are done). Bookkeeping.
+KEY_RETENTION_RAW_CLEARED_UNTIL = "retention.raw_cleared_until"
 # Rows kept in app_setting that are state rather than settings.
 INTERNAL_KEYS: frozenset[str] = frozenset(
-    {KEY_KEY_PERMISSIONS, KEY_ACTION_RATES, KEY_VIOLATION_SCAN_CURSORS}
+    {
+        KEY_KEY_PERMISSIONS,
+        KEY_ACTION_RATES,
+        KEY_VIOLATION_SCAN_CURSORS,
+        KEY_UPDATE_REPORTED_EVENTS,
+        KEY_RETENTION_RAW_CLEARED_UNTIL,
+    }
 )
 
 # Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
@@ -150,6 +220,7 @@ SECRET_KEYS: dict[str, str] = {
     # who has it can post to the channel. It is stored encrypted, never shown
     # back, and kept out of audit entries and backups like any other secret.
     KEY_WEBHOOK_URL: PURPOSE_WEBHOOK_URL,
+    KEY_UPDATE_TOKEN: PURPOSE_UPDATE_TOKEN,
 }
 
 ALLOWED_INTERVAL_MINUTES: tuple[int, ...] = (2, 5, 15, 60)
@@ -163,6 +234,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_USAGE_PERIOD: DEFAULT_PERIOD,
     KEY_USAGE_PAGE_SIZE: 100,
     KEY_RETENTION_DAYS: 365,
+    KEY_RETENTION_THIN_SNAPSHOTS: True,
     KEY_SMTP_PORT: 587,
     KEY_SMTP_USE_TLS: True,
     KEY_NOTIFY_MIN_SEVERITY: "warning",
@@ -181,7 +253,18 @@ DEFAULTS: dict[str, Any] = {
     KEY_CEILING_WAIVED_ONCE: False,
     KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
     KEY_FUSION_LOCK: True,
+    KEY_AI_ROLES: list(DEFAULT_AI_ROLE_NAMES),
     KEY_AUTO_TRIAGE_TO_INITIATOR: False,
+    KEY_VERIFY_INTERVAL_MINUTES: 60,
+    KEY_MAX_VERIFICATIONS: 2000,
+    KEY_MAX_WRITES: 1000,
+    KEY_VIOLATION_PROJECTS: 150,
+    KEY_ATTRIBUTION_PROJECTS: 150,
+    KEY_ATTRIBUTION_REQUESTS: 600,
+    KEY_READ_CONCURRENCY: 4,
+    KEY_CYCLE_TIME_BUDGET_PCT: 80,
+    KEY_UPDATE_AUTO: True,
+    KEY_UPDATE_QUIET_HOUR: 3,
 }
 
 
@@ -306,17 +389,65 @@ def enforcement_guard(session: Session) -> EnforcementGuard:
             get_value(session, KEY_MAX_NEW_TARGETS), DEFAULTS[KEY_MAX_NEW_TARGETS]
         ),
         ceiling_waived_once=bool(get_value(session, KEY_CEILING_WAIVED_ONCE, False)),
-        protected_roles=frozenset(
-            name.strip().lower()
-            for name in str(roles or "").replace(";", ",").split(",")
-            if name.strip()
-        ),
+        protected_roles=parse_protected_roles(roles),
+    )
+
+
+def thin_snapshots(session: Session) -> bool:
+    """Whether the retention job thins old usage snapshots (on unless switched off)."""
+    return (
+        get_value(session, KEY_RETENTION_THIN_SNAPSHOTS, DEFAULTS[KEY_RETENTION_THIN_SNAPSHOTS])
+        is not False
     )
 
 
 def fusion_lock_enabled(session: Session) -> bool:
     """Whether turning Fusion off also tries to lock it against per-scan override."""
     return get_value(session, KEY_FUSION_LOCK, DEFAULTS[KEY_FUSION_LOCK]) is not False
+
+
+# Role names that look like administration roles. Taking one away from a person
+# over a budget would take away far more than AI features, so choosing one as an
+# AI role needs an explicit confirmation.
+ADMIN_ROLE_PATTERNS: tuple[str, ...] = ("*admin*", "manage-*", "realm-*", "iam-*")
+
+
+def admin_like_role(name: str) -> bool:
+    """Whether a role name matches one of ADMIN_ROLE_PATTERNS (case ignored)."""
+    lowered = name.strip().lower()
+    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in ADMIN_ROLE_PATTERNS)
+
+
+def parse_protected_roles(value: Any) -> frozenset[str]:
+    """The protected role names (lowercase) from the stored comma separated text."""
+    return frozenset(
+        name.strip().lower()
+        for name in str(value or "").replace(";", ",").split(",")
+        if name.strip()
+    )
+
+
+def normalise_role_names(value: Any) -> list[str]:
+    """A list of role names, trimmed, without blanks or repeats, in order."""
+    if isinstance(value, str):
+        value = value.replace(";", ",").split(",")
+    if not isinstance(value, list | tuple):
+        return []
+    seen: dict[str, None] = {}
+    for entry in value:
+        if isinstance(entry, str) and entry.strip():
+            seen.setdefault(entry.strip(), None)
+    return list(seen)
+
+
+def ai_role_names(session: Session) -> tuple[str, ...]:
+    """The client roles a user restriction removes from now on.
+
+    Falls back to the default list when unset or unusable, so a stray stored
+    value can never make a restriction remove nothing.
+    """
+    names = normalise_role_names(get_value(session, KEY_AI_ROLES, DEFAULTS[KEY_AI_ROLES]))
+    return tuple(names[:AI_ROLES_MAX]) or DEFAULT_AI_ROLE_NAMES
 
 
 def action_rates(session: Session) -> dict[str, Any] | None:
@@ -335,6 +466,22 @@ def credit_unit_cost(session: Session) -> float:
     except (TypeError, ValueError):
         return 0.0
     return cost if cost >= 0 else 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class UpdatePolicy:
+    auto_enabled: bool
+    quiet_hour: int  # 0-23, UTC
+
+
+def update_policy(session: Session) -> UpdatePolicy:
+    hour = get_value(session, KEY_UPDATE_QUIET_HOUR, DEFAULTS[KEY_UPDATE_QUIET_HOUR])
+    if not isinstance(hour, int) or isinstance(hour, bool) or not 0 <= hour <= 23:
+        hour = DEFAULTS[KEY_UPDATE_QUIET_HOUR]
+    return UpdatePolicy(
+        auto_enabled=get_value(session, KEY_UPDATE_AUTO, DEFAULTS[KEY_UPDATE_AUTO]) is not False,
+        quiet_hour=hour,
+    )
 
 
 def get_raw(session: Session, key: str) -> AppSetting | None:

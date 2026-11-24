@@ -81,6 +81,10 @@ class AutoTriageState:
     config: dict[str, Any] = field(default_factory=dict)
     scope: str | None = None
     raw: dict[str, Any] | None = None
+    # The entry's ``allowOverride`` exactly as Checkmarx One sent it (seen as
+    # ``{"projects": false, "branches": true, ...}`` on a project-scope read), or
+    # None when absent. Recorded verbatim; its meaning is not documented.
+    allow_override: Any = None
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:
@@ -181,6 +185,7 @@ def parse_auto_triage(payload: Any) -> AutoTriageState:
             config=config if isinstance(config, dict) else {},
             scope=payload.get("scope") if isinstance(payload.get("scope"), str) else None,
             raw=payload,
+            allow_override=entry.get("allowOverride"),
         )
     # The feature is simply absent for this project.
     return AutoTriageState(enabled=None, raw=payload)

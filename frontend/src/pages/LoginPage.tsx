@@ -3,6 +3,7 @@ import { ApiError, api } from "../api/client";
 import type { MessageResponse, SessionInfo } from "../api/types";
 import { Button, ErrorNote, Field, Input, InfoNote } from "../components/ui";
 import { BrandMark } from "../components/Icon";
+import { AuthFrame } from "../components/AppShell";
 
 type Mode = "login" | "forgot" | "reset";
 
@@ -107,24 +108,23 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
     }
   }
 
+  const heading =
+    mode === "login" ? "Sign in" : mode === "forgot" ? "Forgot your password" : "Set a new password";
+
   return (
-    <div className="cg-auth">
-      <div className="cg-bg" aria-hidden="true">
-        <div className="cg-grid" />
-      </div>
-      <div className="cg-auth-card">
-        <div className="cg-brand mb-4" style={{ paddingLeft: 0 }}>
+    <AuthFrame
+      title={heading}
+      description="Keep Checkmarx One AI credits within budget, and prove every restriction"
+    >
+      <div className="cg-panel cg-auth-card">
+        <span className="cg-auth-mark" aria-hidden="true">
           <BrandMark />
-          <span>
-            <b>CxCreditGuard</b>
-            <small>Credit governance</small>
-          </span>
-        </div>
+        </span>
 
         {mode === "login" && (
           <form
             onSubmit={submitLogin}
-            className="cg-panel flex flex-col gap-4 p-5"
+            className="mt-4 flex flex-col gap-4"
           >
             <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
               Sign in to manage Checkmarx One AI credit budgets.
@@ -175,7 +175,7 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
               </>
             )}
 
-            <Button type="submit" variant="primary" loading={busy}>
+            <Button type="submit" variant="primary" loading={busy} className="self-start">
               {needsTotp ? "Verify and sign in" : "Sign in"}
             </Button>
 
@@ -186,7 +186,7 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
             )}
 
             {!needsTotp && (
-              <div className="flex justify-between text-xs">
+              <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs">
                 <button
                   type="button"
                   className="underline"
@@ -211,7 +211,7 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
         {mode === "forgot" && (
           <form
             onSubmit={submitForgot}
-            className="cg-panel flex flex-col gap-4 p-5"
+            className="mt-4 flex flex-col gap-4"
           >
             <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
               Enter your username or email. If the account exists and has an email on file, a
@@ -230,12 +230,12 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
               />
             </Field>
 
-            <Button type="submit" variant="primary" loading={busy}>
+            <Button type="submit" variant="primary" loading={busy} className="self-start">
               Send reset code
             </Button>
             <button
               type="button"
-              className="text-xs underline"
+              className="self-start text-xs underline"
               style={{ color: "var(--text-secondary)" }}
               onClick={() => switchMode("login")}
             >
@@ -247,7 +247,7 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
         {mode === "reset" && (
           <form
             onSubmit={submitReset}
-            className="cg-panel flex flex-col gap-4 p-5"
+            className="mt-4 flex flex-col gap-4"
           >
             <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
               Enter the one-time code and choose a new password (at least 12 characters).
@@ -276,12 +276,12 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
               />
             </Field>
 
-            <Button type="submit" variant="primary" loading={busy}>
+            <Button type="submit" variant="primary" loading={busy} className="self-start">
               Set new password
             </Button>
             <button
               type="button"
-              className="text-xs underline"
+              className="self-start text-xs underline"
               style={{ color: "var(--text-secondary)" }}
               onClick={() => switchMode("login")}
             >
@@ -290,6 +290,6 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
           </form>
         )}
       </div>
-    </div>
+    </AuthFrame>
   );
 }

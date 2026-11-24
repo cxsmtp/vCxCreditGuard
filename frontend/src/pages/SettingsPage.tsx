@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { useLocation } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { ApiError, api } from "../api/client";
 import type {
   AdminResetResult,
   AppSettings,
   Attestation,
   AutoTriageOverview,
+  ClientRoles,
   CycleRun,
   OrgEntity,
   RestoreResult,
@@ -41,6 +42,7 @@ import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 import { LookPicker } from "../components/AppShell";
 import { StatTile } from "../components/StatTile";
+import { UpdatesPanel } from "../components/UpdatesPanel";
 import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
 /** Unsaved edits. The last three are write only: the server never sends the
@@ -59,7 +61,8 @@ export type SettingsSection =
   | "attribution"
   | "accounts"
   | "appearance"
-  | "operations";
+  | "operations"
+  | "updates";
 
 const SECTION_HEAD: Record<SettingsSection, { title: string; description: string }> = {
   general: {
@@ -95,7 +98,97 @@ const SECTION_HEAD: Record<SettingsSection, { title: string; description: string
     title: "Backups & health",
     description: "Configuration backup and restore, the scheduler watchdog and the release attestation.",
   },
+  updates: {
+    title: "Updates",
+    description:
+      "New releases, installed in place from the private registry. Automatic by default, with a rollback.",
+  },
 };
+
+type PacingKey =
+  | "verify_interval_minutes"
+  | "max_verifications_per_cycle"
+  | "max_writes_per_cycle"
+  | "violation_projects_per_cycle"
+  | "attribution_projects_per_cycle"
+  | "attribution_requests_per_cycle"
+  | "read_concurrency"
+  | "cycle_time_budget_pct";
+
+/** The per-cycle budgets (pacing.py), with what each one means. */
+const PACING_FIELDS: {
+  key: PacingKey;
+  label: string;
+  hint: string;
+  min: number;
+  max: number;
+  fallback: number;
+}[] = [
+  {
+    key: "verify_interval_minutes",
+    label: "Verify each restriction every (minutes)",
+    hint: "How often each restriction in force is read back from Checkmarx One, at most, spread over the cycles: including those kept in force outside a limit's current plan (a project that left the group, a held earlier period), not those being lifted. A new restriction is always read back at once, and one whose limit changed what it turns off is next. 0 reads every one back every cycle.",
+    min: 0,
+    max: 10080,
+    fallback: 60,
+  },
+  {
+    key: "max_verifications_per_cycle",
+    label: "Read-backs per cycle (most)",
+    hint: "The oldest-verified first. If more are in force than this covers within the interval above, each is verified less often; the cycle record says how often, and a notification says when any goes unverified for more than twice the interval. 0: no cap.",
+    min: 0,
+    max: 1000000,
+    fallback: 2000,
+  },
+  {
+    key: "max_writes_per_cycle",
+    label: "Restriction changes per cycle (most)",
+    hint: "Changes made in one cycle: lifts first, then drift re-asserted, then new restrictions (small limits first), so giving access back is never held up. A larger group or application is restricted (or lifted) over several cycles, resuming where it stopped, with its progress on the Budgets page. The safety ceilings judge each target of such a rollout once. 0: no cap.",
+    min: 0,
+    max: 1000000,
+    fallback: 1000,
+  },
+  {
+    key: "violation_projects_per_cycle",
+    label: "Projects checked for violations per cycle",
+    hint: "Restricted projects whose scans are listed, the least recently checked first: each is checked at least every (restricted projects / this) cycles.",
+    min: 0,
+    max: 1000000,
+    fallback: 150,
+  },
+  {
+    key: "attribution_projects_per_cycle",
+    label: "Auto-triage projects per cycle",
+    hint: "Projects whose new Auto Triage is traced to a scan per cycle, the longest waiting first. Credits not traced yet stay on the project meanwhile.",
+    min: 0,
+    max: 1000000,
+    fallback: 150,
+  },
+  {
+    key: "attribution_requests_per_cycle",
+    label: "Auto-triage scan requests per cycle",
+    hint: "Scan listings auto-triage attribution may make in one cycle.",
+    min: 0,
+    max: 1000000,
+    fallback: 600,
+  },
+  {
+    key: "read_concurrency",
+    label: "Parallel reads",
+    hint: "Independent read-only calls (read-backs, scan listings) made at the same time. Writes are always one at a time. 1 makes every call one after another.",
+    min: 1,
+    max: 16,
+    fallback: 4,
+  },
+  {
+    key: "cycle_time_budget_pct",
+    label: "Cycle time budget (% of interval)",
+    hint: "Once a cycle has run this long, it stops starting new per-project work and leaves the rest to the next cycle instead of overrunning. 0 removes the budget.",
+    min: 0,
+    max: 100,
+    fallback: 80,
+  },
+];
 
 export function SettingsPage({
   isAdmin,
@@ -122,6 +215,8 @@ export function SettingsPage({
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [testing, setTesting] = useState(false);
+  // Administration-like AI roles the admin confirmed in the picker's dialog.
+  const [confirmedAdminRoles, setConfirmedAdminRoles] = useState<string[]>([]);
   const [testResult, setTestResult] = useState<{
     ok: boolean;
     channels: Record<string, string>;
@@ -153,10 +248,22 @@ export function SettingsPage({
     setBusy(true);
     setError(null);
     try {
-      const updated = await api.put<AppSettings>("/api/settings", changes);
+      // An administration-like AI role is saved only with an explicit
+      // confirmation: one given in the picker's dialog, or one already saved.
+      const adminLike = (changes.ai_roles ?? []).filter(isAdminLikeRole);
+      const confirmed =
+        adminLike.length > 0 &&
+        adminLike.every(
+          (name) => confirmedAdminRoles.includes(name) || (current?.ai_roles ?? []).includes(name),
+        );
+      const updated = await api.put<AppSettings>(
+        "/api/settings",
+        confirmed ? { ...changes, confirm_admin_roles: true } : changes,
+      );
       settings.setData(updated);
       applyAccent(updated.ui_accent);
       settingsDraft.clear();
+      setConfirmedAdminRoles([]);
       toast.success(`Settings saved. Schedule is now ${updated.current_schedule_description}.`);
       await status.reload();
       // Refresh the bootstrap profile so shell-level state (the demo banner,
@@ -394,6 +501,15 @@ export function SettingsPage({
               />
             </Field>
           </div>
+          <div className="mt-4 border-t border-hairline pt-4">
+            <Toggle
+              checked={value("retention_thin_snapshots") ?? true}
+              disabled={!isAdmin}
+              onChange={(next) => set({ retention_thin_snapshots: next })}
+              label="Thin old consumption readings"
+              description="Keep every reading of the last 3 days, one an hour for each dimension up to 40 days, and one a day after that. A reading anything refers to (a restriction's baseline, a budget period's usage breakdown, the latest) is always kept. Off: every reading is kept for the whole retention period."
+            />
+          </div>
         </Card>
         )}
 
@@ -575,7 +691,11 @@ export function SettingsPage({
                 isAdmin={isAdmin}
                 value={value("ui_accent") ?? "default"}
                 options={current.allowed_accents ?? ["default"]}
-                onPick={(accent) => set({ ui_accent: accent })}
+                onPick={(accent) => {
+                  // Picking what is stored (or the swatch a legacy accent shows as) is no change.
+                  const stored = current.ui_accent ?? "default";
+                  set({ ui_accent: accent === (LEGACY_ACCENT[stored] ?? stored) ? undefined : accent });
+                }}
               />
             </>
           )}
@@ -674,6 +794,52 @@ export function SettingsPage({
                     spellCheck={false}
                   />
                 </Field>
+              </div>
+              <div className="mt-4 border-t border-hairline pt-4">
+                <p className="text-sm font-medium">Pacing for large tenants</p>
+                <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                  How much one cycle does, so a tenant of thousands of projects is worked through
+                  over several cycles and every cycle finishes well within its interval. 0 means no
+                  budget: everything, every cycle (for the violation check and auto-triage
+                  attribution that is no cap at all, where they had fixed caps before pacing).
+                </p>
+                <div className="mt-3 grid gap-4 sm:grid-cols-3">
+                  {PACING_FIELDS.map((field) => (
+                    <Field key={field.key} label={field.label} fold={false} hint={field.hint}>
+                      <Input
+                        type="number"
+                        min={field.min}
+                        max={field.max}
+                        step="1"
+                        disabled={!isAdmin}
+                        value={String(value(field.key) ?? field.fallback)}
+                        onChange={(event) =>
+                          set({
+                            [field.key]: Math.min(
+                              field.max,
+                              Math.max(field.min, Math.floor(Number(event.target.value) || 0)),
+                            ),
+                          })
+                        }
+                      />
+                    </Field>
+                  ))}
+                </div>
+              </div>
+              <div className="mt-4 border-t border-hairline pt-4">
+                <AiRolesPicker
+                  isAdmin={isAdmin}
+                  value={value("ai_roles") ?? current.ai_roles ?? []}
+                  defaults={current.default_ai_roles ?? []}
+                  protectedRoles={(value("protected_roles") ?? "")
+                    .split(/[,;]/)
+                    .map((name) => name.trim().toLowerCase())
+                    .filter(Boolean)}
+                  onChange={(next) => set({ ai_roles: next })}
+                  onConfirmAdmin={(name) =>
+                    setConfirmedAdminRoles((previous) => [...previous, name])
+                  }
+                />
               </div>
               <div className="mt-4 border-t border-hairline pt-4">
                 <Toggle
@@ -791,6 +957,7 @@ export function SettingsPage({
             />
           )}
           {isAdmin && section === "operations" && <OperationsCard />}
+          {isAdmin && section === "updates" && <UpdatesPanel onChanged={onSettingsSaved} />}
           {isAdmin && section === "accounts" && <AccountsCard />}
         </>
       </div>
@@ -1116,16 +1283,19 @@ function isCounted(s: UnresolvedSubject): boolean {
 
 /* ------------------------------------------------------------- appearance */
 
-// Representative swatch colour per accent (the light-mode value). Purely for the
-// picker preview; the real tokens live in index.css under [data-accent].
-const ACCENT_SWATCH: Record<string, string> = {
-  default: "#0b6b86",
-  teal: "#0f766e",
-  violet: "#6d46c8",
-  amber: "#b45309",
-  rose: "#be123c",
-  slate: "#475569",
-};
+// The five earth accents of the Standard look, in the order the picker shows them,
+// with their light-mode colour for the swatch. The real tokens live in index.css
+// under [data-accent]. The keys are the stored values the API accepts.
+const ACCENTS: { key: string; name: string; swatch: string }[] = [
+  { key: "default", name: "Ink", swatch: "#34507a" },
+  { key: "teal", name: "Lagoon", swatch: "#1f6b68" },
+  { key: "sage", name: "Sage", swatch: "#3e6a46" },
+  { key: "violet", name: "Plum", swatch: "#6c4265" },
+  { key: "amber", name: "Ochre", swatch: "#8f5716" },
+];
+
+// Accents from before the earth colours, still accepted and shown as their nearest.
+const LEGACY_ACCENT: Record<string, string> = { rose: "violet", slate: "default" };
 
 function AppearanceCard({
   isAdmin,
@@ -1138,23 +1308,24 @@ function AppearanceCard({
   options: string[];
   onPick: (accent: string) => void;
 }) {
+  const shown = LEGACY_ACCENT[value] ?? value;
   return (
     <Card
       title="Organisation accent"
       description="The one accent colour of the Standard look, for everyone in this organisation. Command Center uses each person's phosphor colour instead."
     >
       <div className="flex flex-wrap gap-2.5">
-        {options.map((accent) => {
-          const selected = accent === value;
+        {ACCENTS.filter((accent) => options.includes(accent.key)).map((accent) => {
+          const selected = accent.key === shown;
           return (
             <button
-              key={accent}
+              key={accent.key}
               type="button"
               disabled={!isAdmin}
               aria-pressed={selected}
-              onClick={() => onPick(accent)}
-              title={accent}
-              className="flex items-center gap-2 rounded-lg border px-3 py-2 text-sm capitalize transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => onPick(accent.key)}
+              title={accent.name}
+              className="flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60"
               style={{
                 borderColor: selected ? "var(--accent)" : "var(--border)",
                 background: selected ? "var(--hover)" : "transparent",
@@ -1165,12 +1336,12 @@ function AppearanceCard({
               <span
                 className="inline-block size-4 rounded-full"
                 style={{
-                  background: ACCENT_SWATCH[accent] ?? "var(--accent)",
+                  background: accent.swatch,
                   outline: selected ? "2px solid var(--accent)" : "none",
                   outlineOffset: "1px",
                 }}
               />
-              {accent === "default" ? "standard" : accent}
+              {accent.name}
             </button>
           );
         })}
@@ -1561,9 +1732,9 @@ function OperationsCard() {
                 <div>
                   v{att.version}
                   {att.update.update_available && (
-                    <span className="ml-2">
+                    <Link to="/settings/updates" className="ml-2">
                       <Badge tone="warning">Update to {att.update.latest}</Badge>
-                    </span>
+                    </Link>
                   )}
                 </div>
                 <code className="text-xs break-all" style={{ color: "var(--text-muted)" }}>
@@ -2028,5 +2199,184 @@ function DemoCard({
         </div>
       </div>
     </Card>
+  );
+}
+
+/** Role names that look like administration roles (as the server checks:
+ * `*admin*`, `manage-*`, `realm-*`, `iam-*`). */
+function isAdminLikeRole(name: string): boolean {
+  const lowered = name.trim().toLowerCase();
+  return (
+    lowered.includes("admin") ||
+    lowered.startsWith("manage-") ||
+    lowered.startsWith("realm-") ||
+    lowered.startsWith("iam-")
+  );
+}
+
+/** The client roles a user restriction removes, picked from the tenant's own roles. */
+function AiRolesPicker({
+  isAdmin,
+  value,
+  defaults,
+  protectedRoles,
+  onChange,
+  onConfirmAdmin,
+}: {
+  isAdmin: boolean;
+  value: string[];
+  defaults: string[];
+  /** Protected role names, lowercase: they cannot be AI roles. */
+  protectedRoles: string[];
+  onChange: (next: string[]) => void;
+  onConfirmAdmin: (name: string) => void;
+}) {
+  const roles = useResource<ClientRoles | null>(
+    (signal) =>
+      isAdmin ? api.get<ClientRoles>("/api/settings/client-roles", undefined, signal) : Promise.resolve(null),
+    [isAdmin],
+  );
+  const [choice, setChoice] = useState("");
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const listing = roles.data;
+  const isProtected = (name: string) => protectedRoles.includes(name.toLowerCase());
+  const adminLike = (name: string) => byName.get(name)?.admin_like ?? isAdminLikeRole(name);
+
+  function add(name: string) {
+    if (isProtected(name)) return;
+    if (adminLike(name)) {
+      setConfirming(name);
+      return;
+    }
+    onChange([...value, name]);
+  }
+  const byName = new Map((listing?.roles ?? []).map((role) => [role.name, role]));
+  const addable = (listing?.roles ?? []).filter((role) => !value.includes(role.name));
+  const isDefault =
+    value.length === defaults.length && value.every((name) => defaults.includes(name));
+
+  function remove(name: string) {
+    const next = value.filter((entry) => entry !== name);
+    if (next.length > 0) onChange(next);
+  }
+
+  return (
+    <div>
+      <p className="text-sm font-medium">Roles a user restriction removes</p>
+      <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+        The client roles (on <code>ast-app</code>) taken from a person who goes over a user
+        budget. The default is the three general Risk Management roles AI Triage and AI
+        Remediation are reached through, so a restricted person also loses the Risk Management
+        pages. When Checkmarx One ships dedicated AI Triage and Remediation roles (announced for
+        10 January), add them here and remove the general ones. A change applies only to
+        restrictions made from then on: a restriction in force keeps, and gives back, exactly
+        the roles it recorded. A role a person holds through a group or a composite role is not
+        taken away by removing their direct mapping; CreditGuard says so when it happens.
+      </p>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {value.map((name) => {
+          const role = byName.get(name);
+          const title = role?.known_description ?? role?.description ?? undefined;
+          return (
+            <span
+              key={name}
+              title={title}
+              className="inline-flex items-center gap-1 rounded border border-hairline px-2 py-0.5 text-xs"
+            >
+              <code>{name}</code>
+              {role?.composite && <Badge tone="neutral">composite</Badge>}
+              {adminLike(name) && <Badge tone="warning">admin role</Badge>}
+              {isProtected(name) && <Badge tone="warning">protected</Badge>}
+              {listing?.available && !role && <Badge tone="warning">not on the tenant</Badge>}
+              {isAdmin && value.length > 1 && (
+                <button
+                  type="button"
+                  className="ml-0.5"
+                  aria-label={`Remove ${name}`}
+                  onClick={() => remove(name)}
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  ×
+                </button>
+              )}
+            </span>
+          );
+        })}
+      </div>
+      {isAdmin && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {roles.loading ? (
+            <span className="flex items-center gap-2 text-xs" style={{ color: "var(--text-secondary)" }}>
+              <Spinner size={12} /> Reading the tenant's roles
+            </span>
+          ) : listing?.available ? (
+            <>
+              <Select
+                value={choice}
+                onChange={(event) => setChoice(event.target.value)}
+                aria-label="Role to add"
+                className="max-w-xs"
+              >
+                <option value="">Add a role…</option>
+                {addable.map((role) => (
+                  <option
+                    key={role.name}
+                    value={role.name}
+                    disabled={isProtected(role.name)}
+                  >
+                    {role.name}
+                    {role.composite ? " (composite)" : ""}
+                    {isProtected(role.name)
+                      ? " (protected: cannot be an AI role)"
+                      : adminLike(role.name)
+                        ? " ⚠ admin role"
+                        : ""}
+                  </option>
+                ))}
+              </Select>
+              <Button
+                size="sm"
+                disabled={!choice}
+                onClick={() => {
+                  if (choice) add(choice);
+                  setChoice("");
+                }}
+              >
+                Add
+              </Button>
+            </>
+          ) : (
+            <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+              {listing?.message ?? roles.error ?? "The tenant's roles could not be listed."} Only
+              roles already in the list (or the defaults) can be kept until they can be read.
+            </span>
+          )}
+          {!isDefault && (
+            <Button size="sm" onClick={() => onChange([...defaults])}>
+              Back to the default
+            </Button>
+          )}
+        </div>
+      )}
+      <ConfirmDialog
+        open={confirming !== null}
+        title="Remove an administration role from people over budget?"
+        destructive
+        confirmLabel="Add it anyway"
+        message={
+          confirming
+            ? `${confirming} looks like an administration role. A user restriction would take it from anyone who goes over a user budget, along with everything it allows besides AI features (managing users, the tenant or its settings). Add it only if that is what you want.`
+            : ""
+        }
+        onConfirm={() => {
+          if (confirming) {
+            onConfirmAdmin(confirming);
+            onChange([...value, confirming]);
+          }
+          setConfirming(null);
+        }}
+        onCancel={() => setConfirming(null)}
+      />
+    </div>
   );
 }

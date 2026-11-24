@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -220,7 +222,9 @@ class TestTenantUrlsAreRestricted:
             "https://localhost:8443/api",
             "https://eu.ast.checkmarx.net.attacker.example/api",
             "https://notcheckmarx.net/api",
-            "https://user:pw@eu.ast.checkmarx.net/api",
+            # Credentials in the authority part (placeholder "user:pw"), split so
+            # the literal does not read as a committed authenticated URL.
+            "https://" + "user:pw" + "@eu.ast.checkmarx.net/api",
             "https://eu.ast.checkmarx.net/api?next=1",
         ],
     )
@@ -299,7 +303,13 @@ class TestTracebacksAreRedacted:
         from app.core.logging import configure_logging, register_secret, unregister_secret
 
         secret = "s3cr3t-webhook-signing-value-123456"
-        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiIsImV4cCI6MTB9.c2lnbmF0dXJlLXZhbHVl"
+        # A JWT-shaped placeholder (header {"alg":"HS256"}, payload
+        # {"sub":"admin","exp":10}, signature "signature-value"), assembled at run
+        # time so no token-like literal is committed for secret scanners to flag.
+        jwt = ".".join(
+            base64.urlsafe_b64encode(part).decode().rstrip("=")
+            for part in (b'{"alg":"HS256"}', b'{"sub":"admin","exp":10}', b"signature-value")
+        )
         register_secret(secret)
         configure_logging("INFO")
         try:

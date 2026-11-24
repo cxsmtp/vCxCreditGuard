@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.db.base import utcnow
 from app.models.enums import EnforcementStatus, LimitStatus
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
-from app.services import enforcement, evaluation, settings_store
+from app.services import evaluation, settings_store
 from app.services.periods import PeriodError, current_window
 
 # A day in seconds, as a Decimal, for burn-rate arithmetic.
@@ -64,10 +64,15 @@ class Report:
     breaching_soon: int = 0
 
 
-def forward_projection(session: Session, *, now: datetime | None = None) -> list[Projection]:
+def forward_projection(
+    session: Session,
+    *,
+    now: datetime | None = None,
+    index: evaluation.UsageIndex | None = None,
+) -> list[Projection]:
     """Straight-line projection of where each active limit lands by period end."""
     moment = now or utcnow()
-    index = evaluation.UsageIndex(session)
+    index = index or evaluation.UsageIndex(session)
     projections: list[Projection] = []
 
     limits = list(session.scalars(select(CreditLimit).where(CreditLimit.is_active.is_(True))))
@@ -157,9 +162,14 @@ def _timedelta_days(days: Decimal):  # type: ignore[no-untyped-def]
     return timedelta(seconds=float(capped * _DAY))
 
 
-def impact_summary(session: Session, *, now: datetime | None = None) -> Impact:
+def impact_summary(
+    session: Session,
+    *,
+    now: datetime | None = None,
+    index: evaluation.UsageIndex | None = None,
+) -> Impact:
     """What governance is holding back right now, from stored state only."""
-    index = evaluation.UsageIndex(session)
+    index = index or evaluation.UsageIndex(session)
     enforced_limits = 0
     credits_over_budget = Decimal("0")
     monitor_only_breaches = 0
@@ -177,9 +187,7 @@ def impact_summary(session: Session, *, now: datetime | None = None) -> Impact:
         if not available:
             continue
         over = max(Decimal("0"), used - Decimal(limit.credit_limit))
-        exempt = enforcement.is_exempt(
-            session, entity_type=limit.entity_type, entity_id=limit.entity_id
-        )
+        exempt = index.is_exempt(limit.entity_type, limit.entity_id)
         if limit.enforce and not exempt:
             enforced_limits += 1
             # Only count over-budget that enforcement would actually act on; an
@@ -228,8 +236,10 @@ def impact_summary(session: Session, *, now: datetime | None = None) -> Impact:
 
 def build_report(session: Session, *, now: datetime | None = None) -> Report:
     moment = now or utcnow()
-    projections = forward_projection(session, now=moment)
-    impact = impact_summary(session, now=moment)
+    # One reading of the usage (and of the auto-triage charges) for both.
+    index = evaluation.UsageIndex(session)
+    projections = forward_projection(session, now=moment, index=index)
+    impact = impact_summary(session, now=moment, index=index)
     limits_total = int(session.scalar(select(func.count()).select_from(CreditLimit)) or 0)
     limits_enforcing = int(
         session.scalar(

@@ -43,7 +43,9 @@ Checkmarx call, and one project's failure never stops the others.
 
 from __future__ import annotations
 
+import bisect
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -74,7 +76,7 @@ from app.models.violations import (
     STATUS_RESOLVED,
     PolicyViolation,
 )
-from app.services import ingestion, notifications, settings_store, usage_mix
+from app.services import error_text, ingestion, notifications, pacing, settings_store, usage_mix
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -439,6 +441,14 @@ class DetectionResult:
     skipped_projects: int = 0
     truncated: int = 0
     errors: list[str] = field(default_factory=list)
+    # Coverage of the rotation: restricted projects watched, checked per cycle
+    # at most, and so every how many cycles each one is listed at least; and
+    # how long ago the project checked least recently was last checked.
+    watched: int = 0
+    per_cycle: int = 0
+    each_checked_every_cycles: int = 0
+    oldest_check_minutes: int | None = None
+    stopped_for_time: bool = False
 
     def as_stats(self) -> dict[str, Any]:
         return {
@@ -449,6 +459,11 @@ class DetectionResult:
             "updated": self.updated,
             "skipped_projects": self.skipped_projects,
             "truncated": self.truncated,
+            "watched": self.watched,
+            "per_cycle": self.per_cycle,
+            "each_checked_every_cycles": self.each_checked_every_cycles,
+            "oldest_check_minutes": self.oldest_check_minutes,
+            "stopped_for_time": self.stopped_for_time,
             "errors": self.errors,
         }
 
@@ -627,35 +642,64 @@ def _detect_scans(session: Session, client: CheckmarxClient, result: DetectionRe
     watches = _fusion_watches(session)
     if not watches:
         return
-    if len(watches) > MAX_PROJECTS_PER_CYCLE:
-        result.skipped_projects += len(watches) - MAX_PROJECTS_PER_CYCLE
-        watches = watches[:MAX_PROJECTS_PER_CYCLE]
+    config = pacing.pacing(session)
+    per_cycle = config.violation_projects_per_cycle or len(watches)
     cursors = _cursors(session)
+    live = {watch.project_id for watch in watches}
+    # Fair rotation: the projects checked least recently first (never checked
+    # before any), so every watched project is listed at least once every
+    # ceil(watched / per_cycle) cycles, however many there are.
+    watches.sort(key=lambda watch: (_checked_at(cursors.get(watch.project_id)) or "", watch.since))
+    result.watched = len(watches)
+    result.per_cycle = min(per_cycle, len(watches))
+    result.each_checked_every_cycles = math.ceil(len(watches) / max(1, result.per_cycle))
+    oldest = _checked_at(cursors.get(watches[0].project_id))
+    oldest_at = scans_api.parse_time(oldest) if oldest else None
+    result.oldest_check_minutes = (
+        int((utcnow() - oldest_at).total_seconds() // 60) if oldest_at is not None else None
+    )
+    if len(watches) > per_cycle:
+        result.skipped_projects += len(watches) - per_cycle
+        watches = watches[:per_cycle]
     rates = usage_mix.rate_table(session)
 
     # 1. List each project's scans and sort them out, without single-scan reads.
-    projects: list[_ProjectScans] = []
+    # The listings are independent reads, made a few at a time; nothing is
+    # open in the database meanwhile.
+    planned: list[tuple[_FusionWatch, datetime | None, dict[str, str], datetime, set[str]]] = []
     for watch in watches:
         cursor, kept_pending = _scan_state(cursors.get(watch.project_id))
         since = max(watch.since, cursor) if cursor is not None else watch.since
-        recorded = _recorded_scan_ids(session, watch)
-        session.commit()  # nothing open while Checkmarx is called
-        try:
-            listing = scans_api.list_project_scans(
-                client,
-                project_id=watch.project_id,
-                since=since,
-                page_size=SCAN_PAGE_SIZE,
-                max_pages=MAX_PAGES_PER_PROJECT,
-            )
-        except CheckmarxAuthError:
-            raise
-        except CheckmarxError as exc:
-            session.rollback()
+        planned.append((watch, cursor, kept_pending, since, _recorded_scan_ids(session, watch)))
+    session.commit()  # nothing open while Checkmarx is called
+    if pacing.out_of_time():
+        result.stopped_for_time = True
+        result.skipped_projects += len(planned)
+        return
+    listings = pacing.parallel_map(
+        lambda item: scans_api.list_project_scans(
+            client,
+            project_id=item[0].project_id,
+            since=item[3],
+            page_size=SCAN_PAGE_SIZE,
+            max_pages=MAX_PAGES_PER_PROJECT,
+        ),
+        planned,
+        workers=config.read_concurrency,
+    )
+    projects: list[_ProjectScans] = []
+    for (watch, cursor, kept_pending, since, recorded), listing, exc in listings:
+        if isinstance(exc, CheckmarxAuthError):
+            raise exc
+        if exc is not None and not isinstance(exc, CheckmarxError):
+            raise exc
+        if exc is not None or listing is None:
             logger.warning(
                 "Could not list the scans of restricted project %s: %s", watch.project_id, exc
             )
-            result.errors.append(f"{watch.label or watch.project_id}: {exc}")
+            result.errors.append(
+                f"{watch.label or watch.project_id}: {error_text.public_error(exc)}"
+            )
             continue
         result.scans_read += len(listing.scans)
         project = _ProjectScans(
@@ -697,7 +741,14 @@ def _detect_scans(session: Session, client: CheckmarxClient, result: DetectionRe
             reads_left -= 1
 
     # 3. Per project: its reads, then its findings and its cursor, committed.
-    for project in projects:
+    # The cursors are kept in one setting, written every few projects and at
+    # the end rather than after each one: a scan already recorded is never
+    # recorded twice (its key is unique), so a cursor lost to a crash in
+    # between only means that scan is listed again.
+    checked_at = utcnow().isoformat()
+    for position, project in enumerate(projects):
+        if position and position % 25 == 0:
+            _save_cursors(session, cursors, live)
         watch = project.watch
         listed_scans = {scan.id: scan for scan in project.listing.scans}
         session.commit()  # nothing open while Checkmarx is called
@@ -729,6 +780,7 @@ def _detect_scans(session: Session, client: CheckmarxClient, result: DetectionRe
         state_before = cursors.get(watch.project_id)
         try:
             _record_project_scans(session, project, cursors=cursors, rates=rates, result=result)
+            cursors[watch.project_id] = {**cursors.get(watch.project_id, {}), "checked": checked_at}
             session.commit()
         except Exception as exc:  # noqa: BLE001 - one project must not stop the others
             session.rollback()
@@ -740,7 +792,32 @@ def _detect_scans(session: Session, client: CheckmarxClient, result: DetectionRe
             logger.warning(
                 "Could not record the scans of project %s", watch.project_id, exc_info=True
             )
-            result.errors.append(f"{watch.label or watch.project_id}: {exc}")
+            result.errors.append(
+                f"{watch.label or watch.project_id}: {error_text.public_error(exc)}"
+            )
+    _save_cursors(session, cursors, live)
+    session.commit()
+
+
+def _checked_at(entry: Any) -> str | None:
+    """When this project's scans were last listed (ISO text), if recorded."""
+    return entry.get("checked") if isinstance(entry, dict) else None
+
+
+def _save_cursors(session: Session, cursors: dict[str, Any], live: set[str]) -> None:
+    """Store the cursors of the projects still restricted (no commit)."""
+    bounded = {project: state for project, state in cursors.items() if project in live}
+    if settings_store.get_value(session, settings_store.KEY_VIOLATION_SCAN_CURSORS) == bounded:
+        return
+    settings_store.set_value(
+        session,
+        settings_store.KEY_VIOLATION_SCAN_CURSORS,
+        bounded,
+        description=(
+            "Newest scan looked at, scans not classified yet, and when each restricted "
+            "project was last checked (bookkeeping)."
+        ),
+    )
 
 
 def _record_project_scans(
@@ -791,21 +868,14 @@ def _record_project_scans(
         # Listed again from the earliest pending scan in the listing (the
         # listing includes a scan created at ``since``).
         cursor_at = min(held) if held else max(created_times, default=project.cursor)
+    previous = cursors.get(watch.project_id)
     state: dict[str, Any] = {
         "at": cursor_at.isoformat() if cursor_at is not None else None,
         "pending": {scan_id: at.isoformat() for scan_id, at in pending.items()},
     }
-    if cursors.get(watch.project_id) != state:
-        cursors[watch.project_id] = state
-        settings_store.set_value(
-            session,
-            settings_store.KEY_VIOLATION_SCAN_CURSORS,
-            _bounded_cursors(session, cursors),
-            description=(
-                "Newest scan looked at, and scans not classified yet, per restricted project "
-                "(bookkeeping)."
-            ),
-        )
+    if isinstance(previous, dict) and previous.get("checked"):
+        state["checked"] = previous["checked"]
+    cursors[watch.project_id] = state
 
 
 def _waiting(scan: scans_api.ScanSummary, created: datetime, now: datetime) -> bool:
@@ -886,12 +956,6 @@ def _note_not_checked(
         severity=Severity.INFO,
         notify=False,
     )
-
-
-def _bounded_cursors(session: Session, cursors: dict[str, Any]) -> dict[str, Any]:
-    """Only the projects still restricted keep a cursor."""
-    live = {watch.project_id for watch in _fusion_watches(session)}
-    return {project: at for project, at in cursors.items() if project in live}
 
 
 def _record_scan(
@@ -1078,6 +1142,96 @@ def _bucketed(record: UsageRecord | None) -> dict[str, int]:
     return totals
 
 
+class _UsageReader:
+    """The consumption readings ``_detect_usage`` compares, read in bulk.
+
+    The same answers as ``ingestion.latest_snapshot``, ``usage_mix._snapshot_at``
+    and ``_record_for``, but one query per view and per snapshot rather than
+    several per restricted target: a large tenant has thousands of them.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+        self._latest: dict[str, UsageSnapshot | None] = {}
+        # view -> believed snapshots (collected_at, id), oldest first.
+        self._timeline: dict[str, list[tuple[datetime, int]]] = {}
+        self._records: dict[tuple[int, str], UsageRecord | None] = {}
+
+    def latest(self, view: str) -> UsageSnapshot | None:
+        if view not in self._latest:
+            self._latest[view] = ingestion.latest_snapshot(self.session, view)
+        return self._latest[view]
+
+    def prepare(self, view: str, moments: list[datetime]) -> None:
+        """Load the snapshots that can be the reading at any of these moments."""
+        if not moments:
+            return
+        first = usage_mix._snapshot_at(self.session, view, min(moments))
+        query = select(UsageSnapshot.collected_at, UsageSnapshot.id).where(
+            UsageSnapshot.view_by == view,
+            UsageSnapshot.held_reason.is_(None),
+            UsageSnapshot.collected_at > min(moments),
+            UsageSnapshot.collected_at <= max(moments),
+        )
+        if not settings_store.demo_mode(self.session):
+            query = query.where(
+                UsageSnapshot.period_param.is_distinct_from(settings_store.DEMO_PERIOD_PARAM)
+            )
+        timeline = [(row.collected_at, row.id) for row in self.session.execute(query)]
+        if first is not None:
+            timeline.append((first.collected_at, first.id))
+        timeline.sort()
+        self._timeline[view] = timeline
+
+    def baseline(self, view: str, action: EnforcementAction) -> UsageSnapshot | None:
+        """The reading a rise since this restriction is measured from.
+
+        The snapshot pinned when it was applied (``baseline_snapshot_id``), or,
+        for a restriction from before that existed (or whose snapshot is gone),
+        the newest believed snapshot at or before ``applied_at``, as before.
+        """
+        if action.baseline_snapshot_id is not None:
+            pinned = self.session.get(UsageSnapshot, action.baseline_snapshot_id)
+            if pinned is not None and pinned.view_by == view and pinned.held_reason is None:
+                return pinned
+        if action.applied_at is None:
+            return None
+        return self.at(view, action.applied_at)
+
+    def at(self, view: str, moment: datetime) -> UsageSnapshot | None:
+        """The newest believed snapshot taken at or before ``moment``."""
+        timeline = self._timeline.get(view)
+        if timeline is None:
+            return usage_mix._snapshot_at(self.session, view, moment)
+        position = bisect.bisect_right(timeline, (moment, math.inf))
+        if position == 0:
+            return None
+        return self.session.get(UsageSnapshot, timeline[position - 1][1])
+
+    def preload(self, snapshot: UsageSnapshot | None, entity_ids: set[str]) -> None:
+        if snapshot is None:
+            return
+        wanted = sorted(eid for eid in entity_ids if (snapshot.id, eid) not in self._records)
+        for start in range(0, len(wanted), 1000):
+            chunk = wanted[start : start + 1000]
+            for eid in chunk:
+                self._records[(snapshot.id, eid)] = None
+            for record in self.session.scalars(
+                select(UsageRecord)
+                .where(UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.in_(chunk))
+                .order_by(UsageRecord.id)
+            ):
+                # The first row, as ``_record_for`` returns it.
+                if self._records.get((snapshot.id, record.entity_id)) is None:
+                    self._records[(snapshot.id, record.entity_id)] = record
+
+    def record(self, snapshot: UsageSnapshot, entity_id: str) -> UsageRecord | None:
+        key = (snapshot.id, entity_id)
+        if key not in self._records:
+            self._records[key] = _record_for(self.session, snapshot, entity_id)
+        return self._records[key]
+
+
 def _detect_usage(session: Session, result: DetectionResult) -> None:
     groups: dict[tuple[str, str], list[EnforcementAction]] = {}
     for action in session.scalars(
@@ -1090,9 +1244,39 @@ def _detect_usage(session: Session, result: DetectionResult) -> None:
     ):
         if str(action.kind) in _STOPS:
             groups.setdefault((action.target_type, action.target_id), []).append(action)
+    reader = _UsageReader(session)
+    for view, target_type in ((UsageView.USER.value, "cx_user"), (UsageView.PROJECT.value, None)):
+        mine = {
+            key: actions
+            for key, actions in groups.items()
+            if (key[0] == "cx_user") == (target_type == "cx_user")
+        }
+        if not mine:
+            continue
+        reader.prepare(
+            view, [a.applied_at for actions in mine.values() for a in actions if a.applied_at]
+        )
+        ids = {key[1] for key in mine}
+        reader.preload(reader.latest(view), ids)
+        baselines = {
+            reader.baseline(view, a) for actions in mine.values() for a in actions if a.applied_at
+        }
+        for snapshot in baselines:
+            reader.preload(snapshot, ids)
+    session.commit()
     for (target_type, target_id), actions in groups.items():
+        if any(
+            action.kind == EnforcementKind.REMOVE_USER_ROLES
+            and (action.undo_snapshot or {}).get("kept_effective")
+            for action in actions
+        ):
+            # The person still holds an AI role through a group or a composite
+            # role, which the restriction cannot take away and which was said
+            # once when it was applied ("keeps AI access through ..."). Their
+            # usage is not acting against the restriction.
+            continue
         try:
-            outcome = _usage_for_target(session, target_type, target_id, actions)
+            outcome = _usage_for_target(session, target_type, target_id, actions, reader=reader)
             if outcome == "detected":
                 result.detected += 1
             elif outcome == "updated":
@@ -1101,11 +1285,16 @@ def _detect_usage(session: Session, result: DetectionResult) -> None:
         except Exception as exc:  # noqa: BLE001 - one target must not stop the others
             session.rollback()
             logger.warning("Could not check usage after restricting %s", target_id, exc_info=True)
-            result.errors.append(f"usage of {target_id}: {exc}")
+            result.errors.append(f"usage of {target_id}: {error_text.public_error(exc)}")
 
 
 def _usage_for_target(
-    session: Session, target_type: str, target_id: str, actions: list[EnforcementAction]
+    session: Session,
+    target_type: str,
+    target_id: str,
+    actions: list[EnforcementAction],
+    *,
+    reader: _UsageReader | None = None,
 ) -> str | None:
     """ "detected", "updated", or None when there is nothing (new) to say.
 
@@ -1115,10 +1304,11 @@ def _usage_for_target(
     """
     first = actions[0]
     view = UsageView.USER.value if target_type == "cx_user" else UsageView.PROJECT.value
-    latest = ingestion.latest_snapshot(session, view)
+    reader = reader or _UsageReader(session)
+    latest = reader.latest(view)
     if latest is None:
         return None
-    now_record = _record_for(session, latest, target_id)
+    now_record = reader.record(latest, target_id)
     if now_record is None:
         return None
     now_counts = _bucketed(now_record)
@@ -1132,10 +1322,10 @@ def _usage_for_target(
     baselines: dict[str, UsageSnapshot] = {}
     for action_type in sorted(since_by_type):
         restricted = since_by_type[action_type]
-        before = usage_mix._snapshot_at(session, view, restricted.applied_at)  # type: ignore[arg-type]
+        before = reader.baseline(view, restricted)
         if before is None or before.id == latest.id:
             continue
-        then_counts = _bucketed(_record_for(session, before, target_id))
+        then_counts = _bucketed(reader.record(before, target_id))
         rise = now_counts.get(action_type, 0) - then_counts.get(action_type, 0)
         if rise < 0:
             # Older transactions left the lookback window: new ones cannot be
@@ -1150,7 +1340,7 @@ def _usage_for_target(
     # whose action type rose (evidence only; priced below for Fusion alone).
     earliest_type = min(rises, key=lambda t: (since_by_type[t].applied_at, since_by_type[t].id))
     before = baselines[earliest_type]
-    then_record = _record_for(session, before, target_id)
+    then_record = reader.record(before, target_id)
     credits_rise = Decimal(now_record.credits_used or 0) - Decimal(
         (then_record.credits_used if then_record else 0) or 0
     )

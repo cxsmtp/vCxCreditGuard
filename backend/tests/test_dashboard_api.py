@@ -349,6 +349,8 @@ class TestSettingsApi:
         body = admin_client.get("/api/settings").json()
         assert body["ui_accent"] == "default"
         assert "teal" in body["allowed_accents"]
+        # The earth accents, and the older keys a saved setting may still hold.
+        assert {"sage", "rose", "slate"} <= set(body["allowed_accents"])
 
         response = admin_client.put("/api/settings", json={"ui_accent": "teal"})
         assert response.status_code == httpx.codes.OK

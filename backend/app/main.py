@@ -27,6 +27,7 @@ from app.api.routes import (
     preview,
     reports,
     requests,
+    updates,
     violations,
 )
 from app.api.routes import (
@@ -59,6 +60,19 @@ def _startup(settings: Settings) -> None:
         settings_store.encrypt_legacy_secrets(db)
         connection_service.warn_if_untrusted(db)
         bootstrap_admin_if_needed(db, settings)
+    _report_update_events()
+
+
+def _report_update_events() -> None:
+    """What the launcher did before this start (a switch, a rollback) goes into
+    the audit log and the notifications now. Never stops the app from starting."""
+    try:
+        from app.updates.service import get_service
+
+        with session_scope() as db:
+            get_service().report_launcher_events(db)
+    except Exception:  # noqa: BLE001 - reporting is best effort
+        logger.exception("Could not report the launcher's update events")
 
 
 @asynccontextmanager
@@ -138,6 +152,7 @@ def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) 
     api.include_router(settings_routes.router)
     api.include_router(dashboard.router)
     api.include_router(violations.router)
+    api.include_router(updates.router)
     app.include_router(api)
     app.include_router(health.router)
 

@@ -30,7 +30,7 @@ if [ -z "${CXCG_MASTER_KEY:-}" ] && [ -z "${CXCG_MASTER_KEY_FILE:-}" ]; then
         echo "CxCreditGuard: using the master key persisted at $KEY_FILE"
     else
         CXCG_MASTER_KEY="$(python -c 'import os,base64;print(base64.b64encode(os.urandom(32)).decode())')"
-        umask 177
+        umask 077
         printf '%s\n' "$CXCG_MASTER_KEY" > "$KEY_FILE"
         chmod 600 "$KEY_FILE"
         echo "CxCreditGuard: generated a new master key and stored it at $KEY_FILE"
@@ -72,7 +72,7 @@ while True:
 print(pw)
 PY
         )"
-        umask 177
+        umask 077
         printf '%s\n' "$CXCG_BOOTSTRAP_ADMIN_PASSWORD" > "$PW_FILE"
         chmod 600 "$PW_FILE"
         echo "CxCreditGuard: initial credentials -> username=$CXCG_BOOTSTRAP_ADMIN_USERNAME password=$CXCG_BOOTSTRAP_ADMIN_PASSWORD"
@@ -87,7 +87,16 @@ export CXCG_BOOTSTRAP_ADMIN_USERNAME CXCG_BOOTSTRAP_ADMIN_PASSWORD
 # copy (a new image started while the old container is still running) change
 # the schema underneath the first before being refused. Any other command, such
 # as one of the scripts, gets an up to date schema first.
+#
+# "launch" (the default command) starts the launcher: it runs the app version
+# selected on Settings -> Updates (or the image's own), health-checks a new one
+# and rolls back by itself if it does not come up. A plain "uvicorn ..." command
+# still works, without in-app updates.
 case "${1:-}" in
+launch)
+    # -I: no PYTHONPATH, user site, current or script folder on sys.path; -B: no bytecode.
+    exec python -I -B /usr/local/lib/cxcreditguard/launcher.py run
+    ;;
 uvicorn) ;;
 *)
     echo "CxCreditGuard: applying database migrations"

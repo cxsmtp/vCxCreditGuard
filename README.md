@@ -14,13 +14,129 @@ reversible from the GUI with one click.
 > the operator runbooks — written for administrators. Open it in any browser.
 > This README is the deeper architecture, security and configuration reference.
 
+## Features and limitations
+
+The same list is on the app's **About** page (Settings → About, or *About* in
+the user menu) and in the [User Guide](docs/user-guide.html#features). Each
+point links to the section below that explains it.
+
+### What it does
+
+**Measure and attribute**
+
+- Reads AI credit use from Checkmarx One on a schedule (every 15 minutes by
+  default) for every user, group, project and application
+  ([How usage is measured](#how-usage-is-measured)).
+- Matches each usage row to a Checkmarx user: exactly where it can, by name
+  similarity where not. Unsure matches wait for an admin to confirm
+  ([Attribution](#attribution)).
+- Can also charge a project's Auto Triage credits to the person whose scan set
+  it off, off by default ([Charging auto triage](#charging-auto-triage-to-the-person-who-started-the-scan)).
+- Overview of spend over time, by action type and by top consumers, with each
+  budget marked ([The GUI](#the-gui)).
+- Explains a figure: each budget shows what Checkmarx reported and what the
+  period's starting point discounted; `scripts/diagnose_usage.py` walks the
+  whole chain ([Runbook](#runbook-a-figure-on-screen-does-not-match-checkmarx)).
+
+**Budgets and requests**
+
+- Budgets per user, group, project or application: monthly, quarterly, a custom
+  range or lifetime.
+- A warning when usage reaches a set share of the budget (80% by default).
+- Every new budget only monitors until you switch it to enforce.
+- Exemptions, permanent or until a date, for people and projects that must
+  never be restricted.
+- Bulk edit, and import and export as CSV.
+- Credit requests: when an admin allows it, viewers ask for more budget; an
+  admin approves in full or in part, optionally until a date, or refuses with a
+  reason.
+- Optional automatic approval of small increases, up to a cap you set (off by
+  default).
+- Reports: where each budget is heading this period, chargeback by business
+  unit (with a cost per credit if you set one), and a weekly summary by email
+  (off by default).
+
+**Enforcement and safety**
+
+- At the limit, an enforcing budget removes a person's AI roles, or turns off
+  Auto Triage, PR triage and remediation and Fusion (your choice) on the
+  projects it covers ([What the enforcement actions actually are](#what-the-enforcement-actions-actually-are)).
+- Records what was there before every change; *Restore access* puts it back in
+  one click.
+- Gives access back by itself when usage drops under budget, the budget is
+  raised or a new period starts (unless the budget is set to hold until
+  released).
+- Simulation: a dry run of the next cycle showing who would be warned and
+  restricted, before anything happens.
+- Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users
+  and projects restricts nobody and pauses itself; a pause switch stops new
+  restrictions at once; protected roles (`ast-admin`, `iam-admin` by default)
+  are never restricted; a sudden fall in reported usage is held until later
+  readings confirm it ([Enforcement safety](#enforcement-safety)).
+
+**Watch and alert**
+
+- Reads each restriction back and puts it back if someone undid it in
+  Checkmarx One ([Policy violations](#policy-violations)).
+- Policy violations (admins only): settings switched back on, Fusion scans
+  during a restriction, usage still rising after one.
+- A Notification Center, with copies by email and webhook (optionally signed),
+  filtered by severity ([Notification delivery](#notification-delivery)).
+- Checks the API key's permissions and says what is missing before it matters
+  ([The key permission check](#the-key-permission-check)).
+- An audit log of every action and change, hash-chained so that an edited or
+  deleted entry can be detected.
+
+**Operate**
+
+- Runs on your own server: one container with SQLite, or Compose with
+  PostgreSQL behind an HTTPS proxy ([Deploy](#deploy)).
+- Admin and viewer accounts, two-factor sign-in with recovery codes, password
+  reset by email ([Accounts](#accounts)).
+- In-app updates for the single container: signed releases, installed in a
+  quiet hour, rolled back if the new version does not start ([Updates](#updates)).
+- Configuration backup (settings, budgets, exemptions) to download, email or
+  restore; Compose also dumps the database daily ([Backup and restore](#backup-and-restore)).
+- Demo mode with made-up data that never touches a tenant
+  ([Trying it without a tenant](#trying-it-without-a-tenant)).
+- Two looks, Standard and Command Center, each in light and dark.
+
+**What it connects to.** Your Checkmarx One tenant; your mail server and your
+webhook, only if you set them up; and, only with a registry token entered under
+Settings → Updates, GitHub's container registry (`ghcr.io` and
+`pkg-containers.githubusercontent.com`) to check for and download releases. No
+telemetry, no analytics, and nothing else is contacted.
+
+### Limitations
+
+| Limitation | What it means for you |
+| ---------- | --------------------- |
+| **It acts once a cycle**, not the moment credits are spent. | Usage is read and budgets judged once a cycle (every 15 minutes by default), and Checkmarx can report credits a little after they are spent. Usage in between can take a budget past its limit before the restriction lands, so leave some headroom. A large group or application is restricted over several cycles (at most 1,000 changes a cycle by default; [Sizing and scale](#sizing-and-scale)). |
+| **It restricts access, it does not meter credits.** | It removes roles and turns settings off; it cannot stop an action already running or cap a budget to the exact credit. |
+| **Only roles held directly are removed.** | An AI role a person holds through a group or a composite role stays in effect. CreditGuard says so once and never changes the group or role, because that would affect everyone in it. Remove it there in Checkmarx One, or exempt the person ([Restricting a user, in detail](#what-the-enforcement-actions-actually-are)). |
+| **A project budget does not stop people's own AI Triage and AI Remediation.** | Turning project features off leaves what people start themselves working; only a user budget stops that ([What the breach and restriction messages say](#what-the-breach-and-restriction-messages-say)). |
+| **Account-wide Auto Triage may override a project.** | If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project. |
+| **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
+| **The general Risk Management roles are used for now.** | AI Triage and AI Remediation are reached through them today, so a restricted person also loses the Risk Management pages and dashboard. When Checkmarx One's dedicated AI permissions reach your tenant, swap them in under Settings → Enforcement, *Roles a user restriction removes*. |
+| **Figures only cover Checkmarx's lookback window.** | Checkmarx reports totals over a window (at most the last year), not individual events. "Lifetime" means everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened, unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
+| **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution). |
+| **It cannot say who undid a restriction.** | Checkmarx One does not report who switched a setting back on. By default each restriction is read back once an hour (`verify_interval_minutes`), so a setting switched back on can stay on for up to about that long, and one undone and redone between two read-backs is not seen. |
+| **Some Checkmarx behaviour is not yet verified on a real tenant.** | Where a person's roles come from (groups, composite roles); the Fusion lock and the repository's Fusion setting; usage rows per group (only ever seen empty; the sum of its projects is used instead); paging of a very long user list; finding a project's repository (without it, PR triage and remediation is skipped there); the names of the default protected roles (check them against your tenant); whether a Fusion setting the project inherited can inherit again after Restore (for now it is restored on the project itself). Each degrades safely and says so rather than guessing ([Remaining unknowns](#remaining-unknowns)). |
+| **Tested to 2,000 projects on a synthetic tenant.** | Load tested with 2,000 projects and 1,000 users made up for the test, not on a real tenant of that size. Use PostgreSQL above about 500 projects or 300 users ([Sizing and scale](#sizing-and-scale)). |
+| **One instance only.** | A second copy against the same database refuses to start. Availability comes from restarting the one copy, not from running several ([One instance only](#one-instance-only)). |
+| **The database is the only record of how to undo a restriction.** | The in-app backup holds configuration only. Back the database up; after restoring an older one, restrictions made since it was taken have to be given back by hand in Checkmarx One ([Backup and restore](#backup-and-restore)). |
+| **Updates are only as trustworthy as the release signing key.** | Until the image carries the release signing key, auto-update installs nothing and a manual install cannot be verified. Updates need a registry token, and only the single container updates itself: Compose shows the steps instead. Operating system, Python and OpenSSL fixes need a new image ([Updates](#updates)). |
+| **The audit log is tamper-evident, not tamper-proof.** | An edited or deleted entry is detected, but someone with full write access to the database could rewrite the whole chain. |
+
 ## High-level architecture
 
 CxCreditGuard is **one deployable unit**: a FastAPI backend that also serves the
 React single-page app from the same origin, a background scheduler running in the
 same process, and a database (SQLite by default, PostgreSQL for the hardened
-deployment). It talks to exactly one external system — the Checkmarx One APIs —
-and it does so only through a single hardened HTTP client.
+deployment). The external system it works with is Checkmarx One, reached only
+through a single hardened HTTP client; beyond that it sends mail and webhooks
+only when they are set up, and the in-app updater reads GitHub's container
+registry only once a registry token is entered (see [Updates](#updates)).
 
 Everything of consequence happens in one loop, `services/cycle.py`, run on a
 schedule or on demand via `POST /api/ops/run-cycle`:
@@ -109,6 +225,11 @@ total from **416 to 237**:
   coreutils, tar) was the source of ~175 OS-package CVEs; Alpine carries a small
   fraction. psycopg runs in its pure-Python mode against the system `libpq`, since
   `psycopg[binary]` ships glibc-only wheels.
+  Since then the runtime base is `python:3.13-alpine3.24` (the 3.11 images still
+  carry pip 24.0, setuptools and wheel with known CVEs), the build runs
+  `apk upgrade` so the base's OS packages take Alpine's later fixes, and every
+  base image (Python, Node, `postgres:16.16-alpine3.24`, the proxy's
+  `nginx:1.30.8-alpine3.24-slim`) is pinned by tag and digest.
 - **IaC (KICS).** `HEALTHCHECK` on both images; the unpinned `apt-get install curl`
   layer removed (the health check uses the bundled interpreter); `cap_drop: ALL`
   plus a minimal `cap_add` and `no-new-privileges` on the `db` and `proxy`
@@ -149,7 +270,8 @@ timestamps and no project ids in the user view. So per-period usage cannot be
 summed from events. Instead:
 
 1. Each cycle polls the endpoint per dimension and stores the reported totals
-   (`usage_snapshot` and `usage_record`, with the raw payload kept for audit).
+   (`usage_snapshot` and `usage_record`, with each row's raw payload kept for a
+   week for audit; see [Data retention](#data-retention)).
 2. When a budget period opens, the total reported at that moment becomes the
    period's **baseline**.
 3. Usage for the period is `latest reported total - baseline`.
@@ -298,8 +420,14 @@ counted and the per project parts all from the same rebuild); the period's
 `credits_used` is from its last evaluation and catches up at the next cycle, for
 example after an initiator is mapped (`evaluated_counted` shows what it included).
 
-**Bounded and crash safe.** Listing is paged and capped (50 projects and 300
-requests per cycle, 500 scans per project interval). Scans are listed newest
+**Bounded and crash safe.** Listing is paged and capped
+(`attribution.max_projects_per_cycle` projects and
+`attribution.max_requests_per_cycle` requests per cycle, 150 and 600 by default;
+500 scans per project interval). The work waiting longest goes first, new
+increases and history estimates alike, so a capped cycle leaves the newest
+work and nothing waits for ever; the step's record says how much is left
+(`backlog`), how long the oldest has waited (`oldest_waiting_minutes`) and
+within how many cycles each is reached at this backlog (`each_within_cycles`). Scans are listed newest
 first by when they were created, so an interval is listed back to four hours before
 it opened, enough for a long SAST scan of a large repository to finish inside it. The
 listing does not ask the server to filter by date (the pages read are the same), so
@@ -369,7 +497,7 @@ status, and the Settings page groups them into **Disputes**, **Auto-matched** an
 
 | Level breached | What changes |
 | -------------- | ------------ |
-| User | The AI roles (`view-risk-management`, `view-risk-management-dashboard`, `view-risk-management-tab`) are unmapped from the user on the `ast-app` client. Nothing else is touched: whether the user can view scans (`view-scans`) stays whatever their Checkmarx permission says |
+| User | The AI roles are unmapped from the user on the `ast-app` client: the list under Settings → Enforcement (*Roles a user restriction removes*, API field `ai_roles`), by default `view-risk-management`, `view-risk-management-dashboard`, `view-risk-management-tab`. Only roles mapped to the user **directly** can be removed; one held through a group or a composite role is reported, not taken (see below). Nothing else is touched: whether the user can view scans (`view-scans`) stays whatever their Checkmarx permission says |
 | Project | What the limit's **What to turn off for projects** choice selects (`project_actions`): **Auto Triage** is disabled via `PUT /api/ai-agents-coordinator/projects/{id}/configuration`; **PR triage and remediation** is disabled by clearing `remediationSeverities` via `PATCH /api/repos-manager/repo/{repo_id}?projectId={id}`; **Fusion** is turned off by writing `scan.config.ai.fusionEnabled` = `"false"` via `PATCH /api/configuration/project?project-id={id}` and, for a project with a repository, `fusionScanConfig.enabled` = `false` via the same repos-manager `PATCH` |
 | Group | The chosen project actions, on every project in the group |
 | Application | The chosen project actions, on every project in the application |
@@ -393,6 +521,122 @@ flag **and its full config**, the prior severity list, and for Fusion the whole
 repository's prior `fusionScanConfig`. Restore replays that snapshot. A feature
 that was already off before the utility touched it stays off afterwards, and a
 restore never resets branches, severity levels or the Fusion model.
+
+**Restricting a user, in detail.**
+
+* **Which roles.** The default three are *general* Risk Management roles: AI
+  Triage and AI Remediation are reached through them today, so a person
+  restricted also loses the Risk Management pages and dashboard. Settings →
+  Enforcement, *Roles a user restriction removes* (setting
+  `enforcement.ai_roles`, API field `ai_roles`), changes the list. Names are
+  checked against the roles the tenant actually has on `ast-app`
+  (`GET /api/settings/client-roles`, admins only, cached for a minute, never an
+  error when IAM cannot be read; while it cannot, only names already in the
+  list or the defaults are accepted). An empty list is refused, and so is a
+  protected role (its holders are never restricted, so naming it would make a
+  restriction do nothing for them; protecting a role the list names is refused
+  the same way). A role that looks like an administration role (`*admin*`,
+  `manage-*`, `realm-*`, `iam-*`) is saved only with an explicit confirmation
+  (API field `confirm_admin_roles: true`; the picker marks such roles and asks
+  first). An upgrade changes nothing: the default is the three roles above.
+* **10 January.** Checkmarx One is to ship dedicated AI Triage and AI
+  Remediation permissions and roles on 10 January. When they are on your
+  tenant, add them to the list and remove the general ones: no code change is
+  needed.
+* **A change applies to restrictions made from then on.** Every user
+  restriction records the list it used (`ai_roles` on its undo snapshot).
+  Restore gives back exactly the roles that restriction recorded as removed; the
+  drift check looks for those roles only; and the pass that returns roles an
+  earlier version should not have taken (`view-scans`, once) goes by the
+  recorded list too, the default one for a restriction made before the list
+  was a setting. Protected roles work as before.
+* **Where each role comes from.** Before restricting, CreditGuard reads, best
+  effort: the user's direct client role mappings (as before), their effective
+  client roles (`GET .../users/{id}/role-mappings/clients/{clientUuid}/composite`),
+  their groups (`GET .../users/{id}/groups`) with the parent groups worked out
+  from the group paths (`GET /auth/realms/<tenant>/groups`) and each group's
+  client role mappings (`GET .../groups/{id}/role-mappings/clients/{clientUuid}`),
+  and which composite roles contain an AI role
+  (`GET .../clients/{clientUuid}/roles/{roleName}/composites`). These follow
+  Keycloak's admin REST API (Checkmarx One's IAM is Keycloak based) and are
+  **not verified on a real Checkmarx One tenant**: any refusal (403), 404 or
+  other failure only means *source unknown*, is listed on the record
+  (`role_sources_unread`), never stops the restriction and is not reported on
+  the key permission check (the platform client and its role list, which the
+  key is checked for, still are). The reads are bounded: at most 50 of a
+  user's groups (the rest are listed as not read), composite roles followed 4
+  levels deep (deeper nesting is listed as not read), and only the composite
+  children that belong to `ast-app` (matched by client id, never by name).
+  Realm-level composite roles (a realm's default roles, for example) are not
+  traversed: an AI role held through one shows as *source unknown*.
+* **What is removed.** Only the AI roles mapped to the user directly. A role
+  still held through a group or a composite role stays effective however the
+  direct mapping is changed, so for that role the restriction **is not
+  effective**. It is recorded on the action (`kept_effective`, with each
+  source), said once in a notification (*<user> keeps <role> through group
+  <name> / role <name>; CreditGuard removed only the direct mapping. Remove it
+  from the group or role in Checkmarx One, or add the user to an exemption*),
+  and audited once (`enforcement.not_effective`). CreditGuard never changes a
+  group or a composite role: that would take the role from everyone else who
+  holds it that way. It is not re-notified each cycle.
+* **Read back.** After the direct mappings are removed, the effective roles are
+  read back once (the direct mappings when the effective ones cannot be read;
+  nothing is then reported as kept, and the unread read-back is listed).
+  A removed role still read as held for no reason that can be seen is in doubt,
+  as with Fusion: the first time is a quiet retry on the next cycle; the second
+  time it is recorded as kept through a source that cannot be seen. A role still
+  mapped directly on two consecutive read-backs means the tenant did not keep
+  the removal: said once (*AI role removal not kept*), not sent again this
+  period, still restorable.
+* **Drift.** A role of the recorded list mapped to the user directly again is
+  drift, as before. A role effective only through a group or a composite role is
+  not drift: it was reported when the restriction was applied. Nor is usage by
+  a person who keeps an AI role that way a *usage kept rising after a
+  restriction* violation.
+* **Simulation.** The Simulation page and the blast radius in the limit form
+  show, for each user who would be restricted, the roles that would be removed
+  (with what each grants: its composite children, and for the default three
+  *Risk Management pages and dashboard; AI Triage/Remediation are reached from
+  here*), the roles that would stay effective and where from, and what could
+  not be read. Admins only: a viewer sees which roles a restriction removes,
+  and no IAM read is made for them. The tenant is read best effort for the
+  request: at most 50 users per preview (the page says when it stopped there),
+  each read tried once with a 5 s timeout, 10 s in all, and nothing more once
+  IAM does not answer (the remaining users say *not read: Checkmarx IAM did not
+  answer*). A user already restricted is not read again (*already
+  restricted*). A user's reading is reused for a minute (dropped when the
+  connection changes). Not read at all in demo mode or without a connection.
+
+**Auto Triage and PR triage and remediation are read back.** Both writes are
+read back once, like Fusion's: what was there before always stays on the
+record, so Restore stays exact. Still on (Auto Triage) or still listing
+severities (PR triage and remediation) straight after the write, the outcome is
+in doubt and the next cycle tries again, quietly. Still so after that attempt
+too:
+
+* Auto Triage is taken to be **set account-wide** ("select all") with the
+  project unable to override it: said once (*<project>: Auto Triage is set
+  account-wide*, audit `enforcement.not_restricted`), the action stays
+  restorable, the write is not sent again for the rest of the period, and it is
+  never a policy violation every cycle. The configuration's `allowOverride`
+  (seen as `{"projects": false, "branches": true, ...}` on a project-scope read)
+  is recorded verbatim on the action (`auto_triage_allow_override`, and
+  `auto_triage_allow_override_read_back`); its meaning is not documented and is
+  not interpreted. The Simulation page says that turning Auto Triage off *may
+  not hold* for a project whose latest restriction (in its limit's current
+  period, else the latest one) found it set account-wide; or, softly (*not
+  verified yet*), for one whose latest restriction is not applied, was not read
+  back, and was read with `allowOverride.projects` false. That shape is the
+  ordinary one, so an applied restriction never warns because of it. A later
+  read that shows Auto Triage off on the project (a restriction applied and
+  read back off, or one verified to hold) withdraws an earlier account-wide
+  conclusion.
+* PR triage and remediation is taken not to be kept by the tenant: said once
+  (*PR triage and remediation change not kept*), restorable, not sent again
+  this period.
+
+A read-back that fails says nothing either way; the drift check reads the
+setting again next cycle.
 
 **Turning Fusion off, in detail.** One kind per write, like the other halves:
 `disable_fusion` (the project's scan setting) and `disable_repo_fusion` (the
@@ -502,6 +746,17 @@ podman volume create cxcreditguard-data
 podman run -d --name cxcreditguard --restart unless-stopped \
   -p 8000:8000 -v cxcreditguard-data:/app/data cxcreditguard:podman
 ```
+
+Or run a published release instead of building one (the package is private: log
+in with a GitHub token that has `read:packages`, see [Updates](#updates)):
+
+```sh
+podman login ghcr.io
+podman run -d --name cxcreditguard --restart unless-stopped \
+  -p 8000:8000 -v cxcreditguard-data:/app/data ghcr.io/cxsmtp/vcxcreditguard:latest
+```
+
+From then on it updates itself (Settings → Updates).
 
 | Action | `make` | `run.bat` | `run-podman.ps1` |
 | ------ | ------ | --------- | ---------------- |
@@ -698,15 +953,24 @@ backend/app/
                  applications, AI toggles, Fusion settings), credits (pool,
                  action rates), scans
   services/      connection, auth, audit, org_sync, ingestion, periods,
-                 evaluation, enforcement, violations, usage_mix,
-                 limits_service, notifications, settings_store, cycle
+                 evaluation, enforcement, role_sources (where a user's
+                 roles come from), violations, usage_mix, limits_service,
+                 notifications, settings_store, pacing (per-cycle budgets and
+                 rotation for large tenants), cycle
+  updates/       in-app updates: GHCR client, release manifest and signature,
+                 installed versions, check / install / rollback / auto-update
   scheduler.py   APScheduler wiring, reconfigurable at runtime
   api/           dependencies (auth, CSRF, RBAC), middleware, routes
   schemas/       request and response models with strict validation
   static/        the built SPA (produced by the frontend build, not in git)
 alembic/         migrations
-scripts/         seed_demo.py, for a tenant-free demo database
+scripts/         seed_demo.py, for a tenant-free demo database; loadtest.py,
+                 the load test (see Sizing and scale); release_manifest.py
+                 and release_keygen.py, for signed releases
+cxcg_launcher.py the single image's main process: runs the selected version,
+                 rolls back one that does not come up (standard library only)
 tests/           unit, service and API tests, plus the in-memory fake tenant
+                 and its 2,000-project synthetic variant (scale_tenant.py)
 
 frontend/src/
   api/           typed fetch client with CSRF handling, response types
@@ -730,7 +994,10 @@ Two design decisions worth knowing before reading the code:
 **Sync I/O throughout.** This is a single tenant admin tool whose busiest hour
 involves a handful of admins and one scheduler thread. Sync SQLAlchemy and
 `httpx.Client` remove a whole class of async footguns (accidental blocking
-calls, session sharing across tasks) at no practical cost.
+calls, session sharing across tasks) at no practical cost. The one exception is
+bounded: independent read-only Checkmarx calls of a cycle (verification
+read-backs, scan listings) are made a few at a time on worker threads that
+never touch the database (`pacing.parallel_map`).
 
 **One HTTP client for all Checkmarx traffic.** `app/checkmarx/client.py` owns
 base URL selection, token injection, re-authentication on 401, retry with
@@ -814,6 +1081,38 @@ the normal cycle. Five safeguards are worth knowing:
    the only code anywhere that deletes audit rows, and it writes an entry stating
    the counts, so the log always explains its own gaps.
 
+Consumption readings are most of the database (one row per user, project,
+application and group per cycle), so two more things keep them in check, both
+summarised in the prune's audit entry (`thinned_snapshots`, `raw_cleared_records`,
+`pinned_snapshots`):
+
+* **Raw rows are kept for a week.** Each reading stores every row as Checkmarx
+  sent it (`usage_record.raw`) next to the parsed figures. After 7 days the raw
+  copy is cleared, except where something still reads it: the latest reading of
+  each dimension, the readings an open budget period's usage breakdown starts
+  from (the Fusion model of each scan is only in the raw row), the baseline of a
+  restriction in force, and rows that matched no user, project or application.
+  The response pages of a reading (`usage_snapshot.raw`) are no longer stored at
+  all, except for a held reading (the evidence of a collapsed answer, which has
+  no rows). Cleared in batches, at most 20,000 readings a run, oldest first; a
+  reading passed over while something referred to it is cleared once nothing does.
+* **Old readings are thinned** (*Thin old consumption readings*, Settings →
+  General, on by default): every reading of the last 3 days is kept, then one an
+  hour per dimension up to 40 days, then one a day. The tiers are a choice of
+  resolution for the trend and for reading the history; correctness rests on
+  the pins: a reading any calculation refers to is never removed, whatever its
+  age: the latest of each dimension and lookback window, each restriction's
+  baseline (the reading a rise in usage since it was applied is measured from,
+  see [Policy violations](#policy-violations)), and the readings open periods'
+  usage breakdowns start from. Auto-triage charges and each project's
+  auto-triage cursor record a reading's id but never read it back, so they pin
+  nothing (the charges themselves are kept, for the consumption window). Whole
+  readings only, never single rows; held and demo readings are never thinned.
+  Deleted in batches of 100 readings, a transaction each, at most 20,000 a run;
+  the retention window's own prune deletes in batches of 1,000 (never one list
+  of ids, which PostgreSQL limits to 65,535). Off: every reading is kept for the
+  whole retention window, as before.
+
 ## Configuration
 
 Every variable is documented in [.env.example](.env.example). The ones that
@@ -832,6 +1131,9 @@ change behaviour most:
 | `CXCG_CX_ALLOWED_HOSTS` | none | Extra Checkmarx One hostnames to accept. Tenant URLs must be `https` and end in `checkmarx.net`; a dedicated or private host has to be listed here or the connection is refused. |
 | `CXCG_SMTP_CA_FILE` | system CAs | CA bundle used to verify the mail server's certificate, for a server with a private CA. |
 | `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP_DAYS` | 24 / 14 | Compose only: how often the database is dumped and how long dumps are kept. |
+| `CXCG_DATA_DIR` | `./data` (`/app/data` in the image) | Where installed versions, the launcher's state and pre-update backups are kept. |
+| `CXCG_UPDATE_START_TIMEOUT` | 180 | Seconds a newly installed version has to answer its health check before the launcher rolls it back. |
+| `CXCG_UPDATE_PUBLIC_KEY` | the image's key | Release signing public key (PEM), instead of the image's own `/app/app/updates/release-signing-key.pub` (never one from the data volume). Without either, nothing is installed automatically. |
 
 ## Security posture
 
@@ -946,6 +1248,7 @@ The key needs to reach these endpoints:
 | Credit usage | `GET /api/credits/consumption` | Read credit consumption |
 | Scans (only with auto-triage charging on) | `GET /api/scans/`, `GET /api/ai-agents-coordinator/projects/{id}/configuration` | Read scans and project configuration |
 | Role mapping (enforce mode only) | `GET`/`POST`/`DELETE` `/auth/admin/realms/<tenant>/users/{id}/role-mappings/clients/{clientUuid}`, plus `GET .../clients` and `GET .../clients/{uuid}/roles` | IAM admin, sufficient to manage role mappings |
+| Where a user's roles come from (optional, enforce mode and Simulation) | `GET .../users/{id}/role-mappings/clients/{clientUuid}/composite`, `GET .../users/{id}/groups`, `GET .../groups/{id}/role-mappings/clients/{clientUuid}`, `GET .../clients/{clientUuid}/roles/{roleName}/composites` (Keycloak admin API, unverified on Checkmarx One) | IAM admin, read users, groups and roles; without it the source of a role is *unknown* and nothing else changes. Not part of the key permission check |
 | Project AI toggles (enforce mode only) | `GET`/`PUT` `/api/ai-agents-coordinator/projects/{id}/configuration`, `PATCH /api/repos-manager/repo/{repoId}?projectId={id}` | Manage project configuration |
 | Fusion (enforce mode, limits that turn Fusion off) | `GET`/`PATCH` `/api/configuration/project?project-id={id}`, and the repos-manager `PATCH` above for `fusionScanConfig` (unverified) | Read and manage project configuration |
 | Credits per action (optional) | `GET /api/v1/credits/action-rates` | Read credits; without it Fusion is given as transaction counts |
@@ -1078,6 +1381,11 @@ counted as *could not verify* in the cycle's result. It is no longer reported as
 *re-disabled*: only a setting actually read back as switched on again is drift.
 The first such re-apply of a restriction is audited
 (`enforcement.reapplied_unverified`), once per restriction, not every cycle.
+Such a restriction is written again at most once per verification interval
+(it then moves behind the others in the rotation), and only after the cycle's
+new restrictions, so an unreadable setting never takes the budget a new
+breach needs; it stays counted, and the daily "not read back" notification
+names it.
 
 Projects the key cannot see are projects whose usage cannot be counted. The org
 sync reports that as a warning rather than undercounting quietly.
@@ -1085,9 +1393,11 @@ sync reports that as a warning rather than undercounting quietly.
 ## Policy violations
 
 CreditGuard does not rely on Checkmarx One keeping a restricted setting off.
-Every cycle it reads each restriction in force back and applies it again if it
-was undone (the drift check above), so a setting switched back on holds for one
-interval at most. What it finds is recorded on the **Violations** page (main
+It reads each restriction in force back and applies it again if it was undone
+(the drift check above), in rotation: each at least every
+`verify_interval_minutes` (60 by default; 0 reads every restriction every
+cycle; see [Sizing and scale](#sizing-and-scale)), so a setting switched back
+on holds for about that long at most. What it finds is recorded on the **Violations** page (main
 menu, admins only; *Policy violations* in Jump to), for an admin to follow up:
 
 | Kind | What is detected | When |
@@ -1100,9 +1410,12 @@ menu, admins only; *Policy violations* in Jump to), for an admin to follow up:
 
 Scans are listed newest first from the later of the restriction's
 `applied_at` and the newest scan already looked at (a per-project cursor),
-bounded like the auto-triage reads: 50 projects, 2 pages per project and 50
-single-scan reads (for a listing that leaves the scan's settings out) per
-cycle. Each scan is reported once whatever happens (a unique key per finding),
+bounded: `violations.max_projects_per_cycle` projects (150 by default; the
+ones checked least recently first, so each restricted project is listed at
+least every ceil(restricted / 150) cycles, and the cycle record says how often:
+`each_checked_every_cycles`, `oldest_check_minutes`), 2 pages per project and
+50 single-scan reads (for a listing that leaves the scan's settings out) per
+cycle. The listings are made `cycle.read_concurrency` at a time. Each scan is reported once whatever happens (a unique key per finding),
 with its final classification, and a scan already recorded is never read
 again. A scan still queued or running (for up to a day), or one whose settings
 could not be read this cycle, is not recorded yet: it is kept by id as pending
@@ -1278,7 +1591,8 @@ restart.
 
 ### Upgrading
 
-Take a backup, pull the new source, `podman compose up -d --build`. Migrations
+The single container updates itself (see [Updates](#updates)). Compose: take a
+backup, check out the release tag, `podman compose up -d --build`. Migrations
 run at start. Coming from a version before the production hardening, check
 these, because each one can stop something that used to work:
 
@@ -1331,6 +1645,245 @@ these, because each one can stop something that used to work:
   `history_ceiling`; a row from before it (null) bounds the estimate by the current
   reading until the next fall sets it, and a restart sets it at once.
 
+### Updates
+
+Releases are published as a **private** container image,
+`ghcr.io/cxsmtp/vcxcreditguard:<version>` (and `:latest`), and the single
+container installs them itself from **Settings → Updates** (admins only).
+**Auto-update is on by default, but installs nothing until the image has a
+release signing key** (see *Signing* below).
+
+**How it works.** The image's main process is a small launcher
+(`backend/cxcg_launcher.py`, standard library only). It runs the version selected
+on the Updates page from the data volume (`/app/data/versions/<version>/`), or the
+image's own copy in `/app` (owned by root and read-only for the app's user).
+Installing a release:
+
+1. reads the release's image from the registry and downloads **only its app
+   layer** (the last layer of the image, a few MB). Every answer is read as sent
+   (`Accept-Encoding: identity`; an encoded answer is refused) and reading stops
+   at a size limit; every blob is checked against its sha256 digest; the layer
+   is read once, front to back, refusing paths outside the app folder, links and
+   special files, and stopping at size limits (decompressed size included).
+   Unpacking happens in memory: nothing is written yet;
+2. verifies the release's file list (`release-manifest.json`: **every** file the
+   release ships and its sha256, nothing excluded) and its ed25519 signature
+   (see *Signing*). Only the files the verified list names are written to the
+   data volume, each matching its sha256: a release holding any other file, or
+   any compiled bytecode (`*.pyc`, `__pycache__`), `.pth` file or
+   `sitecustomize`/`usercustomize` module (listed or not), is refused as a whole
+   and nothing of it is written. Its *signed* dependency hash must be this
+   image's (see below);
+3. waits for any running enforcement cycle, backs the database up
+   (`/app/data/backups/pre-update-*.sqlite3`, the last three are kept), selects
+   the new version and asks the launcher to switch, a second and a half later
+   so the page gets its answer first. The page reconnects in a few seconds;
+   migrations run as the new version starts, as on any start;
+4. the launcher checks the installed files again before **every** start - the
+   first, a switch, a restart after a crash, a rollback: exactly the listed
+   files, each matching; when the image has a signing key, the signature (over
+   the very manifest bytes whose file list, version and dependency hash it then
+   uses) against **the image's** key; a manifest, and an `app/__init__.py`, for
+   the version that was selected (an older signed release copied under a newer
+   name is refused); and this image's dependency hash. Any difference (an extra
+   file included) and the version is not run: the image's own runs and the
+   version is marked *failed to start*. The checked files are then **copied** to
+   a private folder outside the data volume (`/tmp/cxcreditguard-run`, mode
+   0700), each hashed again as it is copied, and made read-only (files 0400,
+   folders 0500); the version runs from that copy. A file written to the data
+   volume after the check, a module the app imports late included, is therefore
+   never run, and a file changed between the check and the copy refuses the
+   version. It runs as
+   `python -I -B -X pycache_prefix=/dev/null/... launcher.py serve --app-dir <copy>`:
+   an isolated interpreter (no `PYTHONPATH`, no current or script folder on
+   `sys.path`) that writes **and reads** no bytecode (the cache prefix cannot
+   exist, so a planted `__pycache__/*.pyc`, unchecked-hash ones included, is
+   never loaded), in which the version's folder is *appended* to `sys.path`,
+   after the standard library and the image's packages, and serves only the
+   `app` and `scripts` packages. Nothing is imported from the data volume
+   (`/app/data`, which sits inside the image's `/app`, is not importable), and
+   nothing in it runs at interpreter start. Migrations run in the same process
+   and leave `sys.path` alone. *What this does not cover:* the launcher and the
+   app run as the same user (uid 10001; the image never runs as root), so code
+   that already runs as the app - the app itself, compromised - could change its
+   own copy or the data volume; the read-only modes stop a bug that can only
+   write files, not code that can change modes. If the container's temporary
+   folder cannot be used (a read-only root file system without a writable
+   `/tmp`), the version runs from the data volume after the same check, and the
+   launcher logs it;
+5. the new version is **on trial** until `/healthz` answers with its version. If
+   it exits first, or does not answer within 180 seconds
+   (`CXCG_UPDATE_START_TIMEOUT`), the launcher stops it, puts the pre-update
+   database backup back **if the new version changed the schema**, runs the
+   previous version again and marks the new one *failed to start*: auto-update
+   never installs it again. A version that passed its health check and then
+   stops 3 times within 10 minutes is rolled back the same way, except that the
+   launcher never restores a backup by itself then (it reports it instead). The
+   rollback is audited and notified, saying whether data written since the
+   update was lost. When the launcher puts a backup back it first keeps a copy of
+   the replaced database (taken through SQLite, so what was only in its
+   write-ahead log is kept too) and removes the old `-wal`/`-shm` files before
+   the backup is moved in.
+
+The data volume keeps the running version, the one before it and the image's
+own; older installed versions are removed. A full or read-only data volume does
+not stop the launcher: it logs, and runs the image's own version when it cannot
+read or record a selection.
+
+**Signing.** Each release's file list is signed in the release workflow with an
+ed25519 key; installations check it against the public key **of the image they
+run on** (`/app/app/updates/release-signing-key.pub`, or
+`CXCG_UPDATE_PUBLIC_KEY`), never a key from the data volume or a downloaded
+version, so a release cannot bring its own key.
+
+- **Image without a key** (the placeholder file): auto-update installs
+  nothing; the Updates page and the top bar say *Auto-update waits for the
+  release signing key* and admins get one notification. An admin can still
+  install a release by hand after a warning that it cannot be verified and an
+  explicit confirmation (`allow_unsigned`), which is audited
+  (`update.unsigned_install_confirmed`). **Until the image has a key, nothing
+  proves where a release came from:** the launcher's check before each start
+  then only proves that the installed files match the manifest stored next to
+  them, in the same writable folder - it catches damage and stray files, not a
+  deliberate replacement of both. Auto-update stays off until a key is in the
+  image.
+- **Image with a key:** automatic and manual installs both require a signature
+  that verifies; an unsigned release is always refused.
+- **A key that is set but unusable** (`CXCG_UPDATE_PUBLIC_KEY` that is not an
+  ed25519 public key in PEM form, or a key file with anything but comments and
+  such a key) is never read as "no key", and never falls back to the image's
+  file: every install, manual ones included, is refused, the Updates page and
+  the top bar say *The configured release key is invalid*, and the launcher runs
+  only the image's own version (installed versions are not marked failed: they
+  run again once the key is fixed).
+
+**Automatic updates.** The registry is checked every 6 hours (and a minute after
+start); *Check now* is limited to once per 30 seconds. A newer release installs
+only in the **quiet hour** (default 03:00 UTC), never while an enforcement cycle
+runs, never a version that failed to start here or that an admin rolled back
+(below), and never an older one. When the newest release needs a new image, the
+newest one that fits this image is installed, if there is one (and admins are
+told about the newer one). On PostgreSQL a release that changes the schema is
+recognised from its `io.cxcreditguard.migrations` label before anything is
+downloaded: it is not installed automatically, admins are notified once, and it
+installs by hand after confirming a backup of their own. Turn auto-update off,
+or move the hour, on Settings → Updates; when off, admins are notified once when
+a release is published and install it from the page. Every action (check,
+install, switch, rollback, token and setting changes) is in the audit log;
+installed, rolled back, *needs a new image*, *waits for the signing key* and
+*token refused* are also notifications.
+
+**Rolling back.** *Roll back* on the Updates page returns to the version that ran
+before the last update. If the database schema changed since that update, the
+backup taken before it is restored: **everything written since the update is
+lost** (usage readings, budget changes, requests, audit entries), and the page
+says so and asks for confirmation. The replaced database is kept in
+`/app/data/backups/` for manual recovery. Without a schema change the database
+is kept as it is. If the backup cannot be put back, the version the rollback
+started from keeps running. The version rolled back from is **skipped**:
+auto-update does not install it again (the page shows *Skipped after rollback*)
+until an admin installs it by hand or a newer release supersedes it. The list
+is kept in `/app/data/updates/skipped.json`, apart from the versions that
+failed to start (`failed.json`).
+
+**When the image itself must be replaced.** Each image carries a *dependency
+hash* (`io.cxcreditguard.deps`, also inside the signed file list): the base
+image **by digest** (`python:3.13-alpine3.24@sha256:…`), the OS packages installed on
+it (`apk info -v`), the pinned Python packages, the launcher and the entrypoint.
+A release with a different signed hash cannot run as a layer on this image; the
+page says *needs a new image*, notifies admins once and shows the command. So
+the small in-place update applies to releases that change only the app and are
+built on the **same base**: the release workflow reuses the latest release's base
+digest unless the tag's message has a line `base: refresh`, which builds on the
+base tag's current digest (OS, Python, OpenSSL fixes) and makes that release a
+full image replacement. Even on the same base, a new revision of an OS package
+installed on it (libpq, or a fix the build's `apk upgrade` takes) changes the hash: such a release is a replacement too.
+When the newest release needs a new image, auto-update installs the newest one
+that does fit, if any, whether the label or the signed file list said so.
+
+```sh
+podman login ghcr.io   # a GitHub user and the read:packages token
+podman pull ghcr.io/cxsmtp/vcxcreditguard:1.2.3
+podman rm -f cxcreditguard
+podman run -d --name cxcreditguard --restart unless-stopped \
+  -p 8000:8000 -v cxcreditguard-data:/app/data ghcr.io/cxsmtp/vcxcreditguard:1.2.3
+```
+
+The data volume carries over; a replaced image runs its own version unless an
+installed one is newer and built for the same dependencies.
+
+**OS, Python and OpenSSL fixes arrive only by replacing the image.** In-app
+updates replace the app's own files, never the operating system, Python or
+OpenSSL beneath them. Because the base image's digest and the OS packages are in
+the dependency hash, a release built on a patched base says *needs a new
+image*. Independently, when the running image's OS packages are **more than 90
+days old** (recorded at build time in
+`/usr/local/share/cxcreditguard/image.json`), the Updates page and the top bar
+say *Image is N days old* and show the command to replace it. Replace the image
+at least that often, and whenever a base-image security advisory applies.
+
+**Compose and source installations** are not updated in place: there is no
+launcher and the database is PostgreSQL, which the app cannot back up itself.
+The Updates page still checks (with a token) and notifies, and shows the steps:
+`git fetch --tags && git checkout v<version>`, then
+`podman compose up -d --build`, after a dump (see [Backup and
+restore](#backup-and-restore)). Rebuilding also picks up base-image fixes. The
+single container pointed at PostgreSQL with `CXCG_DATABASE_URL` installs a
+release that changes the schema only after an admin confirms having a backup of
+their own, and rolls such a release back only by restoring that backup.
+
+#### One-time setup (repository owner)
+
+1. **Signing key.** On a trusted machine:
+   `python backend/scripts/release_keygen.py` writes the private key to
+   `cxcg-release-signing-key.pem` and prints the public key. Paste the public key
+   into `backend/app/updates/release-signing-key.pub` and commit it; images built
+   from that commit on verify every release against it. Keep an offline copy of
+   the private key and delete the file after step 2.
+2. **The `release` environment.** On GitHub: Settings → Environments → *New
+   environment* `release`. Add **required reviewers** (the release managers;
+   prevent self-review), limit *Deployment branches and tags* to tags matching
+   `v*.*.*`, and store the private key file's whole contents there as the
+   environment secret **`CXCG_RELEASE_SIGNING_KEY`** (not as a repository
+   secret): the release job runs in this environment, so the key is handed to it
+   only after a reviewer approved that run.
+3. **Tag ruleset.** Settings → Rules → Rulesets → *New tag ruleset*, target
+   `v*`: restrict creations, updates and deletions (bypass list: the release
+   managers) and block force pushes, so only they can start a release.
+4. **Publishing.** Push a version tag: `git tag -a v1.2.3 -m "notes"` then
+   `git push origin v1.2.3`. `.github/workflows/release.yml` (third-party
+   actions pinned by commit SHA) installs its signing tools from hash-pinned
+   wheels (`.github/release-requirements.txt`) before the key is in any step's
+   environment, **fails** if the public key is still the placeholder or the
+   secret is missing, stamps the version into `backend/app/__init__.py` (the one
+   place it lives), chooses the base image's digest, builds the release
+   manifest from `deploy/podman/Dockerfile`, signs it and verifies the signature
+   against the committed public key, builds the image, checks that the image's
+   `/app/release-manifest.json` and `.sig` are byte for byte the signed ones,
+   that `/app` is not writable by the app's user and that the image comes up as
+   that version, and pushes `:1.2.3` and `:latest` with the job's `GITHUB_TOKEN`
+   (`packages: write`). The base image is the latest release's, unless the tag's
+   message has a line `base: refresh` (then the base tag's current digest; see
+   *When the image itself must be replaced*): refresh it at least every 90 days
+   and whenever a base-image advisory applies. The release notes shown in the
+   app are the `## 1.2.3`
+   section of a `CHANGELOG.md`, if there is one, else the tag's message. New
+   packages are private by default; check the package's visibility after the
+   first release, and keep it private.
+5. **A read-only token per installation.** On GitHub: Settings → Developer
+   settings → Personal access tokens → Tokens (classic) → *Generate new token*,
+   scope **`read:packages` only**, from an account that can see the package (give
+   it access under the package's settings, *Manage Actions access* / *Manage
+   access*). Enter it on Settings → Updates → *Registry token*. It is encrypted
+   with the master key like the Checkmarx API key, never shown again, never logged,
+   and is tried at once. Until one is entered, auto-update stays on and the page
+   and the top bar say *needs a registry token*; nothing fails in a loop.
+
+**Network.** Outbound HTTPS (443) to `ghcr.io` (token exchange, tags, manifests)
+and `pkg-containers.githubusercontent.com` (where GHCR serves the layer). Both are
+fixed in code: no address an admin types or a registry answers is ever called,
+and the registry token is only ever sent to `ghcr.io`.
+
 ### Enforcement safety
 
 Settings has an **Enforcement safety** card. These exist because the dangerous
@@ -1345,7 +1898,10 @@ failure of this tool is restricting many people at once for a wrong reason.
   pauses itself, and alerts the admins with the counts. Both numbers are
   configurable; the defaults suit a tenant of a few hundred engineers. Resuming
   after such a pause lets the next cycle through once without the ceiling, on
-  the understanding that an admin has looked.
+  the understanding that an admin has looked. A first enforcement too large
+  for one cycle's write budget (see [Sizing and scale](#sizing-and-scale)) is
+  judged once, when it starts: its continuation on the next cycles is not
+  counted as new, but users or projects added to the limit since are.
 - **Protected roles.** A user holding one of the listed Checkmarx roles
   (default `ast-admin`, `iam-admin`) is never restricted, and is released if
   the role is granted later. They still get the warning. **Check these names
@@ -1356,6 +1912,10 @@ failure of this tool is restricting many people at once for a wrong reason.
   until at least three readings in a row over at least two hours tell the same
   story. Limits keep being judged on the last believed reading meanwhile, and
   each cycle that holds one reports it as a warning in its result.
+- **Roles a user restriction removes.** The client roles a user restriction
+  takes (API field `ai_roles`; default the three Risk Management roles), picked
+  from the tenant's own roles. Applies to restrictions made from then on. See
+  [Restricting a user, in detail](#what-the-enforcement-actions-actually-are).
 - **Fusion lock.** *Lock Fusion against per-scan override* (on by default, API
   field `fusion_lock_override`): when a limit turns Fusion off, also set
   `allowOverride: false` on the project's setting. Not verified to stop a scan
@@ -1386,6 +1946,158 @@ switches two factor off for that account, and records the reset in the audit
 log. The bootstrap variables do not help here: they only create an account when
 there are none.
 
+## Sizing and scale
+
+CxCreditGuard has been load tested against a synthetic tenant of **2,000
+projects** (60% with a repository, half with Auto Triage on), **1,000 users**,
+**100 groups** (nested, one holding 1,000 projects), **30 applications**,
+consumption for every dimension and scans on 400 projects, with **50 ms per
+Checkmarx call** and a **429 every 500 calls** (`Retry-After: 1`). Seeded
+limits: 200 user, 50 project, 10 group (one covering 1,000 projects with all
+three project actions, about 3,500 restrictions) and 5 application limits, all
+enforcing. The cycle interval is the default 15 minutes.
+
+Measured (`scripts/loadtest.py`; before = the version without pacing, 6
+cycles; after on PostgreSQL = this version, 7 cycles, re-measured after the
+review fixes below; after on SQLite = the first pacing version, 10 cycles):
+
+| | Before, PostgreSQL | After, PostgreSQL | Before, SQLite | After, SQLite |
+| --- | --- | --- | --- | --- |
+| First enforcement of 3,545 restrictions | 1 cycle of 874 s | 5 cycles of 180–196 s | 1 cycle of 744 s | 5 cycles of 69–183 s |
+| Steady-state cycle | 313 s | **68–72 s** | 281 s | 65 s |
+| Checkmarx calls per steady cycle | 3,796 | 1,642–1,720 | 3,796 | 1,658 |
+| Database statements per steady cycle | 43,230 | 12,416–13,004 | 49,469 | 19,364 |
+| Restrictions in force read back | all, every cycle | each every 60 min (806 a cycle) | all, every cycle | each every 60 min |
+| Restricted projects checked for policy violations | the same 50 of 1,070, never the rest | 150 a cycle: each every 8 cycles (2 h) | the same 50 | each every 8 cycles |
+| Consumption readings on disk after a month (15 min) | 5.5 GB | **≈ 1.0 GB** | 9 GB | (not measured) |
+| Peak memory (RSS) | 226 MB | 240 MB | 216 MB | 258 MB |
+| Slowest GUI endpoint | dry run 1,967 ms | dashboard 670 ms, dry run 643 ms | dry run 1,049 ms | dry run 686 ms |
+
+Every endpoint the GUI uses answers in under a second at this size (the
+Simulation dry run 0.65 s, the Budgets list 0.5 s, the report 0.25 s, the blast
+radius of the 1,000-project group 0.1 s and 22 KB instead of 0.9 s and 344 KB,
+a page of restrictions in force 26 ms).
+Auto-triage attribution, with 1,000 projects showing new Auto Triage every
+cycle, works through 150 a cycle: each is traced within 7 cycles (the oldest
+waited 2.5 hours; until then its credits count on the project).
+
+**What a cycle costs.** In steady state about 820 Checkmarx calls per
+1,000 projects per cycle (verification read-backs spread over the hour, scan
+listings for policy violations and auto-triage attribution, consumption pages,
+and the organisation sync every 30 minutes; about 575 of them read repository
+settings back: PR triage and remediation, repository Fusion), about 70 s on
+PostgreSQL and 65 s on SQLite with 50 ms calls: well inside a 15 minute
+interval. The first enforcement of the 1,000-project group (3,545
+restrictions) is spread over 5 cycles of about 3 minutes each, with
+the progress on the Budgets page.
+
+**Database growth.** Each cycle stores one consumption reading per dimension:
+3,033 `usage_record` rows for this tenant. Measured on PostgreSQL:
+
+| | Before | Now |
+| --- | --- | --- |
+| A reading, as stored | ≈ 1.9 MB (rows with their raw copy, plus every response page again on `usage_snapshot.raw`) | ≈ 1.7 MB (rows with their raw copy; no response pages) |
+| A reading older than a week | the same | ≈ 0.7 MB (raw copy cleared: 64% of the rows' bytes) |
+| Readings kept, per dimension, 30 days at 15 minutes | 2,880 | 936 (all of 3 days, then one an hour) |
+| Readings kept, per dimension, 365 days | 35,040 | 1,501 (… then one a day after 40 days) |
+| On disk after a month | ≈ 5.5 GB | **≈ 1.0 GB** |
+| On disk after a year (`retention.days` 365) | ≈ 66 GB | **≈ 1.4 GB** |
+| Growth after the first 40 days | ≈ 5.5 GB a month | ≈ 21 MB a month (one reading a day) |
+
+The simulation in the load test (`--simulate-thinning-days 45`: 45 days of
+readings at 15 minutes, 25 rows each, with auto-triage attribution on and so a
+charge on every project reading, 4,470 in all, then one retention run) kept
+1,184 readings per dimension of 4,322 (the project dimension too: charges pin
+nothing, and all 4,470 were kept), and the two tables went from 169 MB to
+35 MB after `VACUUM FULL` (the run took 3 s); the figures above scale its
+per-row sizes to the real 3,033 rows. With thinning switched off, readings are kept
+whole for the whole window (raw copies are still cleared after a week:
+≈ 2.7 GB a month, ≈ 25 GB a year). Restrictions, notifications and
+audit entries add a few MB per thousand restrictions, once. At this size use
+PostgreSQL. PostgreSQL reuses the space freed by thinning for new rows; it does
+not give it back to the file system without a `VACUUM FULL`.
+
+**Recommendations.**
+
+* **PostgreSQL above about 500 projects** (or 300 users). SQLite has a single
+  writer: a cycle's writes and the GUI's sign-ins and edits queue behind each
+  other. It works at 2,000 projects (measured above) but PostgreSQL is
+  faster and does not stall the GUI.
+* **A 15 minute interval** up to about 3,000 projects with the default budgets;
+  30 minutes above that, or raise the budgets below only as far as the cycle
+  record shows time to spare (`http.time_budget_left_seconds`).
+* Do not lower the interval to 2 or 5 minutes at this size: the time budget
+  keeps a cycle from overrunning, but each cycle then does less of the rotating
+  work, so coverage (below) takes more cycles.
+
+**Pacing settings** (Settings → Enforcement, *Pacing for large tenants*; API
+fields in brackets). Each is a per-cycle budget; **0 means no budget**:
+everything, every cycle. For the verification interval and cap, the
+restriction changes and the time budget that is the behaviour before pacing
+existed. It is not for the two rotations: before pacing the policy violation
+check had a fixed cap of 50 restricted projects a cycle (always the same 50)
+and auto-triage attribution one of 50 projects and 300 scan listings; set to 0
+they now have **no cap at all**, every restricted project and every waiting
+project each cycle.
+
+| Setting | Default | What it means |
+| ------- | ------- | ------------- |
+| Verify each restriction every (`verify_interval_minutes`) | 60 | Each restriction in force is read back at most this often, spread evenly over the cycles, the oldest-verified first. That is every restriction the cycle keeps in force, including those no limit's current plan still includes (a project that left the group or application, which stays restricted until its period ends; a hold-until-released limit's earlier periods), but not those being lifted. A new restriction is read back as it is applied; a limit whose enforcement, active state or project actions change has its restrictions read back first on the next cycle. One that cannot be read back (an error, or no readable answer) moves behind the others and is not due again for an interval; one with no readable answer is written again then, to keep it in force. A notification (once a day, decided after the cycle's read-backs) says when any restriction in force has gone unread for more than twice the interval, also naming attempts whose outcome has stayed unknown that long and restrictions whose lifting keeps failing. A restriction on a user or project deleted in Checkmarx One is not read back (counted as `target_deleted`). 0: every restriction, every cycle. |
+| Read-backs per cycle (`max_verifications_per_cycle`) | 2000 | At most this many read-backs in one cycle. With more in force than this covers within the interval, each is verified less often; the cycle record says how often (`each_verified_within_minutes`). At the defaults and a 15 minute interval every restriction is read back within the hour up to 8,000 in force, if the cycle has the time. |
+| Restriction changes per cycle (`max_writes_per_cycle`) | 1000 | Every change a cycle makes to the tenant, spent in this order: **lifts** first (a limit switched off or within budget again, an exemption, the period rollover), then **drift re-asserted** by the verification, then **new restrictions**, small limits first, and last **restrictions that could not be read back, written again** to keep them in force (each at most once per verification interval). Giving access back therefore never waits behind a rollout, and a re-assert the budget does not reach is done first on the next cycle (the restriction stays due); at worst a drift found waits as many cycles as lifts and re-asserts fill. A larger group or application is restricted over several cycles, resuming where it stopped ("Restricting 1,240 of 2,000 projects" on the Budgets page, one notification when it starts); a large lift likewise ("Lifting: 760 still in force"; the period shows *restored* only once the last is lifted). A limit needing more than 50 changes waits until every other limit has had its turn in the cycle. A limit switched off in the GUI lifts at most 200 at once (whatever the cycle is doing meanwhile), the rest by the cycles. The safety ceilings judge each user or project of a rollout once: the ones it has still to restrict are remembered by id, and anything else (a project added to the group since, a new breach after the period was lifted) is judged again. |
+| Projects checked for violations per cycle (`violation_projects_per_cycle`) | 150 | Restricted projects whose scans are listed, least recently checked first: each at least every ceil(restricted / 150) cycles. |
+| Auto-triage projects per cycle (`attribution_projects_per_cycle`) | 150 | Projects whose new Auto Triage is traced to scans, longest waiting first. |
+| Auto-triage scan requests per cycle (`attribution_requests_per_cycle`) | 600 | Scan listings attribution may make in one cycle. |
+| Parallel reads (`read_concurrency`) | 4 | Independent read-only calls (read-backs, scan listings) made at the same time; writes are always one at a time. 1: one call after another. 429 and `Retry-After` are honoured per call as before. |
+| Cycle time budget (`cycle_time_budget_pct`) | 80 | Once a cycle has run this share of its interval (at least a minute), it stops starting new per-target work and leaves the rest to the next cycle instead of overrunning. The hung-cycle watchdog (2 hours) is unchanged. |
+
+**Coverage is on every cycle's record** (`scheduler_run.stats`, also
+returned by `POST /api/ops/run-cycle`): `evaluate.pacing.verification` (restrictions in
+force (applied, plus `outcome_unknown`), `rotation` = `in_a_plan` +
+`outside_a_plan`, `being_lifted` (of which `lift_failing`), `target_deleted`,
+due, `verified` (read back: `held` + `reasserted`), `unverified` (no readable
+answer, written again), `reapplies_deferred`, `reasserts_deferred`, `failed`,
+`each_verified_within_minutes`, `oldest_verified_minutes_ago`,
+`unverified_beyond_twice_the_interval`,
+`outcome_unknown_beyond_twice_the_interval`, `lift_failing_still_in_force`),
+`evaluate.pacing.writes` (budget, used, deferred, `lifts`, `reasserts`,
+`reapplies_unreadable`, `stopped_for_time`), `evaluate.rollouts` (limit, done, total),
+`violations` (`watched`, `per_cycle`, `each_checked_every_cycles`,
+`oldest_check_minutes`), `auto_triage_attribution` (`backlog`,
+`oldest_waiting_minutes`, `each_within_cycles`) and `http` (requests, 429s,
+retries, seconds waited, per step, and the time budget left). The API client
+keeps its connections open between calls and cycles.
+
+**Large lists in the GUI.** Budgets, Simulation, Reports and Policy violations
+show 100 rows a page (sorting and the column filters still apply to every row);
+the Notification Center's active restrictions are searched and paged on the
+server (`GET /api/notifications/enforcements/page?q=&offset=&limit=`); the
+entity pickers search the server. A blast radius lists its first 200 targets
+(20 per Simulation row) with the complete counts (`targets_total`).
+
+**Running the load test.** Not part of `pytest`:
+
+```sh
+cd backend
+# SQLite (a file in a temporary directory)
+python -m scripts.loadtest --database sqlite --cycles 10 --out /tmp/lt-sqlite.md
+# PostgreSQL: a fresh database is created on this server and dropped afterwards
+python -m scripts.loadtest \
+  --database "postgresql+psycopg://postgres@/postgres?host=/tmp&port=5433" \
+  --cycles 10 --latency-ms 50 --rate-limit-every 500 --out /tmp/lt-pg.md
+```
+
+Options set the tenant size (`--projects`, `--users`, `--groups`,
+`--applications`), latency and rate limiting, and `--profile-cycle N` profiles
+one cycle (functions and the most frequent SQL). Each cycle's record has the
+size of the consumption readings (`usage`); on PostgreSQL
+`--simulate-thinning-days N` (with `--simulate-rows R`) then writes N days of
+readings at the interval and runs the retention job once, reporting the
+readings kept per dimension and the size before and after. The simulated clock moves on
+by the interval before every cycle, so time-based work behaves as on a real
+schedule. The synthetic tenant is `backend/tests/scale_tenant.py`; small
+regression tests of the pacing are in `backend/tests/test_scale_pacing.py`.
+
 ## Runbook: the utility restricted someone it should not have
 
 1. **Restore first, investigate second.** Open the Notification Center, find the
@@ -1401,7 +2113,8 @@ there are none.
    by a group, project or application limit they had no idea applied to them.
 4. **Check the attribution.** The Audit Log holds the before and after state of
    every action. If usage was attributed to the wrong user, the raw consumption
-   payload is stored on each event for exactly this comparison.
+   row is stored on each reading of the last week (and on the latest reading,
+   whatever its age) for exactly this comparison.
 5. **If the GUI is unavailable**, restoring access in Checkmarx One directly is
    always safe: re-add the role, or re-enable the project setting. Then mark the
    enforcement record as reversed in the utility, or clear the limit, before the
@@ -1501,6 +2214,20 @@ They are listed because each has a cost worth knowing about.
    the request the UI sends when the project value is reset to the inherited
    one; if it is a per-key call, Restore can use it for an entry whose
    `origin_level_before` is not `Project`.
+
+7. **Where a user's roles come from.** The effective-roles, user-groups,
+   group-role-mapping and composite-role reads follow Keycloak's admin REST API
+   and are not verified against a real Checkmarx One tenant. Each failure is
+   *source unknown*, never a reason not to restrict; a removed role then still
+   read as held is decided on the next attempt (in doubt once, concluded the
+   second time). A realm-level composite role containing an AI role is seen
+   only as *source unknown*.
+8. **Auto Triage's `allowOverride`.** The project-scope Auto Triage
+   configuration carries `allowOverride` (`{"projects": false, "branches":
+   true, ...}` in a captured HAR). What each key means is not documented: it is
+   recorded verbatim and only used, best effort, for the Simulation's *may not
+   hold* warning. That a project cannot override an account-wide ("select
+   all") setting is concluded from two read-backs, not from this field.
 
 Settled since the first draft: the `period` parameter accepts exactly
 `last_month`, `last_30_days`, `last_90_days`, `last_180_days` and `last_year`, all
