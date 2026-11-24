@@ -552,20 +552,22 @@ def _model_key(name: str | None) -> str | None:
 
 
 def _fusion_price(
-    model: str | None, rates: dict[str, tuple[Decimal, str | None]]
-) -> Decimal | None:
-    """Credits per Fusion scan with this model (``opus-5.5``), when the rates say.
+    model: str | None, prices: dict[str, usage_mix.ActionPrice]
+) -> usage_mix.ActionPrice | None:
+    """Credits per Fusion scan with this model (``opus-5.5``), when known.
 
-    The model must match a Fusion rate's model exactly (by its action type or
+    The model must match a Fusion price's model exactly (by its action type or
     its display name): ``opus-5.5`` never takes the price of ``x-opus-5.5``.
+    The price is the listed rate or, where the feed disagrees with it, the
+    feed's observed average (see ``usage_mix.price_table``).
     """
     wanted = _model_key(model)
     if wanted is None:
         return None
-    for key, (price, display) in rates.items():
+    for key, price in prices.items():
         if usage_api.normalise_action_type(key) != ActionType.FUSION:
             continue
-        for name in (key, display):
+        for name in (key, price.display):
             if _model_key(usage_api.fusion_model(name)) == wanted:
                 return price
     return None
@@ -661,7 +663,7 @@ def _detect_scans(session: Session, client: CheckmarxClient, result: DetectionRe
     if len(watches) > per_cycle:
         result.skipped_projects += len(watches) - per_cycle
         watches = watches[:per_cycle]
-    rates = usage_mix.rate_table(session)
+    rates = usage_mix.price_table(session)
 
     # 1. List each project's scans and sort them out, without single-scan reads.
     # The listings are independent reads, made a few at a time; nothing is
@@ -825,7 +827,7 @@ def _record_project_scans(
     project: _ProjectScans,
     *,
     cursors: dict[str, Any],
-    rates: dict[str, tuple[Decimal, str | None]],
+    rates: dict[str, usage_mix.ActionPrice],
     result: DetectionResult,
 ) -> None:
     """Record one project's findings and move its cursor (no commit)."""
@@ -964,7 +966,7 @@ def _record_scan(
     watch: _FusionWatch,
     scan: scans_api.ScanSummary,
     limit: CreditLimit | None,
-    rates: dict[str, tuple[Decimal, str | None]],
+    rates: dict[str, usage_mix.ActionPrice],
 ) -> bool:
     if not scan.fusion:
         return _count_ai_scan(session, watch=watch, scan=scan, limit=limit)
@@ -985,16 +987,25 @@ def _record_scan(
         "llm_model": model,
         "source_origin": scan.source_origin,
         "source_type": scan.source_type,
-        "credits_per_scan": str(price) if price is not None else None,
+        "credits_per_scan": str(price.per_transaction) if price is not None else None,
+        # "rate" (the listed rate) or "observed" (the consumption feed's average).
+        "price_source": price.source if price is not None else None,
         "restricted_since": watch.since.isoformat(),
     }
     who = scan.initiator or "someone Checkmarx One does not name"
-    cost = (
-        f" At the current rate a Fusion scan with {model} costs "
-        f"{usage_mix.format_credits(price)} credits."
-        if price is not None and model
-        else ""
-    )
+    cost = ""
+    if price is not None and model:
+        if price.source == usage_mix.PRICE_OBSERVED:
+            cost = (
+                f" A Fusion scan with {model} costs about "
+                f"{usage_mix.format_credits(price.per_transaction.quantize(Decimal('0.01')))} "
+                f"credits ({price.source_words()})."
+            )
+        else:
+            cost = (
+                f" At the listed rate a Fusion scan with {model} costs "
+                f"{usage_mix.format_credits(price.per_transaction)} credits."
+            )
     unfinished = "" if finished else f" It had not finished when it was checked ({scan.status})."
     what = (
         f"Scan {scan.id} on {label} ran Fusion{f' ({model})' if model else ''} although "
@@ -1026,7 +1037,7 @@ def _record_scan(
             actor=scan.initiator,
             source=source,
             evidence=evidence,
-            credits=price,
+            credits=price.per_transaction if price is not None else None,
         )
         is not None
     )
@@ -1354,7 +1365,7 @@ def _usage_for_target(
             own=max(credits_rise, Decimal("0")),
         )
         if priced:
-            credits = sum((part[3] for part in priced), Decimal("0"))
+            credits = sum((part.credits for part in priced), Decimal("0"))
     label = first.target_label or target_id
     listed = ", ".join(
         f"{usage_mix.ACTION_LABELS.get(action_type, action_type)} {count} transaction"

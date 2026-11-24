@@ -126,6 +126,13 @@ def fetch_credit_balance(client: CheckmarxClient) -> CreditBalance | None:
 #   {"count": 3, "rates": [{"action_type": "fusion_scan_-_opus_5.5",
 #    "credits_per_action": "2", "display_name": "Fusion Scan - Opus 5.5",
 #    "is_active": true, ...}, ...]}
+# A rate is NOT always the credits one transaction costs. On a live tenant
+# (2026-11) it was for triage (1) and remediation (3); for Fusion and DAST
+# correlation the consumption feed reports far more per transaction (Opus 5.5:
+# rate 2, about 108.9 credits per transaction; DAST correlation: rate 14, about
+# 156.8). So nothing multiplies a rate by a count unchecked: the price used is
+# the rate only when the feed agrees with it within 10% (or has no figure), and
+# otherwise the feed's own credits / transactions (usage_mix.price_table).
 ACTION_RATES_PATH = "/v1/credits/action-rates"
 
 

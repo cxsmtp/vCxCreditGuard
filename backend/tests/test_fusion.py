@@ -223,7 +223,8 @@ class TestRates:
 
         month = utcnow().strftime("%B %Y")
         assert breach.body.startswith(
-            f"4 of 3 credits used in {month}: Fusion scan (Opus 5.5) 2 scans = 4 credits.\n"
+            f"4 of 3 credits used in {month}: Fusion scan (Opus 5.5) 2 scans = 4 credits "
+            "(2 per scan, the listed rate).\n"
         ), breach.body
         assert "cannot switch Fusion off yet" not in breach.body
         assert "Auto Triage, PR triage and remediation and Fusion are turned off" in breach.body
@@ -1610,13 +1611,17 @@ class TestPricesAndNames:
         from app.services import violations
 
         rates = {
-            "fusion_scan___claude_opus_5.5": (Decimal("9"), "Fusion Scan - Claude Opus 5.5"),
-            "fusion_scan___haiku_4.5": (Decimal("1.5"), "Fusion Scan - Haiku 4.5"),
+            "fusion_scan___claude_opus_5.5": usage_mix.ActionPrice(
+                Decimal("9"), "Fusion Scan - Claude Opus 5.5", usage_mix.PRICE_RATE
+            ),
+            "fusion_scan___haiku_4.5": usage_mix.ActionPrice(
+                Decimal("1.5"), "Fusion Scan - Haiku 4.5", usage_mix.PRICE_RATE
+            ),
         }
         assert violations._fusion_price("opus-5.5", rates) is None
         assert violations._fusion_price("5.5", rates) is None
-        assert violations._fusion_price("claude-opus-5.5", rates) == Decimal("9")
-        assert violations._fusion_price("Haiku 4.5", rates) == Decimal("1.5")
+        assert violations._fusion_price("claude-opus-5.5", rates).per_transaction == Decimal("9")
+        assert violations._fusion_price("Haiku 4.5", rates).per_transaction == Decimal("1.5")
 
     @pytest.mark.parametrize("raw", ["fusion_sast", "fusionsomething", "Fusion Report"])
     def test_other_fusion_types_stay_visible(self, raw: str) -> None:
