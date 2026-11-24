@@ -85,6 +85,9 @@ class FakeTenant:
     page_size_override: int | None = None
     users_requires_paging: bool = False
     requests: list[tuple[str, str]] = field(default_factory=list)
+    # What the token endpoint hands out. Opaque by default; access_token_with()
+    # builds a JWT-shaped one carrying role claims.
+    access_token: str = "fake-access-token"
     # Called with every request before it is answered. Lets a test observe the
     # state of the world at the exact moment the utility is talking to Checkmarx.
     on_request: Callable[[httpx.Request], None] | None = None
@@ -291,9 +294,7 @@ class FakeTenant:
                 return httpx.Response(status_code, json={"message": "forced failure"})
 
         if path.endswith("/protocol/openid-connect/token"):
-            return httpx.Response(
-                200, json={"access_token": "fake-access-token", "expires_in": 1800}
-            )
+            return httpx.Response(200, json={"access_token": self.access_token, "expires_in": 1800})
 
         if path.endswith(f"/auth/realms/{TENANT}/users/v2"):
             return self._users_response(params)
@@ -524,6 +525,26 @@ class FakeTenant:
             settings=get_settings(),
             sleep=lambda _s: None,
         )
+
+
+def access_token_with(
+    *,
+    realm_roles: list[str] | None = None,
+    client_roles: dict[str, list[str]] | None = None,
+    groups: list[str] | None = None,
+) -> str:
+    """A JWT-shaped access token with role claims (synthetic; never verified)."""
+    from tests.conftest import b64url
+
+    payload: dict[str, Any] = {
+        "sub": "service-account-creditguard",
+        "realm_access": {"roles": realm_roles or []},
+        "resource_access": {name: {"roles": roles} for name, roles in (client_roles or {}).items()},
+    }
+    if groups is not None:
+        payload["groups"] = groups
+    header = b64url({"alg": "RS256", "typ": "JWT"})
+    return f"{header}.{b64url(payload)}.c2lnbmF0dXJl"
 
 
 def _iso(moment: datetime) -> str:

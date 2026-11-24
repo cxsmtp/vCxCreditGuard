@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ApiError, api } from "../api/client";
 import type { ConnectionPreview, ConnectionStatusResponse, ConnectionTestResult } from "../api/types";
 import { useResource } from "../hooks/useResource";
@@ -14,6 +14,7 @@ import {
   PageHeader,
   Spinner,
 } from "../components/ui";
+import { PermissionDetails, useKeyPermissions } from "../components/KeyPermissions";
 import { formatDateTime } from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
@@ -26,6 +27,13 @@ import { useToast } from "../lib/ui-context";
  */
 export function SetupPage({ isAdmin, onConnected }: { isAdmin: boolean; onConnected: () => void }) {
   const toast = useToast();
+  const permissions = useKeyPermissions(true);
+
+  // The top bar light and the pop-up link here: bring the card into view.
+  useEffect(() => {
+    if (window.location.hash !== "#key-permissions" || !permissions.report) return;
+    document.getElementById("key-permissions")?.scrollIntoView({ block: "start" });
+  }, [permissions.report]);
   const connection = useResource<ConnectionStatusResponse>(
     (signal) => api.get("/api/connection", undefined, signal),
     [],
@@ -68,6 +76,9 @@ export function SetupPage({ isAdmin, onConnected }: { isAdmin: boolean; onConnec
           : {}),
       });
       setTestResult(result);
+      // A new key: the last report was about the old one. Without a fresh
+      // report (the check could not run) show none rather than the old key's.
+      permissions.setReport(result.permissions ?? null);
       setApiKey("");
       setPreview(null);
       await connection.reload();
@@ -89,6 +100,8 @@ export function SetupPage({ isAdmin, onConnected }: { isAdmin: boolean; onConnec
     try {
       const result = await api.post<ConnectionTestResult>("/api/connection/test");
       setTestResult(result);
+      if (result.permissions) permissions.setReport(result.permissions);
+      onConnected();
       await connection.reload();
       if (result.ok) toast.success(result.message);
       else toast.error(result.message);
@@ -106,6 +119,8 @@ export function SetupPage({ isAdmin, onConnected }: { isAdmin: boolean; onConnec
         api_base_url: apiBaseUrl.trim(),
       });
       setTestResult(result);
+      if (result.permissions) permissions.setReport(result.permissions);
+      onConnected();
       await connection.reload();
       toast.info(result.message);
     } catch (caught) {
@@ -324,11 +339,55 @@ export function SetupPage({ isAdmin, onConnected }: { isAdmin: boolean; onConnec
                 To use enforce mode, also manage IAM role mappings and project configuration. A read
                 only key runs the whole utility in monitor only mode.
               </li>
-              <li>Use a dedicated service account rather than a person's key.</li>
+              <li>
+                Use a dedicated service account rather than a person's key. A key carries only the
+                roles chosen when it was created, so a key made under an administrator's account can
+                still lack what the administrator can do. The Key permissions card shows what is
+                missing.
+              </li>
             </ul>
           </Card>
         </div>
       </div>
+
+      <section id="key-permissions" className="mt-6 scroll-mt-4">
+        <Card
+          title="Key permissions"
+          description="What this API key is allowed to do, checked with read-only calls."
+          actions={
+            isAdmin &&
+            current?.configured && (
+              <Button
+                size="sm"
+                loading={permissions.checking}
+                onClick={async () => {
+                  await permissions.checkAgain();
+                  onConnected();
+                }}
+              >
+                Check again
+              </Button>
+            )
+          }
+        >
+          {permissions.loading && !permissions.report ? (
+            <Spinner />
+          ) : permissions.report ? (
+            <PermissionDetails report={permissions.report} isAdmin={isAdmin} />
+          ) : (
+            <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
+              {current?.configured
+                ? "Not checked yet. It runs when the connection is saved or tested, and every few hours."
+                : "Connect a tenant first."}
+            </p>
+          )}
+          {permissions.error && permissions.report && (
+            <div className="mt-3">
+              <ErrorNote>{permissions.error}</ErrorNote>
+            </div>
+          )}
+        </Card>
+      </section>
     </>
   );
 }

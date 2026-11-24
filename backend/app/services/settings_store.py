@@ -119,6 +119,13 @@ KEY_AUTO_TRIAGE_TO_INITIATOR = "attribution.auto_triage_to_scan_initiator"
 # a single "observed" rise. Not part of the configuration backup.
 KEY_AUTO_TRIAGE_OBSERVATION_EPOCH = "attribution.auto_triage_observation_epoch"
 
+# The latest API key permission report (app/services/key_permissions.py), as
+# JSON. Bookkeeping, not configuration: it is never shown on the Settings page,
+# never part of a configuration backup and never part of the attestation digest.
+KEY_KEY_PERMISSIONS = "connection.key_permissions"
+# Rows kept in app_setting that are state rather than settings.
+INTERNAL_KEYS: frozenset[str] = frozenset({KEY_KEY_PERMISSIONS})
+
 # Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
 # so it can never collide with a real Checkmarx lookback window, and so the read
 # path can hide demo snapshots whenever demo mode is off.
@@ -407,6 +414,8 @@ def all_public_settings(session: Session) -> dict[str, Any]:
     stored = {row.key: row for row in session.scalars(select(AppSetting))}
     result: dict[str, Any] = dict(DEFAULTS)
     for key, row in stored.items():
+        if key in INTERNAL_KEYS:
+            continue
         if key in SECRET_KEYS:
             result[key] = "********" if row.value else None
         elif row.value is not None:

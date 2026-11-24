@@ -858,6 +858,107 @@ in monitor-only mode, which is a reasonable way to start. Enforcement then fails
 with a clear 403 message naming the missing permission rather than silently doing
 nothing.
 
+**Why a tenant admin's own key can still be refused.** A Checkmarx One API key
+most likely carries only the roles chosen when the key was created, not
+automatically everything its owner holds. So a key created under a tenant
+administrator's account can get 403 on a call the same administrator's browser
+session makes without trouble (seen in the field on
+`GET /api/ai-agents-coordinator/projects/{id}/configuration`): the path is right,
+the key has fewer permissions than the login. This is one more reason for a
+dedicated service account, with a key created for CreditGuard.
+
+#### The key permission check
+
+CreditGuard checks what the key may do instead of finding out at the first breach:
+
+- **When:** every time the connection is saved or tested, at most every six hours
+  at the start of a cycle, and whenever an admin presses **Check again**
+  (Settings → Connection → *Key permissions*, or the pop-up).
+- **What it can test:** one small read per call in the table above (`limit=1`
+  style; `GET /api/scans/` only when auto-triage charging is on or someone presses
+  Check again), on one synced project and one synced user where a call needs one.
+  Each is reported as allowed, refused (403), not found, error, or skipped with the
+  reason (for example when no project is linked to a repository yet).
+- **What it cannot test:** the writes (role mapping `POST`/`DELETE`, the Auto Triage
+  `PUT`, the repos-manager `PATCH`) cannot be tried without changing the tenant.
+  They are shown as *not tested*, and as *will fail* when the read on the same
+  service was refused. The role and group names in the key's access token are
+  shown too (never the token), and a token that lists `realm-management` roles
+  without `manage-users` marks role mapping as *probably refused* (a guess: shown
+  as a warning on the card, never on its own a reason for the banner or a red
+  verdict).
+- **Refusals at run time:** any 403 CreditGuard meets while it works (a restriction,
+  a restore, a read in a cycle, including reads whose failure is otherwise
+  tolerated) is added to the same report straight away, with the call and when.
+  Each refusal belongs to the key it was made with: saving another key drops the
+  old key's, and the connection test is a check of its own, not a run-time event.
+  A refused read is cleared by the next check (automatic or Check again) that reads
+  it successfully. A read refused on one particular project, repository or user
+  (the key cannot see it, though it reads others fine) is cleared only when that
+  same one is read successfully: the check reads it again directly, and
+  CreditGuard's own later reads of it count too. A refused change (role mapping,
+  Auto Triage, repository setting) is cleared only when CreditGuard next makes
+  that same change successfully: a change cannot be tested without making it, so
+  Check again does not clear it while it is needed. Once nothing configured needs
+  it any more (its limit was deleted or no longer enforces), Check again drops
+  it, and so does the automatic check once it is a week old.
+- **Verdict:** *ok*; *limited* when only something not in use is affected (enforce
+  mode calls while no limit of that kind enforces, scans while auto-triage charging
+  is off, the credit pool, groups while no group limit exists, applications while
+  no application limit exists) or a change is only *probably refused*;
+  *insufficient* when counting usage is broken (users, projects, consumption), the
+  groups or applications read is refused while a group or application limit
+  exists, or an enforce-mode call is refused while a limit that needs it enforces
+  (user limits need role mapping, project, group and application limits need the
+  project configuration calls). It is worked out again from the stored results
+  whenever limits change. Refused groups or applications reads do not stop the org
+  sync: users and projects are still synced, and a warning is raised only when a
+  limit of that kind exists.
+- **Where it shows:** only when something needed with the current setup is
+  confirmed missing: a banner at the top of every page (viewers are told to ask an
+  admin), a *Key permissions* light in the top bar, the Command Center status, and
+  a pop-up for admins once per sign-in per distinct problem (never blocking;
+  *Remind me later*). Anything else (an optional check, a feature not in use, a
+  *probably refused*) is shown on the *Key permissions* card on the Connection page
+  only, with an info notification. Always: a log line, one notification per
+  distinct set of missing permissions (category *API key permissions*; error when
+  insufficient, warning when limited and needed now, info otherwise; it never
+  lists the key's roles, which only admins see on the card), an audit entry
+  (`connection.permissions_changed`) when the verdict changes, and an info
+  notification when it is fine again. `GET /api/connection/permissions` returns the
+  last report (details for admins), `POST` runs it again (admins). Saving the
+  connection, testing it, or changing the API base URL also runs it.
+
+The fix is always the same: create a new key that includes the permissions for the
+calls listed as missing (or add them), paste it on the Connection page, or press
+Check again.
+
+#### What the breach and restriction messages say
+
+The *reached its credit limit* and *restricted* notifications give the credits the
+limit counted in the period and what they went on: for example *4 of 3 credits
+used in November 2026: Fusion scan 4.* The consumption feed reports credits per
+entity and transactions per action type, so the credits are put on one action
+type only when that is the only type whose count rose in the period and no
+type's count fell. Otherwise the credits are given as a total and the actions
+behind them as transaction counts; when a count fell (older transactions left the
+feed's lookback window) the period's transactions cannot be told apart from older
+ones, and the whole window's counts are given, saying so. A lifetime limit's
+figure is everything in the feed's reporting window. The messages then say plainly
+what the restriction does and does not stop: turning off Auto Triage and PR triage
+and remediation does not stop Fusion scans, nor AI Triage and AI Remediation that
+people start themselves (they count towards project, group and application
+figures too; only a user limit can stop them), and removing a user's AI roles
+changes no project setting and does not stop Fusion scans either; CreditGuard
+cannot switch Fusion off yet.
+
+A restriction already in force whose setting cannot be read back (the repository
+settings read failing, for example) is re-applied quietly to keep it in force and
+counted as *could not verify* in the cycle's result. It is no longer reported as
+*re-disabled*: only a setting actually read back as switched on again is drift.
+The first such re-apply of a restriction is audited
+(`enforcement.reapplied_unverified`), once per restriction, not every cycle.
+
 Projects the key cannot see are projects whose usage cannot be counted. The org
 sync reports that as a warning rather than undercounting quietly.
 
@@ -1019,6 +1120,10 @@ these, because each one can stop something that used to work:
 - **Automatic approvals.** The auto-approve threshold is now a budget per
   30 days, per entity and per requester, not a size per request. Several small
   requests no longer add up past it.
+- **API key permission check (new).** No migration: the last report is kept in
+  `app_setting`. The first cycle after the upgrade, or the next connection test,
+  checks the key with read-only calls. If the key lacks something needed with the
+  current setup, a banner appears on every page; see [The key permission check](#the-key-permission-check).
 - **Auto-triage charging (new, off).** The migration adds two tables
   (`auto_triage_charge`, `auto_triage_project_state`) and two nullable columns on
   `limit_period_state` (`baseline_at`, `attributed_credits`). Nothing changes until

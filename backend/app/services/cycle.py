@@ -43,6 +43,7 @@ from app.services import (
     delivery,
     evaluation,
     ingestion,
+    key_permissions,
     notifications,
     org_sync,
     requests_service,
@@ -301,6 +302,24 @@ def _run_step(
             result.status = RunStatus.PARTIAL
             _warn_committed(session, name, str(exc))
         return False
+    finally:
+        _record_refusals(session)
+
+
+def _record_refusals(session: Session) -> None:
+    """Put any 403 the step met on the API key permission report, and commit it.
+
+    A refused write is only ever discovered at run time, and some reads swallow
+    the error; recording them here makes every one of them visible at once.
+    """
+    if not key_permissions.pending_denials():
+        return
+    try:
+        if key_permissions.flush_runtime_denials(session, actor=AuditActor.system("scheduler")):
+            session.commit()
+    except Exception:  # noqa: BLE001 - recording a refusal must not fail the cycle
+        session.rollback()
+        logger.warning("Could not record a refused call on the permission report", exc_info=True)
 
 
 def _warn_committed(session: Session, step: str, message: str) -> None:
@@ -361,6 +380,23 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
         result.skipped_reason = str(exc)
         result.steps["connection"] = {"ok": False, "reason": str(exc)}
         return
+
+    # Step 0: what the API key may do, at most every few hours. Read only and
+    # cheap; it commits before calling Checkmarx and never fails the cycle.
+    def check_key_permissions() -> None:
+        if not key_permissions.check_due(session):
+            result.steps["key_permissions"] = {"skipped": "checked recently"}
+            return
+        report = key_permissions.run_check(
+            session, trigger=key_permissions.TRIGGER_CYCLE, actor=actor, client=client
+        )
+        result.steps["key_permissions"] = (
+            {"ok": True, "verdict": report["verdict"], "missing": report["missing"]}
+            if report is not None
+            else {"ok": False, "reason": "the check could not run"}
+        )
+
+    _run_step(session, result, "key_permissions", check_key_permissions, degrades_run=False)
 
     # Step 1: organisation model, only when due.
     def sync_org() -> None:

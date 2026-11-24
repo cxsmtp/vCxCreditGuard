@@ -36,6 +36,7 @@ const CATEGORIES = [
   { value: "attribution", label: "Attribution" },
   { value: "sync_error", label: "Sync errors" },
   { value: "auth_failure", label: "Authentication" },
+  { value: "permissions", label: "API key permissions" },
 ];
 
 const RESTRICTION_VIEW: ViewColumn<EnforcementActionItem>[] = [
