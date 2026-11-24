@@ -1183,6 +1183,21 @@ class _UsageReader:
         timeline.sort()
         self._timeline[view] = timeline
 
+    def baseline(self, view: str, action: EnforcementAction) -> UsageSnapshot | None:
+        """The reading a rise since this restriction is measured from.
+
+        The snapshot pinned when it was applied (``baseline_snapshot_id``), or,
+        for a restriction from before that existed (or whose snapshot is gone),
+        the newest believed snapshot at or before ``applied_at``, as before.
+        """
+        if action.baseline_snapshot_id is not None:
+            pinned = self.session.get(UsageSnapshot, action.baseline_snapshot_id)
+            if pinned is not None and pinned.view_by == view and pinned.held_reason is None:
+                return pinned
+        if action.applied_at is None:
+            return None
+        return self.at(view, action.applied_at)
+
     def at(self, view: str, moment: datetime) -> UsageSnapshot | None:
         """The newest believed snapshot taken at or before ``moment``."""
         timeline = self._timeline.get(view)
@@ -1244,10 +1259,7 @@ def _detect_usage(session: Session, result: DetectionResult) -> None:
         ids = {key[1] for key in mine}
         reader.preload(reader.latest(view), ids)
         baselines = {
-            reader.at(view, a.applied_at)
-            for actions in mine.values()
-            for a in actions
-            if a.applied_at
+            reader.baseline(view, a) for actions in mine.values() for a in actions if a.applied_at
         }
         for snapshot in baselines:
             reader.preload(snapshot, ids)
@@ -1310,7 +1322,7 @@ def _usage_for_target(
     baselines: dict[str, UsageSnapshot] = {}
     for action_type in sorted(since_by_type):
         restricted = since_by_type[action_type]
-        before = reader.at(view, restricted.applied_at)  # type: ignore[arg-type]
+        before = reader.baseline(view, restricted)
         if before is None or before.id == latest.id:
             continue
         then_counts = _bucketed(reader.record(before, target_id))

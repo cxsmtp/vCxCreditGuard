@@ -663,6 +663,7 @@ def test_the_pacing_settings_round_trip_through_a_backup(db: Session) -> None:
         settings_store.KEY_ATTRIBUTION_REQUESTS: 300,
         settings_store.KEY_READ_CONCURRENCY: 2,
         settings_store.KEY_CYCLE_TIME_BUDGET_PCT: 60,
+        settings_store.KEY_RETENTION_THIN_SNAPSHOTS: False,
     }
     for key, value in changed.items():
         settings_store.set_value(db, key, value)

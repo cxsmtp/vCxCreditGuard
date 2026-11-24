@@ -590,6 +590,7 @@ export interface AppSettings {
   usage_period_param: string;
   usage_page_size: number;
   retention_days: number;
+  retention_thin_snapshots?: boolean;
   notify_min_severity: Severity;
   smtp_host: string | null;
   smtp_port: number;

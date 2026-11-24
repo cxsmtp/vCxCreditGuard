@@ -182,6 +182,7 @@ class SettingsResponse(BaseModel):
     usage_period_param: str
     usage_page_size: int
     retention_days: int
+    retention_thin_snapshots: bool = True
     notify_min_severity: Severity
     smtp_host: str | None
     smtp_port: int
@@ -251,6 +252,7 @@ class SettingsUpdateRequest(StrictModel):
     usage_period_param: str | None = Field(default=None, max_length=32)
     usage_page_size: int | None = Field(default=None, ge=1, le=1000)
     retention_days: int | None = Field(default=None, ge=7, le=3650)
+    retention_thin_snapshots: bool | None = None
     notify_min_severity: Severity | None = None
     smtp_host: str | None = Field(default=None, max_length=256)
     smtp_port: int | None = Field(default=None, ge=1, le=65535)

@@ -48,6 +48,7 @@ from app.models.enums import (
     EntityType,
     ProjectAction,
     Severity,
+    UsageView,
 )
 from app.models.limits import (
     CreditLimit,
@@ -58,6 +59,7 @@ from app.models.limits import (
 from app.models.org import CxApplicationProject, CxProject, CxProjectGroup, CxUser
 from app.services import (
     error_text,
+    ingestion,
     key_permissions,
     notifications,
     pacing,
@@ -479,6 +481,14 @@ def target_released(session: Session, action: EnforcementAction) -> str | None:
     if is_exempt(session, entity_type=EntityType.PROJECT, entity_id=action.target_id):
         return EXEMPTED_REASON
     return None
+
+
+def baseline_snapshot_id(session: Session, target_type: str) -> int | None:
+    """The latest believed usage snapshot of the view a restriction's usage is
+    read from: the user view for a user, the project view for a project."""
+    view = UsageView.USER if target_type == TARGET_USER else UsageView.PROJECT
+    snapshot = ingestion.latest_snapshot(session, view)
+    return snapshot.id if snapshot is not None else None
 
 
 # --------------------------------------------------------------------- planning
@@ -1108,6 +1118,9 @@ def _enforce_target(
     # Read back straight after the write (every kind is): verified at once.
     action.last_verified_at = action.applied_at
     action.last_checked_at = None
+    # The reading a rise in usage since is measured from (policy violations),
+    # pinned so the retention job's thinning keeps it.
+    action.baseline_snapshot_id = baseline_snapshot_id(session, target.target_type)
     action.error = None
     if target.kind == EnforcementKind.DISABLE_AUTO_TRIAGE and captured.outcome.get(
         "auto_triage_seen_off"

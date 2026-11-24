@@ -337,6 +337,7 @@ _SETTING_FIELD_BY_KEY: dict[str, str] = {
     settings_store.KEY_AUTOMATION_ENABLED: "automation_enabled",
     settings_store.KEY_AUTO_APPROVE_MAX_INCREASE: "auto_approve_max_increase",
     settings_store.KEY_AUTO_APPROVE_EXPIRY_DAYS: "auto_approve_expiry_days",
+    settings_store.KEY_RETENTION_THIN_SNAPSHOTS: "retention_thin_snapshots",
     # Pacing for large tenants: how much a cycle does, not a guard rail (the
     # safety ceilings are separate and stay out of the backup, see above).
     settings_store.KEY_VERIFY_INTERVAL_MINUTES: "verify_interval_minutes",

@@ -127,7 +127,7 @@ const PACING_FIELDS: {
   {
     key: "verify_interval_minutes",
     label: "Verify each restriction every (minutes)",
-    hint: "How often each restriction in force is read back from Checkmarx One, at most, spread over the cycles. A new restriction is always read back at once, and an edited limit's are next. 0 reads every one back every cycle.",
+    hint: "How often each restriction in force is read back from Checkmarx One, at most, spread over the cycles: including those kept in force outside a limit's current plan (a project that left the group, a held earlier period), not those being lifted. A new restriction is always read back at once, and one whose limit changed what it turns off is next. 0 reads every one back every cycle.",
     min: 0,
     max: 10080,
     fallback: 60,
@@ -135,7 +135,7 @@ const PACING_FIELDS: {
   {
     key: "max_verifications_per_cycle",
     label: "Read-backs per cycle (most)",
-    hint: "The oldest-verified first. If more are in force than this covers within the interval above, each is verified less often; the cycle record says how often.",
+    hint: "The oldest-verified first. If more are in force than this covers within the interval above, each is verified less often; the cycle record says how often, and a notification says when any goes unverified for more than twice the interval. 0: no cap.",
     min: 0,
     max: 1000000,
     fallback: 2000,
@@ -143,7 +143,7 @@ const PACING_FIELDS: {
   {
     key: "max_writes_per_cycle",
     label: "Restriction changes per cycle (most)",
-    hint: "Restrictions applied or lifted in one cycle. A larger group or application is restricted over several cycles, resuming where it stopped, with its progress on the Budgets page. Small limits go first. The safety ceilings judge such a rollout once, when it starts.",
+    hint: "Changes made in one cycle: lifts first, then drift re-asserted, then new restrictions (small limits first), so giving access back is never held up. A larger group or application is restricted (or lifted) over several cycles, resuming where it stopped, with its progress on the Budgets page. The safety ceilings judge each target of such a rollout once. 0: no cap.",
     min: 0,
     max: 1000000,
     fallback: 1000,
@@ -501,6 +501,15 @@ export function SettingsPage({
               />
             </Field>
           </div>
+          <div className="mt-4 border-t border-hairline pt-4">
+            <Toggle
+              checked={value("retention_thin_snapshots") ?? true}
+              disabled={!isAdmin}
+              onChange={(next) => set({ retention_thin_snapshots: next })}
+              label="Thin old consumption readings"
+              description="Keep every reading of the last 3 days, one an hour for each dimension up to 40 days, and one a day after that. A reading anything refers to (a restriction's baseline, a budget period's usage breakdown, the latest) is always kept. Off: every reading is kept for the whole retention period."
+            />
+          </div>
         </Card>
         )}
 
@@ -791,7 +800,8 @@ export function SettingsPage({
                 <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
                   How much one cycle does, so a tenant of thousands of projects is worked through
                   over several cycles and every cycle finishes well within its interval. 0 means no
-                  budget (everything, every cycle).
+                  budget: everything, every cycle (for the violation check and auto-triage
+                  attribution that is no cap at all, where they had fixed caps before pacing).
                 </p>
                 <div className="mt-3 grid gap-4 sm:grid-cols-3">
                   {PACING_FIELDS.map((field) => (

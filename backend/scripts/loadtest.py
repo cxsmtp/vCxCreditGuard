@@ -246,6 +246,177 @@ def _db_size_mb(session: Any, url: str) -> float:
     return float(session.scalar(text("SELECT pg_database_size(current_database())"))) / 1_048_576
 
 
+def _usage_bytes(session: Any, url: str) -> dict[str, Any]:
+    """What the consumption readings take (PostgreSQL: on disk, and per column)."""
+    from sqlalchemy import text
+
+    if url.startswith("sqlite"):
+        row = session.execute(
+            text(
+                "SELECT count(*), coalesce(sum(length(raw)), 0) FROM usage_record "
+                "WHERE raw IS NOT NULL"
+            )
+        ).one()
+        return {"records_with_raw": int(row[0]), "record_raw_bytes": int(row[1])}
+    disk = session.execute(
+        text(
+            "SELECT pg_total_relation_size('usage_record'), "
+            "pg_total_relation_size('usage_snapshot')"
+        )
+    ).one()
+    rows = session.execute(
+        text(
+            "SELECT count(*), coalesce(sum(pg_column_size(r.*)), 0), "
+            "coalesce(sum(pg_column_size(r.raw)), 0) FROM usage_record r"
+        )
+    ).one()
+    snapshots = session.execute(
+        text(
+            "SELECT count(*), coalesce(sum(pg_column_size(s.*)), 0), "
+            "coalesce(sum(pg_column_size(s.raw)), 0) FROM usage_snapshot s"
+        )
+    ).one()
+    return {
+        "usage_record_disk_mb": round(disk[0] / 1_048_576, 2),
+        "usage_snapshot_disk_mb": round(disk[1] / 1_048_576, 2),
+        "records": int(rows[0]),
+        "record_bytes": int(rows[1]),
+        "record_raw_bytes": int(rows[2]),
+        "snapshots": int(snapshots[0]),
+        "snapshot_bytes": int(snapshots[1]),
+        "snapshot_raw_bytes": int(snapshots[2]),
+    }
+
+
+def _simulate_thinning(session: Any, *, days: int, rows: int, interval: int) -> dict[str, Any]:
+    """A history of ``days`` of readings at the cycle interval, then the retention job.
+
+    Each dimension's latest reading is copied back in time, one snapshot per
+    interval, with its first ``rows`` records (raw rows included), so the
+    thinning tiers and the raw clearing run on realistic timestamps without
+    the full volume. Returns snapshot and row counts, and their logical size,
+    before and after one retention run (thinning is idempotent: one run does
+    what a month of daily runs would).
+    """
+    from sqlalchemy import func, insert, select, text
+
+    from app.db.base import utcnow
+    from app.models.usage import UsageRecord, UsageSnapshot
+    from app.services import retention
+    from app.services.audit import AuditActor
+
+    now = utcnow()
+    views = list(session.scalars(select(UsageSnapshot.view_by).distinct()))
+    for view in views:
+        template = session.scalar(
+            select(UsageSnapshot)
+            .where(UsageSnapshot.view_by == view, UsageSnapshot.held_reason.is_(None))
+            .order_by(UsageSnapshot.collected_at.desc())
+            .limit(1)
+        )
+        if template is None:
+            continue
+        records = list(
+            session.scalars(
+                select(UsageRecord)
+                .where(UsageRecord.snapshot_id == template.id)
+                .order_by(UsageRecord.id)
+                .limit(rows)
+            )
+        )
+        if not records:
+            continue  # a dimension the tenant reports nothing for
+        steps = days * 24 * 60 // interval
+        for step in range(1, steps + 1):
+            snapshot_id = session.execute(
+                insert(UsageSnapshot)
+                .values(
+                    collected_at=now - timedelta(minutes=interval * step),
+                    view_by=view,
+                    period_param=template.period_param,
+                    total_items=template.total_items,
+                    pages_fetched=template.pages_fetched,
+                    total_credits=template.total_credits,
+                )
+                .returning(UsageSnapshot.id)
+            ).scalar_one()
+            session.execute(
+                insert(UsageRecord),
+                [
+                    {
+                        "snapshot_id": snapshot_id,
+                        "view_by": record.view_by,
+                        "subject_key": record.subject_key,
+                        "subject_name": record.subject_name,
+                        "subject_email": record.subject_email,
+                        "entity_type": record.entity_type,
+                        "entity_id": record.entity_id,
+                        "credits_used": record.credits_used,
+                        "percent_of_total": record.percent_of_total,
+                        "transactions": record.transactions,
+                        "actions": record.actions,
+                        "raw": record.raw,
+                    }
+                    for record in records
+                ],
+            )
+            if step % 500 == 0:
+                session.commit()
+        session.commit()
+
+    def measure() -> dict[str, Any]:
+        # Compacted first, so the sizes on disk are what the rows take, not
+        # what deleted or updated rows left behind.
+        session.commit()
+        with (
+            session.get_bind()
+            .connect()
+            .execution_options(isolation_level="AUTOCOMMIT") as connection
+        ):
+            connection.execute(text("VACUUM FULL usage_record"))
+            connection.execute(text("VACUUM FULL usage_snapshot"))
+            disk = connection.execute(
+                text(
+                    "SELECT pg_total_relation_size('usage_record') "
+                    "+ pg_total_relation_size('usage_snapshot')"
+                )
+            ).scalar_one()
+        snapshots = dict(
+            session.execute(
+                select(UsageSnapshot.view_by, func.count()).group_by(UsageSnapshot.view_by)
+            ).all()
+        )
+        sizes = session.execute(
+            text(
+                "SELECT count(*), coalesce(sum(pg_column_size(r.*)), 0), "
+                "coalesce(sum(pg_column_size(r.raw)), 0) FROM usage_record r"
+            )
+        ).one()
+        return {
+            "snapshots_per_view": snapshots,
+            "disk_mb": round(disk / 1_048_576, 2),
+            "records": int(sizes[0]),
+            "record_bytes": int(sizes[1]),
+            "record_raw_bytes": int(sizes[2]),
+        }
+
+    before = measure()
+    started = time.monotonic()
+    result = retention.prune(session, retention_days=365, actor=AuditActor.system("loadtest"))
+    session.commit()
+    seconds = time.monotonic() - started
+    after = measure()
+    return {
+        "days": days,
+        "rows_per_snapshot": rows,
+        "interval_minutes": interval,
+        "before": before,
+        "after": after,
+        "prune_seconds": round(seconds, 1),
+        "prune": result.as_stats(),
+    }
+
+
 def _restricted_progress(session: Any) -> dict[str, int]:
     from sqlalchemy import func, select
 
@@ -351,6 +522,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--profile-cycle", type=int, default=0, help="profile this cycle (cProfile, top SQL)"
     )
+    parser.add_argument(
+        "--simulate-thinning-days",
+        type=int,
+        default=0,
+        help="after the cycles, copy the latest readings back over this many days and run "
+        "the retention job (PostgreSQL only)",
+    )
+    parser.add_argument(
+        "--simulate-rows",
+        type=int,
+        default=25,
+        help="records per simulated snapshot (sizes scale per record)",
+    )
     args = parser.parse_args(argv)
 
     workdir = Path(tempfile.mkdtemp(prefix="cxcg-loadtest-"))
@@ -436,6 +620,7 @@ def main(argv: list[str] | None = None) -> int:
             progress = _restricted_progress(session)
             tables = _table_counts(session)
             size = _db_size_mb(session, url)
+            usage = _usage_bytes(session, url)
             paused = settings_store.enforcement_guard(session).paused
         steps = {
             name: {
@@ -457,6 +642,7 @@ def main(argv: list[str] | None = None) -> int:
             "rss_mb": round(_rss_mb()),
             "peak_mb": round(_peak_mb()),
             "db_mb": round(size, 1),
+            "usage": usage,
             "progress": progress,
             "tables": tables,
             "paused": paused,
@@ -480,6 +666,16 @@ def main(argv: list[str] | None = None) -> int:
                 _resume_enforcement(session)
 
     api_rows = [] if args.no_api else _time_api(tenant, admin_password)
+    simulation = None
+    if args.simulate_thinning_days and not url.startswith("sqlite"):
+        with session_scope() as session:
+            simulation = _simulate_thinning(
+                session,
+                days=args.simulate_thinning_days,
+                rows=args.simulate_rows,
+                interval=args.interval_minutes,
+            )
+        print(json.dumps(simulation, indent=1, default=str), flush=True)
     report = {
         "label": args.label,
         "database": "sqlite" if url.startswith("sqlite") else "postgresql",
@@ -495,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
         "limits": seeded,
         "cycles": cycles,
         "api": api_rows,
+        "simulation": simulation,
         "peak_mb": round(_peak_mb()),
     }
     if args.json:
@@ -560,6 +757,16 @@ def render(report: dict[str, Any]) -> str:
         lines.append(f"\nRows: {c['tables']}")
         if c["errors"]:
             lines.append(f"\nErrors: {c['errors']}")
+    lines.append("\n## Consumption readings per cycle\n")
+    lines.append("```json")
+    for c in report["cycles"]:
+        lines.append(json.dumps({"cycle": c["cycle"], **(c.get("usage") or {})}))
+    lines.append("```")
+    if report.get("simulation"):
+        lines.append("\n## Thinning simulation\n")
+        lines.append(
+            "```json\n" + json.dumps(report["simulation"], indent=1, default=str) + "\n```"
+        )
     if report["api"]:
         lines.append("\n## API (after the cycles)\n")
         lines.append("| endpoint | status | ms | KB |")
