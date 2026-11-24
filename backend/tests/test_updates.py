@@ -40,6 +40,7 @@ from tests.conftest import USING_SQLITE, postgres_only, sqlite_only
 from tests.fake_registry import (
     GOOD_TOKEN,
     STORAGE_HOST,
+    TEST_PUBLIC_KEY,
     FakeRegistry,
     Release,
     app_files,
@@ -73,7 +74,7 @@ def make_service(
     registry: FakeRegistry,
     *,
     supervised: bool = True,
-    public_key: Any = None,
+    public_key: Any = "test",
     deps: str = "deps-1",
     deployment: str = "single",
 ) -> UpdateService:
@@ -93,7 +94,8 @@ def make_service(
         runtime,
         transport=registry.transport(),
         arch="amd64",
-        public_key=public_key,
+        # By default the image trusts the key the fake releases are signed with.
+        public_key=load_public_key(TEST_PUBLIC_KEY) if public_key == "test" else public_key,
         signal_launcher=signals.append,
     )
     update_service.set_service(service)
@@ -240,7 +242,9 @@ def release_files(release: Release) -> dict[str, bytes]:
 
 class TestReleaseManifest:
     def test_unsigned_release_verifies_without_a_key(self) -> None:
-        verified = verify_release(release_files(Release(V_NEXT)), public_key=None)
+        verified = verify_release(
+            release_files(Release(V_NEXT, private_key_pem=None)), public_key=None
+        )
         assert verified.version == V_NEXT and not verified.signed and not verified.has_signature
 
     def test_signed_release_verifies_with_its_key(self) -> None:
@@ -254,7 +258,10 @@ class TestReleaseManifest:
     def test_unsigned_release_is_rejected_once_a_key_is_configured(self) -> None:
         _private, public = ed25519_keypair()
         with pytest.raises(ReleaseRejected, match="not signed"):
-            verify_release(release_files(Release(V_NEXT)), public_key=load_public_key(public))
+            verify_release(
+                release_files(Release(V_NEXT, private_key_pem=None)),
+                public_key=load_public_key(public),
+            )
 
     def test_signature_from_another_key_is_rejected(self) -> None:
         other, _ = ed25519_keypair()
@@ -408,11 +415,12 @@ class TestInstall:
         service = make_service(
             tmp_path,
             builtin_dir,
-            FakeRegistry(releases=[Release(V_NEXT)]),
+            FakeRegistry(releases=[Release(V_NEXT, private_key_pem=None)]),
             public_key=load_public_key(public),
         )
         save_token(db)
-        job = service.install(db, V_NEXT, actor=ADMIN, background=False)
+        # Not even with the confirmation meant for images without a key.
+        job = service.install(db, V_NEXT, actor=ADMIN, allow_unsigned=True, background=False)
         assert job.state == "failed" and "not signed" in job.error
         assert service.store.get(V_NEXT) is None
 
@@ -792,3 +800,495 @@ def test_layer_bytes_helper_round_trip() -> None:
         info.size = 1
         archive.addfile(info, io.BytesIO(b"y"))
     assert extract_app_files(raw.getvalue()).files == {"app/x.py": b"y"}
+
+
+# ------------------------------------------------- security review findings
+
+
+def _pyc(tmp: Path, source: str, name: str) -> bytes:
+    """Bytecode that runs whatever its source says, whatever the .py next to it holds."""
+    import py_compile
+
+    src = tmp / f"{name}.py"
+    src.write_text(source)
+    out = tmp / f"{name}.pyc"
+    py_compile.compile(
+        str(src),
+        cfile=str(out),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    return out.read_bytes()
+
+
+class TestOnlyTheSignedFilesRun:
+    """B1: nothing outside the signed manifest is installed, or run."""
+
+    def test_pyc_files_outside_the_signed_manifest_are_refused(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        import subprocess
+        import sys
+
+        import cxcg_launcher as L
+
+        work = tmp_path / "craft"
+        work.mkdir()
+        marker = tmp_path / "PWNED"
+        evil = f"open({str(marker)!r}, 'w').write('x')\n"
+        tag = sys.implementation.cache_tag
+        sitecustomize = _pyc(work, evil, "sitecustomize")
+        main_pyc = _pyc(work, evil + "app = None\n", "main")
+
+        def tamper(files: dict[str, bytes]) -> None:
+            # Added AFTER the manifest was written and signed.
+            files["sitecustomize.pyc"] = sitecustomize
+            files[f"app/__pycache__/main.{tag}.pyc"] = main_pyc
+
+        registry = FakeRegistry(releases=[Release(V_NEXT, tamper=tamper)])
+        service = make_service(tmp_path, builtin_dir, registry)
+        save_token(db)
+        job = service.install(db, V_NEXT, actor=ADMIN, background=False)
+        assert job.state == "failed", "a release with files outside its manifest was installed"
+        assert "not installed" in job.error
+        assert service.store.get(V_NEXT) is None
+        assert not (service.store.versions / V_NEXT).exists()
+        assert service.store.selection() is None
+
+        # Planted in an installed version afterwards: the launcher refuses the version...
+        clean = FakeRegistry(releases=[Release(V_NEXT)])
+        service = make_service(tmp_path, builtin_dir, clean)
+        assert service.install(db, V_NEXT, actor=ADMIN, background=False).state == "switching"
+        root = service.store.versions / V_NEXT
+        assert L.tree_problems(root) == []
+        (root / "sitecustomize.pyc").write_bytes(sitecustomize)
+        (root / "app" / "__pycache__").mkdir()
+        (root / "app" / "__pycache__" / f"main.{tag}.pyc").write_bytes(main_pyc)
+        problems = L.tree_problems(root)
+        assert any("sitecustomize.pyc" in p for p in problems), problems
+        assert any("__pycache__" in p for p in problems), problems
+        paths = L.Paths(service.store.data)
+        image = L.ImageInfo(builtin_dir, __version__, "deps-1")
+        target = L.choose_target(paths, image)
+        assert target.source == "built-in" and target.refused
+
+        # ...and even when the app's folder is the one that runs, nothing in it runs
+        # at interpreter start or shadows a module: it is appended to sys.path and
+        # serves the app package only, in an isolated interpreter.
+        launcher = L.Launcher(paths=paths, image=image)
+        chosen = L.Target(V_NEXT, root, "installed", "test", False, V_NEXT)
+        (root / "json.py").write_text(evil)
+        env = {**launcher.environment(chosen), "PYTHONPATH": str(root)}
+        assert "-I" in launcher.command(chosen) and "-B" in launcher.command(chosen)
+        result = subprocess.run(  # noqa: S603 - this interpreter, the launcher's own command
+            [*launcher.command(chosen), "--dry-run"],
+            env=env,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert not marker.exists(), "code from the version's folder ran at start"
+        shown = json.loads(result.stdout.strip().splitlines()[-1])
+        assert shown["app"] == str((root / "app" / "__init__.py").resolve())
+        assert shown["sys_path"][-1] == str(root.resolve())
+        assert str(root.resolve()) not in shown["sys_path"][:-1]
+
+    def test_every_file_must_be_listed_and_no_bytecode_ever(self) -> None:
+        private, public = ed25519_keypair()
+        key = load_public_key(public)
+
+        def listed_pyc(files: dict[str, bytes]) -> None:
+            files["app/x.pth"] = b"import os\n"
+
+        for tamper, match in (
+            (listed_pyc, "do not match its manifest|outside what a release may ship"),
+            (lambda f: f.update({"app/__pycache__/x.pyc": b"\0"}), "outside what"),
+            (lambda f: f.update({"version.json": b"{}"}), "version.json"),
+        ):
+            with pytest.raises(ReleaseRejected, match=match):
+                verify_release(
+                    release_files(Release(V_NEXT, private_key_pem=private, tamper=tamper)),
+                    public_key=key,
+                )
+
+    def test_a_manifest_listing_bytecode_is_refused_even_when_signed(self, tmp_path: Path) -> None:
+        from app.updates.manifest import build_manifest, manifest_bytes, sign
+
+        private, public = ed25519_keypair()
+        files = app_files(V_NEXT)
+        files["app/__pycache__/main.cpython-311.pyc"] = b"\0"
+        import hashlib
+
+        manifest = {
+            "format": 1,
+            "version": V_NEXT,
+            "revision": "",
+            "deps_hash": "deps-1",
+            "files": {rel: hashlib.sha256(data).hexdigest() for rel, data in files.items()},
+        }
+        raw = manifest_bytes(manifest)
+        files["release-manifest.json"] = raw
+        files["release-manifest.sig"] = sign(raw, private).encode()
+        with pytest.raises(ReleaseRejected, match="compiled bytecode"):
+            verify_release(files, public_key=load_public_key(public))
+        # The release build refuses a tree with bytecode (and lists everything else).
+        for rel, data in files.items():
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        with pytest.raises(ReleaseRejected, match="bytecode"):
+            build_manifest(tmp_path, version=V_NEXT, revision="", deps_hash="x")
+        for cache in tmp_path.rglob("__pycache__"):
+            for item in cache.iterdir():
+                item.unlink()
+            cache.rmdir()
+        built = build_manifest(tmp_path, version=V_NEXT, revision="", deps_hash="x")
+        assert "app/static/index.html" in built["files"] and "scripts/tool.py" in built["files"]
+
+    def test_the_store_writes_only_listed_files(self, tmp_path: Path) -> None:
+        from app.updates.store import VersionStore
+
+        files = release_files(Release(V_NEXT))
+        store = VersionStore(tmp_path / "data")
+        with pytest.raises(ReleaseRejected, match="not in the release's manifest"):
+            store.install(V_NEXT, {**files, "app/evil.py": b"x"}, {})
+        with pytest.raises(ReleaseRejected, match="does not match"):
+            store.install(V_NEXT, {**files, "app/main.py": b"changed"}, {})
+        assert store.get(V_NEXT) is None
+        assert store.install(V_NEXT, files, {}).version == V_NEXT
+
+
+class TestSigningKey:
+    """B2: no key, no automatic install; an unsigned manual install is confirmed and
+    audited; a key is required once configured; it comes from the image only."""
+
+    QUIET = datetime(2026, 11, 24, 3, 10, tzinfo=UTC)
+
+    def test_auto_update_waits_for_the_signing_key(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        registry = FakeRegistry(releases=[Release(V_NEXT, private_key_pem=None)])
+        service = make_service(tmp_path, builtin_dir, registry, public_key=None)
+        save_token(db)
+        for _ in range(2):
+            result = service.auto_tick(self.QUIET)
+            assert result.startswith("Auto-update waits for the release signing key"), result
+        assert service.store.selection() is None
+        app_layer = registry.built[V_NEXT]["app_layer_digest"]
+        assert not any(app_layer in p for p in registry.paths())
+        db.commit()
+        titles = [n.title for n in update_notifications(db)]
+        assert titles == ["Auto-update waits for the release signing key."]
+        status = service.status(db)
+        assert status["signing"]["configured"] is False and status["signing"]["auto_waits"]
+        assert status["notice"]["kind"] == "needs_signing_key"
+        with pytest.raises(UpdateError) as refused:
+            service.install(db, V_NEXT, actor=ADMIN, automatic=True, background=False)
+        assert refused.value.code == "needs_signing_key"
+
+    def test_unsigned_manual_install_needs_an_explicit_confirmation(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        registry = FakeRegistry(releases=[Release(V_NEXT, private_key_pem=None)])
+        service = make_service(tmp_path, builtin_dir, registry, public_key=None)
+        save_token(db)
+        with pytest.raises(UpdateError) as refused:
+            service.install(db, V_NEXT, actor=ADMIN, background=False)
+        assert refused.value.code == "confirm_unsigned"
+        assert registry.requests == []
+        job = service.install(db, V_NEXT, actor=ADMIN, allow_unsigned=True, background=False)
+        assert job.state == "switching", job.error
+        assert service.store.get(V_NEXT).info["signed"] is False  # type: ignore[union-attr]
+        assert "update.unsigned_install_confirmed" in audit_actions(db)
+
+    def test_the_key_comes_from_the_image_never_the_data_volume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.updates import manifest
+
+        _private, public = ed25519_keypair()
+        image = tmp_path / "image"
+        (image / "app" / "updates").mkdir(parents=True)
+        (image / "app" / "updates" / "release-signing-key.pub").write_text(public)
+        installed = tmp_path / "data" / "versions" / V_NEXT
+        (installed / "app" / "updates").mkdir(parents=True)
+        _other_private, other = ed25519_keypair()
+        (installed / "app" / "updates" / "release-signing-key.pub").write_text(other)
+        monkeypatch.delenv(manifest.PUBLIC_KEY_ENV, raising=False)
+        monkeypatch.setenv("CXCG_DATA_DIR", str(tmp_path / "data"))
+        # Whichever version runs, the launcher points at the image's own folder.
+        monkeypatch.setenv("CXCG_BUILTIN_DIR", str(image))
+        key = manifest.configured_public_key()
+        assert (
+            key is not None and key.public_bytes_raw() == load_public_key(public).public_bytes_raw()
+        )
+        # A "built-in" folder inside the data volume is never trusted.
+        monkeypatch.setenv("CXCG_BUILTIN_DIR", str(installed))
+        assert manifest.configured_public_key() is None
+
+    def test_install_route_needs_the_confirmation_without_a_key(
+        self, admin_client: TestClient, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        make_service(
+            tmp_path,
+            builtin_dir,
+            FakeRegistry(releases=[Release(V_NEXT, private_key_pem=None)]),
+            public_key=None,
+        )
+        admin_client.put("/api/ops/updates/token", json={"token": GOOD_TOKEN})
+        refused = admin_client.post("/api/ops/updates/install", json={"version": V_NEXT})
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["code"] == "confirm_unsigned"
+        response = admin_client.post(
+            "/api/ops/updates/install", json={"version": V_NEXT, "allow_unsigned": True}
+        )
+        assert response.status_code == 202, response.text
+
+
+class TestSkippedAfterRollback:
+    """S1: a version an admin rolled back is not reinstalled by auto-update."""
+
+    QUIET = datetime(2026, 11, 25, 3, 5, tzinfo=UTC)
+
+    def _rolled_back(self, db: Session, tmp_path: Path, builtin_dir: Path, registry: FakeRegistry):
+        set_revision("aaa")
+        service = make_service(tmp_path, builtin_dir, registry)
+        save_token(db)
+        job = service.install(
+            db, V_NEXT, actor=ADMIN, accept_no_backup=not USING_SQLITE, background=False
+        )
+        assert job.state == "switching", job.error
+        selection = service.store.selection() or {}
+        selection["trial"] = False
+        service.store.write_selection(selection)
+        service.rt = Runtime(
+            **{**service.rt.__dict__, "running_version": V_NEXT, "running_source": "installed"}
+        )
+        service.job = None
+        service.rollback(db, actor=ADMIN, confirm_data_loss=True)
+        # The launcher switched back: the built-in version runs again.
+        service.rt = Runtime(
+            **{
+                **service.rt.__dict__,
+                "running_version": service.rt.builtin_version,
+                "running_source": "built-in",
+            }
+        )
+        service.job = None
+        return service
+
+    def test_manual_rollback_is_not_reinstalled_by_auto_update_that_night(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        service = self._rolled_back(db, tmp_path, builtin_dir, FakeRegistry([Release(V_NEXT)]))
+        result = service.auto_tick(self.QUIET)
+        assert result != f"Installing {V_NEXT}.", "the rolled-back version was reinstalled"
+        assert (service.store.selection() or {})["version"] == "built-in"
+        status = service.status(db)
+        row = next(r for r in status["available"] if r["version"] == V_NEXT)
+        assert row["skipped"] == "Skipped after a rollback"
+        assert V_NEXT in status["skipped"]
+        # An admin installing it again clears it.
+        job = service.install(
+            db, V_NEXT, actor=ADMIN, accept_no_backup=not USING_SQLITE, background=False
+        )
+        assert job.state == "switching", job.error
+        assert service.store.skipped() == {}
+
+    def test_a_newer_release_supersedes_the_skipped_one(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        registry = FakeRegistry([Release(V_NEXT)])
+        service = self._rolled_back(db, tmp_path, builtin_dir, registry)
+        registry.releases.append(Release(V_LATER))
+        registry.rebuild()
+        service.store.save_state({"last_check": None})
+        result = service.auto_tick(self.QUIET)
+        assert result == f"Installing {V_LATER}.", result
+        assert service.store.skipped() == {}
+
+
+class TestReviewMinors:
+    QUIET = datetime(2026, 11, 24, 3, 10, tzinfo=UTC)
+
+    def test_content_encoding_gzip_bomb_is_never_decoded(self) -> None:
+        import gzip
+        import hashlib
+        import tracemalloc
+
+        plain = b"\0" * (200 * 1024 * 1024)
+        body = gzip.compress(plain, compresslevel=1)
+        digest = "sha256:" + hashlib.sha256(plain).hexdigest()
+        del plain
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.url.path == "/token":
+                return httpx.Response(200, json={"token": "t"})
+            # As from the network: the body is a stream, not read yet.
+            return httpx.Response(
+                200,
+                stream=httpx.ByteStream(body),
+                headers={"content-encoding": "gzip", "content-length": str(len(body))},
+            )
+
+        client = RegistryClient(GOOD_TOKEN, transport=httpx.MockTransport(handle), arch="amd64")
+        tracemalloc.start()
+        with pytest.raises(RegistryError):
+            client.blob(digest, max_bytes=8 * 1024 * 1024)
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert peak < 32 * 1024 * 1024, f"{peak} bytes were held to refuse a 2 MB answer"
+        assert all(r.headers.get("accept-encoding") == "identity" for r in seen)
+
+    def test_a_body_over_the_limit_is_not_read_to_the_end(self) -> None:
+        sent: list[int] = []
+
+        class Endless(httpx.SyncByteStream):
+            def __iter__(self):
+                for _ in range(10_000):
+                    sent.append(1)
+                    yield b"\0" * 65536
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/token":
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(200, stream=Endless())
+
+        client = RegistryClient(GOOD_TOKEN, transport=httpx.MockTransport(handle), arch="amd64")
+        with pytest.raises(UnsafeArchive):
+            client.blob("sha256:" + "0" * 64, max_bytes=1024 * 1024)
+        assert len(sent) <= 20
+
+    def test_a_layer_inflating_past_the_limit_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.updates import registry as registry_module
+
+        monkeypatch.setattr(registry_module, "MAX_LAYER_STREAM_BYTES", 1024 * 1024)
+        layer = tar_gz([("etc/big", b"\0" * (4 * 1024 * 1024)), ("app/app/main.py", b"x")])
+        with pytest.raises(UnsafeArchive, match="more than allowed"):
+            extract_app_files(layer)
+
+    def test_malformed_registry_json_is_a_clean_error(
+        self, admin_client: TestClient, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        registry = FakeRegistry(releases=[Release(V_NEXT)])
+        config = registry.built[V_NEXT]["config_digest"]
+        registry.manifests[V_NEXT] = json.dumps(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {"digest": config, "size": 1},
+                "layers": [{"digest": "sha256:" + "0" * 64, "size": "not a number"}],
+            }
+        ).encode()
+        service = make_service(tmp_path, builtin_dir, registry)
+        with (
+            RegistryClient(GOOD_TOKEN, transport=registry.transport(), arch="amd64") as client,
+            pytest.raises(RegistryError, match="cannot read"),
+        ):
+            client.image(V_NEXT)
+        admin_client.put("/api/ops/updates/token", json={"token": GOOD_TOKEN})
+        service._last_manual_check = None
+        response = admin_client.post("/api/ops/updates/check")
+        assert response.status_code == 200, response.text
+        assert "cannot read" in response.json()["last_check"]["error"]
+        # Once per 30 seconds.
+        again = admin_client.post("/api/ops/updates/check")
+        assert again.status_code == 429 and again.json()["detail"]["code"] == "too_soon"
+
+    def test_the_signed_dependency_hash_decides_not_the_label(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        registry = FakeRegistry(releases=[Release(V_NEXT, deps="deps-2", label_deps="deps-1")])
+        service = make_service(tmp_path, builtin_dir, registry)
+        save_token(db)
+        job = service.install(db, V_NEXT, actor=ADMIN, background=False)
+        assert job.state == "failed" and "different image" in job.error
+        assert service.store.get(V_NEXT) is None
+        # Not tried again at every tick.
+        service.check(db)
+        service.job = None
+        assert service.auto_tick(self.QUIET) != f"Installing {V_NEXT}."
+
+    def test_a_schema_change_on_an_unbacked_database_is_seen_before_downloading(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        registry = FakeRegistry(releases=[Release(V_NEXT, migrations=("aaa", "bbb"))])
+        service = make_service(tmp_path, builtin_dir, registry)
+        service._db_backed_up = lambda: False  # type: ignore[method-assign]
+        save_token(db)
+        service.check(db)
+        app_layer = registry.built[V_NEXT]["app_layer_digest"]
+        with pytest.raises(UpdateError) as refused:
+            service.install(db, V_NEXT, actor=ADMIN, background=False)
+        assert refused.value.code == "needs_backup"
+        for _ in range(3):
+            result = service.auto_tick(self.QUIET)
+            assert "changes the database schema" in result, result
+        assert not any(app_layer in p for p in registry.paths())
+        db.commit()
+        assert audit_actions(db).count("update.needs_backup") == 1
+        assert [r["schema_change"] for r in service.status(db)["available"]] == [True]
+
+    def test_an_installable_intermediate_release_is_taken(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        registry = FakeRegistry(releases=[Release(V_NEXT), Release(V_LATER, deps="deps-2")])
+        service = make_service(tmp_path, builtin_dir, registry)
+        save_token(db)
+        result = service.auto_tick(self.QUIET)
+        assert result == f"Installing {V_NEXT}.", result
+        db.commit()
+        assert f"CxCreditGuard {V_LATER} needs a new image" in [
+            n.title for n in update_notifications(db)
+        ]
+
+    def test_a_dead_install_thread_is_not_busy(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        import threading
+
+        from app.db.base import utcnow
+        from app.updates.service import Job
+
+        service = make_service(tmp_path, builtin_dir, FakeRegistry())
+        job = Job(version=V_NEXT, by="x", automatic=False)
+        job.thread = threading.Thread(target=lambda: None)
+        job.thread.start()
+        job.thread.join()
+        service.job = job
+        assert not service._job_busy()
+        job.thread = None
+        job.heartbeat_at = utcnow() - update_service.JOB_HEARTBEAT_STALE
+        assert not service._job_busy()
+        job.heartbeat_at = utcnow()
+        assert service._job_busy()
+
+    def test_the_switch_request_waits_for_the_answer(
+        self, db: Session, tmp_path: Path, builtin_dir: Path
+    ) -> None:
+        service = make_service(tmp_path, builtin_dir, FakeRegistry(releases=[Release(V_NEXT)]))
+        save_token(db)
+        before = time.time()
+        service.install(db, V_NEXT, actor=ADMIN, background=False)
+        request = json.loads((service.store.updates / "request.json").read_text())
+        assert request["not_before"] >= before + update_service.SWITCH_DELAY_SECONDS - 0.01
+
+    def test_an_old_image_says_so(self, db: Session, tmp_path: Path, builtin_dir: Path) -> None:
+        service = make_service(tmp_path, builtin_dir, FakeRegistry())
+        save_token(db)
+        service.rt = Runtime(**{**service.rt.__dict__, "image_created": "2026-01-02T00:00:00Z"})
+        status = service.status(db)
+        assert status["image_age"]["stale"] is True and status["image_age"]["days"] > 90
+        assert status["notice"]["kind"] == "image_old"
+        assert "replace the image" in status["notice"]["detail"]
+        service.rt = Runtime(**{**service.rt.__dict__, "image_created": now_text()})
+        assert service.status(db)["image_age"]["stale"] is False
+
+
+def now_text() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")

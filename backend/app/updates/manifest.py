@@ -6,10 +6,16 @@ dependency hash of the image it was built for. The release workflow signs those
 exact bytes with an ed25519 key held as a repository secret, and the signature is
 written next to it as ``release-manifest.sig`` (base64).
 
-An installation verifies the signature with the public key embedded in the
-running app (``release-signing-key.pub`` beside this file, or
-``CXCG_UPDATE_PUBLIC_KEY``). Once a key is configured, a release without a valid
-signature, or whose files differ from its list, is never installed.
+An installation verifies the signature with the public key of the IMAGE it
+runs on (``app/updates/release-signing-key.pub`` in the image's own ``/app``, or
+``CXCG_UPDATE_PUBLIC_KEY``): never a key from the data volume or from a
+downloaded version, so a release cannot bring its own key. Once a key is
+configured, a release without a valid signature is never installed.
+
+The manifest covers EVERY file a release ships (nothing is excluded), and a
+release never ships bytecode (``*.pyc``, ``__pycache__``), ``.pth`` files or
+``sitecustomize``/``usercustomize`` modules: anything outside the list, or of
+those kinds, rejects the whole release.
 
 Imports nothing from the rest of the app, so the release build can run it
 before the app is configured.
@@ -43,8 +49,32 @@ class ReleaseRejected(ValueError):
 
 
 def covered(rel: str) -> bool:
+    """Every file except the manifest, its signature and the store's version.json."""
+    return rel not in UNCOVERED
+
+
+_STARTUP_HOOKS = frozenset({"sitecustomize", "usercustomize"})
+
+
+def forbidden(rel: str) -> str | None:
+    """Why a release may never contain ``rel`` (even when listed), or None.
+
+    Bytecode would run instead of the verified source next to it; ``.pth`` files
+    and the interpreter's start-up hooks run code before the app is imported.
+    """
     parts = rel.split("/")
-    return rel not in UNCOVERED and "__pycache__" not in parts and not rel.endswith(".pyc")
+    base = parts[-1]
+    if "__pycache__" in parts or base.endswith((".pyc", ".pyo")):
+        return "compiled bytecode"
+    if base.endswith(".pth"):
+        return "a .pth file"
+    if any(part.split(".", 1)[0] in _STARTUP_HOOKS for part in parts):
+        return "an interpreter start-up hook"
+    if not rel or rel.startswith("/") or "\\" in rel or "\x00" in rel:
+        return "an unsafe path"
+    if any(part in ("", ".", "..") for part in parts):
+        return "an unsafe path"
+    return None
 
 
 def sha256_hex(data: bytes) -> str:
@@ -52,17 +82,25 @@ def sha256_hex(data: bytes) -> str:
 
 
 def tree_files(root: Path) -> dict[str, str]:
-    """Every covered regular file under ``root`` with its sha256. Links are refused."""
+    """Every covered file under ``root`` with its sha256. Links and other special files,
+    and files a release may never hold (bytecode, .pth, start-up hooks), are refused."""
     out: dict[str, str] = {}
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for name in [*dirnames, *filenames]:
+            path = Path(dirpath) / name
+            rel = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                raise ReleaseRejected(f"{rel} is a link; a release holds regular files only.")
         for name in filenames:
             path = Path(dirpath) / name
             rel = path.relative_to(root).as_posix()
             if not covered(rel):
                 continue
-            if path.is_symlink():
-                raise ReleaseRejected(f"{rel} is a link; a release holds regular files only.")
+            why = forbidden(rel)
+            if why:
+                raise ReleaseRejected(f"{rel} is {why}, which a release never ships.")
+            if not path.is_file():
+                raise ReleaseRejected(f"{rel} is not a regular file.")
             out[rel] = sha256_hex(path.read_bytes())
     return dict(sorted(out.items()))
 
@@ -117,13 +155,35 @@ def load_public_key(text: str | bytes | None) -> Any:
     return key
 
 
+def public_key_path() -> Path | None:
+    """Where the trusted public key is read from: the IMAGE's own copy of the app.
+
+    Under the launcher, ``CXCG_BUILTIN_DIR`` is the image's ``/app`` whichever
+    version runs, so an installed (downloaded) version never supplies the key it
+    is checked against. A path inside the data volume is never used.
+    """
+    builtin = os.environ.get("CXCG_BUILTIN_DIR", "").strip()
+    path = Path(builtin) / "app" / "updates" / PUBLIC_KEY_FILE.name if builtin else PUBLIC_KEY_FILE
+    data = os.environ.get("CXCG_DATA_DIR", "").strip()
+    if data:
+        try:
+            if path.resolve().is_relative_to(Path(data).resolve()):
+                return None
+        except OSError:
+            return None
+    return path
+
+
 def configured_public_key() -> Any:
-    """The key releases must be signed with: the environment's, else the embedded one."""
+    """The key releases must be signed with: the environment's, else the image's."""
     from_env = os.environ.get(PUBLIC_KEY_ENV, "").strip()
     if from_env:
         return load_public_key(from_env)
+    path = public_key_path()
+    if path is None:
+        return None
     try:
-        return load_public_key(PUBLIC_KEY_FILE.read_text(encoding="utf-8"))
+        return load_public_key(path.read_text(encoding="utf-8"))
     except OSError:
         return None
 
@@ -155,6 +215,13 @@ class VerifiedRelease:
     # Whether the release carries a signature at all (checked or not).
     has_signature: bool
     files: int
+    # The paths the (verified) manifest lists: the only files that are installed.
+    listed: frozenset[str] = frozenset()
+
+    def installable(self, files: Mapping[str, bytes]) -> dict[str, bytes]:
+        """Exactly what may be written: the listed files, the manifest and its signature."""
+        allowed = self.listed | {MANIFEST_FILE, SIGNATURE_FILE}
+        return {rel: data for rel, data in files.items() if rel in allowed}
 
 
 def _differences(listed: Mapping[str, str], actual: Mapping[str, str]) -> list[str]:
@@ -187,6 +254,13 @@ def verify_release(files: Mapping[str, bytes], *, public_key: Any) -> VerifiedRe
     version = str(manifest.get("version") or "")
     if parse_version(version) is None:
         raise ReleaseRejected("The release's file manifest names no release version.")
+    for rel in listed:
+        why = "listed by the store" if not covered(rel) else forbidden(rel)
+        if why:
+            raise ReleaseRejected(
+                f"{version}'s manifest lists {rel[:80]!r} ({why}), which a release never "
+                "ships: not installed."
+            )
 
     signature = files.get(SIGNATURE_FILE)
     signed = False
@@ -201,6 +275,15 @@ def verify_release(files: Mapping[str, bytes], *, public_key: Any) -> VerifiedRe
             )
         signed = True
 
+    if VERSION_FILE in files:
+        raise ReleaseRejected(f"{version} carries its own {VERSION_FILE}: not installed.")
+    for rel in files:
+        why = forbidden(rel)
+        if why and covered(rel):
+            raise ReleaseRejected(
+                f"{version} holds {rel[:80]!r} ({why}), outside what a release may ship: "
+                "not installed."
+            )
     actual = {rel: sha256_hex(data) for rel, data in files.items() if covered(rel)}
     problems = _differences(listed, actual)
     if problems:
@@ -216,6 +299,7 @@ def verify_release(files: Mapping[str, bytes], *, public_key: Any) -> VerifiedRe
         signed=signed,
         has_signature=bool(signature),
         files=len(actual),
+        listed=frozenset(listed),
     )
 
 

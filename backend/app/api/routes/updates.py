@@ -23,6 +23,9 @@ class InstallRequest(BaseModel):
     version: str = Field(min_length=5, max_length=16)
     # PostgreSQL only: the admin has a backup of their own for a schema change.
     accept_no_backup: bool = False
+    # Only while the image has no release signing key: the admin confirms that the
+    # release cannot be verified (audited). Ignored once a key is configured.
+    allow_unsigned: bool = False
 
 
 class RollbackRequest(BaseModel):
@@ -57,7 +60,11 @@ def update_status(ctx: AdminUser, db: DbSession) -> dict[str, Any]:
 @router.post("/check")
 def check_now(ctx: AdminUser, db: DbSession) -> dict[str, Any]:
     service = get_service()
-    service.check(db, actor=ctx.actor)
+    try:
+        service.check_now(db, actor=ctx.actor)
+    except UpdateError as exc:
+        db.rollback()
+        raise _refuse(exc) from exc
     db.commit()
     return service.status(db)
 
@@ -67,7 +74,11 @@ def install(payload: InstallRequest, ctx: AdminUser, db: DbSession) -> dict[str,
     service = get_service()
     try:
         service.install(
-            db, payload.version, actor=ctx.actor, accept_no_backup=payload.accept_no_backup
+            db,
+            payload.version,
+            actor=ctx.actor,
+            accept_no_backup=payload.accept_no_backup,
+            allow_unsigned=payload.allow_unsigned,
         )
     except UpdateError as exc:
         db.rollback()

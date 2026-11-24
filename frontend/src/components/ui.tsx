@@ -544,6 +544,7 @@ export function ConfirmDialog({
   confirmLabel = "Confirm",
   destructive = false,
   busy = false,
+  confirmDisabled = false,
   onConfirm,
   onCancel,
 }: {
@@ -553,6 +554,8 @@ export function ConfirmDialog({
   confirmLabel?: string;
   destructive?: boolean;
   busy?: boolean;
+  /** The confirm button stays disabled (e.g. until a required box is ticked). */
+  confirmDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -571,6 +574,7 @@ export function ConfirmDialog({
             variant={destructive ? "danger" : "primary"}
             onClick={onConfirm}
             loading={busy}
+            disabled={confirmDisabled}
           >
             {confirmLabel}
           </Button>

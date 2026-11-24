@@ -94,7 +94,8 @@ export CXCG_BOOTSTRAP_ADMIN_USERNAME CXCG_BOOTSTRAP_ADMIN_PASSWORD
 # still works, without in-app updates.
 case "${1:-}" in
 launch)
-    exec python /usr/local/lib/cxcreditguard/launcher.py run
+    # -I: no PYTHONPATH, user site, current or script folder on sys.path; -B: no bytecode.
+    exec python -I -B /usr/local/lib/cxcreditguard/launcher.py run
     ;;
 uvicorn) ;;
 *)

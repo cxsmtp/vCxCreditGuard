@@ -42,7 +42,14 @@ export interface Me {
 }
 
 export interface UpdateNotice {
-  kind: "available" | "needs_token" | "token_invalid" | "needs_image" | "installing";
+  kind:
+    | "available"
+    | "needs_token"
+    | "token_invalid"
+    | "needs_image"
+    | "needs_signing_key"
+    | "image_old"
+    | "installing";
   tone: "warn" | "bad" | "off";
   label: string;
   detail: string;
@@ -58,6 +65,10 @@ export interface UpdateRelease {
   running: boolean;
   installed: boolean;
   failed: string | null;
+  /** Rolled back by an admin: auto-update does not install it again. */
+  skipped: string | null;
+  /** From the release's migrations label; null when the release does not say. */
+  schema_change: boolean | null;
   notes: string;
 }
 
@@ -70,6 +81,7 @@ export interface InstalledVersion {
   bytes: number | null;
   running: boolean;
   failed: string | null;
+  skipped: string | null;
 }
 
 export interface UpdateEvent {
@@ -98,6 +110,8 @@ export interface UpdatesStatus {
   latest: string | null;
   update_available: boolean;
   latest_needs_image: boolean;
+  /** The release auto-update would install (fits this image, not failed or skipped). */
+  latest_installable: string | null;
   whats_new: { version: string; notes: string }[];
   rollback: {
     possible: boolean;
@@ -110,7 +124,9 @@ export interface UpdatesStatus {
   selection: { version: string | null; previous: string | null; at: string | null; by: string | null };
   settings: { auto_enabled: boolean; quiet_hour: number; timezone: string };
   token: { configured: boolean; status: "ok" | "invalid" | "missing" | "unknown" };
-  signing: { configured: boolean };
+  signing: { configured: boolean; auto_waits: boolean; message: string };
+  image_age: { created: string | null; days: number | null; stale: boolean; max_days: number };
+  skipped: Record<string, { at: string; by: string; reason: string }>;
   database: { kind: string; backups: boolean };
   last_check: { at: string; error: string | null; count?: number } | null;
   last_auto: { at: string; result: string } | null;

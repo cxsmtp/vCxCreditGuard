@@ -5,6 +5,7 @@
     <data>/updates/request.json     "switch" / "restart", for the launcher
     <data>/updates/events.jsonl     what the launcher did (started, rollback, crash, ...)
     <data>/updates/failed.json      versions that failed to start: never auto-installed
+    <data>/updates/skipped.json     versions an admin rolled back: not auto-installed again
     <data>/updates/launcher.json    the launcher's own view of what runs
     <data>/updates/state.json       the updater's last check and last automatic step
     <data>/backups/                 database backups taken before each switch
@@ -19,6 +20,7 @@ import contextlib
 import json
 import os
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,7 +28,14 @@ from pathlib import Path
 from typing import Any
 
 from app.updates import BUILT_IN, compare_versions, parse_version
-from app.updates.manifest import VERSION_FILE
+from app.updates.manifest import (
+    MANIFEST_FILE,
+    SIGNATURE_FILE,
+    VERSION_FILE,
+    ReleaseRejected,
+    forbidden,
+    sha256_hex,
+)
 
 PROTOCOL = 1
 REQUIRED_FILES = ("app/__init__.py", "app/main.py", "alembic.ini", "alembic/env.py")
@@ -100,12 +109,33 @@ class VersionStore:
     def install(
         self, version: str, files: dict[str, bytes], meta: dict[str, Any]
     ) -> InstalledVersion:
-        """Write a verified release to ``versions/<version>``: staged, then moved in place."""
+        """Write a verified release to ``versions/<version>``: staged, then moved in place.
+
+        Only what the release's own manifest lists is written (plus the manifest
+        and its signature), each file matching its sha256: anything else in
+        ``files``, or anything a release may never ship, refuses the whole release.
+        """
         if parse_version(version) is None:
             raise ValueError(f"Not a release version: {version!r}")
         missing = [rel for rel in REQUIRED_FILES if rel not in files]
         if missing:
             raise ValueError(f"The release is missing {', '.join(missing)}: not installed.")
+        listed = _listed(files)
+        for rel, data in files.items():
+            if rel in (MANIFEST_FILE, SIGNATURE_FILE):
+                continue
+            why = forbidden(rel)
+            if why or rel not in listed:
+                raise ReleaseRejected(
+                    f"{rel[:80]!r} is not in the release's manifest"
+                    + (f" ({why})" if why else "")
+                    + ": not installed."
+                )
+            if sha256_hex(data) != listed[rel]:
+                raise ReleaseRejected(f"{rel[:80]!r} does not match its manifest: not installed.")
+        absent = [rel for rel in listed if rel not in files]
+        if absent:
+            raise ReleaseRejected(f"The release is missing {absent[0][:80]!r}: not installed.")
         total = sum(len(data) for data in files.values())
         if total > MAX_VERSION_BYTES:
             raise ValueError("The release is larger than allowed: not installed.")
@@ -180,14 +210,47 @@ class VersionStore:
     def write_selection(self, value: dict[str, Any]) -> None:
         write_json_atomic(self.updates / "selection.json", {"protocol": PROTOCOL, **value})
 
-    def request(self, kind: str, by: str) -> dict[str, Any]:
-        request = {"id": uuid.uuid4().hex, "kind": kind, "by": by, "at": now_iso()}
+    def request(self, kind: str, by: str, *, delay: float = 0.0) -> dict[str, Any]:
+        """Ask the launcher to switch or restart; not before ``delay`` seconds from now."""
+        request: dict[str, Any] = {"id": uuid.uuid4().hex, "kind": kind, "by": by, "at": now_iso()}
+        if delay > 0:
+            request["not_before"] = round(time.time() + delay, 3)
         write_json_atomic(self.updates / "request.json", request)
         return request
 
     def failed(self) -> dict[str, dict[str, Any]]:
         value = read_json(self.updates / "failed.json", {})
         return value if isinstance(value, dict) else {}
+
+    def skipped(self) -> dict[str, dict[str, Any]]:
+        """Versions an admin rolled back: auto-update does not install them again."""
+        value = read_json(self.updates / "skipped.json", {})
+        return (
+            {k: v for k, v in value.items() if isinstance(v, dict)}
+            if isinstance(value, dict)
+            else {}
+        )
+
+    def skip(self, version: str, *, by: str, reason: str) -> None:
+        if parse_version(version) is None:
+            return
+        skipped = self.skipped()
+        skipped[version] = {"at": now_iso(), "by": by, "reason": reason[:300]}
+        write_json_atomic(self.updates / "skipped.json", skipped)
+
+    def unskip(self, *, version: str | None = None, up_to: str | None = None) -> list[str]:
+        """Clear ``version``, or every version not newer than ``up_to`` (superseded)."""
+        skipped = self.skipped()
+        gone = [
+            v
+            for v in skipped
+            if v == version or (up_to is not None and compare_versions(v, up_to) <= 0)
+        ]
+        if gone:
+            for v in gone:
+                del skipped[v]
+            write_json_atomic(self.updates / "skipped.json", skipped)
+        return gone
 
     def launcher_state(self) -> dict[str, Any] | None:
         value = read_json(self.updates / "launcher.json")
@@ -222,6 +285,19 @@ class VersionStore:
         state = {**self.state(), **patch}
         write_json_atomic(self.updates / "state.json", state)
         return state
+
+
+def _listed(files: dict[str, bytes]) -> dict[str, str]:
+    try:
+        manifest = json.loads(files[MANIFEST_FILE].decode("utf-8"))
+        listed = manifest["files"]
+    except (KeyError, UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise ReleaseRejected("The release has no readable file manifest: not installed.") from exc
+    if not isinstance(listed, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in listed.items()
+    ):
+        raise ReleaseRejected("The release's file manifest has no file list: not installed.")
+    return listed
 
 
 def newer(a: str, b: str) -> bool:

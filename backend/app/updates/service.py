@@ -4,17 +4,26 @@
   (the releases channel: plain version tags only) with their labels: the
   dependency hash they were built for, whether they are signed, their notes.
 * **Install** downloads only the release's app layer, checks every blob against
-  its digest, unpacks it safely, verifies its signed file list, keeps it in the
-  data volume, backs the database up and asks the launcher to switch. The
-  launcher rolls back by itself if the new version does not come up.
+  its digest, unpacks it safely, verifies its signed file list, keeps exactly the
+  listed files in the data volume, backs the database up and asks the launcher
+  to switch. The launcher rolls back by itself if the new version does not come up.
+* **Signing.** Automatic installs need the release signing key of the image (and
+  a release whose signature verifies against it). Without a key, an admin may
+  install a release by hand only after confirming that it cannot be verified
+  (audited); once a key is configured, an unsigned release is never installed.
 * **Roll back** returns to the version that ran before the last switch. When the
   database schema changed since, the backup taken before that switch is put
   back, and everything written since is lost; the admin confirms that first.
+  The version rolled back from is skipped by auto-update until an admin installs
+  it again or a newer release supersedes it.
 * **Auto-update** (on by default) checks every 6 hours (first a minute after
   start) and installs a newer release in the quiet hour (UTC), never during an
-  enforcement cycle, never a version that failed to start, never a downgrade.
-* A release built for different Python packages than this image ("needs a new
-  image") is never installed as a layer: the page shows the pull/run command.
+  enforcement cycle, never a version that failed to start or was rolled back,
+  never a downgrade.
+* A release built for a different image (Python packages, base image digest,
+  OS packages: "needs a new image") is never installed as a layer: the page
+  shows the pull/run command, and auto-update takes the newest release that
+  does fit this image, if any.
 
 The registry token is read from the settings store only when needed and never
 logged, returned, or put in a message.
@@ -28,6 +37,7 @@ import os
 import re
 import signal
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -66,7 +76,20 @@ CHECK_EVERY = timedelta(hours=6)
 TICK_MINUTES = 15
 FIRST_TICK_SECONDS = 60
 DETAIL_READS_PER_CHECK = 10
-JOB_STALE_AFTER = timedelta(minutes=30)
+# An install (downloads, verification, backup) that has not reached the switch
+# within this time is stopped; a job is "busy" only while its thread is alive and
+# has reported progress recently, and never longer than this plus a margin.
+MAX_INSTALL_TIME = timedelta(minutes=20)
+JOB_STALE_AFTER = MAX_INSTALL_TIME + timedelta(minutes=5)
+JOB_HEARTBEAT_STALE = timedelta(minutes=5)
+# After asking the launcher to switch, how long the job still counts as busy (the
+# launcher's start timeout, 180 s, plus stopping and backing up).
+SWITCH_GRACE = timedelta(minutes=8)
+# The switch request waits this long, so the HTTP answer reaches the browser
+# before the app is stopped.
+SWITCH_DELAY_SECONDS = 1.5
+CHECK_MIN_SECONDS = 30
+IMAGE_MAX_AGE_DAYS = 90
 SCHEDULER_RESUME_SECONDS = 300
 # Token states (not secrets).
 TOKEN_MISSING = "missing"  # noqa: S105 - a state name
@@ -75,6 +98,12 @@ TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-]{20,255}$")
 NEEDS_TOKEN = (
     "Updates need a registry token: a GitHub token with read:packages for "
     f"{IMAGE}, entered on Settings -> Updates."
+)
+WAITS_FOR_KEY = "Auto-update waits for the release signing key."
+NO_KEY_DETAIL = (
+    "This image has no release signing key, so releases cannot be verified and are never "
+    "installed automatically. An admin can install one by hand on Settings -> Updates after "
+    "confirming that it cannot be verified; a newer image with the key restores auto-update."
 )
 _REVISION_LINE = re.compile(r"""^revision(?:\s*:\s*str)?\s*=\s*["']([0-9A-Za-z_]+)["']""", re.M)
 _VERSION_LINE = re.compile(r"""^__version__\s*=\s*["']([^"']+)["']""", re.M)
@@ -110,6 +139,8 @@ class Runtime:
     supervised: bool
     deployment: str  # "single" | "compose" | "source"
     launcher_pid: int | None = None
+    # When the image was built (image.json "created"): its OS packages are as old.
+    image_created: str = ""
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -134,24 +165,26 @@ def runtime_from_environment() -> Runtime:
         deployment = "source"
     source = env.get("CXCG_RUNNING_SOURCE") or ("built-in" if deployment != "source" else "source")
     builtin_dir = Path(env.get("CXCG_BUILTIN_DIR") or Path(__file__).resolve().parents[2])
+    image_info = _image_info()
     return Runtime(
         data_dir=Path(env.get("CXCG_DATA_DIR") or "data").resolve(),
         builtin_dir=builtin_dir,
         builtin_version=env.get("CXCG_BUILTIN_VERSION") or __version__,
         running_version=__version__,
         running_source=source if source in ("built-in", "installed", "source") else "source",
-        image_deps_hash=env.get("CXCG_IMAGE_DEPS_HASH") or _image_info_deps(),
+        image_deps_hash=env.get("CXCG_IMAGE_DEPS_HASH") or str(image_info.get("deps_hash") or ""),
         supervised=supervised,
         deployment=deployment,
         launcher_pid=pid,
+        image_created=env.get("CXCG_IMAGE_CREATED") or str(image_info.get("created") or ""),
     )
 
 
-def _image_info_deps() -> str:
+def _image_info() -> dict[str, Any]:
     from app.updates.store import read_json
 
     info = read_json(Path("/usr/local/share/cxcreditguard/image.json"), {}) or {}
-    return str(info.get("deps_hash") or "") if isinstance(info, dict) else ""
+    return info if isinstance(info, dict) else {}
 
 
 def migration_revisions(
@@ -185,6 +218,21 @@ class Job:
     step: str = "Starting"
     error: str = ""
     started_at: datetime = field(default_factory=utcnow)
+    heartbeat_at: datetime = field(default_factory=utcnow)
+    thread: threading.Thread | None = None
+
+    def beat(self, step: str | None = None, *, deadline: bool = True) -> None:
+        """Progress: a new step, and proof that the install is alive and within its time."""
+        now = utcnow()
+        if deadline and now - self.started_at > MAX_INSTALL_TIME:
+            raise UpdateError(
+                f"The install took longer than {int(MAX_INSTALL_TIME.total_seconds() // 60)} "
+                "minutes and was stopped before switching.",
+                code="timeout",
+            )
+        self.heartbeat_at = now
+        if step is not None:
+            self.step = step
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -220,6 +268,7 @@ class UpdateService:
         self._engine_factory = engine_factory
         self._lock = threading.Lock()
         self.job: Job | None = None
+        self._last_manual_check: float | None = None
 
     # -- plumbing
 
@@ -273,15 +322,56 @@ class UpdateService:
         return self.rt.builtin_dir
 
     def needs_image(self, deps_hash: str) -> bool:
+        """From a registry label (unsigned): a first look, before anything is downloaded."""
         return bool(self.rt.image_deps_hash and deps_hash and deps_hash != self.rt.image_deps_hash)
+
+    def fits_image(self, signed_deps_hash: str) -> bool:
+        """From the verified manifest: exactly this image's dependency hash."""
+        return not self.rt.image_deps_hash or signed_deps_hash == self.rt.image_deps_hash
 
     def _job_busy(self) -> bool:
         job = self.job
-        return (
-            job is not None
-            and job.state in ("running", "switching")
-            and utcnow() - job.started_at < JOB_STALE_AFTER
-        )
+        if job is None:
+            return False
+        now = utcnow()
+        if job.state == "running":
+            if job.thread is not None and not job.thread.is_alive():
+                return False
+            return (
+                now - job.heartbeat_at < JOB_HEARTBEAT_STALE
+                and now - job.started_at < JOB_STALE_AFTER
+            )
+        if job.state == "switching":
+            return now - job.heartbeat_at < SWITCH_GRACE
+        return False
+
+    def _db_backed_up(self) -> bool:
+        """Whether the app backs this database up before a switch (SQLite only)."""
+        try:
+            return self._engine().dialect.name == "sqlite"
+        except Exception:  # noqa: BLE001 - unknown means no
+            return False
+
+    def _schema_change_expected(self, details: dict[str, Any]) -> bool | None:
+        """From the release's migrations label (or a refused attempt): None when unknown."""
+        if details.get("needs_backup"):
+            return True
+        listed = details.get("migrations")
+        if not isinstance(listed, list):
+            return None
+        return bool({str(v) for v in listed} - migration_revisions(root=self._running_root()))
+
+    def image_age_days(self) -> int | None:
+        text = (self.rt.image_created or "").strip()
+        if not text:
+            return None
+        try:
+            created = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if created.tzinfo is None:
+            return None
+        return max(0, (utcnow() - created).days)
 
     # ------------------------------------------------------------ status
 
@@ -290,15 +380,20 @@ class UpdateService:
         return value if isinstance(value, dict) else {}
 
     def candidate(self) -> dict[str, Any] | None:
-        """The newest release auto-update may install: newer than the running version and
-        never failed to start here. (Whether it needs a new image is the caller's check.)"""
+        """The newest release auto-update may install: newer than the running version,
+        built for this image, never failed to start here and not rolled back by an
+        admin. When the newest needs a new image, an older one that fits may be it."""
         failed = self.store.failed()
+        skipped = self.store.skipped()
+        releases = self.releases()
         for version in self._sorted_versions():
             if compare_versions(version, self.rt.running_version) <= 0:
                 return None
-            if version in failed:
+            if version in failed or version in skipped:
                 continue
-            return self.releases()[version]
+            if self.needs_image(str(releases[version].get("deps_hash") or "")):
+                continue
+            return releases[version]
         return None
 
     def _sorted_versions(self) -> list[str]:
@@ -389,6 +484,7 @@ class UpdateService:
         state = self.store.state()
         policy = settings_store.update_policy(session)
         failed = self.store.failed()
+        skipped = self.store.skipped()
         selection = self.store.selection() or {}
         installed = []
         for item in self.store.list_installed():
@@ -404,6 +500,7 @@ class UpdateService:
                     "running": self.rt.running_source == "installed"
                     and item.version == self.rt.running_version,
                     "failed": failed.get(item.version, {}).get("reason"),
+                    "skipped": skipped.get(item.version, {}).get("reason"),
                 }
             )
         available = []
@@ -421,6 +518,8 @@ class UpdateService:
                     "running": version == self.rt.running_version,
                     "installed": self.store.get(version) is not None,
                     "failed": failed.get(version, {}).get("reason"),
+                    "skipped": skipped.get(version, {}).get("reason"),
+                    "schema_change": self._schema_change_expected(details),
                     "notes": details.get("notes") or "",
                 }
             )
@@ -431,6 +530,8 @@ class UpdateService:
             if row["newer"] and row["notes"]
         ][:8]
         engine = self._engine()
+        age = self.image_age_days()
+        candidate = self.candidate()
         events = [
             {k: v for k, v in event.items() if k in _EVENT_FIELDS}
             for event in reversed(self.store.events(50))
@@ -449,6 +550,7 @@ class UpdateService:
             "latest_needs_image": bool(
                 latest and self.needs_image(str(releases[latest].get("deps_hash") or ""))
             ),
+            "latest_installable": str(candidate["version"]) if candidate else None,
             "whats_new": whats_new,
             "rollback": self.rollback_plan(),
             "selection": {
@@ -466,7 +568,18 @@ class UpdateService:
                 "configured": bool(self._token(session)),
                 "status": self.token_status(session),
             },
-            "signing": {"configured": self.public_key is not None},
+            "signing": {
+                "configured": self.public_key is not None,
+                "auto_waits": policy.auto_enabled and self.public_key is None,
+                "message": NO_KEY_DETAIL if self.public_key is None else "",
+            },
+            "image_age": {
+                "created": self.rt.image_created or None,
+                "days": age,
+                "stale": age is not None and age > IMAGE_MAX_AGE_DAYS,
+                "max_days": IMAGE_MAX_AGE_DAYS,
+            },
+            "skipped": skipped,
             "database": {
                 "kind": engine.dialect.name,
                 "backups": engine.dialect.name == "sqlite",
@@ -521,6 +634,13 @@ class UpdateService:
                     "label": f"Update {latest}: new image",
                     "detail": f"{latest} is published and is installed by replacing the image.",
                 }
+            if policy.auto_enabled and self.public_key is None:
+                return {
+                    "kind": "needs_signing_key",
+                    "tone": "warn",
+                    "label": f"Update {latest}: install by hand",
+                    "detail": f"{WAITS_FOR_KEY} {NO_KEY_DETAIL}",
+                }
             return {
                 "kind": "available",
                 "tone": "warn",
@@ -531,9 +651,35 @@ class UpdateService:
                     else "Auto-update is off: install it from Settings -> Updates."
                 ),
             }
+        age = self.image_age_days()
+        if age is not None and age > IMAGE_MAX_AGE_DAYS:
+            return {
+                "kind": "image_old",
+                "tone": "warn",
+                "label": f"Image is {age} days old",
+                "detail": (
+                    f"The image is {age} days old: replace the image to get OS, Python and "
+                    "OpenSSL fixes (in-app updates replace only the app's own files)."
+                ),
+            }
         return None
 
     # ------------------------------------------------------------- check
+
+    def check_now(self, session: Session, *, actor: AuditActor) -> dict[str, Any]:
+        """An admin's "Check now": at most once per CHECK_MIN_SECONDS."""
+        moment = time.monotonic()
+        with self._lock:
+            last = self._last_manual_check
+            if last is not None and moment - last < CHECK_MIN_SECONDS:
+                wait = int(CHECK_MIN_SECONDS - (moment - last)) + 1
+                raise UpdateError(
+                    f"The registry was checked a moment ago; try again in {wait} s.",
+                    status_code=429,
+                    code="too_soon",
+                )
+            self._last_manual_check = moment
+        return self.check(session, actor=actor)
 
     def check(self, session: Session, *, actor: AuditActor | None = None) -> dict[str, Any]:
         """Read the published releases. Never raises for registry problems."""
@@ -570,6 +716,17 @@ class UpdateService:
             self.store.save_state({"last_check": {"at": at, "error": str(exc)}})
             logger.warning("Update check failed: %s", exc)
             return self.store.state()
+        except Exception as exc:  # noqa: BLE001 - a check must never fail the page
+            logger.exception("Update check failed")
+            self.store.save_state(
+                {
+                    "last_check": {
+                        "at": at,
+                        "error": f"Unexpected error ({type(exc).__name__}); see the server log.",
+                    }
+                }
+            )
+            return self.store.state()
         self.store.save_state(
             {
                 "token_status": "ok",
@@ -601,6 +758,7 @@ class UpdateService:
             "signed": image.signed_label,
             "label_version": image.version,
             "notes": image.notes,
+            "migrations": image.migrations,
         }
 
     def _after_check(self, session: Session) -> None:
@@ -611,6 +769,8 @@ class UpdateService:
         details = self.releases()[latest]
         if self.rt.supervised and self.needs_image(str(details.get("deps_hash") or "")):
             self._notify_needs_image(session, latest)
+        elif self.rt.supervised and policy.auto_enabled and self.public_key is None:
+            self._notify_waits_for_key(session, latest)
         elif not policy.auto_enabled or not self.rt.supervised:
             created = notifications.notify(
                 session,
@@ -661,6 +821,49 @@ class UpdateService:
                 detail=f"{version} needs a new image (its dependencies differ from this image's).",
             )
 
+    def _notify_waits_for_key(self, session: Session, version: str) -> None:
+        """Once per installation: auto-update cannot install anything without a key."""
+        created = notifications.notify(
+            session,
+            category=notifications.CATEGORY_UPDATES,
+            severity=Severity.WARNING,
+            title=WAITS_FOR_KEY,
+            body=(f"{version} is published (running {self.rt.running_version}). {NO_KEY_DETAIL}"),
+            dedupe_key="update-waits-for-signing-key",
+        )
+        if created is not None:
+            record_audit(
+                session,
+                action="update.waits_for_signing_key",
+                actor=AuditActor.system("updates"),
+                target_type="updates",
+                target_id=version,
+                detail=one_line(f"{WAITS_FOR_KEY} {version} is published."),
+            )
+
+    def _notify_needs_backup(self, session: Session, version: str) -> None:
+        created = notifications.notify(
+            session,
+            category=notifications.CATEGORY_UPDATES,
+            severity=Severity.WARNING,
+            title=f"CxCreditGuard {version} changes the database schema",
+            body=(
+                f"{version} changes the database schema, and this database is not backed up by "
+                "the app, so it is not installed automatically. Take a backup of your own, then "
+                "install it from Settings -> Updates and confirm that you have one."
+            ),
+            dedupe_key=f"update-needs-backup:{version}",
+        )
+        if created is not None:
+            record_audit(
+                session,
+                action="update.needs_backup",
+                actor=AuditActor.system("updates"),
+                target_type="updates",
+                target_id=version,
+                detail=f"{version} changes the database schema; waiting for an admin's backup.",
+            )
+
     def _token_refused(self, session: Session, token: str, message: str) -> None:
         fingerprint = get_secret_box().digest(token, purpose=PURPOSE_UPDATE_TOKEN)[:16]
         created = notifications.notify(
@@ -689,6 +892,7 @@ class UpdateService:
         *,
         actor: AuditActor,
         accept_no_backup: bool = False,
+        allow_unsigned: bool = False,
         automatic: bool = False,
         background: bool = True,
     ) -> Job:
@@ -710,6 +914,31 @@ class UpdateService:
             )
         if automatic and version in self.store.failed():
             raise UpdateError(f"{version} failed to start before; it is not retried automatically.")
+        if automatic and version in self.store.skipped():
+            raise UpdateError(f"{version} was rolled back by an admin; it is not reinstalled.")
+        unsigned = self.public_key is None
+        if unsigned and automatic:
+            raise UpdateError(f"{WAITS_FOR_KEY} {NO_KEY_DETAIL}", code="needs_signing_key")
+        if unsigned and not allow_unsigned:
+            raise UpdateError(
+                "This image has no release signing key, so nothing proves that this release was "
+                "published by the CxCreditGuard release workflow: anyone able to push to the "
+                "registry could have replaced it. Install it only if you trust that, and confirm "
+                "it explicitly.",
+                code="confirm_unsigned",
+            )
+        details = self.releases().get(version) or {}
+        if (
+            not accept_no_backup
+            and not self._db_backed_up()
+            and self._schema_change_expected(details)
+        ):
+            raise UpdateError(
+                f"{version} changes the database schema, and this installation's database cannot "
+                "be backed up by the app. Take a backup yourself, then install it again and "
+                "confirm that you have one.",
+                code="needs_backup",
+            )
         if not self._token(session):
             raise UpdateError(NEEDS_TOKEN, code="needs_token")
         with self._lock:
@@ -717,6 +946,18 @@ class UpdateService:
                 raise UpdateError("An update is already in progress.", code="busy")
             job = Job(version=version, by=actor.actor_name or "admin", automatic=automatic)
             self.job = job
+        if unsigned:
+            record_audit(
+                session,
+                action="update.unsigned_install_confirmed",
+                actor=actor,
+                target_type="updates",
+                target_id=version,
+                detail=(
+                    f"Install of {version} confirmed although it cannot be verified: this image "
+                    "has no release signing key."
+                ),
+            )
         record_audit(
             session,
             action="update.install_started",
@@ -731,7 +972,8 @@ class UpdateService:
         session.commit()
         run = lambda: self._run_install(job, actor, accept_no_backup)  # noqa: E731
         if background:
-            threading.Thread(target=run, name="update-install", daemon=True).start()
+            job.thread = threading.Thread(target=run, name="update-install", daemon=True)
+            job.thread.start()
         else:
             run()
         return job
@@ -741,7 +983,7 @@ class UpdateService:
         try:
             with self._session_scope() as session:
                 token = self._token(session) or ""
-            job.step = "Reading the release"
+            job.beat("Reading the release")
             with self._client(token) as registry:
                 image = registry.image(version)
                 if image.version and image.version != version:
@@ -763,18 +1005,30 @@ class UpdateService:
                         raise RegistryError(
                             f"A layer has an unsupported format ({layer.media_type})."
                         )
-                    job.step = (
+                    job.beat(
                         f"Downloading {index} of {len(layers)} ({max(1, layer.size // 1024)} KB) "
                         "and checking its digest"
                     )
                     extract_app_files(registry.blob(layer.digest), into=unpacked)
                 downloaded = registry.downloaded
-            job.step = "Verifying the release"
+            job.beat("Verifying the release")
             files = unpacked.files
             verified = verify_release(files, public_key=self.public_key)
+            if self.public_key is not None and not verified.signed:
+                raise ReleaseRejected(f"{version} is not signed: not installed.")
             if verified.version != version:
                 raise ReleaseRejected(
                     f"The release's manifest names {verified.version}, not {version}."
+                )
+            if not self.fits_image(verified.deps_hash):
+                # The signed value decides, whatever the label said.
+                with self._session_scope() as session:
+                    self._notify_needs_image(session, version)
+                raise UpdateError(
+                    f"{version} was built for a different image (its signed dependency hash "
+                    "differs from this image's): replace the image to update (the command is on "
+                    "this page).",
+                    code="needs_image",
                 )
             if image.deps_hash and verified.deps_hash != image.deps_hash:
                 raise ReleaseRejected(
@@ -788,10 +1042,10 @@ class UpdateService:
             new_migrations = sorted(
                 migration_revisions(files=files) - migration_revisions(root=self._running_root())
             )
-            job.step = "Installing"
+            job.beat("Installing")
             self.store.install(
                 version,
-                files,
+                verified.installable(files),
                 {
                     "image": IMAGE,
                     "tag": version,
@@ -835,9 +1089,17 @@ class UpdateService:
                 logger.exception("Update to %s failed", version)
             job.state = "failed"
             job.error = message
-            self.store.save_state(
-                {"last_error": {"at": now_iso(), "version": version, "error": message}}
-            )
+            patch: dict[str, Any] = {
+                "last_error": {"at": now_iso(), "version": version, "error": message}
+            }
+            if isinstance(exc, UpdateError) and exc.code in ("needs_backup", "needs_image"):
+                # Not retried at every tick: the next check or an admin decides.
+                releases = dict(self.releases())
+                if version in releases:
+                    flag = "needs_backup" if exc.code == "needs_backup" else "needs_image_signed"
+                    releases[version] = {**releases[version], flag: True}
+                    patch["releases"] = releases
+            self.store.save_state(patch)
             with contextlib.suppress(Exception), self._session_scope() as session:
                 record_audit(
                     session,
@@ -850,6 +1112,8 @@ class UpdateService:
                 if isinstance(exc, RegistryAuthError):
                     self.store.save_state({"token_status": "invalid"})
                     self._token_refused(session, self._token(session) or "", message)
+                if isinstance(exc, UpdateError) and exc.code == "needs_backup" and job.automatic:
+                    self._notify_needs_backup(session, version)
 
     # ------------------------------------------------------------ switch
 
@@ -871,7 +1135,7 @@ class UpdateService:
 
         holder = f"updater-{uuid.uuid4().hex[:12]}"
         if job is not None:
-            job.step = "Waiting for the database (no enforcement cycle may run during a switch)"
+            job.beat("Waiting for the database (no enforcement cycle may run during a switch)")
         with self._session_scope() as session:
             if not acquire_lock(session, holder=holder):
                 raise UpdateError(
@@ -881,7 +1145,7 @@ class UpdateService:
                 )
         try:
             if job is not None:
-                job.step = "Backing up the database"
+                job.beat("Backing up the database")
             label = f"{self.rt.running_version}-to-{target}"
             backup = backup_database(self._engine(), self.store.backups, label=label)
             if backup.path is None and schema_changes and not accept_no_backup:
@@ -906,6 +1170,9 @@ class UpdateService:
                     "restore": restore,
                 }
             )
+            if reason == "install":
+                # Installed by an admin, or superseded by a newer release: no longer skipped.
+                self.store.unskip(up_to=target)
             keep = {v for v in (target, previous, self.rt.running_version) if parse_version(v)}
             removed = self.store.prune(keep)
             with self._session_scope() as session:
@@ -933,8 +1200,9 @@ class UpdateService:
             with contextlib.suppress(Exception), self._session_scope() as session:
                 release_lock(session, holder=holder)
         if job is not None:
+            # The selection is written: past the point where the install may stop.
+            job.beat(f"Switching to {target}: the page reconnects in a few seconds", deadline=False)
             job.state = "switching"
-            job.step = f"Switching to {target}: the page reconnects in a few seconds"
         self._ask_launcher("switch", by)
 
     def _pause_scheduler(self) -> None:
@@ -950,7 +1218,9 @@ class UpdateService:
                 timer.start()
 
     def _ask_launcher(self, kind: str, by: str) -> None:
-        self.store.request(kind, by)
+        # The launcher acts on the request (polled or nudged) only after not_before,
+        # so the answer to this HTTP request reaches the browser first.
+        self.store.request(kind, by, delay=SWITCH_DELAY_SECONDS)
         pid = self.rt.launcher_pid
         if not pid:
             return
@@ -959,8 +1229,7 @@ class UpdateService:
             with contextlib.suppress(OSError):
                 self._signal(pid)
 
-        # Let the answer reach the browser before this process is stopped.
-        timer = threading.Timer(0.5, nudge)
+        timer = threading.Timer(SWITCH_DELAY_SECONDS + 0.2, nudge)
         timer.daemon = True
         timer.start()
 
@@ -985,11 +1254,25 @@ class UpdateService:
                 code="confirm_data_loss",
             )
         target = str(plan["target"])
-        detail = f"Rollback from {self.rt.running_version} to {plan.get('target_version')}" + (
-            f", restoring the database backup from {since}: data written since then is lost."
-            if plan["restores_backup"]
-            else "; the database is kept as it is (its schema did not change)."
+        rolled_back = self.rt.running_version if self.rt.running_source == "installed" else ""
+        detail = (
+            f"Rollback from {self.rt.running_version} to {plan.get('target_version')}"
+            + (
+                f", restoring the database backup from {since}: data written since then is lost."
+                if plan["restores_backup"]
+                else "; the database is kept as it is (its schema did not change)."
+            )
+            + (
+                f" Auto-update skips {rolled_back} until an admin installs it again or a newer "
+                "release supersedes it."
+                if rolled_back
+                else ""
+            )
         )
+        if rolled_back:
+            self.store.skip(
+                rolled_back, by=actor.actor_name or "admin", reason="Skipped after a rollback"
+            )
         session.commit()
         self._switch(
             target,
@@ -1094,16 +1377,35 @@ class UpdateService:
             return "Auto-update is off." + (
                 f" {self.latest()} is available." if self.update_available() else ""
             )
+        latest = self.latest()
+        latest_needs_image = bool(
+            latest
+            and self.update_available()
+            and self.needs_image(str(self.releases()[latest].get("deps_hash") or ""))
+        )
+        if latest_needs_image and self.rt.supervised:
+            self._notify_needs_image(session, str(latest))
         candidate = self.candidate()
         if candidate is None:
             error = (state.get("last_check") or {}).get("error")
+            if latest_needs_image:
+                return f"{latest} needs a new image; see Settings -> Updates for the command."
+            if self.update_available():
+                return f"{latest} is published but not installed automatically (see the page)."
             return f"Check failed: {error}" if error else f"Up to date ({self.rt.running_version})."
         version = str(candidate["version"])
         if not self.rt.supervised:
             return f"{version} is available; this installation updates by replacing its image."
-        if self.needs_image(str(candidate.get("deps_hash") or "")):
-            self._notify_needs_image(session, version)
+        if self.public_key is None:
+            self._notify_waits_for_key(session, version)
+            return f"{WAITS_FOR_KEY} {version} can be installed by hand."
+        if candidate.get("needs_image_signed"):
             return f"{version} needs a new image; see Settings -> Updates for the command."
+        if not self._db_backed_up() and self._schema_change_expected(candidate):
+            self._notify_needs_backup(session, version)
+            return (
+                f"{version} changes the database schema: install it by hand after taking a backup."
+            )
         if moment.hour != policy.quiet_hour:
             return f"{version} is ready; it installs at {policy.quiet_hour:02d}:00 UTC."
         if self._cycle_running(session):
@@ -1233,6 +1535,28 @@ class UpdateService:
                         f"{Path(str(event.get('backup'))).name}; data written after it was taken "
                         "is lost (the replaced database is kept in the backups folder)."
                     ),
+                )
+            elif kind in ("restore_failed", "restore_skipped"):
+                record_audit(
+                    session,
+                    action="update.restore_failed",
+                    actor=launcher,
+                    target_type="updates",
+                    target_id=str(event.get("to") or ""),
+                    detail=one_line(
+                        "The database could not be restored from "
+                        f"{Path(str(event.get('backup'))).name}: "
+                        f"{event.get('detail') or 'unusable'}. "
+                        f"{event.get('runs') or 'The version that ran before'} runs instead."
+                    ),
+                )
+                notifications.notify(
+                    session,
+                    category=notifications.CATEGORY_UPDATES,
+                    severity=Severity.CRITICAL,
+                    title="A rollback could not restore the database backup",
+                    body=one_line(event.get("detail") or "The backup was not usable."),
+                    dedupe_key=f"update-restore-failed:{event['id']}",
                 )
             elif kind == "selection_ignored":
                 record_audit(

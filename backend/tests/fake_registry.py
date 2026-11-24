@@ -2,8 +2,9 @@
 
 Releases are built in memory the way the release workflow builds them: an app
 layer (a gzipped tar of ``app/...``) holding the app files and their
-release-manifest.json (optionally signed), a config blob with the labels, an
-image manifest and an OCI index per tag.
+release-manifest.json (signed with TEST_PRIVATE_KEY unless a test says
+otherwise), a config blob with the labels, an image manifest and an OCI index
+per tag.
 """
 
 from __future__ import annotations
@@ -26,6 +27,26 @@ REPO = "cxsmtp/vcxcreditguard"
 GOOD_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
 BEARER = "pull-token-xyz"
 STORAGE_HOST = "pkg-containers.githubusercontent.com"
+
+
+def ed25519_keypair() -> tuple[bytes, str]:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
+
+    key = Ed25519PrivateKey.generate()
+    private = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    public = key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    return private, public.decode()
+
+
+# Releases are signed with this key unless a test says otherwise; make_service
+# (tests/test_updates.py) trusts its public half by default.
+TEST_PRIVATE_KEY, TEST_PUBLIC_KEY = ed25519_keypair()
 
 
 def digest_of(data: bytes) -> str:
@@ -69,8 +90,12 @@ def app_layer(files: dict[str, bytes]) -> bytes:
 class Release:
     version: str
     deps: str = "deps-1"
-    private_key_pem: bytes | None = None
+    private_key_pem: bytes | None = TEST_PRIVATE_KEY
     migrations: tuple[str, ...] = ("aaa",)
+    # The io.cxcreditguard.migrations label (None: no label, as older releases).
+    migrations_label: bool = True
+    # The deps hash in the label, when it differs from the signed manifest's.
+    label_deps: str | None = None
     notes: str = ""
     # Change the files after the manifest is written (a tampered release).
     tamper: Callable[[dict[str, bytes]], None] | None = None
@@ -104,10 +129,15 @@ class Release:
                     "Labels": {
                         "org.opencontainers.image.version": self.version,
                         "org.opencontainers.image.revision": "abcdef0123456789",
-                        "io.cxcreditguard.deps": self.deps,
+                        "io.cxcreditguard.deps": self.label_deps or self.deps,
                         "io.cxcreditguard.app-layers": "1",
                         "io.cxcreditguard.signed": "true" if self.private_key_pem else "false",
                         "io.cxcreditguard.release-notes": self.notes,
+                        **(
+                            {"io.cxcreditguard.migrations": " ".join(self.migrations)}
+                            if self.migrations_label
+                            else {}
+                        ),
                     }
                 },
             }
@@ -244,18 +274,3 @@ class FakeRegistry:
                 307, headers={"location": f"https://{self.redirect_host}/blob/{digest}?sig=x"}
             )
         return httpx.Response(404)
-
-
-def ed25519_keypair() -> tuple[bytes, str]:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import (
-        Encoding,
-        NoEncryption,
-        PrivateFormat,
-        PublicFormat,
-    )
-
-    key = Ed25519PrivateKey.generate()
-    private = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
-    public = key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
-    return private, public.decode()

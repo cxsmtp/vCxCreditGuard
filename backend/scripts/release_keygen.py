@@ -5,9 +5,11 @@
 Writes the PRIVATE key to ``--out`` (mode 600; refuses to overwrite) and prints
 the PUBLIC key. Then:
 
-1. Store the private key file's whole contents as the repository secret
-   ``CXCG_RELEASE_SIGNING_KEY`` (GitHub: Settings -> Secrets and variables ->
-   Actions), keep an offline copy somewhere safe, and delete the file.
+1. Store the private key file's whole contents as the secret
+   ``CXCG_RELEASE_SIGNING_KEY`` of the repository's ``release`` environment
+   (GitHub: Settings -> Environments -> release -> Environment secrets; the
+   environment requires a reviewer), keep an offline copy somewhere safe, and
+   delete the file.
 2. Paste the printed public key into
    ``backend/app/updates/release-signing-key.pub`` and commit it.
 
@@ -45,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     with os.fdopen(fd, "wb") as handle:
         handle.write(private_pem)
     print(f"Private key written to {args.out} (keep it secret; never commit it).")
-    print("Store its contents as the repository secret CXCG_RELEASE_SIGNING_KEY.\n")
+    print("Store its contents as the secret CXCG_RELEASE_SIGNING_KEY of the release environment.\n")
     print("Public key - paste into backend/app/updates/release-signing-key.pub:\n")
     print(public_pem.decode("ascii"))
     return 0

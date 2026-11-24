@@ -53,7 +53,9 @@ RUN apk add --no-cache libpq \
     && pip install --no-cache-dir -c constraints.txt -r /tmp/requirements.txt "psycopg[c]" \
     && rm /tmp/requirements.txt \
     && apk del .build \
-    && (pip uninstall -y pip setuptools wheel 2>/dev/null || true)
+    && (pip uninstall -y pip setuptools wheel 2>/dev/null || true) \
+    && mkdir -p /usr/local/share/cxcreditguard \
+    && printf '{"created": "%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /usr/local/share/cxcreditguard/image.json
 
 COPY backend/alembic.ini ./
 COPY backend/alembic ./alembic
@@ -77,7 +79,11 @@ RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
     && addgroup -g 10001 cxcg \
     && adduser -D -H -u 10001 -G cxcg cxcg \
     && mkdir -p /app/data \
-    && chown -R cxcg:cxcg /app
+    && chown cxcg:cxcg /app/data \
+    && chmod -R u=rwX,go=rX /app/alembic /app/app /app/scripts
+# /app stays owned by root and read-only for the app's user; only /app/data is
+# writable. image.json records when the OS packages were installed: Settings ->
+# Updates says when the image is older than 90 days.
 
 # Settings -> Updates shows the steps for this deployment: it is updated by
 # rebuilding the image from a release tag (README "Updates"), not in place.

@@ -7,17 +7,22 @@ URL, never from a ``WWW-Authenticate`` realm, and a blob redirect is followed
 only to GitHub's package storage host, over https, without the registry token.
 
 Everything is content-addressed: every manifest fetched by digest and every blob
-is checked against its sha256 before it is used, and sizes are bounded.
+is checked against its sha256 before it is used, and sizes are bounded. Answers
+are read as a stream of raw bytes (``Accept-Encoding: identity``; an encoded
+answer is refused) and reading stops at the limit, so nothing is ever held in
+memory, or decompressed, beyond it.
 """
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
 import platform
 import re
 import tarfile
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -40,11 +45,19 @@ LABEL_DEPS = "io.cxcreditguard.deps"
 LABEL_APP_LAYERS = "io.cxcreditguard.app-layers"
 LABEL_SIGNED = "io.cxcreditguard.signed"
 LABEL_NOTES = "io.cxcreditguard.release-notes"
+# The release's alembic revisions (space separated): read before anything is
+# downloaded, to tell whether a release changes the database schema.
+LABEL_MIGRATIONS = "io.cxcreditguard.migrations"
+_REVISION_ID = re.compile(r"^[0-9A-Za-z_]{1,64}$")
 
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
 MAX_LAYER_BYTES = 96 * 1024 * 1024
 MAX_UNPACKED_BYTES = 256 * 1024 * 1024
+# The whole tar stream of a layer (headers and members outside the app folder
+# included) once decompressed: a small gzip that inflates past it is refused.
+MAX_LAYER_STREAM_BYTES = MAX_UNPACKED_BYTES + 32 * 1024 * 1024
+MAX_TOKEN_BYTES = 64 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_FILES = 20_000
 MAX_TAG_PAGES = 20
@@ -119,6 +132,17 @@ class ReleaseImage:
         return str(self.labels.get(LABEL_NOTES) or "")[:4000]
 
     @property
+    def migrations(self) -> list[str] | None:
+        """The alembic revisions the label lists, or None without a (usable) label."""
+        raw = self.labels.get(LABEL_MIGRATIONS)
+        if raw is None:
+            return None
+        found = [part for part in re.split(r"[\s,]+", str(raw)) if part]
+        if len(found) > 2000 or not all(_REVISION_ID.match(part) for part in found):
+            return None
+        return sorted(set(found))
+
+    @property
     def signed_label(self) -> bool:
         return str(self.labels.get(LABEL_SIGNED) or "").lower() == "true"
 
@@ -164,7 +188,8 @@ class RegistryClient:
             transport=transport,
             timeout=timeout,
             follow_redirects=False,
-            headers={"User-Agent": USER_AGENT},
+            # Never a compressed answer: sizes are checked on the bytes as sent.
+            headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
             trust_env=True,
         )
 
@@ -186,26 +211,26 @@ class RegistryClient:
         """Exchange the stored token for a pull token on the fixed token URL."""
         if not self._token:
             raise RegistryAuthError("No registry token is configured.")
-        try:
-            response = self._client.get(
-                TOKEN_URL,
-                params={"scope": f"repository:{REPOSITORY}:pull", "service": REGISTRY_HOST},
-                auth=(TOKEN_USERNAME, self._token),
-            )
-        except httpx.HTTPError as exc:
-            raise RegistryError(_unreachable(REGISTRY_HOST, exc)) from exc
+        response = self._open(
+            TOKEN_URL,
+            params={"scope": f"repository:{REPOSITORY}:pull", "service": REGISTRY_HOST},
+            auth=(TOKEN_USERNAME, self._token),
+        )
         if response.status_code in (401, 403):
+            response.close()
             raise RegistryAuthError(
                 f"{REGISTRY_HOST} refused the registry token (HTTP {response.status_code}). It may "
                 "have expired or been revoked, or lack the read:packages scope or access to "
                 f"{IMAGE}."
             )
         if response.status_code != 200:
+            response.close()
             raise RegistryError(
                 f"{REGISTRY_HOST} answered HTTP {response.status_code} to the token exchange."
             )
+        raw = _read_limited(response, MAX_TOKEN_BYTES, "The token answer is larger than expected.")
         try:
-            body = response.json()
+            body = json.loads(raw)
         except ValueError as exc:
             raise RegistryError(f"{REGISTRY_HOST} sent an unreadable token answer.") from exc
         bearer = (body.get("token") or body.get("access_token")) if isinstance(body, dict) else None
@@ -215,6 +240,22 @@ class RegistryClient:
 
     # -- requests
 
+    def _open(
+        self,
+        url: str | httpx.URL,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
+        auth: tuple[str, str] | None = None,
+    ) -> httpx.Response:
+        """A GET whose body is not read yet (the caller reads it, bounded, and closes it)."""
+        target = httpx.URL(url)
+        request = self._client.build_request("GET", target, headers=headers, params=params)
+        try:
+            return self._client.send(request, stream=True, auth=auth)
+        except httpx.HTTPError as exc:
+            raise RegistryError(_unreachable(target.host or REGISTRY_HOST, exc)) from exc
+
     def _registry_get(self, path: str, *, accept: str | None = None) -> httpx.Response:
         if self._bearer is None:
             self.authenticate()
@@ -223,12 +264,10 @@ class RegistryClient:
             headers = {"Authorization": f"Bearer {self._bearer}"}
             if accept:
                 headers["Accept"] = accept
-            try:
-                response = self._client.get(url, headers=headers)
-            except httpx.HTTPError as exc:
-                raise RegistryError(_unreachable(REGISTRY_HOST, exc)) from exc
+            response = self._open(url, headers=headers)
             if response.status_code == 401 and attempt == 1:
                 # The pull token expired between requests: one fresh exchange.
+                response.close()
                 self.authenticate()
                 continue
             return response
@@ -237,9 +276,9 @@ class RegistryClient:
     def _json(self, path: str, *, accept: str | None = None) -> tuple[Any, bytes, httpx.Response]:
         response = self._registry_get(path, accept=accept)
         _raise_for(response, path)
-        body = response.content
-        if len(body) > MAX_JSON_BYTES:
-            raise RegistryError("The registry answer is larger than expected.")
+        body = _read_limited(
+            response, MAX_JSON_BYTES, "The registry answer is larger than expected."
+        )
         try:
             return json.loads(body), body, response
         except ValueError as exc:
@@ -277,6 +316,16 @@ class RegistryClient:
 
     def image(self, ref: str) -> ReleaseImage:
         """The image for ``ref`` on this server's platform: labels and layers."""
+        try:
+            return self._image(ref)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            # A manifest or configuration of an unexpected shape: a clean refusal.
+            raise RegistryError(
+                f"{ref[:40]}: the registry answered with an image description this server cannot "
+                "read."
+            ) from exc
+
+    def _image(self, ref: str) -> ReleaseImage:
         body, digest = self.manifest(ref)
         media = str(body.get("mediaType") or "")
         if media in INDEX_TYPES or isinstance(body.get("manifests"), list):
@@ -313,6 +362,8 @@ class RegistryClient:
             config = json.loads(config_raw)
         except ValueError as exc:
             raise RegistryError(f"{ref}'s configuration is not JSON.") from exc
+        if not isinstance(config, dict):
+            raise RegistryError(f"{ref}'s configuration is not an image configuration.")
         labels = (config.get("config") or {}).get("Labels") or {}
         return ReleaseImage(
             ref=ref,
@@ -330,6 +381,7 @@ class RegistryClient:
         response = self._registry_get(f"/blobs/{digest}")
         hops = 0
         while response.status_code in (301, 302, 303, 307, 308):
+            response.close()
             hops += 1
             location = response.headers.get("location", "")
             target = httpx.URL(response.url).join(location) if location else None
@@ -343,17 +395,9 @@ class RegistryClient:
                 )
             # The storage URL is pre-signed: the registry token never goes along.
             headers = {"Authorization": f"Bearer {self._bearer}"} if host == REGISTRY_HOST else {}
-            try:
-                response = self._client.get(target, headers=headers)
-            except httpx.HTTPError as exc:
-                raise RegistryError(_unreachable(host, exc)) from exc
+            response = self._open(target, headers=headers)
         _raise_for(response, f"/blobs/{digest}")
-        declared = int(response.headers.get("content-length") or 0)
-        if declared > max_bytes:
-            raise UnsafeArchive(f"A layer is larger than allowed ({declared} bytes).")
-        data = response.content
-        if len(data) > max_bytes:
-            raise UnsafeArchive(f"A layer is larger than allowed ({len(data)} bytes).")
+        data = _read_limited(response, max_bytes, "A layer is larger than allowed.")
         actual = sha256_digest(data)
         if actual != digest:
             raise DigestMismatch(
@@ -364,9 +408,46 @@ class RegistryClient:
         return data
 
 
+def _read_limited(response: httpx.Response, max_bytes: int, too_large: str) -> bytes:
+    """The body as sent, read until ``max_bytes`` at most; the response is closed.
+
+    An encoded answer (gzip, br, ...) is refused rather than decoded: it was not
+    asked for, and its decoded size is unknown until it has been decoded.
+    """
+    try:
+        encoding = response.headers.get("content-encoding", "").strip().lower()
+        if encoding not in ("", "identity"):
+            raise UnsafeArchive(
+                f"{response.url.host or REGISTRY_HOST} sent a {encoding[:20]}-encoded answer, "
+                "which this server does not accept: nothing was installed."
+            )
+        declared = response.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > max_bytes:
+            raise UnsafeArchive(f"{too_large} ({int(declared)} bytes)")
+        if response.is_stream_consumed:
+            # Already in memory (an in-process transport, as in the tests).
+            data = response.content
+            if len(data) > max_bytes:
+                raise UnsafeArchive(f"{too_large} ({len(data)} bytes)")
+            return data
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_raw():
+            total += len(chunk)
+            if total > max_bytes:
+                raise UnsafeArchive(f"{too_large} (more than {max_bytes} bytes)")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except httpx.HTTPError as exc:
+        raise RegistryError(_unreachable(response.url.host or REGISTRY_HOST, exc)) from exc
+    finally:
+        response.close()
+
+
 def _raise_for(response: httpx.Response, path: str) -> None:
     if response.status_code < 300:
         return
+    response.close()
     host = response.url.host or REGISTRY_HOST
     if response.status_code in (401, 403):
         raise RegistryAuthError(
@@ -421,17 +502,44 @@ def extract_app_files(
     crafted layer cannot write outside the install folder or fill the volume.
     """
     out = into or Unpacked()
+    raw: io.BufferedIOBase = io.BytesIO(blob)
+    if blob[:2] == b"\x1f\x8b":
+        raw = gzip.GzipFile(fileobj=raw, mode="rb")
+    # Read once, front to back ("r|"): members outside the app folder are passed
+    # over without being kept, and the decompressed stream is bounded as a whole.
+    stream = _Bounded(raw, MAX_LAYER_STREAM_BYTES)
     try:
-        archive = tarfile.open(fileobj=io.BytesIO(blob), mode="r:*")  # noqa: SIM115
-    except (tarfile.TarError, OSError, EOFError) as exc:
+        archive = tarfile.open(fileobj=stream, mode="r|")  # noqa: SIM115
+    except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
         raise UnsafeArchive(f"A layer could not be unpacked: {exc}") from exc
     with archive:
         try:
             for member in archive:
                 _take(archive, member, out, prefix)
-        except (tarfile.TarError, OSError, EOFError) as exc:
+        except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
             raise UnsafeArchive(f"A layer could not be unpacked: {exc}") from exc
     return out
+
+
+class _Bounded(io.RawIOBase):
+    """A read-only stream that refuses to yield more than ``limit`` bytes in all."""
+
+    def __init__(self, inner: io.BufferedIOBase, limit: int) -> None:
+        self._inner = inner
+        self._limit = limit
+        self.total = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        data = self._inner.read(len(buffer))
+        size = len(data)
+        self.total += size
+        if self.total > self._limit:
+            raise UnsafeArchive("A layer unpacks to more than allowed: not installed.")
+        buffer[:size] = data
+        return size
 
 
 def _take(archive: tarfile.TarFile, member: tarfile.TarInfo, out: Unpacked, prefix: str) -> None:

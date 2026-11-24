@@ -17,9 +17,13 @@
 # For the hardened multi-service deployment see the root docker-compose.yml,
 # which uses backend/Dockerfile instead.
 
-# The base image is part of the dependency hash (see below): keep the default
-# in step with backend/Dockerfile.
-ARG PYTHON_IMAGE=python:3.11-alpine
+# The base image is part of the dependency hash (see below), named by its
+# DIGEST: a rebuilt python:3.11-alpine (OS, Python, OpenSSL fixes) is another
+# base, so its fixes arrive by replacing the image, never as an app layer. The
+# release workflow resolves the tag's current digest and passes it here; this
+# default is the digest last pinned by hand (keep the tag in step with
+# backend/Dockerfile).
+ARG PYTHON_IMAGE=python:3.11-alpine@sha256:7fbad8e4652eae0186429a6f26cf5b23e27e8c6fd7ac4d0cfd7a6988cdeea1e1
 
 # --- Stage 1: build the SPA ------------------------------------------------
 FROM node:22-alpine AS frontend
@@ -56,8 +60,12 @@ WORKDIR /app
 # Only the project's dependencies are installed, read from pyproject.toml: the
 # app itself is the last layer, never a site-packages copy.
 COPY backend/pyproject.toml backend/constraints.txt ./
-# Python dependency versions are pinned in constraints.txt, and pinning apk
-# --no-cache installs to exact versions is fragile across base-image updates.
+# Python dependency versions are pinned in constraints.txt. apk packages are not
+# pinned to exact versions (an Alpine branch keeps only the latest revision of a
+# package, so an exact pin stops building at its next fix); instead the
+# installed OS packages are recorded (os-packages.txt) and are part of the
+# dependency hash, with the date they were installed (the image's age, shown on
+# Settings -> Updates after 90 days).
 # Suppress the KICS unpinned-version findings for this build step.
 # kics-scan ignore-block
 RUN apk add --no-cache libpq \
@@ -66,7 +74,10 @@ RUN apk add --no-cache libpq \
     && pip install --no-cache-dir -c constraints.txt -r /tmp/requirements.txt "psycopg[c]" \
     && rm /tmp/requirements.txt \
     && apk del .build \
-    && (pip uninstall -y pip setuptools wheel 2>/dev/null || true)
+    && (pip uninstall -y pip setuptools wheel 2>/dev/null || true) \
+    && mkdir -p /usr/local/share/cxcreditguard \
+    && apk info -v 2>/dev/null | sort > /usr/local/share/cxcreditguard/os-packages.txt \
+    && date -u +%Y-%m-%dT%H:%M:%SZ > /usr/local/share/cxcreditguard/os-installed-at
 
 # The image-level files an app update never replaces. Their content, the
 # packages above and the base image make the dependency hash: a release built
@@ -82,16 +93,21 @@ COPY deploy/podman/easy-entrypoint.sh /usr/local/bin/easy-entrypoint.sh
 # checkout that predates it.
 RUN sed -i 's/\r$//' /usr/local/bin/easy-entrypoint.sh /usr/local/lib/cxcreditguard/launcher.py \
     && chmod +x /usr/local/bin/easy-entrypoint.sh \
-    && python /usr/local/lib/cxcreditguard/launcher.py image-info \
+    && python -I -B /usr/local/lib/cxcreditguard/launcher.py image-info \
         --write /usr/local/share/cxcreditguard/image.json \
         --constraints constraints.txt --pyproject pyproject.toml \
         --base-image "$PYTHON_IMAGE" \
         --launcher /usr/local/lib/cxcreditguard/launcher.py \
         --entrypoint /usr/local/bin/easy-entrypoint.sh \
+        --os-packages /usr/local/share/cxcreditguard/os-packages.txt \
+        --created "$(cat /usr/local/share/cxcreditguard/os-installed-at)" \
     && addgroup -g 10001 cxcg \
     && adduser -D -H -u 10001 -G cxcg cxcg \
     && mkdir -p /app/data \
-    && chown -R cxcg:cxcg /app
+    && chown cxcg:cxcg /app/data \
+    && chmod 700 /app/data
+# /app (the image's own version) stays owned by root and read-only for the app's
+# user: only /app/data, the data volume, is writable.
 
 # --- Stage 3: the app's own files, with their release manifest --------------
 FROM base AS assemble
@@ -105,11 +121,15 @@ COPY backend/scripts /out/scripts
 COPY --from=frontend /build/dist /out/app/static
 # Every file with its sha256 (release-manifest.json), so an installation can
 # verify what it downloads. Built from the files, never from a timestamp: the
-# same sources give the same bytes, which the release workflow signs.
-RUN cd /out \
-    && python -m scripts.release_manifest build --root /out --revision "$CXCG_REVISION" \
-        --image-info /usr/local/share/cxcreditguard/image.json \
-    && find /out -name __pycache__ -type d -prune -exec rm -rf {} +
+# same sources give the same bytes, which the release workflow signs. The list
+# covers EVERY file of the layer: no bytecode is shipped (any is removed first,
+# and the build refuses a tree that still has some), and nothing is written
+# after it (-B).
+RUN find /out \( -name __pycache__ -type d -prune -exec rm -rf {} + \) -o \( -name '*.py[co]' -exec rm -f {} + \) \
+    && chmod -R u=rwX,go=rX /out \
+    && cd /out \
+    && python -B -m scripts.release_manifest build --root /out --revision "$CXCG_REVISION" \
+        --image-info /usr/local/share/cxcreditguard/image.json
 
 # Just the manifest, for the release workflow to sign: --target release-manifest
 FROM scratch AS release-manifest
@@ -157,4 +177,5 @@ CMD ["launch"]
 
 # The app's own files: ONE layer, and the last. Keep it that way - an in-app
 # update downloads exactly the layers counted by io.cxcreditguard.app-layers.
-COPY --from=signed --chown=10001:10001 /out/ /app/
+# Owned by root, so the app (uid 10001) cannot change the image's own version.
+COPY --from=signed /out/ /app/

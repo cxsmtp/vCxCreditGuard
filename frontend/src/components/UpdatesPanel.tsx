@@ -48,6 +48,7 @@ const EVENT_LABEL: Record<string, string> = {
   rollback: "Rolled back automatically",
   rollback_blocked: "Failed, could not roll back",
   restore: "Database restored",
+  restore_failed: "Database restore failed",
   crash: "Stopped unexpectedly",
   selection_ignored: "Selection not used",
 };
@@ -63,6 +64,7 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
   const [busy, setBusy] = useState<string | null>(null);
   const [installing, setInstalling] = useState<UpdateRelease | null>(null);
   const [acceptNoBackup, setAcceptNoBackup] = useState(false);
+  const [allowUnsigned, setAllowUnsigned] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -117,6 +119,7 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
   const newer = data.available.filter((release) => release.newer);
   const latest = data.available.find((release) => release.version === data.latest) ?? null;
   const needsToken = data.token.status === "missing";
+  const unverifiable = !data.signing.configured;
 
   return (
     <div className="flex flex-col gap-6">
@@ -127,6 +130,21 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
           <span>
             <b>Auto-update is on, but needs a registry token.</b> Releases are published to a private
             registry: enter a read-only token below and updates install by themselves.
+          </span>
+        </div>
+      )}
+      {data.signing.auto_waits && supervised && (
+        <div className="cg-banner" role="status">
+          <span>
+            <b>Auto-update waits for the release signing key.</b> {data.signing.message}
+          </span>
+        </div>
+      )}
+      {data.image_age.stale && (
+        <div className="cg-banner" role="status">
+          <span>
+            <b>The image is {data.image_age.days} days old.</b> In-app updates replace only the app's
+            own files: replace the image to get OS, Python and OpenSSL fixes (the command is below).
           </span>
         </div>
       )}
@@ -221,7 +239,8 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
             </InfoNote>
           )}
 
-          {(data.latest_needs_image || !supervised) && data.update_available && (
+          {((data.update_available && (data.latest_needs_image || !supervised)) ||
+            data.image_age.stale) && (
             <Field label="Update by replacing the image" fold={false} hint="Run on the server.">
               <pre
                 className="overflow-x-auto rounded-md px-3 py-2 font-mono text-xs"
@@ -282,6 +301,8 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
               data.settings.auto_enabled
                 ? needsToken
                   ? "On, waiting for a registry token."
+                  : unverifiable
+                    ? "On, but waiting for the release signing key: nothing is installed automatically until the image has one."
                   : `On: newer releases install at ${hourLabel(data.settings.quiet_hour)} ${data.settings.timezone}.`
                 : "Off: you are notified when a release is published, and install it here."
             }
@@ -376,10 +397,11 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
               </Button>
             )}
           </div>
-          {!data.signing.configured && (
+          {unverifiable && (
             <p className="text-xs" style={{ color: "var(--text-muted)" }}>
-              No release signing key is embedded in this version yet: downloads are checked against
-              their digests and file list, and shown as unsigned.
+              This image has no release signing key: nothing proves who published a release, so none
+              is installed automatically, and installing one by hand asks for an explicit
+              confirmation (audited).
             </p>
           )}
         </div>
@@ -455,7 +477,13 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
                           <Badge tone="critical">Failed to start</Badge>
                         </span>
                       )}
+                      {release.skipped && (
+                        <span title="Rolled back by an admin: auto-update does not install it again until it is installed by hand or a newer release supersedes it.">
+                          <Badge tone="warning">Skipped after rollback</Badge>
+                        </span>
+                      )}
                       {release.needs_image && <Badge tone="serious">Needs a new image</Badge>}
+                      {release.schema_change && <Badge tone="info">Changes the database</Badge>}
                       <Badge tone={release.signed ? "good" : "neutral"}>
                         {release.signed ? "Signed" : "Unsigned"}
                       </Badge>
@@ -469,6 +497,7 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
                         disabled={busy !== null || switching}
                         onClick={() => {
                           setAcceptNoBackup(false);
+                          setAllowUnsigned(false);
                           setInstalling(release);
                         }}
                       >
@@ -495,6 +524,7 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
                         <Badge tone={item.running ? "good" : "info"}>
                           {item.running ? "Running" : "Installed"}
                         </Badge>
+                        {item.skipped && <Badge tone="warning">Skipped after rollback</Badge>}
                         <span className="text-xs" style={{ color: "var(--text-muted)" }}>
                           {sizeLabel(item.bytes)}
                         </span>
@@ -537,7 +567,9 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
       <ConfirmDialog
         open={installing !== null}
         title={installing ? `Install v${installing.version}?` : "Install"}
-        confirmLabel="Install and switch"
+        confirmLabel={unverifiable ? "Install the unverified release" : "Install and switch"}
+        destructive={unverifiable}
+        confirmDisabled={unverifiable && !allowUnsigned}
         busy={busy === "install"}
         onCancel={() => setInstalling(null)}
         onConfirm={async () => {
@@ -548,6 +580,7 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
               api.post("/api/ops/updates/install", {
                 version: installing.version,
                 accept_no_backup: acceptNoBackup,
+                allow_unsigned: unverifiable && allowUnsigned,
               }),
             `Installing v${installing.version}.`,
           );
@@ -560,6 +593,30 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
               then the server switches to v{installing?.version}: the page reconnects in a few seconds.
               If it does not come up, v{data.running.version} runs again by itself.
             </span>
+            {unverifiable && (
+              <div className="cg-banner bad" role="alert">
+                <span>
+                  <b>This release cannot be verified.</b> This image has no release signing key, so
+                  nothing proves that v{installing?.version} was published by the CxCreditGuard
+                  release workflow: anyone able to push to the registry could have replaced it, and
+                  it would run with access to this server's database and secrets. Install it only if
+                  you trust the registry and the people who can publish to it.
+                </span>
+              </div>
+            )}
+            {unverifiable && (
+              <label className="flex items-start gap-2 text-[13px]">
+                <input
+                  type="checkbox"
+                  checked={allowUnsigned}
+                  onChange={(event) => setAllowUnsigned(event.target.checked)}
+                />
+                <span>
+                  I understand that this release is not verified and install it anyway. (This is
+                  recorded in the audit log.)
+                </span>
+              </label>
+            )}
             {installing?.notes && (
               <span className="whitespace-pre-wrap text-[13px]" style={{ color: "var(--text-secondary)" }}>
                 {installing.notes}
