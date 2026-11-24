@@ -18,6 +18,7 @@ const FEATURES: FeatureGroup[] = [
     items: [
       "Reads AI credit use from Checkmarx One on a schedule (every 15 minutes by default) for every user, group, project and application.",
       "Matches each usage row to a Checkmarx user: exactly where it can, by name similarity where not. Unsure matches wait for an admin to confirm.",
+      "Shows the usage that counts towards no budget, and why: automation (Auto Triage, bots, integrations without an email), people it could not match, and project or application names that match no project (an admin can map them).",
       "Can also charge a project's Auto Triage credits to the person whose scan set it off (off by default).",
       "Overview of spend over time, by action type and by top consumers, with each budget marked.",
       "Explains a figure: each budget shows what Checkmarx reported and what the period's starting point discounted.",
@@ -43,6 +44,7 @@ const FEATURES: FeatureGroup[] = [
       "Records what was there before every change; Restore access puts it back in one click.",
       "Gives access back by itself when usage drops under budget, the budget is raised or a new period starts (unless the budget is set to hold until released).",
       "Simulation: a dry run of the next cycle showing who would be warned and restricted, before anything happens.",
+      "Enforcement coverage: how many of the people holding an AI role a user restriction could actually take it from, and why not the rest (composite roles, groups, protected roles), with a warning when user budgets will not bite. It never changes the role list.",
       "Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users and projects restricts nobody and pauses itself.",
       "A pause switch stops new restrictions at once; warnings and giving access back carry on.",
       "Protected roles (ast-admin and iam-admin by default) are never restricted.",
@@ -113,6 +115,20 @@ const LIMITATIONS: Limitation[] = [
     ),
   },
   {
+    title: "User budgets may not bite at all.",
+    group: "enforcement",
+    meaning: (
+      <>
+        On a live tenant ast-admin, held by 274 of 296 users, is a composite
+        role containing all three default AI roles, and it is protected: a user
+        restriction would have reached almost nobody. Check Enforcement coverage
+        (Simulation or Settings → Enforcement) before relying on user budgets;
+        project, group and application budgets still turn AI features off on
+        projects.
+      </>
+    ),
+  },
+  {
     title:
       "A project budget does not stop people's own AI Triage and AI Remediation.",
     group: "enforcement",
@@ -179,7 +195,23 @@ const LIMITATIONS: Limitation[] = [
       <>
         Credits reported under a name that matches no Checkmarx user, or an
         unconfirmed match, count towards no person's budget until an admin maps
-        them (Settings → Attribution).
+        them (Settings → Attribution). Automation (bots, integrations without an
+        email) never does. Project usage reported under a repository name that
+        is no project counts towards no project, group or application budget
+        until mapped. All of it is shown on the Overview.
+      </>
+    ),
+  },
+  {
+    title: "Credits per action are measured, not quoted.",
+    group: "data",
+    meaning: (
+      <>
+        Checkmarx's listed rate is not what a Fusion or DAST correlation action
+        costs (on a live tenant about 109 credits per Opus 5.5 Fusion scan
+        against a rate of 2). Where they disagree, messages price an action at
+        the feed's average over the lookback window and say so; it is an
+        average, not the cost of one scan.
       </>
     ),
   },
@@ -208,14 +240,14 @@ const LIMITATIONS: Limitation[] = [
             usage rows per group (only ever seen empty; the sum of its projects
             is used instead);
           </li>
-          <li>paging of a very long user list;</li>
+          <li>
+            writes of PR triage and remediation and Auto Triage in the shape a
+            live tenant reads them (sent back as read, not yet tested by a
+            write on one);
+          </li>
           <li>
             finding a project's repository (without it, PR triage and
             remediation is skipped there);
-          </li>
-          <li>
-            the names of the default protected roles: check them against your
-            tenant;
           </li>
           <li>
             whether a Fusion setting the project inherited can inherit again

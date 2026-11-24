@@ -30,6 +30,10 @@ point links to the section below that explains it.
 - Matches each usage row to a Checkmarx user: exactly where it can, by name
   similarity where not. Unsure matches wait for an admin to confirm
   ([Attribution](#attribution)).
+- Shows the usage that counts towards no budget, and why: automation (Auto
+  Triage, bots, integrations without an email), people it could not match, and
+  project or application names that match no project (an admin can map them)
+  ([Attribution](#attribution)).
 - Can also charge a project's Auto Triage credits to the person whose scan set
   it off, off by default ([Charging auto triage](#charging-auto-triage-to-the-person-who-started-the-scan)).
 - Overview of spend over time, by action type and by top consumers, with each
@@ -68,6 +72,11 @@ point links to the section below that explains it.
   released).
 - Simulation: a dry run of the next cycle showing who would be warned and
   restricted, before anything happens.
+- Enforcement coverage (Simulation and Settings → Enforcement): how many of the
+  people holding an AI role a user restriction could actually take it from,
+  how many keep it through a composite role or a group, and how many are
+  protected; it warns when user budgets will not bite and names the tenant's
+  dedicated AI roles, without changing the role list.
 - Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users
   and projects restricts nobody and pauses itself; a pause switch stops new
   restrictions at once; protected roles (`ast-admin`, `iam-admin` by default)
@@ -114,14 +123,16 @@ telemetry, no analytics, and nothing else is contacted.
 | **It acts once a cycle**, not the moment credits are spent. | Usage is read and budgets judged once a cycle (every 15 minutes by default), and Checkmarx can report credits a little after they are spent. Usage in between can take a budget past its limit before the restriction lands, so leave some headroom. A large group or application is restricted over several cycles (at most 1,000 changes a cycle by default; [Sizing and scale](#sizing-and-scale)). |
 | **It restricts access, it does not meter credits.** | It removes roles and turns settings off; it cannot stop an action already running or cap a budget to the exact credit. |
 | **Only roles held directly are removed.** | An AI role a person holds through a group or a composite role stays in effect. CreditGuard says so once and never changes the group or role, because that would affect everyone in it. Remove it there in Checkmarx One, or exempt the person ([Restricting a user, in detail](#what-the-enforcement-actions-actually-are)). |
+| **User budgets may not bite at all.** | On a live tenant `ast-admin`, held by 274 of 296 users, is a composite role containing all three default AI roles, and it is protected: a user restriction would have reached almost nobody. Check *Enforcement coverage* (Simulation or Settings → Enforcement) before relying on user budgets; project, group and application budgets still turn AI features off on projects. |
 | **A project budget does not stop people's own AI Triage and AI Remediation.** | Turning project features off leaves what people start themselves working; only a user budget stops that ([What the breach and restriction messages say](#what-the-breach-and-restriction-messages-say)). |
 | **Account-wide Auto Triage may override a project.** | If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project. |
 | **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
 | **The general Risk Management roles are used for now.** | AI Triage and AI Remediation are reached through them today, so a restricted person also loses the Risk Management pages and dashboard. When Checkmarx One's dedicated AI permissions reach your tenant, swap them in under Settings → Enforcement, *Roles a user restriction removes*. |
 | **Figures only cover Checkmarx's lookback window.** | Checkmarx reports totals over a window (at most the last year), not individual events. "Lifetime" means everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened, unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
-| **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution). |
+| **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution). Automation (bots, integrations without an email) never does. Project usage reported under a repository name that is no project (87% of project credits on a live tenant) counts towards no project, group or application budget until mapped. All of it is shown on the Overview. |
+| **Credits per action are measured, not quoted.** | Checkmarx's listed rate is not what a Fusion or DAST correlation action costs (on a live tenant about 109 credits per Opus 5.5 Fusion scan against a rate of 2). Where they disagree, messages price an action at the feed's average over the lookback window and say so; it is an average, not the cost of one scan. |
 | **It cannot say who undid a restriction.** | Checkmarx One does not report who switched a setting back on. By default each restriction is read back once an hour (`verify_interval_minutes`), so a setting switched back on can stay on for up to about that long, and one undone and redone between two read-backs is not seen. |
-| **Some Checkmarx behaviour is not yet verified on a real tenant.** | Where a person's roles come from (groups, composite roles); the Fusion lock and the repository's Fusion setting; usage rows per group (only ever seen empty; the sum of its projects is used instead); paging of a very long user list; finding a project's repository (without it, PR triage and remediation is skipped there); the names of the default protected roles (check them against your tenant); whether a Fusion setting the project inherited can inherit again after Restore (for now it is restored on the project itself). Each degrades safely and says so rather than guessing ([Remaining unknowns](#remaining-unknowns)). |
+| **Some Checkmarx behaviour is not yet verified on a real tenant.** | Where a person's roles come from (groups, composite roles); the Fusion lock and the repository's Fusion setting; usage rows per group (only ever seen empty; the sum of its projects is used instead); writes of PR triage and remediation and Auto Triage in the shape a live tenant reads them (sent back as read, never tested by a write on one); finding a project's repository (without it, PR triage and remediation is skipped there); whether a Fusion setting the project inherited can inherit again after Restore (for now it is restored on the project itself). Each degrades safely and says so rather than guessing ([Remaining unknowns](#remaining-unknowns)). |
 | **Tested to 2,000 projects on a synthetic tenant.** | Load tested with 2,000 projects and 1,000 users made up for the test, not on a real tenant of that size. Use PostgreSQL above about 500 projects or 300 users ([Sizing and scale](#sizing-and-scale)). |
 | **One instance only.** | A second copy against the same database refuses to start. Availability comes from restarting the one copy, not from running several ([One instance only](#one-instance-only)). |
 | **The database is the only record of how to undo a restriction.** | The in-app backup holds configuration only. Back the database up; after restoring an older one, restrictions made since it was taken have to be given back by hand in Checkmarx One ([Backup and restore](#backup-and-restore)). |
@@ -487,11 +498,20 @@ bills the wrong person, decides:
 | ---------- | ------- |
 | **≥ 85%**, one clear winner | Attributed automatically and written to the audit log. Still overridable. |
 | **≥ 60%**, or an auto-worthy near-tie between two people | Left **uncounted** and raised as a *dispute* with ranked suggestions to confirm on the Settings page. |
-| below 60% | Unmatched, mapped by hand. Automation handles (`dependabot[bot]`) are flagged and kept out of the queue. |
+| below 60% | Unmatched, mapped by hand. Automation (handles like `dependabot[bot]`, and integration identities: one handle, no email, matching nobody) is flagged, shown as automation and kept out of the queue and the alerts. |
 
 Nothing is ever dropped: every subject lands in `unresolved_subject` with its
 status, and the Settings page groups them into **Disputes**, **Auto-matched** and
 **Unmatched** tabs. An admin mapping always wins over the automatic decision.
+
+Every page counts unmatched people the same way: not mapped, not auto-matched,
+not automation (`ingestion.unresolved_person_filter`), and the "could not be
+matched" notice is raised only for those. Project and application rows under a
+name that is no synced project or application (on a live tenant, 87% of project
+credits were under `org/repo` names absent from `/api/projects`) are counted in
+the cycle record, on the Overview and in Diagnostics, and an admin can map a
+name to a project or application under Settings → Attribution
+(`/api/usage/unmatched-entities`); a real name match always wins over a mapping.
 
 ## What the enforcement actions actually are
 
@@ -1280,7 +1300,12 @@ CreditGuard checks what the key may do instead of finding out at the first breac
   style; `GET /api/scans/` only when auto-triage charging is on, a limit turns
   Fusion off or a Fusion restriction is in force, or someone presses Check again), on one synced project and one synced user where a call needs one.
   Each is reported as allowed, refused (403), not found, error, or skipped with the
-  reason (for example when no project is linked to a repository yet).
+  reason (for example when no project is linked to a repository yet). The
+  repository read uses a project that has a repository id (from the synced
+  projects, or from the first page of the projects read when none is synced
+  yet), and is *allowed* only when its `remediationSeverities` is in a shape
+  CreditGuard can write back. A check where every read passed says so, and that
+  the writes were not tested.
 - **What it cannot test:** the writes (role mapping `POST`/`DELETE`, the Auto Triage
   `PUT`, the repos-manager `PATCH`, the project configuration `PATCH` that turns
   Fusion off, and the repository Fusion `PATCH`) cannot be tried without changing
@@ -1294,7 +1319,10 @@ CreditGuard checks what the key may do instead of finding out at the first breac
   (policy violations); the action-rates read is optional.
   They are shown as *not tested*, and as *will fail* when the read on the same
   service was refused. The role and group names in the key's access token are
-  shown too (never the token), and a token that lists `realm-management` roles
+  shown too (never the token), with a reminder that they are not the whole
+  story: Checkmarx One applies the roles of the user who owns the key on its
+  side, so on a live tenant a token listing only IAM roles was allowed every
+  platform read. A token that lists `realm-management` roles
   without `manage-users` marks role mapping as *probably refused* (a guess: shown
   as a warning on the card, never on its own a reason for the banner or a red
   verdict).
@@ -2176,13 +2204,27 @@ They are listed because each has a cost worth knowing about.
    string form older payloads carry. Where it is still absent, the PR
    triage and remediation half of project enforcement is skipped and the record says
    so; Auto Triage is still disabled. A list-repositories endpoint would close this,
-   and this is the most valuable of the remaining gaps.
-2. **Pagination parameters for `/users/v2`.** The endpoint is called without
-   parameters first; if fewer users come back than `filteredCount`, it retries with
-   `page` and `size`. If that makes no progress, the sync warns with the exact
-   shortfall rather than treating a partial list as complete.
+   and this is the most valuable of the remaining gaps. *Seen on a live tenant
+   (2026-11, about 2,000 projects):* `repoId` is an integer on every project
+   imported through an SCM integration (760 of 1,968: GitHub, GitHub App, Azure,
+   Bitbucket, GitLab), next to a string `scmRepoId` that is a different value;
+   projects created otherwise (CLI, MCP, upload) carry `repoUrl` but no `repoId`.
+   The repos-manager read returns `remediationSeverities` wrapped as
+   `{"value": [...], "isEditable": true}`. Both that and a bare list are read,
+   and every write sends back the shape that was read; a shape that is neither
+   is never written (the restriction is left unchanged and reported). That the
+   tenant accepts the wrapped form on a write is not yet verified.
+2. **Pagination parameters for `/users/v2`.** Settled on a live tenant: without
+   parameters it returns the first 100 users and `filteredCount`; `first` (a row
+   offset) and `max` page correctly (`max` up to at least 1,000), and `page` and
+   `size` are ignored (the first 100 come back again). The sync asks once without
+   parameters and then pages with `first` and `max`; if that makes no progress it
+   warns with the exact shortfall rather than treating a partial list as
+   complete.
 3. **The `group` dimension's row shape.** `viewBy=group` is a real dimension but
-   has only ever been observed empty, so the row shape is unverified. Group rows are
+   has only ever been observed empty (also on a live tenant of about 2,000
+   projects: `totalItems` 0 for `last_month`, `last_90_days` and `last_year`), so
+   the row shape is unverified. Group rows are
    matched by id then name like projects, and a group that does not match falls back
    to the local rollup of its projects, which is the behaviour that was there before.
    No guess about an unseen payload can cause a wrong figure.
@@ -2201,7 +2243,10 @@ They are listed because each has a cost worth knowing about.
    used: the mechanisms implemented are Auto Triage, PR triage and remediation and
    Fusion. If that flag
    is the authoritative master switch, adding it is one function in
-   `app/checkmarx/platform.py`.
+   `app/checkmarx/platform.py`. Seen on a live tenant: it is set at the tenant
+   level (`originLevel` `Tenant`, `value` `"true"`, `isPersisted` true,
+   `allowOverride` true), and the project's AI agent configuration carries the
+   same flag at its top level (`"allowAiUsage": true`).
 6. **Removing a project's own Fusion value.** Turning Fusion off writes the
    setting at the project level, also when it was inherited (`originLevel`
    `Tenant` or `Environment`), and Restore can only write the previous value back
@@ -2212,8 +2257,15 @@ They are listed because each has a cost worth knowing about.
    overrides. To verify on a tenant: take a project with an inherited
    `scan.config.ai.fusionEnabled`, set it on the project in the UI, and look for
    the request the UI sends when the project value is reset to the inherited
-   one; if it is a per-key call, Restore can use it for an entry whose
-   `origin_level_before` is not `Project`.
+   one; if it is a per-key call, Restore can use it for an entry recorded as
+   inherited. Seen on a live tenant: an entry the project has no value for
+   still reports `originLevel` `Project`, with an empty value and `isPersisted`
+   false, and after a write it reads `isPersisted` true; an inherited one reports
+   the level it comes from (`Tenant`) with that level's `isPersisted`. So
+   whether the project had its own value is recorded from both
+   (`inherited_before`, `is_persisted_before`) and said in the restriction and
+   restore messages; Restore still writes the previous value back on the
+   project.
 
 7. **Where a user's roles come from.** The effective-roles, user-groups,
    group-role-mapping and composite-role reads follow Keycloak's admin REST API
@@ -2224,10 +2276,38 @@ They are listed because each has a cost worth knowing about.
    only as *source unknown*.
 8. **Auto Triage's `allowOverride`.** The project-scope Auto Triage
    configuration carries `allowOverride` (`{"projects": false, "branches":
-   true, ...}` in a captured HAR). What each key means is not documented: it is
+   true, ...}` in a captured HAR; `{"projects": true, "branches": true,
+   "scannerTypes": true, "riskStatuses": true, "severityLevels": true}` on a
+   live tenant, where the same read also lists an `auto_remediation` feature
+   with its own `allowOverride`, and `allowAiUsage` at the top level). The
+   `PUT` sends that whole configuration back as read with only the
+   `auto_triage` entry's `enabled` and `config` changed, so the other feature
+   and every `allowOverride` are kept; Restore reads it again first. What each
+   `allowOverride` key means is not documented: it is
    recorded verbatim and only used, best effort, for the Simulation's *may not
    hold* warning. That a project cannot override an account-wide ("select
    all") setting is concluded from two read-backs, not from this field.
+
+**Fusion and DAST pricing.** `GET /api/v1/credits/action-rates` lists a
+`credits_per_action` that, on a live tenant (2026-11), was the cost of one
+transaction for triage (1) and remediation (3) only. The consumption feed
+reported 31,024 credits for 285 Opus 5.5 Fusion transactions (about 108.9 each,
+rate 2), about 7.65 per Opus 4.7 transaction (rate 2.5), about 5.4 per Haiku 4.5
+(rate 1.5) and 1,568 credits for 10 DAST correlations (about 156.8, rate 14).
+So a price is the listed rate only when the feed's own credits / transactions
+(action dimension) agree with it within 10%, or the feed has no figure;
+otherwise the feed's average is used, and every message and the Overview's
+table say which.
+
+**Other live-tenant observations.** `creditsUsed` arrives as a string
+(`"31024"`, `"252.5"`); no consumption row carries an id (matching is by name,
+the id branch is for payloads that may add one); action rows nest the type and
+count under `actionsPerformed` like every other dimension; the user dimension
+lists the same person more than once (119 rows for 87 subjects), which is
+merged; `/credits/info` carries Checkmarx's own `enforcement` block (state and
+thresholds), shown read only on the Overview. Checkmarx One applies the API key
+owner's roles server-side: a token carrying only IAM roles was allowed every
+platform read.
 
 Settled since the first draft: the `period` parameter accepts exactly
 `last_month`, `last_30_days`, `last_90_days`, `last_180_days` and `last_year`, all
