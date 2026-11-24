@@ -8,8 +8,18 @@
 # Build from the repository root (so both directories are in the context):
 #   podman build -f deploy/podman/Dockerfile -t cxcreditguard:podman .
 #
+# This is also the release image (.github/workflows/release.yml publishes it to
+# ghcr.io/cxsmtp/vcxcreditguard). Its main process is the launcher
+# (backend/cxcg_launcher.py), which runs the app version selected on Settings ->
+# Updates from the data volume, or the image's own. The app's files are the
+# LAST layer, on their own, so an in-app update downloads only that layer.
+#
 # For the hardened multi-service deployment see the root docker-compose.yml,
 # which uses backend/Dockerfile instead.
+
+# The base image is part of the dependency hash (see below): keep the default
+# in step with backend/Dockerfile.
+ARG PYTHON_IMAGE=python:3.11-alpine
 
 # --- Stage 1: build the SPA ------------------------------------------------
 FROM node:22-alpine AS frontend
@@ -24,9 +34,10 @@ COPY frontend/ ./
 # this stage, so redirect the output to a local directory instead.
 RUN npx vite build --outDir dist --emptyOutDir
 
-# --- Stage 2: runtime -------------------------------------------------------
+# --- Stage 2: the runtime base (OS, Python packages, launcher) --------------
 # Alpine keeps the runtime image's OS-package CVE surface minimal.
-FROM python:3.11-alpine AS runtime
+FROM ${PYTHON_IMAGE} AS base
+ARG PYTHON_IMAGE
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -42,6 +53,8 @@ WORKDIR /app
 # the pure-Python mode cannot find libpq on Alpine once the toolchain is removed
 # (see backend/Dockerfile). ".[postgres]" is not used because it pulls
 # psycopg[binary], whose wheels are glibc-only (manylinux).
+# Only the project's dependencies are installed, read from pyproject.toml: the
+# app itself is the last layer, never a site-packages copy.
 COPY backend/pyproject.toml backend/constraints.txt ./
 # Python dependency versions are pinned in constraints.txt, and pinning apk
 # --no-cache installs to exact versions is fragile across base-image updates.
@@ -49,19 +62,17 @@ COPY backend/pyproject.toml backend/constraints.txt ./
 # kics-scan ignore-block
 RUN apk add --no-cache libpq \
     && apk add --no-cache --virtual .build gcc musl-dev python3-dev libpq-dev \
-    && pip install --no-cache-dir -c constraints.txt . "psycopg[c]" \
+    && python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" > /tmp/requirements.txt \
+    && pip install --no-cache-dir -c constraints.txt -r /tmp/requirements.txt "psycopg[c]" \
+    && rm /tmp/requirements.txt \
     && apk del .build \
     && (pip uninstall -y pip setuptools wheel 2>/dev/null || true)
 
-COPY backend/alembic.ini ./
-COPY backend/alembic ./alembic
-COPY backend/app ./app
-COPY backend/scripts ./scripts
+# The image-level files an app update never replaces. Their content, the
+# packages above and the base image make the dependency hash: a release built
+# with a different hash is installed by replacing the image, never as a layer.
+COPY backend/cxcg_launcher.py /usr/local/lib/cxcreditguard/launcher.py
 COPY deploy/podman/easy-entrypoint.sh /usr/local/bin/easy-entrypoint.sh
-
-# The built SPA. app/main.py mounts it when it is present and serves the API
-# only when it is not.
-COPY --from=frontend /build/dist ./app/static
 
 # Alpine ships busybox adduser/addgroup rather than shadow's useradd.
 # Strip any CR bytes first: a Windows checkout (core.autocrlf=true) can rewrite
@@ -69,12 +80,51 @@ COPY --from=frontend /build/dist ./app/static
 # fails to exec with a misleading "No such file or directory". .gitattributes
 # pins these files to LF, but this makes the image build correct even from a
 # checkout that predates it.
-RUN sed -i 's/\r$//' /usr/local/bin/easy-entrypoint.sh \
+RUN sed -i 's/\r$//' /usr/local/bin/easy-entrypoint.sh /usr/local/lib/cxcreditguard/launcher.py \
     && chmod +x /usr/local/bin/easy-entrypoint.sh \
+    && python /usr/local/lib/cxcreditguard/launcher.py image-info \
+        --write /usr/local/share/cxcreditguard/image.json \
+        --constraints constraints.txt --pyproject pyproject.toml \
+        --base-image "$PYTHON_IMAGE" \
+        --launcher /usr/local/lib/cxcreditguard/launcher.py \
+        --entrypoint /usr/local/bin/easy-entrypoint.sh \
     && addgroup -g 10001 cxcg \
     && adduser -D -H -u 10001 -G cxcg cxcg \
     && mkdir -p /app/data \
     && chown -R cxcg:cxcg /app
+
+# --- Stage 3: the app's own files, with their release manifest --------------
+FROM base AS assemble
+ARG CXCG_REVISION=""
+COPY backend/alembic.ini /out/alembic.ini
+COPY backend/alembic /out/alembic
+COPY backend/app /out/app
+COPY backend/scripts /out/scripts
+# The built SPA. app/main.py mounts it when it is present and serves the API
+# only when it is not.
+COPY --from=frontend /build/dist /out/app/static
+# Every file with its sha256 (release-manifest.json), so an installation can
+# verify what it downloads. Built from the files, never from a timestamp: the
+# same sources give the same bytes, which the release workflow signs.
+RUN cd /out \
+    && python -m scripts.release_manifest build --root /out --revision "$CXCG_REVISION" \
+        --image-info /usr/local/share/cxcreditguard/image.json \
+    && find /out -name __pycache__ -type d -prune -exec rm -rf {} +
+
+# Just the manifest, for the release workflow to sign: --target release-manifest
+FROM scratch AS release-manifest
+COPY --from=assemble /out/release-manifest.json /
+
+# The signature (base64, from the release workflow), when there is one. The
+# private key never enters the build: only its signature does.
+FROM assemble AS signed
+ARG CXCG_RELEASE_SIGNATURE=""
+RUN if [ -n "$CXCG_RELEASE_SIGNATURE" ]; then \
+        printf '%s\n' "$CXCG_RELEASE_SIGNATURE" > /out/release-manifest.sig; \
+    fi
+
+# --- Stage 4: runtime -------------------------------------------------------
+FROM base AS runtime
 
 # Browser-first defaults: plain HTTP in development mode so session cookies do
 # not need HTTPS (Set-Cookie:; Secure would otherwise be silently discarded by
@@ -84,7 +134,9 @@ ENV CXCG_ENV=development \
     CXCG_COOKIE_SECURE=false \
     CXCG_HSTS_ENABLED=false \
     CXCG_HOST=0.0.0.0 \
-    CXCG_PORT=8000
+    CXCG_PORT=8000 \
+    CXCG_DATA_DIR=/app/data \
+    CXCG_DEPLOYMENT=single
 
 USER cxcg
 
@@ -95,10 +147,14 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
 
+# How many trailing layers hold the app (the in-app updater downloads only those).
+LABEL io.cxcreditguard.app-layers="1"
+
 # The easy entrypoint generates/persists the master key and a first admin, then
-# applies migrations. Pass the real uvicorn command via CMD.
+# hands over to the launcher, which runs uvicorn with the selected version.
 ENTRYPOINT ["/usr/local/bin/easy-entrypoint.sh"]
-# No --forwarded-allow-ips: the app does not let the web server rewrite the
-# client address from headers. It reads X-Forwarded-For itself, and only as many
-# hops as CXCG_TRUSTED_PROXY_HOPS says are trustworthy.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]
+CMD ["launch"]
+
+# The app's own files: ONE layer, and the last. Keep it that way - an in-app
+# update downloads exactly the layers counted by io.cxcreditguard.app-layers.
+COPY --from=signed --chown=10001:10001 /out/ /app/

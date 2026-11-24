@@ -30,6 +30,8 @@ CATEGORY_ATTRIBUTION = "attribution"
 CATEGORY_PERMISSIONS = "permissions"
 # Someone acted against a restriction in force ("Policy violations").
 CATEGORY_POLICY = "policy"
+# In-app updates: available, installed, rolled back, needs a new image, token refused.
+CATEGORY_UPDATES = "updates"
 
 
 def notify(

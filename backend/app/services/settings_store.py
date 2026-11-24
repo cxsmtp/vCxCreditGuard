@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.checkmarx.usage import DEFAULT_PERIOD
 from app.core.crypto import (
     PURPOSE_SMTP_PASSWORD,
+    PURPOSE_UPDATE_TOKEN,
     PURPOSE_WEBHOOK_SECRET,
     PURPOSE_WEBHOOK_URL,
     get_secret_box,
@@ -124,6 +125,14 @@ KEY_AUTO_TRIAGE_TO_INITIATOR = "attribution.auto_triage_to_scan_initiator"
 # a single "observed" rise. Not part of the configuration backup.
 KEY_AUTO_TRIAGE_OBSERVATION_EPOCH = "attribution.auto_triage_observation_epoch"
 
+# Updates (app/updates). Auto-update is on by default: a newer release is
+# installed in the quiet hour (UTC). The registry token is a read-only GitHub
+# token (read:packages) for the private release images; a secret like the
+# Checkmarx API key, encrypted under its own purpose and never shown back.
+KEY_UPDATE_AUTO = "updates.auto_enabled"
+KEY_UPDATE_QUIET_HOUR = "updates.quiet_hour"
+KEY_UPDATE_TOKEN = "updates.registry_token"  # secret
+
 # The latest API key permission report (app/services/key_permissions.py), as
 # JSON. Bookkeeping, not configuration: it is never shown on the Settings page,
 # never part of a configuration backup and never part of the attestation digest.
@@ -133,9 +142,18 @@ KEY_KEY_PERMISSIONS = "connection.key_permissions"
 KEY_ACTION_RATES = "credits.action_rates"
 # Newest scan the policy violation check has looked at, per restricted project.
 KEY_VIOLATION_SCAN_CURSORS = "violations.scan_cursors"
+# The launcher events (updates) already written to the audit log. Kept in the
+# database, not beside the events, so a database restored by a rollback reports
+# again what its restored copy does not hold.
+KEY_UPDATE_REPORTED_EVENTS = "updates.reported_events"
 # Rows kept in app_setting that are state rather than settings.
 INTERNAL_KEYS: frozenset[str] = frozenset(
-    {KEY_KEY_PERMISSIONS, KEY_ACTION_RATES, KEY_VIOLATION_SCAN_CURSORS}
+    {
+        KEY_KEY_PERMISSIONS,
+        KEY_ACTION_RATES,
+        KEY_VIOLATION_SCAN_CURSORS,
+        KEY_UPDATE_REPORTED_EVENTS,
+    }
 )
 
 # Marker stamped on a demo usage snapshot's period_param. Distinctive on purpose
@@ -150,6 +168,7 @@ SECRET_KEYS: dict[str, str] = {
     # who has it can post to the channel. It is stored encrypted, never shown
     # back, and kept out of audit entries and backups like any other secret.
     KEY_WEBHOOK_URL: PURPOSE_WEBHOOK_URL,
+    KEY_UPDATE_TOKEN: PURPOSE_UPDATE_TOKEN,
 }
 
 ALLOWED_INTERVAL_MINUTES: tuple[int, ...] = (2, 5, 15, 60)
@@ -182,6 +201,8 @@ DEFAULTS: dict[str, Any] = {
     KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
     KEY_FUSION_LOCK: True,
     KEY_AUTO_TRIAGE_TO_INITIATOR: False,
+    KEY_UPDATE_AUTO: True,
+    KEY_UPDATE_QUIET_HOUR: 3,
 }
 
 
@@ -335,6 +356,22 @@ def credit_unit_cost(session: Session) -> float:
     except (TypeError, ValueError):
         return 0.0
     return cost if cost >= 0 else 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class UpdatePolicy:
+    auto_enabled: bool
+    quiet_hour: int  # 0-23, UTC
+
+
+def update_policy(session: Session) -> UpdatePolicy:
+    hour = get_value(session, KEY_UPDATE_QUIET_HOUR, DEFAULTS[KEY_UPDATE_QUIET_HOUR])
+    if not isinstance(hour, int) or isinstance(hour, bool) or not 0 <= hour <= 23:
+        hour = DEFAULTS[KEY_UPDATE_QUIET_HOUR]
+    return UpdatePolicy(
+        auto_enabled=get_value(session, KEY_UPDATE_AUTO, DEFAULTS[KEY_UPDATE_AUTO]) is not False,
+        quiet_hour=hour,
+    )
 
 
 def get_raw(session: Session, key: str) -> AppSetting | None:

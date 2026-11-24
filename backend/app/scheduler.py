@@ -22,6 +22,7 @@ from app.services.cycle import run_cycle
 logger = logging.getLogger(__name__)
 
 JOB_ID = "governance-cycle"
+UPDATE_JOB_ID = "update-check"
 # Tolerate a late fire rather than dropping the run entirely.
 MISFIRE_GRACE_SECONDS = 300
 
@@ -82,9 +83,34 @@ def start() -> None:
         logger.warning("The scheduler is disabled in settings, no cycles will run")
     else:
         scheduler.add_job(_job, trigger=trigger, id=JOB_ID, replace_existing=True)
+    _add_update_job(scheduler)
     if not scheduler.running:
         scheduler.start()
     logger.info("Scheduler started with %s", describe_schedule())
+
+
+def _update_job() -> None:
+    if not instance_guard.still_held(get_engine()):
+        return
+    from app.updates.service import scheduled_tick
+
+    scheduled_tick()
+
+
+def _add_update_job(scheduler: BackgroundScheduler) -> None:
+    """Auto-update: a first look a minute after start, then every 15 minutes (it
+    checks the registry every 6 hours and installs only in the quiet hour)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.updates.service import FIRST_TICK_SECONDS, TICK_MINUTES
+
+    scheduler.add_job(
+        _update_job,
+        trigger=IntervalTrigger(minutes=TICK_MINUTES, timezone="UTC"),
+        id=UPDATE_JOB_ID,
+        replace_existing=True,
+        next_run_time=datetime.now(UTC) + timedelta(seconds=FIRST_TICK_SECONDS),
+    )
 
 
 def reconfigure() -> str:

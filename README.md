@@ -503,6 +503,17 @@ podman run -d --name cxcreditguard --restart unless-stopped \
   -p 8000:8000 -v cxcreditguard-data:/app/data cxcreditguard:podman
 ```
 
+Or run a published release instead of building one (the package is private: log
+in with a GitHub token that has `read:packages`, see [Updates](#updates)):
+
+```sh
+podman login ghcr.io
+podman run -d --name cxcreditguard --restart unless-stopped \
+  -p 8000:8000 -v cxcreditguard-data:/app/data ghcr.io/cxsmtp/vcxcreditguard:latest
+```
+
+From then on it updates itself (Settings → Updates).
+
 | Action | `make` | `run.bat` | `run-podman.ps1` |
 | ------ | ------ | --------- | ---------------- |
 | Build and run | `make podman-run` | `run.bat` | `.\run-podman.ps1` |
@@ -700,12 +711,17 @@ backend/app/
   services/      connection, auth, audit, org_sync, ingestion, periods,
                  evaluation, enforcement, violations, usage_mix,
                  limits_service, notifications, settings_store, cycle
+  updates/       in-app updates: GHCR client, release manifest and signature,
+                 installed versions, check / install / rollback / auto-update
   scheduler.py   APScheduler wiring, reconfigurable at runtime
   api/           dependencies (auth, CSRF, RBAC), middleware, routes
   schemas/       request and response models with strict validation
   static/        the built SPA (produced by the frontend build, not in git)
 alembic/         migrations
-scripts/         seed_demo.py, for a tenant-free demo database
+scripts/         seed_demo.py, for a tenant-free demo database; release_manifest.py
+                 and release_keygen.py, for signed releases
+cxcg_launcher.py the single image's main process: runs the selected version,
+                 rolls back one that does not come up (standard library only)
 tests/           unit, service and API tests, plus the in-memory fake tenant
 
 frontend/src/
@@ -832,6 +848,9 @@ change behaviour most:
 | `CXCG_CX_ALLOWED_HOSTS` | none | Extra Checkmarx One hostnames to accept. Tenant URLs must be `https` and end in `checkmarx.net`; a dedicated or private host has to be listed here or the connection is refused. |
 | `CXCG_SMTP_CA_FILE` | system CAs | CA bundle used to verify the mail server's certificate, for a server with a private CA. |
 | `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP_DAYS` | 24 / 14 | Compose only: how often the database is dumped and how long dumps are kept. |
+| `CXCG_DATA_DIR` | `./data` (`/app/data` in the image) | Where installed versions, the launcher's state and pre-update backups are kept. |
+| `CXCG_UPDATE_START_TIMEOUT` | 180 | Seconds a newly installed version has to answer its health check before the launcher rolls it back. |
+| `CXCG_UPDATE_PUBLIC_KEY` | the embedded key | Release signing public key (PEM), instead of `backend/app/updates/release-signing-key.pub`. |
 
 ## Security posture
 
@@ -1278,7 +1297,8 @@ restart.
 
 ### Upgrading
 
-Take a backup, pull the new source, `podman compose up -d --build`. Migrations
+The single container updates itself (see [Updates](#updates)). Compose: take a
+backup, check out the release tag, `podman compose up -d --build`. Migrations
 run at start. Coming from a version before the production hardening, check
 these, because each one can stop something that used to work:
 
@@ -1330,6 +1350,120 @@ these, because each one can stop something that used to work:
   the upgrade is charged as observed. A third (`c8e1f5a3d6b2`) adds
   `history_ceiling`; a row from before it (null) bounds the estimate by the current
   reading until the next fall sets it, and a restart sets it at once.
+
+### Updates
+
+Releases are published as a **private** container image,
+`ghcr.io/cxsmtp/vcxcreditguard:<version>` (and `:latest`), and the single
+container installs them itself from **Settings → Updates** (admins only).
+**Auto-update is on by default.**
+
+**How it works.** The image's main process is a small launcher
+(`backend/cxcg_launcher.py`, standard library only). It runs the version selected
+on the Updates page from the data volume (`/app/data/versions/<version>/`), or the
+image's own copy in `/app`. Installing a release:
+
+1. reads the release's image from the registry and downloads **only its app
+   layer** (the last layer of the image, a few MB): every blob is checked against
+   its sha256 digest, and the layer is unpacked with no paths outside the app
+   folder, no links and size limits;
+2. verifies the release's file list (`release-manifest.json`: every file and its
+   sha256) and, once a signing key is configured, its ed25519 signature. A release
+   that is unsigned, wrongly signed, or whose files differ from the list is never
+   installed;
+3. waits for any running enforcement cycle, backs the database up
+   (`/app/data/backups/pre-update-*.sqlite3`, the last three are kept), selects
+   the new version and asks the launcher to switch. The page reconnects in a few
+   seconds; migrations run as the new version starts, as on any start;
+4. the launcher keeps the new version **on trial** until `/healthz` answers with
+   its version. If it exits first, or does not answer within 180 seconds
+   (`CXCG_UPDATE_START_TIMEOUT`), the launcher stops it, puts the pre-update
+   database backup back **if the new version changed the schema**, runs the
+   previous version again and marks the new one *failed to start*: auto-update
+   never installs it again. The rollback is audited and notified, saying whether
+   data written since the update was lost.
+
+The data volume keeps the running version, the one before it and the image's
+own; older installed versions are removed.
+
+**Automatic updates.** The registry is checked every 6 hours (and a minute after
+start). A newer release installs only in the **quiet hour** (default 03:00 UTC),
+never while an enforcement cycle runs, never a version that failed to start here,
+and never an older one. Turn it off, or move the hour, on Settings → Updates;
+when off, admins are notified once when a release is published and install it
+from the page. Every action (check, install, switch, rollback, token and setting
+changes) is in the audit log; installed, rolled back, *needs a new image* and
+*token refused* are also notifications.
+
+**Rolling back.** *Roll back* on the Updates page returns to the version that ran
+before the last update. If the database schema changed since that update, the
+backup taken before it is restored: **everything written since the update is
+lost** (usage readings, budget changes, requests, audit entries), and the page
+says so and asks for confirmation. The replaced database is kept in
+`/app/data/backups/` for manual recovery. Without a schema change the database
+is kept as it is.
+
+**When the image itself must be replaced.** Each image carries a *dependency
+hash* (`io.cxcreditguard.deps`: the pinned Python packages, the base image, the
+launcher and the entrypoint). A release with a different hash cannot run as a
+layer on this image; the page says *needs a new image*, notifies admins once and
+shows the command:
+
+```sh
+podman login ghcr.io   # a GitHub user and the read:packages token
+podman pull ghcr.io/cxsmtp/vcxcreditguard:1.2.3
+podman rm -f cxcreditguard
+podman run -d --name cxcreditguard --restart unless-stopped \
+  -p 8000:8000 -v cxcreditguard-data:/app/data ghcr.io/cxsmtp/vcxcreditguard:1.2.3
+```
+
+The data volume carries over; a replaced image runs its own version unless an
+installed one is newer and built for the same dependencies.
+
+**Compose and source installations** are not updated in place: there is no
+launcher and the database is PostgreSQL, which the app cannot back up itself.
+The Updates page still checks (with a token) and notifies, and shows the steps:
+`git fetch --tags && git checkout v<version>`, then
+`podman compose up -d --build`, after a dump (see [Backup and
+restore](#backup-and-restore)). The single container pointed at PostgreSQL with
+`CXCG_DATABASE_URL` installs a release that changes the schema only after an
+admin confirms having a backup of their own, and rolls such a release back only by
+restoring that backup.
+
+#### One-time setup (repository owner)
+
+1. **Signing key.** On a trusted machine:
+   `python backend/scripts/release_keygen.py` writes the private key to
+   `cxcg-release-signing-key.pem` and prints the public key. Store the file's whole
+   contents as the repository secret **`CXCG_RELEASE_SIGNING_KEY`** (Settings →
+   Secrets and variables → Actions), keep an offline copy, delete the file. Paste
+   the public key into `backend/app/updates/release-signing-key.pub` and commit
+   it. From the first release built with it, installations accept only releases
+   signed with that key (`CXCG_UPDATE_PUBLIC_KEY` overrides the embedded key).
+   Without the secret, releases are still published but marked unsigned, and are
+   installed only by versions without a public key.
+2. **Publishing.** Push a version tag: `git tag -a v1.2.3 -m "notes"` then
+   `git push origin v1.2.3`. `.github/workflows/release.yml` stamps the version
+   into `backend/app/__init__.py` (the one place it lives), builds
+   `deploy/podman/Dockerfile`, signs the release manifest, checks that the image
+   comes up as that version, and pushes `:1.2.3` and `:latest` with the job's
+   `GITHUB_TOKEN` (`packages: write`). The release notes shown in the app are the
+   `## 1.2.3` section of a `CHANGELOG.md`, if there is one, else the tag's message.
+   New packages are private by default; check the package's visibility after the
+   first release, and keep it private.
+3. **A read-only token per installation.** On GitHub: Settings → Developer
+   settings → Personal access tokens → Tokens (classic) → *Generate new token*,
+   scope **`read:packages` only**, from an account that can see the package (give
+   it access under the package's settings, *Manage Actions access* / *Manage
+   access*). Enter it on Settings → Updates → *Registry token*. It is encrypted
+   with the master key like the Checkmarx API key, never shown again, never logged,
+   and is tried at once. Until one is entered, auto-update stays on and the page
+   and the top bar say *needs a registry token*; nothing fails in a loop.
+
+**Network.** Outbound HTTPS (443) to `ghcr.io` (token exchange, tags, manifests)
+and `pkg-containers.githubusercontent.com` (where GHCR serves the layer). Both are
+fixed in code: no address an admin types or a registry answers is ever called,
+and the registry token is only ever sent to `ghcr.io`.
 
 ### Enforcement safety
 

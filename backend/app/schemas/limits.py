@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from app.models.enums import (
     EntityType,
@@ -306,8 +306,3 @@ class RestoreResultResponse(BaseModel):
     limits_created: int
     limits_updated: int
     exemptions: int
-
-
-class SetLatestVersionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    version: str = Field(min_length=1, max_length=64)

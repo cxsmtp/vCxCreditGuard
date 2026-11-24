@@ -4,6 +4,8 @@
 !.env.example
 *.key
 secrets/
+# The release signing key (backend/scripts/release_keygen.py): never committed.
+cxcg-release-signing-key*.pem
 
 # Python
 __pycache__/

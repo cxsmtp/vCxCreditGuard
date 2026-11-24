@@ -62,7 +62,12 @@ export function settingsNav(me: Me): [string, SettingsLink[]][] {
       "System",
       [
         { to: "/settings/appearance", label: "Appearance" },
-        ...(admin ? [{ to: "/settings/operations", label: "Backups & health" }] : []),
+        ...(admin
+          ? [
+              { to: "/settings/operations", label: "Backups & health" },
+              { to: "/settings/updates", label: "Updates" },
+            ]
+          : []),
         { to: "/settings/about", label: "About" },
       ],
     ],
@@ -191,6 +196,15 @@ function Lights({ me }: { me: Me }) {
       label: `${me.open_violations} policy violation${me.open_violations === 1 ? "" : "s"}`,
       to: "/violations",
       title: "Someone acted against a restriction in force. Open Policy violations to follow up.",
+    });
+  }
+  if (me.update_notice) {
+    lights.push({
+      key: "update",
+      tone: me.update_notice.tone,
+      label: me.update_notice.label,
+      to: "/settings/updates",
+      title: me.update_notice.detail,
     });
   }
   if (me.enforcement_paused) {
@@ -655,6 +669,23 @@ export function AppShell({
           </header>
 
           <PermissionBanner me={me} onOpen={() => setPermOpen(true)} />
+          {(me.update_notice?.kind === "needs_token" || me.update_notice?.kind === "token_invalid") &&
+            !location.pathname.startsWith("/settings/updates") && (
+              <div
+                className={`cg-banner ${me.update_notice.kind === "token_invalid" ? "bad" : ""}`}
+                role="status"
+              >
+                <span>
+                  <b>
+                    {me.update_notice.kind === "token_invalid"
+                      ? "The update registry refused its token."
+                      : "Auto-update is on but has no registry token."}
+                  </b>{" "}
+                  Updates cannot be checked or installed until a read-only token is entered.
+                </span>
+                <Link to="/settings/updates">Add a token</Link>
+              </div>
+            )}
           {me.demo_mode && (
             <div className="cg-banner" role="status">
               Demo mode: showing synthetic data. Enforcement is suppressed, so nothing is changed in

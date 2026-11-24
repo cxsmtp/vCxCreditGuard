@@ -1,0 +1,13 @@
+# The public half of the release signing key (ed25519, PEM).
+#
+# Releases published by .github/workflows/release.yml are signed with the
+# private half, held as the repository secret CXCG_RELEASE_SIGNING_KEY. Once a
+# key is pasted here, this installation (and every later version built with it)
+# installs only releases whose signature verifies against it.
+#
+# Until then it is empty and updates are checked against their file list only
+# (marked "unsigned" on Settings -> Updates). To set it up once:
+#   python backend/scripts/release_keygen.py
+# then paste the printed "-----BEGIN PUBLIC KEY-----" block below these comments,
+# and store the private key file's contents as the CXCG_RELEASE_SIGNING_KEY secret.
+# CXCG_UPDATE_PUBLIC_KEY (the PEM text) overrides this file.
