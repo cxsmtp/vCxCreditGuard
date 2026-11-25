@@ -695,6 +695,15 @@ export interface AppSettings {
   allowed_accents: string[];
   self_service_requests: boolean;
   charge_auto_triage_to_scan_initiator: boolean;
+  /** Where project, user and application budgets get their usage: the credit
+   * activity log (with the summary as fallback) or the summary only. */
+  usage_source: "activity" | "summary";
+  allowed_usage_sources?: string[];
+  /** Pages of the activity log one cycle may read (0 = no cap). */
+  activity_max_pages_per_cycle: number;
+  /** Extra integration account names (besides [bot] accounts, Auto-triage, Auto-remediation). */
+  integration_accounts: string[];
+  usage_source_status?: UsageSourceStatus | null;
   report_email_enabled: boolean;
   credit_unit_cost: number;
   demo_mode: boolean;
@@ -724,6 +733,24 @@ export interface AppSettings {
   attribution_requests_per_cycle: number;
   read_concurrency: number;
   cycle_time_budget_pct: number;
+}
+
+export interface UsageSourceStatus {
+  setting: string;
+  status: "active" | "inactive" | "fallback" | "off";
+  active_since?: string | null;
+  last_success_at?: string | null;
+  failing_since?: string | null;
+  retry_after?: string | null;
+  last_error?: string | null;
+  reconciliation?: {
+    status?: string;
+    at?: string;
+    period?: string;
+    activity_credits?: string;
+    summary_credits?: string | null;
+    reason?: string;
+  } | null;
 }
 
 export interface SchedulerStatus {

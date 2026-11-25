@@ -27,6 +27,20 @@ point links to the section below that explains it.
 - Reads AI credit use from Checkmarx One on a schedule (every 15 minutes by
   default) for every user, group, project and application
   ([How usage is measured](#how-usage-is-measured)).
+- Counts each billed action from Checkmarx One's credit activity log in the
+  period it happened in, against its project and application **by id** and its
+  person by email or username (the default usage source). Identical actions in
+  the same second are each counted, never merged
+  ([The credit activity log](#the-credit-activity-log-the-default-usage-source)).
+- Falls back to the consumption summary (totals matched by name) while the
+  activity log cannot be read, and never counts the same usage from both.
+  Settings → Schedule & data can use the summary only.
+- Once a day, checks that the activity log adds up to the summary's total over
+  the same 30 days, and shows a mismatch in Diagnose.
+- Integration accounts (bots, Auto-triage, Auto-remediation, accounts you list)
+  count towards their project's budgets, and towards a person's budget only when
+  their project had no active project budget at the time: never towards two user
+  budgets ([Integration accounts](#integration-accounts)).
 - Matches each usage row to a Checkmarx user: exactly where it can, by name
   similarity where not. Unsure matches wait for an admin to confirm
   ([Attribution](#attribution)).
@@ -130,8 +144,9 @@ telemetry, no analytics, and nothing else is contacted.
 | **Account-wide Auto Triage may override a project.** | If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project. |
 | **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
 | **The general Risk Management roles are used for now.** | AI Triage and AI Remediation are reached through them today, so a restricted person also loses the Risk Management pages and dashboard. When Checkmarx One's dedicated AI permissions reach your tenant, swap them in under Settings → Enforcement, *Roles a user restriction removes*. |
-| **Figures only cover Checkmarx's lookback window.** | Checkmarx reports totals over a window (at most the last year), not individual events. "Lifetime" means everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened, unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
-| **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution). Automation (bots, integrations without an email) never does. Project usage reported under a repository name that is no project (87% of project credits on a live tenant) counts towards no project, group or application budget until mapped. All of it is shown on the Overview. |
+| **A cycle or two of usage is not counted when the usage source switches.** | When the activity log becomes the source (the setting turned on, or the log back after failing), its first read only records what it holds: what happened since the summary's last reading is not counted. When the summary takes over (the setting turned off, the log refused or malformed, or failing for more than an hour), its first reading counts nothing: about one to two cycles are not counted. While the log fails for less than an hour nothing new is counted; it is counted when the log answers again. A row reaching the log more than about two hours late is counted only by the daily full read, and only if dated after the switch; rows of the same second that meet at a page boundary wait for a later cycle ([Switching source](#switching-source-and-what-is-not-counted)). |
+| **Figures only cover Checkmarx's lookback window.** | The consumption summary reports totals over a window (at most the last year), and the activity log covers the last 30 days. "Lifetime", custom and count-existing budgets read the summary's totals, so they mean everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened (or before the budget was created), unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
+| **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution); a mapping counts from then on. Automation counts towards a person only by the [integration-account rule](#integration-accounts) (Auto-remediation towards nobody: no scan initiator is traced for it). With the summary as the source, project usage reported under a repository name that is no project (87% of project credits on a live tenant) counts towards no project, group or application budget until mapped; the activity log names projects by id. All of it is shown on the Overview. |
 | **Credits per action are measured, not quoted.** | Checkmarx's listed rate is not what a Fusion or DAST correlation action costs (on a live tenant about 109 credits per Opus 5.5 Fusion scan against a rate of 2). Where they disagree, messages price an action at the feed's average over the lookback window and say so; it is an average, not the cost of one scan. |
 | **It cannot say who undid a restriction.** | Checkmarx One does not report who switched a setting back on. By default each restriction is read back once an hour (`verify_interval_minutes`), so a setting switched back on can stay on for up to about that long, and one undone and redone between two read-backs is not seen. |
 | **Some Checkmarx behaviour is not yet verified on a real tenant.** | Where a person's roles come from (groups, composite roles); the Fusion lock and the repository's Fusion setting; usage rows per group (only ever seen empty; the sum of its projects is used instead); writes of PR triage and remediation and Auto Triage in the shape a live tenant reads them (sent back as read, never tested by a write on one); finding a project's repository (without it, PR triage and remediation is skipped there); whether a Fusion setting the project inherited can inherit again after Restore (for now it is restored on the project itself). Each degrades safely and says so rather than guessing ([Remaining unknowns](#remaining-unknowns)). |
@@ -277,6 +292,16 @@ requirements, `npm audit`).
 
 This matters more than any other design decision here, and it is not obvious.
 
+There are two sources. By default the **credit activity log**
+(`GET /api/credits/activity`, one row per billed action, with its date and its
+project's id) feeds the budgets of projects, users and applications: see
+[The credit activity log](#the-credit-activity-log-the-default-usage-source).
+The **consumption summary** below is read every cycle all the same: it feeds
+everything the log does not cover (a group's own row, lifetime, custom and
+count-existing budgets, which read its totals), the dashboard and Attribution,
+and it takes over whenever the log cannot be read. With the setting *Usage
+source: Summary only* it is the only source, exactly as before the log was used.
+
 `GET /api/credits/consumption` returns **aggregate totals over a lookback
 window**, not a stream of timestamped events. There are no event ids, no
 timestamps and no project ids in the user view. So per-period usage cannot be
@@ -309,14 +334,142 @@ enough that the reported total falls below the baseline, the baseline is lowered
 match, so usage never goes negative and a stale high baseline cannot mask real
 consumption.
 
-Usage per entity level:
+Usage per entity level (period budgets read the activity log while it is the
+source; the summary column is what they read otherwise, and what lifetime,
+custom and count-existing budgets read always):
 
-| Level | Source |
-| ----- | ------ |
-| User | `viewBy=user`, attributed to a synced IAM user; plus, only with auto-triage charging on, their share of the auto triage their scans triggered (see below) |
-| Application | `viewBy=application`, falling back to the sum of its projects |
-| Project | `viewBy=project` |
-| Group | `viewBy=group` when the group appears in the response, otherwise the sum of the group's projects, plus member users when `include_member_usage` is on |
+| Level | Activity log | Summary |
+| ----- | ------------ | ------- |
+| User | events by email, else username, else unmatched (integration accounts: see below); plus, only with auto-triage charging on, their share of the auto triage their scans triggered | `viewBy=user`, attributed to a synced IAM user; plus the same auto-triage share |
+| Application | events whose `applicationIds[0]` is it, or whose project is one of its projects | `viewBy=application`, falling back to the sum of its projects |
+| Project | events whose `projectIds[0]` is it | `viewBy=project` |
+| Group | events of its projects (unless its own summary row feeds it), plus of its members when `include_member_usage` is on, each once | `viewBy=group` when the group appears in the response, otherwise the sum of the group's projects, plus member users when `include_member_usage` is on |
+
+### The credit activity log (the default usage source)
+
+```
+GET /api/credits/activity?period=last_30_days&page=1&size=500&sort_by=date&sort_order=asc
+{"items": [{"date": "2026-11-25T10:21:28Z", "action": "Fusion Scan - Opus 5.5",
+            "creditsUsed": "144.5", "user": "jdoe", "userEmail": "",
+            "projectIds": ["<uuid>"], "applicationIds": [], "scanIds": ["<uuid>"],
+            "scanner": "sast", ...}],
+ "totalItems": 1939, "totalPages": 20, "currentPage": 1}
+```
+
+On a live tenant 30 days held 1,939 rows whose `creditsUsed` (a string) added
+up exactly to the summary's total; every row had one project id and 68 an
+application id; `userEmail` was empty on 1,511 rows. Each cycle reads it first
+(`app/services/activity_source.py`, `app/checkmarx/activity.py`) and adds every
+**new event** to the month's and the quarter's counter, **of the period of the
+event's own date**, of each active budget it counts towards and that was created
+before it happened:
+
+* its project's budgets, by `projectIds[0]` (no name matching);
+* the project's groups' budgets, as the ledger feeds them (not a plain group
+  budget its own summary row feeds);
+* its application's budgets: `applicationIds[0]` and the project's synced
+  applications, once;
+* its person's budget (and group budgets that include member usage): the IAM
+  user by `userEmail`, else by `user` as username (with an admin's mapping and
+  the summary's matching ladder: unambiguous full name, confident similarity),
+  else nobody, and the name is raised under Settings → Attribution to be mapped
+  (from then on);
+* each budget counts an event once (a group budget that includes member usage
+  too, where the summary adds its project and member views).
+
+**No row id, so a multiset.** Identical rows are distinct events (59 of the
+1,939 rows were exact duplicates of another, to the second): nothing is ever
+deduplicated. A row's identity is every identifying field (date, action,
+credits, user, email, project ids, application ids, scan ids, scanner), hashed,
+and `usage_activity_key` keeps how many rows of each identity have been seen. A
+fetch holding `n` rows of an identity counts `max(0, n − seen)` new events and
+raises `seen` to `n`, in the transaction that feeds the counters, under the
+attribution lock. Nothing is written while Checkmarx is called: every page is
+read first. Keys are pruned 31 days after their date, and an event older than
+that is never counted.
+
+**Fetching so that no row is read twice.** Pages are read in ascending order of
+`sort_order=asc`: new rows append at the end, and rows ageing out leave from the
+front, which moves every row one place earlier, so a row near a page boundary
+can be skipped but not read twice. Since each page is a slice of the sorted log
+as of its own request, a row read on one page can turn up again on a later page
+only if every boundary in between has the same date on both sides. So at each
+boundary: a later date on the next page proves no repeat across it; the **same
+date** makes that date *uncertain* this cycle (its rows are neither counted nor
+recorded, and the next read, with a different page size to move the boundaries,
+covers them); an **earlier** date (the order went back) makes the whole fetch
+count nothing. Within a page the dates must not go back, or the log is taken as
+malformed. With that, no identity is ever read more times than the log holds,
+**whether or not the fetch was complete**, so an over-count cannot happen. The
+cross-checks — `totalItems` the same on the first and the last page, and as many
+rows read as it says lie from the first page read to the end — tell whether a
+fetch was complete; an incomplete one is not discarded (what it counted is
+safe), it is recorded (`total_changed`, `rows_mismatch`) and its skips are made
+up by the next reads.
+
+**Cost.** A normal cycle reads from a page before where the last two hours of
+the log began to its end: two or three requests for 100,000 rows in 30 days
+(about 2,000 projects). The overlap makes up a row skipped by drift, or arriving
+up to two hours late. At most *Activity log pages per cycle* (default 40) are
+read, and the cycle's time budget applies; a cycle that stops early counts only
+complete dates (the last date read may continue on the next page) and warns,
+and the next cycles carry on from there. Once a day the whole 30 days are read
+(at most 400 pages), counting rows that arrived late, and their sum is compared
+with the summary's total over `last_30_days` (`viewBy=action`): a difference of
+more than 0.5% (and a credit) shows as a warning in Diagnose (*Usage source*).
+
+#### Switching source, and what is not counted
+
+The same usage is never counted from both sources:
+
+* **The log becomes the source** (the setting turned on, the first cycle after
+  upgrading, or the log back after a fallback): its first fetch only records
+  what it holds and counts nothing, and events dated before that moment are
+  never counted from it. In the same cycle the summary stops feeding the
+  project, user and application views (its readings are still stored, for the
+  dashboard, totals and Attribution). **Not counted:** what happened between the
+  summary's last reading and that first fetch (about one cycle).
+* **The summary takes over** (the setting turned off; a 403, a 404 or a
+  malformed answer, tried again after 6 hours; or a 5xx, timeout or rate limit
+  lasting more than an hour): the summary's first reading of each covered view
+  counts nothing, and the following ones count increases as before. **Not
+  counted:** what happened between the log's last fetch and the summary's second
+  reading (one to two cycles). This assumes the summary reports an event no
+  later than a cycle after the log does (they are the same data: their totals
+  matched exactly).
+* **A shorter outage** keeps the log as the source: nothing new is counted
+  meanwhile (the cycle is not fresh, so no new restriction is applied on it),
+  and what happened is counted when the log answers again.
+* Also not counted: a row that reaches the log more than two hours late and
+  before the next daily full read is counted then, but one dated before the
+  switch never is; rows of one second at a page boundary wait for a later
+  cycle; a row with no date.
+
+#### Integration accounts
+
+Integration accounts are automation, not people: `[bot]` accounts and known
+bots, `Auto-triage`, `Auto-remediation` (and the other synthetic subjects),
+handles the matcher takes for an integration, and the names an admin lists in
+Settings → Attribution → *Integration accounts* (`attribution.integration_accounts`,
+for an SCM integration's handle). Their usage always counts towards the budgets
+of its project, and the project's groups and application, like any usage.
+Towards a person:
+
+* **if the event's project had an active project budget at the event's date**,
+  towards no user budget: the project budget governs it;
+* otherwise `Auto-triage` goes to the person who started the scan through
+  [auto-triage charging](#charging-auto-triage-to-the-person-who-started-the-scan)
+  (when it is on and resolves one; nobody otherwise), and `Auto-remediation` to
+  nobody (no initiator is traced for it). The project-budget rule also applies
+  to those charges for what was observed while the log was the source;
+* any other account becomes a subject under Settings → Attribution: an admin
+  maps it to the person it acts for, or leaves it as its own subject and sets a
+  user budget on it (the Budgets picker offers it as *name (integration
+  account)*, entity id `subject:<name>`; such a budget is monitor only, there
+  is nobody to restrict).
+
+A project budget created mid-period applies from its creation on. An event is
+never charged to two user budgets.
 
 ### The endpoint silently ignores an unrecognised `viewBy`
 
@@ -657,6 +810,11 @@ fed by a roll-up start from zero). A database at the
 unreleased usage-anchor revision `f9c1e4b7a2d3` (now an empty placeholder) loses
 that schema's tables and columns on the way. **Downgrading** drops the ledger
 tables; period budgets then count from the baseline their period opened with.
+Migration `c9f2b6d4e8a1` adds the activity source's tables
+(`usage_activity_key`, `usage_activity_state`) and seeds nothing: the first
+cycle after upgrading only records what the activity log holds (see
+[Switching source](#switching-source-and-what-is-not-counted)); downgrading
+drops them, and the summary feeds every view again from its next reading but one.
 
 **An organisation sync never deletes after a short listing.** Listings are read
 to their reported total (`filteredTotalCount`, else `totalCount`), rows told

@@ -977,6 +977,7 @@ function LimitDialog({
             onEntityTypeChange={setEntityType}
             selected={entity}
             onSelect={setEntity}
+            includeSubjects
           />
         )}
 
