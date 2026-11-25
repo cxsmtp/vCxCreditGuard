@@ -138,6 +138,9 @@ class DimensionResult:
     # truncated answer, a permission problem), as opposed to the tenant simply
     # not offering it.
     read_failed: bool = False
+    # Names whose fall in a reading the completeness checks doubted is held
+    # (ledger.DIP_MAX_DOUBTS, ledger.DIP_MAX_AGE bound how long).
+    doubted_falls: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -362,10 +365,17 @@ def ingest_usage(
     session: Session,
     client: CheckmarxClient,
     *,
-    period_param: str = usage_api.DEFAULT_PERIOD,
+    period_param: str | None = None,
     page_size: int = usage_api.DEFAULT_PAGE_SIZE,
     views: tuple[UsageView, ...] = DEFAULT_VIEWS,
 ) -> IngestResult:
+    """Read and store every dimension. ``period_param`` defaults to the
+    configured lookback window (Settings), which the ledger also measures
+    remembered names against."""
+    if period_param is None:
+        from app.services import settings_store
+
+        period_param = settings_store.usage_period(session)
     result = IngestResult()
     user_index = build_user_index(session)
     mappings = entity_mappings(session)
@@ -456,6 +466,17 @@ def ingest_usage(
             )
             if dimension.held:
                 result.warnings.append(dimension.error or f"The {view} read was held back.")
+            if dimension.doubted_falls:
+                names = ", ".join(sorted(dimension.doubted_falls)[:5])
+                more = len(dimension.doubted_falls) - 5
+                result.warnings.append(
+                    f"Consumption by {view} looked incomplete (a row repeated or missing), and "
+                    f"{len(dimension.doubted_falls)} name(s) reported less than before: {names}"
+                    + (f" and {more} more" if more > 0 else "")
+                    + ". Their falls are not believed until a complete reading confirms them, "
+                    f"or for at most {ledger.DIP_MAX_DOUBTS} readings or "
+                    f"{int(ledger.DIP_MAX_AGE.total_seconds() // 3600)} hours."
+                )
             _record_dimension(session, view, supported=True, error=None)
         except FallbackDetected as exc:
             # The endpoint answered 200 but gave us the user dimension instead of the
@@ -570,10 +591,12 @@ class _Fetched:
     @property
     def suspect(self) -> bool:
         """The completeness checks doubt this listing: a row was served twice,
-        or fewer distinct rows came back than the feed says it has. A fall in
-        such a reading is not believed (see ledger.record_reading)."""
+        or fewer rows came back (repeats aside) than the feed says it has. Rows
+        the parser skips (no name, email or id) still count as rows here. A
+        fall in such a reading is not believed at once (see
+        ledger.record_reading, which bounds how long)."""
         return self.repeated > 0 or (
-            self.total_items is not None and self.distinct < self.total_items
+            self.total_items is not None and self.rows - self.repeated < self.total_items
         )
 
     @property
@@ -620,7 +643,7 @@ def _fetch_dimension(
             total_pages = page.total_pages
         for item in page.items:
             rows_of = parts.setdefault(item.subject_key, {})
-            identity = _row_identity(item)
+            identity = _row_identity(view, item)
             seen = rows_of.get(identity)
             if seen is None:
                 rows_of[identity] = item
@@ -676,13 +699,18 @@ def _fetch_dimension(
     )
 
 
-def _row_identity(item: usage_api.ParsedUsageItem) -> tuple:
+def _row_identity(view: UsageView, item: usage_api.ParsedUsageItem) -> tuple:
     """What tells one consumption row from another: its id when it has one,
     else its own name and email fields (two rows of one person differ in
-    them; the same row served twice does not)."""
+    them; the same row served twice does not). A project's, application's or
+    group's name is unique; a person's display name is not, so a user row with
+    no id and no email is a row of its own (two people who share a display
+    name are added up, as they always were, and never taken for a repeat)."""
     raw = item.raw if isinstance(item.raw, dict) else {}
     if item.reported_id:
         return ("id", item.reported_id)
+    if view == UsageView.USER and not item.subject_email:
+        return ("unique", id(item))
     return (
         "row",
         *(
@@ -912,7 +940,10 @@ def _store_dimension(
     session.flush()
     # The increases since the last live reading, attributed to where each name
     # counts now, and added to the budgets fed now (see app/services/ledger.py).
-    ledger.record_reading(session, view, snapshot, stored, suspect=fetched.suspect, own=own)
+    counted = ledger.record_reading(
+        session, view, snapshot, stored, suspect=fetched.suspect, own=own
+    )
+    result.doubted_falls = counted.dips
 
     snapshot.total_credits = total
     result.total_credits = total

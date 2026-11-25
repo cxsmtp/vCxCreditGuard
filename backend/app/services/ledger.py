@@ -15,8 +15,12 @@ in the same transaction that stores the reading:
   once older than the lookback window), so a return adds only what it reported
   since. A fall adds nothing: in a believed reading the name continues from its
   new total (the window rolled past old usage); in one the completeness checks
-  doubt (``suspect``), the fall is held (kind "dip") until the name recovers or
-  a believed reading confirms it.
+  doubt (``suspect``), the fall is held (kind "dip") until the name recovers, a
+  believed reading confirms it, or it outlasts DIP_MAX_DOUBTS readings or
+  DIP_MAX_AGE. A remembered name is forgotten once its total last rose
+  (``last_rise_at``) before the lookback window began. A name back after
+  missing readings starts from the highest of its own last total and those of
+  the names it may have been meanwhile (a rename and a rename back).
 * A name never seen before counts in full: a name absent from the previous
   reading reported nothing then. Unless it may be a rename: a name of an entity
   starts from the highest last total of that entity's remembered names and of
@@ -31,10 +35,11 @@ in the same transaction that stores the reading:
   per ingest, says which feeds a group or application budget).
 * Each increase is attributed to the entity the name counts towards at that
   moment (``UsageDelta``), and added to the counter of every active budget that
-  entity feeds at that moment, for the period it was observed in; none of it
-  when its interval (``since`` to ``observed_at``) spans that period's start.
-  A period budget's usage is its counter. Every active budget is fed; one that
-  counts usage already reported reads totals instead.
+  entity feeds at that moment, per month and per quarter of the observation;
+  none of it when its interval (``since`` to ``observed_at``) spans that
+  period's start. A period budget's usage is its counter. Every active budget
+  is fed, whatever its type; one that counts usage already reported reads
+  totals instead.
 * An increase observed while a name counted towards nothing is kept. It is
   claimed by the entity the name comes to match by its own name, for what was
   observed within the window before that entity was first synced (a project
@@ -65,7 +70,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
-from app.models.enums import EntityType, UsageView
+from app.models.enums import EntityType, PeriodType, UsageView
 from app.models.limits import CreditLimit
 from app.models.org import (
     CxApplication,
@@ -91,6 +96,10 @@ ZERO = Decimal("0")
 MISSING = "missing"
 DIP = "dip"
 REBASE = "rebase"
+# A doubted fall is believed after this many doubted readings in a row, or
+# once it has been doubted this long, whichever comes first.
+DIP_MAX_DOUBTS = 3
+DIP_MAX_AGE = timedelta(hours=2)
 AGGREGATE_VIEWS = (UsageView.GROUP.value, UsageView.APPLICATION.value)
 FUSION_MODEL = "fusion_model:"
 SLID = "_slid"
@@ -317,10 +326,14 @@ class LedgerResult:
     history: bool = False
     # Increases held back: a fall in a doubted reading, or a new aggregate row.
     held: int = 0
+    # Names whose fall is held as doubted after this reading.
+    dips: list[str] = field(default_factory=list)
+    # Doubted falls accepted because they persisted past the bound.
+    dips_accepted: int = 0
     # (limit id, period key) -> credits added.
     counted: dict[tuple[int, str], Decimal] = field(default_factory=dict)
     # Credits not counted towards a budget because their interval spans its
-    # period's start.
+    # month's start.
     dropped: Decimal = ZERO
 
 
@@ -344,7 +357,7 @@ def _lookback(period_param: str) -> timedelta:
 
 
 def _highest(rows: list[UsageMissingName]) -> tuple[Decimal, dict[str, int], datetime]:
-    """Where a new name that may be any of ``rows`` renamed starts from: the
+    """Where a name that may be any of ``rows`` renamed starts from: the
     highest total, per action type too, read at the earliest time."""
     counts: dict[str, int] = {}
     for row in rows:
@@ -356,6 +369,16 @@ def _highest(rows: list[UsageMissingName]) -> tuple[Decimal, dict[str, int], dat
         counts,
         min(row.last_seen_at for row in rows),
     )
+
+
+def _raise_to(
+    start: tuple[Decimal, dict[str, int]], other: tuple[Decimal, dict[str, int]]
+) -> tuple[Decimal, dict[str, int]]:
+    counts = dict(start[1])
+    for action, count in other[1].items():
+        if count > counts.get(action, 0):
+            counts[action] = count
+    return max(start[0], other[0]), counts
 
 
 def record_reading(
@@ -373,7 +396,7 @@ def record_reading(
     stores the reading, so a reading is counted exactly once (a failed one
     leaves nothing behind, and the next one is measured from the last one that
     was stored). ``suspect``: the completeness checks doubt the listing (a
-    short or repeated page), so a fall in it is not believed. ``own``: the
+    short or repeated page), so a fall in it is not believed yet. ``own``: the
     groups and applications with a row of their own (``own_figures``), taken
     once per ingest.
     """
@@ -391,8 +414,11 @@ def record_reading(
         # The first reading, or one taken over another lookback window: every
         # total is history. Nothing is counted; every name starts from here. A
         # name remembered as missing has no total in this window: when it
-        # returns, it starts from whatever it reports then.
+        # returns, it starts from whatever it reports then. When each name last
+        # rose is unknown: taken as now, so nothing is forgotten too early.
         present = {record.subject_key for record in records}
+        for record in records:
+            record.last_rise_at = now
         for row in kept.values():
             if row.kind == DIP or row.subject_key in present:
                 _drop(session, row)
@@ -402,15 +428,19 @@ def record_reading(
         result.history = True
         return result
 
-    # A total older than the lookback window has nothing left in it: the name
-    # counts in full when it returns.
+    then = previous.collected_at
+    # A name whose total last rose before the lookback window began has
+    # nothing left in it: forgotten, it counts in full when it reports again.
     horizon = now - _lookback(snapshot.period_param)
     for key, row in list(kept.items()):
-        if row.last_seen_at is None or row.last_seen_at < horizon:
+        rose = row.last_rise_at or row.last_seen_at
+        if rose is None or rose < horizon:
             _drop(session, row)
             del kept[key]
+    # Gone before anything below adds a row for the same name (a flush
+    # inserts before it deletes).
+    session.flush()
 
-    then = previous.collected_at
     previous_rows = {
         record.subject_key: record
         for record in session.scalars(
@@ -430,7 +460,8 @@ def record_reading(
     for key, (credits, counts) in before.items():
         if key in reported:
             continue
-        shifts.leave(previous_rows[key].entity_id, previous_rows[key])
+        earlier = previous_rows[key]
+        shifts.leave(earlier.entity_id, earlier)
         row = kept.get(key)
         if row is None:
             row = UsageMissingName(view_by=view, subject_key=key)
@@ -441,23 +472,25 @@ def record_reading(
             row.last_total = credits
             row.last_actions = counts
             row.last_seen_at = then
+            row.last_rise_at = earlier.last_rise_at or then
         row.kind = MISSING
+        row.doubts = 0
         row.missing_since = now
         row.period_param = snapshot.period_param
-        row.entity_id = previous_rows[key].entity_id
+        row.entity_id = earlier.entity_id
 
     missing = {key: row for key, row in kept.items() if row.kind == MISSING}
 
-    def partners(entity_id: str | None) -> list[UsageMissingName]:
-        """What a name never seen before may be a rename of: any name that
-        left the feed just now (within the window), and, for a name of an
-        entity, that entity's remembered names however long ago they left.
-        A name that left just now may have counted towards another entity
-        when it left (the sync gave its old name to a new project), so it is
-        a candidate whatever it counted towards."""
+    def partners(entity_id: str | None, exclude: str | None = None) -> list[UsageMissingName]:
+        """What a name new to the feed, or back in it, may be a rename of: any
+        name that left the feed just now (within the window), and, for a name
+        of an entity, that entity's remembered names however long ago they
+        left. A name that left just now may have counted towards another
+        entity when it left (the sync gave its old name to a new project), so
+        it is a candidate whatever it counted towards."""
         found = []
         for key, row in missing.items():
-            if key in reported or row.period_param != snapshot.period_param:
+            if key == exclude or key in reported or row.period_param != snapshot.period_param:
                 continue
             recent = row.missing_since >= now - window
             if recent or (entity_id is not None and row.entity_id == entity_id):
@@ -472,37 +505,69 @@ def record_reading(
         since = then
         row = kept.get(key)
         returning: UsageMissingName | None = None
+        # The name's own previous total, when it has one: only a fall below it
+        # is a fall of this name (a start raised to a possible rename's total
+        # is not).
+        own_start: Decimal | None = None
+        # When the name last rose, carried forward; set to now if it rises.
+        if key in before:
+            record.last_rise_at = previous_rows[key].last_rise_at or then
+        elif row is not None:
+            record.last_rise_at = row.last_rise_at or row.last_seen_at
+        else:
+            record.last_rise_at = now
         if aggregate and key not in before:
             # A group's or application's own row, new or back: its projects fed
             # the budget while it was not there, so its total is not new usage.
             if row is not None:
                 _drop(session, row)
+            record.last_rise_at = now
             result.held += 1
             continue
         if row is not None and row.kind == REBASE:
             # Missing when the lookback window changed: its old total is in
             # another window, so it starts from what it reports now.
             _drop(session, row)
+            record.last_rise_at = now
             continue
         if row is not None and row.kind == DIP:
             start_credits, start_counts = Decimal(row.last_total or 0), dict(row.last_actions or {})
             since = row.last_seen_at
             if credits_now >= start_credits:
                 _drop(session, row)
-            elif suspect:
+            elif (
+                suspect
+                and (row.doubts or 0) + 1 < DIP_MAX_DOUBTS
+                and now - row.missing_since < DIP_MAX_AGE
+            ):
+                row.doubts = (row.doubts or 0) + 1
                 result.held += 1
+                result.dips.append(key)
                 continue
             else:
-                # A believed reading confirms the fall: the name continues from
-                # its new total.
+                # A believed reading confirms the fall, or the doubt has lasted
+                # too long to be a glitch: the name continues from its new total.
+                if suspect:
+                    result.dips_accepted += 1
                 _drop(session, row)
                 continue
         elif key in before:
             start_credits, start_counts = before[key]
+            own_start = start_credits
         elif row is not None:
-            # A name back after missing readings.
+            # A name back after missing readings. It may have been renamed and
+            # renamed back: what its other names counted from its total is
+            # never counted again (it starts from the highest of them).
             start_credits, start_counts = Decimal(row.last_total or 0), dict(row.last_actions or {})
+            own_start = start_credits
             since = row.last_seen_at
+            others = partners(record.entity_id, exclude=key)
+            if others:
+                high, high_counts, seen = _highest(others)
+                start_credits, start_counts = _raise_to(
+                    (start_credits, start_counts), (high, high_counts)
+                )
+                since = min(since, seen)
             returning = row
         else:
             found = partners(record.entity_id)
@@ -522,21 +587,25 @@ def record_reading(
                     # figure: its history is handled as a new project's.
                     shifts.join(record.entity_id, earlier)
         credits = credits_now - start_credits
-        if credits < 0 and suspect:
-            # A fall in a listing the completeness checks doubt: not believed.
-            # The name continues from the higher total until it recovers, or a
-            # believed reading confirms the fall.
+        if credits < 0 and suspect and own_start is not None and credits_now < own_start:
+            # A fall in a listing the completeness checks doubt: not believed
+            # yet. The name continues from the higher total until it recovers,
+            # a believed reading confirms the fall, or the doubt outlasts its
+            # bound (DIP_MAX_DOUBTS readings, DIP_MAX_AGE).
             hold = returning or UsageMissingName(view_by=view, subject_key=key)
             if returning is None:
                 session.add(hold)
             hold.kind = DIP
+            hold.doubts = 1
             hold.last_total = start_credits
             hold.last_actions = start_counts
             hold.last_seen_at = since
+            hold.last_rise_at = record.last_rise_at
             hold.missing_since = now
             hold.period_param = snapshot.period_param
             hold.entity_id = record.entity_id
             result.held += 1
+            result.dips.append(key)
             continue
         if returning is not None:
             shifts.join(record.entity_id, _as_row(start_credits, start_counts))
@@ -555,6 +624,8 @@ def record_reading(
                 if plain_now.get(action, 0) or plain_start.get(action, 0)
             ):
                 increase[SLID] = 1
+        if credits > 0:
+            record.last_rise_at = now
         if credits <= 0 and not increase:
             continue
         deltas.append(
@@ -578,8 +649,9 @@ def record_reading(
 
     claimed = _claims(session, view, records, window, now)
     result.claimed = len(claimed)
-    attributed = [d for d in deltas if d.entity_id is not None] + claimed
+    attributed = [d for d in deltas if d.entity_id is not None]
     _feed(session, view, attributed, result, own)
+    _feed(session, view, claimed, result, own, claimed=True)
     shifts.save(now)
     session.flush()
     return result
@@ -617,23 +689,37 @@ def _claims(
             waiting[delta.subject_key].append(delta)
     if not waiting:
         return []
-    model = _VIEW_MODEL.get(view)
+    created = _created(session, view, {candidates[key].entity_id for key in waiting})
     claimed: list[UsageDelta] = []
     for key, rows in waiting.items():
         record = candidates[key]
-        created = (
-            session.scalar(select(model.created_at).where(model.id == record.entity_id))
-            if model is not None
-            else None
-        )
+        first_synced = created.get(str(record.entity_id))
         for delta in rows:
             # Settled either way: claimed now, or left counting towards nothing.
             delta.claimed_at = now
-            if created is not None and created - window <= delta.observed_at <= created:
+            if (
+                first_synced is not None
+                and first_synced - window <= delta.observed_at <= first_synced
+            ):
                 delta.entity_id = record.entity_id
                 delta.entity_type = record.entity_type
                 claimed.append(delta)
     return claimed
+
+
+def _created(session: Session, view: str, entity_ids: set) -> dict[str, datetime]:  # type: ignore[type-arg]
+    """When each entity was first synced, in one query per 500."""
+    model = _VIEW_MODEL.get(view)
+    ids = sorted(str(entity_id) for entity_id in entity_ids if entity_id is not None)
+    found: dict[str, datetime] = {}
+    if model is None:
+        return found
+    for start in range(0, len(ids), 500):
+        for entity_id, created_at in session.execute(
+            select(model.id, model.created_at).where(model.id.in_(ids[start : start + 500]))
+        ):
+            found[str(entity_id)] = created_at
+    return found
 
 
 def settle_waiting(session: Session, view: str, subject_key: str) -> int:
@@ -664,18 +750,28 @@ def _by_entity(deltas: list[UsageDelta]) -> dict[str, list[UsageDelta]]:
     return found
 
 
+# Every budget is fed per month and per quarter, whatever its period type, so
+# that switching its type (to lifetime and back, monthly to quarterly) never
+# loses what was observed meanwhile.
+_GRANULARITIES = (PeriodType.MONTHLY, PeriodType.QUARTERLY)
+
+
 def _feed(
     session: Session,
     view: str,
     deltas: list[UsageDelta],
     result: LedgerResult,
     own: dict[str, set[str]] | None = None,
+    *,
+    claimed: bool = False,
 ) -> None:
-    """Add each increase to the counter, for the period it was observed in, of
-    every budget its entity feeds now. An increase whose interval spans a
-    budget's period start (a reading after downtime, demo mode or a skipped
-    cycle across a rollover) cannot be split: that budget counts none of it."""
-    from app.services.periods import PeriodError, current_window
+    """Add each increase to the month's and the quarter's counter, of the
+    period it was observed in, of every budget its entity feeds now. An
+    increase whose interval spans the period's start (a reading after downtime,
+    demo mode or a skipped cycle across a rollover) cannot be split: that
+    period counts none of it. A claimed increase does not feed a budget created
+    after it was observed."""
+    from app.services.periods import current_window
 
     if not deltas:
         return
@@ -684,7 +780,7 @@ def _feed(
         return
     by_entity = _by_entity(deltas)
     budgets = feeds.budgets(set(by_entity))
-    adds: dict[tuple[int, str], tuple[Decimal, dict[str, int]]] = {}
+    adds: dict[tuple[int, str], tuple[Decimal, dict[str, int], datetime]] = {}
     for entity_id, rows in by_entity.items():
         seen: set[int] = set()
         for limit in budgets.get(entity_id, []):
@@ -692,20 +788,29 @@ def _feed(
                 continue
             seen.add(limit.id)
             for delta in rows:
-                try:
-                    period = current_window(limit, delta.observed_at)
-                except PeriodError:
-                    continue
-                if delta.since < period.start or (
-                    period.end is not None and delta.observed_at >= period.end
+                if (
+                    claimed
+                    and limit.created_at is not None
+                    and limit.created_at > delta.observed_at
                 ):
-                    result.dropped += Decimal(delta.credits or 0)
                     continue
-                credits, counts = adds.get((limit.id, period.key), (ZERO, {}))
-                adds[(limit.id, period.key)] = (
-                    credits + Decimal(delta.credits or 0),
-                    _add(counts, delta.actions),
-                )
+                for granularity in _GRANULARITIES:
+                    period = current_window(
+                        SimpleNamespace(period_type=granularity, created_at=limit.created_at),
+                        delta.observed_at,
+                    )
+                    if delta.since < period.start:
+                        if granularity == PeriodType.MONTHLY:
+                            result.dropped += Decimal(delta.credits or 0)
+                        continue
+                    credits, counts, latest = adds.get(
+                        (limit.id, period.key), (ZERO, {}, delta.observed_at)
+                    )
+                    adds[(limit.id, period.key)] = (
+                        credits + Decimal(delta.credits or 0),
+                        _add(counts, delta.actions),
+                        max(latest, delta.observed_at),
+                    )
     if not adds:
         return
     limit_ids = sorted({limit_id for limit_id, _key in adds})
@@ -718,15 +823,16 @@ def _feed(
             )
         )
     }
-    stamp = utcnow()
-    for (limit_id, key), (credits, counts) in adds.items():
+    for (limit_id, key), (credits, counts, latest) in adds.items():
         row = existing.get((limit_id, key))
         if row is None:
             row = BudgetUsage(limit_id=limit_id, period_key=key, credits=ZERO, actions={})
             session.add(row)
         row.credits = Decimal(row.credits or 0) + credits
         row.actions = _add(dict(row.actions or {}), counts)
-        row.updated_at = stamp
+        # When the newest increase in it was observed: a closed period is
+        # reconciled only with what arrived after it was last evaluated.
+        row.updated_at = max(row.updated_at, latest) if row.updated_at else latest
         result.counted[(limit_id, key)] = credits
 
 
@@ -748,11 +854,20 @@ class _Shifts:
         self.module = auto_triage_attribution
         self.price = auto_triage_attribution.auto_triage_price(session) if self.active else None
         self.changes: dict[str, list] = {}
+        self._created: dict[str, datetime] | None = None
 
     def new_entity(self, entity_id: str | None, now: datetime, window: timedelta) -> bool:
         if not self.active or entity_id is None:
             return False
-        created = self.session.scalar(select(CxProject.created_at).where(CxProject.id == entity_id))
+        if self._created is None:
+            # Every project's first sync, in one query (asked per changed name).
+            self._created = {
+                str(project_id): created_at
+                for project_id, created_at in self.session.execute(
+                    select(CxProject.id, CxProject.created_at)
+                )
+            }
+        created = self._created.get(str(entity_id))
         return created is not None and created >= now - window
 
     def _value(self, record) -> tuple[int, Decimal]:  # type: ignore[no-untyped-def]
@@ -832,7 +947,7 @@ def period_usage(session: Session, limit_id: int, period_key: str):  # type: ign
     return Decimal(row.credits or 0), dict(row.actions or {})
 
 
-def ensure_counter(session: Session, limit_id: int, period_key: str):  # type: ignore[no-untyped-def]
+def ensure_counter(session: Session, limit_id: int, period_key: str, moment: datetime):  # type: ignore[no-untyped-def]
     """(credits, per action counts) of a period's counter, which is created
     at zero when it does not exist yet. In a
     savepoint: an ingest adding the same counter at the same moment wins, and
@@ -854,7 +969,8 @@ def ensure_counter(session: Session, limit_id: int, period_key: str):  # type: i
                     period_key=period_key,
                     credits=ZERO,
                     actions={},
-                    updated_at=utcnow(),
+                    # Nothing observed yet: older than any evaluation of it.
+                    updated_at=moment,
                 )
             )
     except IntegrityError:

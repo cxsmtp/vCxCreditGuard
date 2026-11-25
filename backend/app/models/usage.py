@@ -106,6 +106,10 @@ class UsageRecord(Base):
     # Per action breakdown: {"triage": 3, "remediation": 1}
     actions: Mapped[dict | None] = mapped_column(JSONColumn)
     raw: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    # When the name's total last rose (or it first appeared), carried from
+    # reading to reading by the ledger. Once that is older than the lookback
+    # window, nothing the name reported can still be in it.
+    last_rise_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     snapshot: Mapped[UsageSnapshot] = relationship(back_populates="records")
 
@@ -228,6 +232,7 @@ class UsageDelta(Base):
         UniqueConstraint("snapshot_id", "view_by", "subject_key", name="usage_delta_reading"),
         Index("ix_usage_delta_entity", "view_by", "entity_id", "observed_at"),
         Index("ix_usage_delta_subject", "view_by", "subject_key"),
+        Index("ix_usage_delta_observed", "observed_at"),
     )
 
 
@@ -242,7 +247,12 @@ class UsageMissingName(Base):
 
     ``kind`` "dip": the name fell in a reading the completeness checks doubted
     (a short or repeated page). The fall is not believed: the name continues
-    from this total until it recovers, or a believed reading confirms the fall.
+    from this total until it recovers, a believed reading confirms the fall, or
+    the fall persists through ``ledger.DIP_MAX_DOUBTS`` doubted readings or
+    ``ledger.DIP_MAX_AGE``, whichever comes first.
+
+    ``kind`` "rebase": missing when the lookback window changed; it starts
+    afresh when it returns.
     """
 
     __tablename__ = "usage_missing_name"
@@ -259,6 +269,10 @@ class UsageMissingName(Base):
     # The entity the name counted towards in that reading.
     entity_id: Mapped[str | None] = mapped_column(String(64))
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
+    # When the name's total last rose (forgotten once that is older than the
+    # lookback window), and how many doubted readings a dip has held through.
+    last_rise_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    doubts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     __table_args__ = (
         UniqueConstraint("view_by", "subject_key", name="usage_missing_name_subject"),

@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
@@ -1538,9 +1538,9 @@ def _evaluate_one(
     # that a closed period is reconciled with it (``_settle_closed_periods``)
     # once the budget counts its counter, whatever it counted meanwhile.
     known = index.counter(limit.id, window.key)
-    counter = (
-        known[0] if known is not None else ledger.ensure_counter(session, limit.id, window.key)[0]
-    )
+    if known is None:
+        known = ledger.ensure_counter(session, limit.id, window.key, moment)
+    counter = known[0]
     if counts_from_totals(session, limit, window):
         # A budget that counts usage already reported: the current totals of
         # the names that count towards it. A sliding lookback window can drop
@@ -1848,33 +1848,35 @@ def period_usage(
 
 
 def _settle_closed_periods(session: Session, moment: datetime) -> int:
-    """Bring a closed period's usage up to its counter.
+    """Bring a closed period's usage up to what its counter received after
+    the period was last evaluated.
 
     Counters are kept by the period an increase was observed in, so a reading
     taken just before a rollover and evaluated after it still counts towards
-    the period it belongs to. Only periods that ended, of budgets that count
-    their counter, whose usage differs from it."""
+    the period it belongs to. Only what arrived after the last evaluation is
+    considered, and a closed period's usage is never lowered: changing a
+    budget's settings later never rewrites a period already counted (nor
+    pushes a restricted one under its limit)."""
     rows = session.execute(
-        select(LimitPeriodState, BudgetUsage, CreditLimit)
+        select(LimitPeriodState, BudgetUsage)
         .join(
             BudgetUsage,
             (BudgetUsage.limit_id == LimitPeriodState.limit_id)
             & (BudgetUsage.period_key == LimitPeriodState.period_key),
         )
-        .join(CreditLimit, CreditLimit.id == LimitPeriodState.limit_id)
         .where(
             LimitPeriodState.period_end.is_not(None),
             LimitPeriodState.period_end <= moment,
-            LimitPeriodState.credits_used
-            != BudgetUsage.credits + func.coalesce(LimitPeriodState.attributed_credits, 0),
+            or_(
+                LimitPeriodState.last_evaluated_at.is_(None),
+                BudgetUsage.updated_at > LimitPeriodState.last_evaluated_at,
+            ),
         )
     ).all()
     settled = 0
-    for state, counter, limit in rows:
-        if ledger.counts_existing(limit):
-            continue
+    for state, counter in rows:
         used = Decimal(counter.credits or 0) + Decimal(state.attributed_credits or 0)
-        if used != state.credits_used:
+        if used > state.credits_used:
             state.credits_used = used
             settled += 1
         state.last_evaluated_at = moment

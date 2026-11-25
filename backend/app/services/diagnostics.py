@@ -140,6 +140,9 @@ def run_diagnostics(
     group_names = _group_names_check(session)
     if group_names is not None:
         checks.append(group_names)
+    doubted = _doubted_falls_check(session)
+    if doubted is not None:
+        checks.append(doubted)
     coverage_check = _coverage_check(session)
     if coverage_check is not None:
         checks.append(coverage_check)
@@ -351,6 +354,34 @@ def _coverage_check(session: Session) -> Check | None:
         OK,
         f"A user restriction can take AI access from {report.get('restrictable', 0)} of the "
         f"{holders} users who hold an AI role.",
+    )
+
+
+def _doubted_falls_check(session: Session) -> Check | None:
+    """Names whose fall in a doubted reading is held (usage_missing_name, kind
+    "dip"): their usage counts again once a complete reading confirms the
+    fall or it recovers, at most a few readings later."""
+    from app.models.usage import UsageMissingName
+    from app.services import ledger
+
+    names = list(
+        session.scalars(
+            select(UsageMissingName.subject_key)
+            .where(UsageMissingName.kind == ledger.DIP)
+            .order_by(UsageMissingName.subject_key)
+        )
+    )
+    if not names:
+        return None
+    shown = ", ".join(names[:10]) + (f" and {len(names) - 10} more" if len(names) > 10 else "")
+    return Check(
+        "doubted_falls",
+        "Doubted usage falls",
+        WARN,
+        f"{len(names)} name(s) reported less usage in a reading that looked incomplete "
+        f"(a row repeated or missing): {shown}. The fall is not believed until a complete "
+        f"reading confirms it, for at most {ledger.DIP_MAX_DOUBTS} readings or "
+        f"{int(ledger.DIP_MAX_AGE.total_seconds() // 3600)} hours.",
     )
 
 
