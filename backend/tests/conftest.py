@@ -98,6 +98,8 @@ ACTIVITY_DEFAULT_MODULES = (
     "test_activity_properties",
     "test_review_activity_attacks",
     "test_summary_hold",
+    "test_review2_activity_attacks",
+    "test_log_fed_enforcement",
 )
 
 
@@ -105,6 +107,9 @@ ACTIVITY_DEFAULT_MODULES = (
 def legacy_usage_source(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services import settings_store
 
+    if os.environ.get("REVIEW_REAL_DEFAULTS") == "1":
+        # The whole suite under the real defaults (review switch).
+        return
     if request.module.__name__.rsplit(".", 1)[-1] in ACTIVITY_DEFAULT_MODULES:
         return
     monkeypatch.setitem(

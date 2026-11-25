@@ -1005,3 +1005,104 @@ class TestReviewFixes:
         env.tenant.set_entity_credits(view="group", name="payments", credits=112)
         ingest_groups()
         assert counter(env.db, group) == Decimal(7)
+
+
+class TestSecondReview:
+    def _doubt(self, env: SimpleNamespace) -> set:  # type: ignore[type-arg]
+        """Project listings the completeness checks doubt while the set is not
+        empty (one row fewer than the feed says)."""
+        import httpx
+
+        doubted: set[str] = set()
+        original = env.tenant._consumption_response
+
+        def consumption(params):  # type: ignore[no-untyped-def]
+            response = original(params)
+            if params.get("viewBy", [""])[0] not in doubted or response.status_code != 200:
+                return response
+            body = response.json()
+            body["totalItems"] = int(body.get("totalItems") or 0) + 1
+            return httpx.Response(200, json=body)
+
+        env.tenant._consumption_response = consumption
+        return doubted
+
+    def test_a_rebased_name_back_low_in_a_doubted_reading_counts_no_recovery(
+        self, env: SimpleNamespace
+    ) -> None:
+        """A name missing across the handover (rebased) returns in a doubted
+        reading at a glitched-low total: it is not rebased on that reading,
+        so its recovery in the next believed one counts nothing."""
+        doubted = self._doubt(env)
+        limit = budget(env.db, EntityType.PROJECT, P_API, created_at=START - timedelta(days=1))
+        # A large other row: a row left out is no collapse of the total.
+        env.tenant.set_entity_credits(view="project", name="zz-other", credits=100000)
+        _summary_rows(env, {P_API: 100, P_WEB: 10})
+        _ingest(env)
+        tick(env)
+        _ingest(env)
+        env.tenant.consumption["project"] = [
+            row for row in env.tenant.consumption["project"] if row["name"] != "payments/api"
+        ]
+        tick(env)
+        _ingest(env)  # log era: payments/api remembered as missing
+        env.tenant.activity_status = 404
+        for _ in range(2):  # the paused readings rebase it
+            tick(env)
+            _ingest(env)
+        doubted.add("project")
+        _summary_rows(env, {P_API: 60})
+        tick(env)
+        _ingest(env)  # back, doubted, low
+        doubted.clear()
+        _summary_rows(env, {P_API: 100})
+        tick(env)
+        _ingest(env)
+        assert counter(env.db, limit) == 0
+
+    def test_the_first_cycle_says_the_log_is_the_source_once(self, env: SimpleNamespace) -> None:
+        from app.models import Notification
+
+        seeded(env)
+        tick(env)
+        run(env)
+        notes = env.db.scalars(
+            select(Notification).where(Notification.dedupe_key == activity_source.NOTICE_KEY)
+        ).all()
+        assert len(notes) == 1 and "restrict only" in (notes[0].body or "")
+
+    def test_the_notice_says_how_to_opt_back_in_without_the_log(self, env: SimpleNamespace) -> None:
+        from app.models import Notification
+
+        env.tenant.activity = None
+        result = run(env)
+        assert not result.source_active
+        note = env.db.scalar(
+            select(Notification).where(Notification.dedupe_key == activity_source.NOTICE_KEY)
+        )
+        assert note is not None and "Allow restrictions from summary totals" in (note.body or "")
+        assert "not available" in note.title
+
+    def test_a_reused_group_budget_id_inherits_no_floor(self, env: SimpleNamespace) -> None:
+        from app.models import CreditLimit
+
+        group = budget(env.db, EntityType.GROUP, G_PAY, created_at=START - timedelta(days=1))
+        feeds = {
+            str(group.id): {
+                "since": iso(START),
+                "fed": True,
+                "entity": "other-group",
+                "created": iso(START),
+            }
+        }
+        assert activity_source._entry_of(feeds, group) is None
+        own = {
+            str(group.id): {
+                "since": iso(START),
+                "fed": True,
+                "entity": G_PAY,
+                "created": activity_source._iso(group.created_at),
+            }
+        }
+        assert activity_source._entry_of(own, group) is not None
+        assert isinstance(group, CreditLimit)

@@ -270,3 +270,61 @@ def test_the_banner_endpoint_says_restrictions_are_paused(
     assert response.status_code == 200, response.text
     held = response.json()["restrictions_held"]
     assert held is not None and held["summary_only"] is False
+
+
+def test_auto_triage_charged_to_the_person_never_starts_a_restriction(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It always derives from the summary's project readings (owner's
+    decision): only the log's part of the counter may start a restriction."""
+    from decimal import Decimal
+
+    world = World(db, monkeypatch, log=True)
+    limit = world.budget()
+    index = evaluation.UsageIndex(db)
+    window = evaluation.current_window(limit, world.clock.value)
+    reason = evaluation.summary_hold(
+        db,
+        limit=limit,
+        window=window,
+        index=index,
+        credits_used=Decimal(9),
+        attributed=Decimal(9),
+    )
+    assert reason is not None
+    world.tick()
+    world.spend(6)
+    world.ingest()
+    index = evaluation.UsageIndex(db)
+    assert (
+        evaluation.summary_hold(
+            db,
+            limit=limit,
+            window=window,
+            index=index,
+            credits_used=Decimal(15),
+            attributed=Decimal(9),
+        )
+        is None
+    )
+
+
+def test_a_restriction_after_a_summary_held_breach_is_announced(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = World(db, monkeypatch, log=False)
+    world.budget()
+    assert over_on_summary(world).enforced == 0
+    world.tenant.activity = []
+    world.tick(7 * 60)
+    world.ingest()  # the log is back (seeded)
+    world.tick()
+    world.spend(6)
+    world.ingest()
+    assert world.evaluate().enforced == 1
+    titles = [
+        note.body or ""
+        for note in db.scalars(select(Notification).where(Notification.entity_id == ALICE))
+    ]
+    assert any("summary totals" in body for body in titles)
+    assert any("being restricted now" in body for body in titles)
