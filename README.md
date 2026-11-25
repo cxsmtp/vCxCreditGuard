@@ -168,7 +168,7 @@ schedule or on demand via `POST /api/ops/run-cycle`:
    │    users,        snapshots +    usage vs        reversible     │
    │    projects      attribution    limits,         role / AI      │
    │                  (fuzzy match)   period          changes, with │
-   │                                  baselines       an undo snap  │
+   │                                  ledger          an undo snap  │
    │                                      │                         │
    │                                      ▼                         │
    │                              notifications                     │
@@ -181,8 +181,8 @@ schedule or on demand via `POST /api/ops/run-cycle`:
 ```
 
 - **Poll, don't stream.** Checkmarx reports *aggregate totals over a lookback
-  window*, not events, so per-period usage is derived by diffing against a
-  baseline taken when the period opened (see [How usage is measured](#how-usage-is-measured)).
+  window*, not events, so per-period usage is the sum of the increases between
+  readings (see [How usage is measured](#how-usage-is-measured)).
 - **Attribute, don't guess.** Each usage row is matched to a synced user — first
   exactly, then by similarity — and anything uncertain is surfaced for review
   rather than billed to the wrong person.
@@ -285,26 +285,29 @@ summed from events. Instead:
 1. Each cycle polls the endpoint per dimension and stores the reported totals
    (`usage_snapshot` and `usage_record`, with each row's raw payload kept for a
    week for audit; see [Data retention](#data-retention)).
-2. When a budget period opens, the total reported at that moment becomes the
-   period's **baseline**.
-3. Usage for the period is `latest reported total - baseline`.
+2. Each reading is compared with the previous one, name by name, and every
+   increase is added to the counter of each budget the name counted towards at
+   that moment (the **usage ledger**, see
+   [Where a name's usage counts](#where-a-names-usage-counts-the-usage-ledger)).
+3. Usage for a monthly or quarterly period is its counter: the increases
+   observed while the period was open.
 
-**The baseline depends on the period type**, because the period type is what says
-whether history should count:
+**Whether history counts depends on the period type:**
 
-| Period | Baseline | Why |
-| ------ | -------- | --- |
-| Lifetime | Zero. Everything reported counts. | "Lifetime" means all credits ever. Discounting history would silently redefine it as "since the limit was created", and a budget of 10 against 13 already spent would read as 0 used and within budget. |
-| Custom range | Zero. Everything reported counts. | The admin chose the window explicitly and expects consumption inside it to count. |
-| Monthly, quarterly | The total reported when the period opened. | The lookback window is wider than the period and the API does not say *when* inside it credits were spent, so counting the lot would let a year of history exhaust a fresh monthly budget on day one. Set `count_existing_usage` on the limit to count it anyway. |
+| Period | Usage | Why |
+| ------ | ----- | --- |
+| Lifetime | Everything reported: the current totals of the names that count towards it. | "Lifetime" means all credits ever. Discounting history would silently redefine it as "since the limit was created", and a budget of 10 against 13 already spent would read as 0 used and within budget. |
+| Custom range | Everything reported, as for lifetime. | The admin chose the window explicitly and expects consumption inside it to count. |
+| Monthly, quarterly | The increases observed during the period. | The lookback window is wider than the period and the API does not say *when* inside it credits were spent, so counting the lot would let a year of history exhaust a fresh monthly budget on day one. Set `count_existing_usage` on the limit to count it anyway (it then counts like a lifetime budget, from the baseline taken when the period opened). |
 
-Whenever a baseline is in play, the Limits page shows the reported total and the
-discounted amount underneath the usage bar, so a project that Checkmarx says used 13
-credits reading as 0 against its budget is explained rather than mysterious.
+The Limits page shows the reported total and the part of it not counted in this
+period underneath the usage bar, so a project that Checkmarx says used 13 credits
+reading as 0 against its budget is explained rather than mysterious.
 
-If the lookback window slides far enough that the reported total falls below the
-baseline, the baseline is lowered to match, so usage never goes negative and a stale
-high baseline cannot mask real consumption.
+For a budget that counts the reported totals, if the lookback window slides far
+enough that the reported total falls below the baseline, the baseline is lowered to
+match, so usage never goes negative and a stale high baseline cannot mask real
+consumption.
 
 Usage per entity level:
 
@@ -517,102 +520,94 @@ name to a project or application under Settings → Attribution
 name match always wins over a mapping, and a mapping to a project that is gone is
 shown as broken and ignored.
 
-**Where a name's usage counts, and from when.** The feed reports cumulative
-totals over its lookback window, by name. Each reading is attributed name by
-name (`ingestion._Anchors`); the rule is that a name's history never becomes a
-budget period's usage, and a period never loses usage it already counted.
+#### Where a name's usage counts: the usage ledger
 
-* **A name keeps counting where it counted.** Towards the same entity as in the
-  last reading, in full or from its anchor. If it now matches nothing, it is
-  *kept* there (`usage_record.held_reason = "kept"`): for as long as the entity
-  exists (a rename the sync learnt before the feed), while a user match is
-  disputed (it keeps counting, flagged, until an admin resolves it; mapping it
-  back to the same user changes nothing), and for a deleted entity until the
-  hold may end. If the feed does not report it at all, its last row is
-  *carried* (`"carried"`) until the hold may end.
-* **A hold ends only on the organisation sync.** Never on readings alone: a
-  complete org sync must have listed the entity's kind since the hold began, a
-  deletion must be confirmed by a second complete listing, and at least
-  `attribution.hold_readings` readings (default 8) must have passed. A rename the
-  feed reports first is therefore carried however long the org refresh is (up to
-  7 days), and the renamed name takes over when the sync brings it.
-* **A mapping, or a move from one entity to another, counts forward only.** The
-  name is *anchored* at the total it had reported (`usage_anchor.offset_credits`,
-  with its per action counts in `reference_actions`), and only what it reports
-  beyond that counts (`usage_record.attributed_credits`; null means all of it).
-  The anchor is taken once, in the mapping's own transaction, from the latest
-  live reading (never a demo one), under a lock the ingest takes too (a
-  transaction-scoped advisory lock on PostgreSQL, the write lock on SQLite), which
-  neither holds across a call to Checkmarx One. No baseline is moved by a
-  mapping, so a mapping cannot race an evaluation or another mapping.
-* **A name that counted nowhere and starts to count** (`usage_name_state` keeps
-  what this needs):
-  - if it counted somewhere before it was released (a confirmed deletion, an
-    ended carry), it is anchored at its total then, wherever it now counts; a
-    total that rolled down meanwhile re-anchors lower. Its history never comes
-    back;
-  - if its entity's old name left the feed as it appeared, it is the renamed
-    name taking over: in full, and the old name stops;
-  - a name the feed never reported before counts in full: all of it is new;
-  - an unmatched name whose entity was first synced after the name's first
-    unmatched reading, within one org refresh plus an hour (a project or user
-    created and used before the sync brought it), counts in full, less any
-    history it had when CreditGuard first saw it (a name in the very first
-    reading may be history);
-  - any other unmatched name (its entity existed all along) counts from its last
-    total. A project renamed onto a name the feed already reported separately
-    falls here.
-* **An organisation sync never deletes after a short listing.** Listings are read
-  to their reported total (`filteredTotalCount`, else `totalCount`), rows told
-  apart by id, even when the server caps its pages; without a total, a short page
-  is followed by one more request. A listing that still comes back short, or an
-  IAM user listing that reports a shortfall, deletes nothing and keeps everyone's
-  group and application links, with a warning. Some servers report a total that
-  counts rows the key cannot see: the same short listing (same ids, same total)
-  three times in a row is then taken as everything the key can see, said once. A
-  repeated page or the page limit never is. Groups come in one IAM call with no
-  count: more than one group and more than a fifth of them missing at once is
-  acted on only when the next sync misses the same groups. Every complete listing
-  is remembered (`org_sync.complete_listings`).
+The feed reports, by name, cumulative totals over its lookback window. A period
+budget never counts those totals: every live reading is turned into increases
+(`app/services/ledger.py`), in the transaction that stores the reading and under
+the attribution lock that a mapping takes too (a transaction-scoped advisory lock
+on PostgreSQL, the write lock on SQLite). Neither is held across a call to
+Checkmarx One, so a failed reading leaves nothing behind and the next one is
+measured from the last reading that was stored.
 
-**Unmapping, mapping elsewhere and correcting a match take away only the
-period's usage.** Each budget period records what the names that can move
-brought into it when its baseline was taken (`limit_period_state.baseline_names`:
-anchored, kept and carried names, and every user subject; a project or
-application matched by its own name never moves, so a budget over thousands of
-projects stores next to nothing). A name that stops counting towards the budget
-by an explicit move, or whose anchor is taken afresh while it still counts there,
-has what it brought in discounted, so the move takes away exactly its usage
-within the current period, never its earlier usage and never the budget's own. A
-name moved between two entities that both count towards a budget (two projects of
-a group or application, two members of a group) keeps its old position for that
-budget: nothing is lost or gained there. The confirmation after a mapping and its
-audit entry say so. Periods already open when this version is installed have no
-such record: until they roll over, an unmap there re-baselines as before (a
-backfill from the current reading could over-count, so none is made).
+* **A name's increase** is its total now minus its total in the previous live
+  reading of the same view (per action type too). A fall (the lookback window
+  rolled past older usage) adds nothing, and the name continues from its new
+  total. A name missing from a reading is remembered with its last total
+  (`usage_missing_name`), so when it returns only what it reported since counts.
+* **A name never seen before counts in full**: it reported nothing in the
+  previous reading, so all of its total is new. Except when names left the feed
+  as it appeared, in the same reading or within one org refresh plus an hour (a
+  rename the feed reported first, its total maybe rolled down meanwhile): it
+  may be any of them, so it starts from the highest of their last totals (per
+  action type too). That can under-count a really new name or renames landing
+  together, never over-count.
+  The very first reading, and a reading taken over another lookback window,
+  count nothing: every total in them is history.
+* **Each increase counts towards the entity the name counts towards at that
+  moment** (`usage_delta`, one row per reading and name, unique, so a retried
+  reading cannot count twice), and is added to the counter (`budget_usage`) of
+  every active budget that entity feeds at that moment: a user's, and the user's
+  groups' that include members' usage; a project's, its groups' and its
+  applications' (when the group or application has no figure of its own). The
+  next evaluation moves these into the period it evaluates; a new period starts
+  from zero. A budget switched off counts nothing while it is off.
+* **Usage observed while a name counts towards nothing** (unmatched, deleted,
+  disputed) is kept unattributed. It is claimed by the entity the name first
+  counts towards if that entity was synced after the usage (within one org
+  refresh plus an hour of it): a project or user created and used before the
+  sync brought it keeps its first usage. Otherwise it stays counted nowhere.
 
-**Limits of what can be known.** If the lookback window rolls past usage from
-before a name's anchor, the anchor moves down to the new total, and whatever the
-name reported between the last reading and this one is not counted: the feed
-gives no dates. A name that leaves the feed because its usage rolled out is
-carried until the hold ends and then leaves its entity's figure, which
-re-baselines the period as before. A name in the very first reading CreditGuard
-took is treated as history wherever it later matches. Carried rows count towards
-budgets but are left out of the lists and sums shown by name (top consumers,
-breakdowns, the unmatched list); project and group figures include them while the
-hold lasts. *Design change:* budgets that count existing usage (lifetime, custom,
-or *count existing usage*) count everything reported under their own names, but a
-mapped or moved name only from then on, like every other budget. Usage after a
-restriction compares each name counting towards the restricted person or project
-with the same name in the reading pinned at the restriction, or, for a name
-mapped or moved later, with the counts kept on its anchor (an anchor from before
-this version, which has none, is compared with the pinned reading, and left out
-if the name is not in it); the action mix in notifications, the Fusion price and
-the Auto Triage credits charged to people who scan count a mapped name's forward
-amounts only. Mappings made before this version keep counting in full (anchored
-at 0, dated when they were mapped). Downgrading below this version drops every
-anchor, the name states, the forward-only figures and the period name figures:
-mapped names then count in full again.
+So a mapping, an unmapping, a correction, a rename in either order, a deletion
+and return, a group or application membership change and demo mode only ever
+move usage observed from then on, and no budget loses what it already counted.
+The confirmation after a mapping says exactly that: "Usage reported under *X*
+from now on counts towards *Y*. What it already counted towards *Z* stays
+there." A disputed user match counts towards nobody until an admin resolves it;
+what it counted before stays.
+
+**Budgets that count usage already reported** (lifetime, custom, or *count
+existing usage*), and demo budgets in demo mode, are not ledger budgets: they
+count the current totals of the names that count towards them now, history
+included, by definition. Mapping a name to such a budget's entity brings its
+history in, and unmapping it takes it out again.
+
+**What the ledger cannot know.** The feed gives no dates, so these are lost, by
+construction, and never guessed: usage a name reported between its last reading
+under one name and its first under a new one that could not be paired; increases
+hidden by the lookback window rolling past older usage in the same interval;
+usage in the reading after a change of lookback window; and usage observed while
+a name counted towards nothing that no new entity claims; and what a new name
+adds in the reading where it first appears, when other names left the feed just
+before.
+
+The same increases drive the rest: usage after a restriction is the restricted
+user's or project's increases since the restriction (each action type since its
+own restriction, Fusion priced from the increases' Fusion models); the action mix
+in notifications is the period counter's (or, when an action's count stopped
+rising while another rose, the readings'); and Auto Triage credits charged to
+people who scan use each project's readings shifted by what names joining or
+leaving it brought (`usage_entity_offset`). Ledger rows older than the retention
+window are pruned, except those of an entity with a restriction in force.
+
+**Upgrading** seeds the counter of every budget period still open with the usage
+it shows (its `credits_used`, less the Auto Triage credits charged to people,
+which are added separately), so no open period jumps or loses anything, and the
+ledger starts from the latest live reading. **Downgrading** drops the ledger
+tables; period budgets then count from the baseline their period opened with.
+
+**An organisation sync never deletes after a short listing.** Listings are read
+to their reported total (`filteredTotalCount`, else `totalCount`), rows told
+apart by id, even when the server caps its pages; without a total, a short page
+is followed by one more request. A listing that still comes back short, or an
+IAM user listing that reports a shortfall, deletes nothing and keeps everyone's
+group and application links, with a warning. Some servers report a total that
+counts rows the key cannot see: the same short listing (same ids, same total)
+three times in a row is then taken as everything the key can see, said once. A
+repeated page or the page limit never is. Groups come in one IAM call with no
+count: more than one group and more than a fifth of them missing at once is
+acted on only when the next sync misses the same groups. Every complete listing
+is remembered (`org_sync.complete_listings`).
 
 ## What the enforcement actions actually are
 
@@ -1536,7 +1531,7 @@ menu, admins only; *Policy violations* in Jump to), for an admin to follow up:
 | `fusion_scan_during_restriction` | A scan on a project whose Fusion restriction is in force, created after it was applied, whose engines include `ai` and whose `metadata.configs[type=ai].value.fusionEnabled` is true: Fusion ran anyway (a scan started with its own settings). Records the initiator, `sourceOrigin`/`sourceType`, branch, scan id, model and the price from action-rates when known. | Cycle step `violations`, after evaluation |
 | `ai_scan_during_restriction` | The same scan with `fusionEnabled` false (the AI engine ran without Fusion, LLM-based scanning), or not saying. That is the restriction working, so it is recorded silently: one information row per restriction per day with the count (no notification, no audit entry). Whether it costs credits is not known. | Same |
 | `scans_not_checked` | More scans were made on a restricted project since the last look than one cycle's listing reaches (2 pages of 100), so the older ones in between were not checked. Information, once per restriction (its evidence lists the windows and how often). | Same |
-| `usage_after_restriction` | What the restriction is meant to stop (a user's `triage`/`remediation`; a project's `auto_triage` when Auto Triage is turned off, `fusion` when Fusion is) kept rising in the consumption feed after the restriction. Each action type is compared with the reading taken when *its own* restriction was applied (Fusion restricted after Auto Triage is measured from the Fusion restriction). One record per restriction, brought up to date while it keeps rising; credits only when Fusion is priced. | Same |
+| `usage_after_restriction` | What the restriction is meant to stop (a user's `triage`/`remediation`; a project's `auto_triage` when Auto Triage is turned off, `fusion` when Fusion is) kept rising in the consumption feed after the restriction. Each action type counts the ledger's increases for the restricted user or project since *its own* restriction was applied (Fusion restricted after Auto Triage is measured from the Fusion restriction), so a name renamed, mapped or moved meanwhile is neither missed nor counted for its history. One record per restriction, brought up to date while it keeps rising; credits only when Fusion is priced. | Same |
 
 Scans are listed newest first from the later of the restriction's
 `applied_at` and the newest scan already looked at (a per-project cursor),
