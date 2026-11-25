@@ -306,6 +306,9 @@ class SettingsResponse(BaseModel):
     # fallback) or "summary" (the consumption summary only).
     usage_source: str = "activity"
     allowed_usage_sources: list[str] = Field(default_factory=list)
+    # With the summary only: whether summary-counted usage may restrict period
+    # budgets (off: they warn; usage the activity log counted always may).
+    summary_restricts: bool = False
     activity_max_pages_per_cycle: int = 40
     # Extra integration account names (besides "[bot]" accounts, Auto-triage
     # and Auto-remediation).
@@ -364,6 +367,7 @@ class SettingsUpdateRequest(StrictModel):
     confirm_admin_roles: bool | None = None
     charge_auto_triage_to_scan_initiator: bool | None = None
     usage_source: str | None = Field(default=None, max_length=16)
+    summary_restricts: bool | None = None
     activity_max_pages_per_cycle: int | None = Field(default=None, ge=0, le=100_000)
     integration_accounts: list[str] | None = Field(default=None, max_length=200)
     verify_interval_minutes: int | None = Field(default=None, ge=0, le=10080)

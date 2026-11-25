@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import Index, Integer, String, Text
+from sqlalchemy import ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -86,6 +87,29 @@ class ActivitySourceState(Base):
     reconciliation: Mapped[dict | None] = mapped_column(JSONColumn)
     # What the last fetch did, for Diagnose and the cycle record.
     last_stats: Mapped[dict | None] = mapped_column(JSONColumn)
+
+
+class ActivityBudgetCounter(Base):
+    """What of a budget's period counter (``budget_usage``) the activity log
+    counted. Only this part (with auto-triage charged to the person) can
+    start a new restriction of a period budget: usage the summary ledger
+    counted (after a fallback, or by a group's own row) warns, and never
+    restricts, unless the admin allowed it for the summary only setting
+    (``usage.summary_restricts``). Fed per month and per quarter, like the
+    counter; a row whose counter is gone is pruned."""
+
+    __tablename__ = "usage_activity_counter"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    limit_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_limit.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    period_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    credits: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False, default=Decimal("0"))
+
+    __table_args__ = (
+        UniqueConstraint("limit_id", "period_key", name="usage_activity_counter_period"),
+    )
 
 
 class ProjectBudgetInterval(Base):

@@ -959,6 +959,24 @@ def usage_dimensions(ctx: CurrentUser, db: DbSession) -> dict[str, object]:
     }
 
 
+@router.get("/usage/source")
+def usage_source(ctx: CurrentUser, db: DbSession) -> dict[str, object]:
+    """Where period budgets get their usage, and whether new restrictions of
+    period budgets are held (summary-counted usage warns but never restricts:
+    app/services/evaluation.py ``summary_hold``). Error text is for admins."""
+    from app.services import activity_source
+
+    info = activity_source.describe(db)
+    hold = info.get("restrictions_held")
+    if isinstance(hold, dict) and not ctx.is_admin:
+        hold = {**hold, "reason": None}
+    return {
+        "setting": info.get("setting"),
+        "status": info.get("status"),
+        "restrictions_held": hold,
+    }
+
+
 @router.get("/usage/auto-triage-attribution", response_model=AutoTriageAttributionOverview)
 def auto_triage_attribution_overview(
     ctx: CurrentUser,

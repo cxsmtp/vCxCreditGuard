@@ -13,6 +13,8 @@ Create Date: 2026-11-25
   nothing is counted from it, the highest pruning cutoff, the group budgets
   it feeds through their projects and since when, and its last
   reconciliation with the summary.
+* ``usage_activity_counter`` - what of each period counter the activity log
+  counted: only that part can start a new restriction of a period budget.
 * ``usage_budget_interval`` - when each project budget may have been active,
   as observed, so the integration-account rule decides a past event the
   same way every time.
@@ -76,6 +78,25 @@ def upgrade() -> None:
             sa.Column("last_stats", sa.JSON(), nullable=True),
             sa.PrimaryKeyConstraint("id", name=op.f("pk_usage_activity_state")),
         )
+    if "usage_activity_counter" not in tables:
+        op.create_table(
+            "usage_activity_counter",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("limit_id", sa.Integer(), nullable=False),
+            sa.Column("period_key", sa.String(length=64), nullable=False),
+            sa.Column("credits", sa.Numeric(18, 4), nullable=False),
+            sa.ForeignKeyConstraint(
+                ["limit_id"],
+                ["credit_limit.id"],
+                name=op.f("fk_usage_activity_counter_limit_id_credit_limit"),
+                ondelete="CASCADE",
+            ),
+            sa.PrimaryKeyConstraint("id", name=op.f("pk_usage_activity_counter")),
+            sa.UniqueConstraint("limit_id", "period_key", name="usage_activity_counter_period"),
+        )
+        op.create_index(
+            "ix_usage_activity_counter_limit_id", "usage_activity_counter", ["limit_id"]
+        )
     if "usage_budget_interval" not in tables:
         op.create_table(
             "usage_budget_interval",
@@ -97,6 +118,8 @@ def downgrade() -> None:
     op.drop_index("ix_usage_budget_interval_project_id", table_name="usage_budget_interval")
     op.drop_index("ix_usage_budget_interval_limit_id", table_name="usage_budget_interval")
     op.drop_table("usage_budget_interval")
+    op.drop_index("ix_usage_activity_counter_limit_id", table_name="usage_activity_counter")
+    op.drop_table("usage_activity_counter")
     op.drop_table("usage_activity_state")
     op.drop_index("ix_usage_activity_key_event_at", table_name="usage_activity_key")
     op.drop_table("usage_activity_key")

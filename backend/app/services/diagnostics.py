@@ -86,8 +86,9 @@ _REMEDIATION: dict[tuple[str, str], str] = {
     ("activity_source", WARN): (
         "Check that the API key may read the credit activity log and that the tenant is "
         "reachable. A mismatch with the consumption summary that persists is worth raising "
-        "with Checkmarx; meanwhile Settings → Schedule & data can switch the usage source to "
-        "the summary only."
+        "with Checkmarx. To restrict monthly and quarterly budgets from summary totals "
+        "anyway (less accurate), choose Usage source: Summary only and allow restrictions "
+        "from summary totals under Settings → Schedule & data."
     ),
     ("enforcement", WARN): (
         "Restore the Checkmarx connection; the next healthy cycle retries the pending "
@@ -395,15 +396,30 @@ def _doubted_falls_check(session: Session) -> Check | None:
 
 
 def _activity_check(session: Session, moment: datetime) -> Check | None:
-    """The credit activity log as the usage source: whether it is the source,
-    and whether its sum matched the consumption summary's total over the same
-    window the last time both were read in full."""
+    """The usage source: whether the credit activity log is the source,
+    whether its sum matched the consumption summary's total over the same
+    window the last time both were read in full, and whether new
+    restrictions of period budgets are paused (summary-counted usage warns
+    but never restricts)."""
     from app.services import activity_source
 
-    if settings_store.usage_source(session) != settings_store.USAGE_SOURCE_ACTIVITY:
-        return None
     info = activity_source.describe(session)
     label = "Usage source"
+    paused = (
+        " New restrictions of monthly and quarterly budgets are paused: usage the "
+        "consumption summary counts warns but does not restrict (lifetime, custom and "
+        "count-existing budgets, and restrictions already in force, are not affected)."
+    )
+    if settings_store.usage_source(session) != settings_store.USAGE_SOURCE_ACTIVITY:
+        if settings_store.summary_restricts(session):
+            return None
+        return Check(
+            "activity_source",
+            label,
+            WARN,
+            "Usage comes from the consumption summary only (Settings → Schedule & data), "
+            "and restrictions from summary totals are not allowed." + paused,
+        )
     status = info.get("status")
     if status == activity_source.ACTIVE:
         detail = "The credit activity log is the source of project, user and application usage."
@@ -442,12 +458,24 @@ def _activity_check(session: Session, moment: datetime) -> Check | None:
             "The credit activity log could not be read "
             f"({info.get('last_error')}), so usage comes from the consumption summary, "
             "matched by name. The log is tried again "
-            + (f"after {info.get('retry_after')}." if info.get("retry_after") else "every cycle."),
+            + (f"after {info.get('retry_after')}." if info.get("retry_after") else "every cycle.")
+            + paused,
         )
-    detail = "Usage comes from the consumption summary, matched by name."
-    if info.get("last_error"):
-        detail += f" The credit activity log is not available: {info.get('last_error')}"
-    return Check("activity_source", label, OK, detail)
+    if not info.get("last_error"):
+        return Check(
+            "activity_source",
+            label,
+            OK,
+            "The credit activity log becomes the source of project, user and application usage "
+            "at the next cycle.",
+        )
+    return Check(
+        "activity_source",
+        label,
+        WARN,
+        f"The credit activity log is not available: {info.get('last_error')} Usage comes "
+        "from the consumption summary, matched by name." + paused,
+    )
 
 
 def _group_names_check(session: Session) -> Check | None:

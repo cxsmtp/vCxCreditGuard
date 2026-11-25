@@ -1350,6 +1350,7 @@ def _write(
         _count(session, new_events, now, result, history, group_floors, state)
 
     session.execute(delete(ActivityEventCount).where(ActivityEventCount.event_at < cutoff))
+    _prune_log_counters(session)
 
     _move_cursor(state, plan, read, analysis, cutoff)
     result.sweep = plan.sweep
@@ -1504,6 +1505,24 @@ def _count(
         # When it was observed: a closed period is reconciled with what
         # arrived after it was last evaluated.
         row.updated_at = max(row.updated_at, now) if row.updated_at else now
+    # The log's own part of each counter: only it can start a restriction.
+    from app.models.activity import ActivityBudgetCounter
+
+    mine = {
+        (row.limit_id, row.period_key): row
+        for row in session.scalars(
+            select(ActivityBudgetCounter).where(
+                ActivityBudgetCounter.limit_id.in_(limit_ids),
+                ActivityBudgetCounter.period_key.in_(period_keys),
+            )
+        )
+    }
+    for (limit_id, period_key), (credits, _counts) in adds.items():
+        part = mine.get((limit_id, period_key))
+        if part is None:
+            part = ActivityBudgetCounter(limit_id=limit_id, period_key=period_key, credits=ZERO)
+            session.add(part)
+        part.credits = Decimal(part.credits or 0) + credits
 
 
 def _move_cursor(
@@ -1578,14 +1597,80 @@ def _reconciliation(read: _Read, analysis: _Analysis, now: datetime) -> dict[str
 # ------------------------------------------------------------------ reading
 
 
+def _prune_log_counters(session: Session) -> None:
+    """The log's part of a counter goes with the counter (retention prunes
+    those with their period)."""
+    from sqlalchemy import exists
+
+    from app.models.activity import ActivityBudgetCounter
+
+    session.execute(
+        delete(ActivityBudgetCounter).where(
+            ~exists().where(
+                BudgetUsage.limit_id == ActivityBudgetCounter.limit_id,
+                BudgetUsage.period_key == ActivityBudgetCounter.period_key,
+            )
+        )
+    )
+
+
+def log_counted(session: Session, period_key: str) -> dict[int, Decimal]:
+    """limit id -> what the activity log counted towards it in the period."""
+    from app.models.activity import ActivityBudgetCounter
+
+    return {
+        row.limit_id: Decimal(row.credits or 0)
+        for row in session.scalars(
+            select(ActivityBudgetCounter).where(ActivityBudgetCounter.period_key == period_key)
+        )
+    }
+
+
+def restriction_hold(session: Session) -> dict[str, object] | None:
+    """Why new restrictions of period budgets rest on the activity log's
+    counts only right now (None: they do not, the log is the source or the
+    admin let summary totals restrict). ``reason`` is a sentence; ``since``
+    when the log stopped being the source, if known."""
+    setting = settings_store.usage_source(session)
+    if setting == settings_store.USAGE_SOURCE_SUMMARY:
+        if settings_store.summary_restricts(session):
+            return None
+        return {
+            "reason": (
+                "the usage source is the consumption summary only, and restrictions from "
+                "summary totals are not allowed (Settings → Schedule & data)"
+            ),
+            "since": None,
+            "summary_only": True,
+        }
+    state = _state(session)
+    if state is not None and state.status == ACTIVE:
+        return None
+    since: str | None = None
+    for era in (state.eras or []) if state is not None else []:
+        if isinstance(era, list) and len(era) == 2 and era[1]:
+            since = str(era[1])
+    if since is None and state is not None and state.last_fetch_at is not None:
+        since = _iso(state.last_fetch_at)
+    return {
+        "reason": "the activity log is unavailable"
+        + (f" since {since}" if since else "")
+        + (f" ({state.last_error})" if state is not None and state.last_error else ""),
+        "since": since,
+        "summary_only": False,
+    }
+
+
 def describe(session: Session) -> dict[str, object]:
     """The source's state, for Diagnose and the Settings page."""
     state = _state(session)
     setting = settings_store.usage_source(session)
+    hold = restriction_hold(session)
     if state is None:
-        return {"setting": setting, "status": INACTIVE}
+        return {"setting": setting, "status": INACTIVE, "restrictions_held": hold}
     return {
         "setting": setting,
+        "restrictions_held": hold,
         "status": state.status,
         "active_since": _iso(state.active_since),
         "floor_at": _iso(state.floor_at),

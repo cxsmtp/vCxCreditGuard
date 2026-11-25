@@ -6,7 +6,12 @@ both discover tables through ``Base.metadata``.
 
 from app.db.base import Base
 from app.db.length_guard import install_length_guards  # noqa: E402
-from app.models.activity import ActivityEventCount, ActivitySourceState, ProjectBudgetInterval
+from app.models.activity import (
+    ActivityBudgetCounter,
+    ActivityEventCount,
+    ActivitySourceState,
+    ProjectBudgetInterval,
+)
 from app.models.audit import AuditLogEntry, Notification
 from app.models.auth import LoginAttempt, PasswordResetToken, UtilitySession, UtilityUser
 from app.models.connection import AppSetting, CxConnection
@@ -48,6 +53,7 @@ from app.models.violations import PolicyViolation
 install_length_guards(Base)
 
 __all__ = [
+    "ActivityBudgetCounter",
     "ActivityEventCount",
     "ActivitySourceState",
     "ProjectBudgetInterval",

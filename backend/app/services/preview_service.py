@@ -683,11 +683,27 @@ def _project_one(
     blast: BlastRadius | None = None
     would_enforce = False
     note: str | None = None
+    on_summary = (
+        evaluation.summary_hold(
+            session,
+            limit=limit,
+            window=window,
+            index=index,
+            credits_used=credits_used,
+            attributed=auto_triage,
+        )
+        if projected == LimitStatus.BREACHED and limit.enforce and not exempt
+        else None
+    )
+    if on_summary is not None and evaluation._has_active_enforcement(session, limit.id, window.key):
+        on_summary = None  # a restriction in force stays (and is shown as such)
     if projected == LimitStatus.BREACHED:
         if exempt:
             note = "Would breach, but the entity is exempt."
         elif not limit.enforce:
             note = "Would breach, but the limit is monitor only."
+        elif on_summary is not None:
+            note = f"Would breach on summary totals, but not be restricted, because {on_summary}."
         else:
             blast = blast_radius(
                 session,

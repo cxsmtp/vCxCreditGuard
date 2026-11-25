@@ -53,6 +53,13 @@ USAGE_SOURCES: tuple[str, ...] = (USAGE_SOURCE_ACTIVITY, USAGE_SOURCE_SUMMARY)
 # normal cycle reads the last couple of hours; more is read after downtime,
 # and the daily reconciliation reads the whole window). 0: no cap.
 KEY_ACTIVITY_MAX_PAGES = "usage.activity_max_pages_per_cycle"
+# With the usage source at "summary": whether usage the summary ledger counted
+# may start a restriction of a period budget (the behaviour before the
+# activity log). Off by default: from running totals the summary cannot always
+# tell a glitch from a real fall, so a period budget then warns and is not
+# restricted. Usage the activity log counted always may. Budgets that count
+# current totals (lifetime, custom, count existing usage) are not affected.
+KEY_SUMMARY_RESTRICTS = "usage.summary_restricts"
 
 # Retention
 KEY_RETENTION_DAYS = "retention.days"
@@ -259,6 +266,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_USAGE_PAGE_SIZE: 100,
     KEY_USAGE_SOURCE: USAGE_SOURCE_ACTIVITY,
     KEY_ACTIVITY_MAX_PAGES: 40,
+    KEY_SUMMARY_RESTRICTS: False,
     KEY_INTEGRATION_ACCOUNTS: [],
     KEY_RETENTION_DAYS: 365,
     KEY_RETENTION_THIN_SNAPSHOTS: True,
@@ -662,6 +670,14 @@ def usage_source(session: Session) -> str:
     """ "activity" (the default) or "summary"; anything else reads as the default."""
     value = get_value(session, KEY_USAGE_SOURCE, DEFAULTS[KEY_USAGE_SOURCE])
     return value if value in USAGE_SOURCES else USAGE_SOURCE_ACTIVITY
+
+
+def summary_restricts(session: Session) -> bool:
+    """Whether summary-counted usage may start a restriction of a period
+    budget: only with the usage source at "summary" and the opt-in on."""
+    if usage_source(session) != USAGE_SOURCE_SUMMARY:
+        return False
+    return get_value(session, KEY_SUMMARY_RESTRICTS, DEFAULTS[KEY_SUMMARY_RESTRICTS]) is True
 
 
 def activity_max_pages(session: Session) -> int:
