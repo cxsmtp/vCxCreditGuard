@@ -57,6 +57,15 @@ from tests.fake_tenant import FakeTenant, populated_tenant
 
 ACTOR = AuditActor.system("test")
 AUGUST = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def readings_in_august(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Readings are taken in the month these tests evaluate: the ledger counts
+    an increase towards the period it was observed in."""
+    monkeypatch.setattr(ingestion, "utcnow", lambda: datetime(2026, 8, 11, 11, 0, tzinfo=UTC))
+
+
 PERIOD = "2026-08"
 
 
@@ -314,7 +323,7 @@ class TestCollapsedReadsAreHeld:
         assert result.dimensions["user"].held is False
 
     def test_a_collapsed_read_does_not_lift_and_then_reapply_restrictions(
-        self, db: Session
+        self, db: Session, readings_in_august: None
     ) -> None:
         """The failure this exists to prevent, end to end."""
         tenant, client = synced(db)
@@ -527,7 +536,9 @@ class TestUnrecordedRestrictionsAreStillLifted:
         action = db.scalar(select(EnforcementAction))
         assert enforcement.OUTCOME_UNKNOWN not in action.undo_snapshot
 
-    def test_an_outcome_in_doubt_is_undone_and_can_be_enforced_again(self, db: Session) -> None:
+    def test_an_outcome_in_doubt_is_undone_and_can_be_enforced_again(
+        self, db: Session, readings_in_august: None
+    ) -> None:
         """A 5xx on the write: Checkmarx may or may not have made the change."""
         tenant, client = synced(db)
         ingestion.ingest_usage(db, client)
@@ -603,7 +614,9 @@ class TestPersistentFailuresAreNotNoisy:
 
 
 class TestRestoreIsDurable:
-    def test_a_failed_admin_restore_is_completed_by_the_cycle_not_undone(self, db: Session) -> None:
+    def test_a_failed_admin_restore_is_completed_by_the_cycle_not_undone(
+        self, db: Session, readings_in_august: None
+    ) -> None:
         tenant, client = synced(db)
         ingestion.ingest_usage(db, client)
         alice_limit(db)
@@ -863,7 +876,7 @@ class TestAFailedLiftIsCompletedLater:
 
 class TestApprovalIsOneUnitOfWork:
     def test_nothing_of_an_approval_is_committed_before_all_of_it_is_written(
-        self, db: Session
+        self, db: Session, readings_in_august: None
     ) -> None:
         """Approving lifts a restriction, and lifting commits. The commit must
         come after the request is marked approved, not half way through."""

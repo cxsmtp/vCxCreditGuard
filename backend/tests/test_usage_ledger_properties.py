@@ -1,23 +1,37 @@
-"""Property tests for the usage ledger (fifth review of realfix).
+"""Property tests for the usage ledger (fifth and sixth reviews of realfix).
 
-Random sequences of spending, mapping and unmapping, renames in either order,
-deletions and returns, group membership changes, demo mode on and off, period
-rollovers, the lookback window rolling past old usage, a change of lookback
-window and short org listings run over a small synthetic tenant: an org sync, a
-reading and an evaluation at every step. After every step, for every budget:
+Random sequences over a small synthetic tenant, on a clock the test controls:
+spending; mapping and unmapping; renames in either order; deletions and
+returns; group membership changes; a project synced mid-run whose name was
+already spending (claims), mapped to later; group and application rows of
+their own appearing and leaving; demo mode on and off; plain, late-read and
+skipped-evaluation rollovers; the lookback window rolling past old usage; a
+change of lookback window; short org listings; names missing from a reading;
+page drift serving a row twice; a dip in a doubted reading and its recovery;
+budgets switched to counting existing usage and back. Every step runs an org
+sync and a reading, and (unless the step skips it) an evaluation.
 
-* I1: its usage never exceeds the new usage this period of the names that
-  belonged to one of its entities, now or before (by the reading, or because
-  the name is truly that project's, through renames);
-* I2: its usage is never less than the new usage this period of the names that
-  counted towards one of its entities in both readings around the increase
-  (what is documented as lost: a name moving or appearing, the lookback window
-  rolling past old usage, a change of lookback window).
+The oracle follows each reading: an increase counts towards the period the
+reading was taken in, and towards none when the previous reading was taken in
+an earlier period. A group or application budget is fed by its own row when
+the previous reading of its view had one, by its projects otherwise. Checked
+after every evaluation, for every budget and every period with a state:
+
+* I1: usage never exceeds the new usage, observed in that period, of the names
+  that belonged to one of the budget's entities (by the readings around the
+  increase, or because the name is truly that project's), or of its own row;
+* I2: usage is never less than the new usage, observed in that period, of the
+  names that counted towards one of its entities in both readings around the
+  increase (or of its own row present in both), less what is documented as
+  lost (a name moving, appearing or missing, a roll-down, a doubted reading, a
+  change of lookback window, an interval spanning a rollover).
 
 And a retried or failed reading never counts anything twice.
 
 ``CXCG_PROPERTY_SEEDS`` runs more seeds (default 12). Synthetic data only.
 """
+
+# ruff: noqa: F811 - the connected fixture is imported by name
 
 from __future__ import annotations
 
@@ -33,23 +47,34 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.base import utcnow
+import app.db.base as base_module
 from app.models import LimitPeriodState, UsageDelta, UsageRecord
 from app.models.enums import EntityType
-from app.models.org import CxProjectGroup
+from app.models.org import CxApplicationProject, CxProjectGroup
 from app.services import connection as connection_service
-from app.services import cycle, evaluation, ingestion, ledger, org_sync, settings_store
-from app.services.periods import current_window
+from app.services import (
+    cycle,
+    evaluation,
+    ingestion,
+    ledger,
+    limits_service,
+    org_sync,
+    settings_store,
+)
+from tests.conftest import ADMIN_PASSWORD, login
 from tests.fake_tenant import FakeTenant
 from tests.test_real_tenant_usage import connected, live_tenant  # noqa: F401
-from tests.test_review_followups import _limit, _state
+from tests.test_review_followups import ACTOR, _limit, _state
 
 SEEDS = int(os.environ.get("CXCG_PROPERTY_SEEDS", "12"))
-STEPS = 16
+STEPS = 20
 POOL = ["example-org/repo-a", "example-org/repo-b", "example-org/repo-c"]
 PROJECTS = {"proj-api": "payments/api", "proj-web": "payments/web", "proj-tools": "platform/tools"}
+# A project the sync brings mid-run, under a name the feed already reports.
+NEW_PROJECT, NEW_NAME = "proj-new", "example-org/repo-c"
+APP_MEMBERS = {"proj-api", "proj-web"}
 OPS = [
-    *["spend"] * 4,
+    *["spend"] * 5,
     "map",
     "unmap",
     "rename_feed",
@@ -59,15 +84,32 @@ OPS = [
     "group",
     "demo",
     "rollover",
+    "late_read",
     "roll",
     "lookback",
     "short",
     "gap",
+    "drift",
+    "dip",
+    "new_project",
+    "group_row",
+    "app_row",
+    "existing",
 ]
 
 
+class _Clock(datetime):
+    """``app.db.base.utcnow`` (every timestamp the app takes) reads this."""
+
+    value: datetime
+
+    @classmethod
+    def now(cls, tz=None):  # type: ignore[no-untyped-def, override]
+        return cls.value
+
+
 class _World:
-    def __init__(self, tenant: FakeTenant, rng: random.Random) -> None:
+    def __init__(self, tenant: FakeTenant, rng: random.Random, start: datetime) -> None:
         self.tenant = tenant
         self.rng = rng
         self.totals: dict[str, int] = {}
@@ -76,11 +118,25 @@ class _World:
         self.renames = 0
         self.op = ""
         self.period = "last_year"
-        self.clock = utcnow()
+        self.clock = start
         # The project each project name really belongs to, through renames.
         self.owner: dict[str, str] = {name: pid for pid, name in PROJECTS.items()}
+        self.owner[NEW_NAME] = NEW_PROJECT
         # A name left out of one reading, with its total, back (and grown) after.
         self.gap: tuple[str, int] | None = None
+        # Names reported lower than they are, in a doubted reading, this step.
+        self.dipped: set[str] = set()
+        # The group's and the application's own rows (None: not reported).
+        self.group_row: int | None = None
+        self.app_row: int | None = None
+        # Grown since the last reading, while reported.
+        self.group_grew = 0
+        self.app_grew = 0
+        self.after_late = False
+        # Names the feed moved this step (old, new): their pending usage moves.
+        self.moves: list[tuple[str, str]] = []
+        self.skip_evaluation = False
+        self.existing = False
 
     def set(self, name: str, total: int) -> None:
         self.totals[name] = total
@@ -95,6 +151,55 @@ class _World:
     def project(self, project_id: str) -> dict | None:
         return next((p for p in self.tenant.projects if p["id"] == project_id), None)
 
+    def any_project(self, project_id: str) -> dict | None:
+        return self.project(project_id) or self.saved_projects.get(project_id)
+
+    def spend(self, name: str, amount: int) -> None:
+        self.set(name, self.totals[name] + amount)
+        # The group's and the application's own rows grow with what their
+        # projects spend (as Checkmarx attributes it when it is spent).
+        owner = self.owner.get(name)
+        project = self.any_project(owner) if owner else None
+        if self.group_row is not None and project and "grp-payments" in project["groups"]:
+            self.group_row += amount
+            self.group_grew += amount
+            self._set_row("group", "Payments", "grp-payments", self.group_row)
+        if self.app_row is not None and owner in APP_MEMBERS:
+            self.app_row += amount
+            self.app_grew += amount
+            self._set_row("application", "Payments", "app-payments", self.app_row)
+
+    def _set_row(self, view: str, name: str, entity_id: str, total: int | None) -> None:
+        rows = [r for r in self.tenant.consumption[view] if r["name"] != name]
+        self.tenant.consumption[view] = rows
+        if total is not None:
+            self.tenant.set_entity_credits(view=view, name=name, credits=total, entity_id=entity_id)
+
+
+def _api(client: TestClient, path: str, payload: dict | None = None) -> httpx.Response:
+    """POST as the admin, signing in again when the clock jumped past the
+    session's lifetime."""
+    response = client.post(path, json=payload)
+    if response.status_code == 401:
+        assert login(client, "admin", ADMIN_PASSWORD).status_code == 200
+        response = client.post(path, json=payload)
+    return response
+
+
+def _serve(monkeypatch: pytest.MonkeyPatch, rows_of) -> None:  # type: ignore[no-untyped-def]
+    """Serve the project view as ``rows_of(rows)`` says, in one page."""
+    real = FakeTenant._consumption_response
+
+    def response(self, params):  # type: ignore[no-untyped-def]
+        if params.get("viewBy", [""])[0] != "project":
+            return real(self, params)
+        items, total = rows_of(list(self.consumption["project"]))
+        return httpx.Response(
+            200, json={"items": items, "totalItems": total, "totalPages": 1, "currentPage": 1}
+        )
+
+    monkeypatch.setattr(FakeTenant, "_consumption_response", response)
+
 
 def _truncate_project_listings(monkeypatch: pytest.MonkeyPatch) -> None:
     real = FakeTenant._paged
@@ -108,29 +213,41 @@ def _truncate_project_listings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(FakeTenant, "_paged", paged)
 
 
-def _step(world: _World, client: TestClient, monkeypatch) -> tuple[dict[str, int], set[str]]:  # type: ignore[no-untyped-def]
-    """One random change. Returns (increase per name, names rolled down)."""
+def _step(world: _World, db: Session, client: TestClient, mp: pytest.MonkeyPatch, budgets) -> dict:  # type: ignore[no-untyped-def]
+    """One random change. Returns the increase per name, and the names whose
+    total really fell (rolled down)."""
     rng, increase, rolled = world.rng, defaultdict(int), set()
+    world.dipped = set()
+    world.moves = []
+    world.skip_evaluation = False
+    if world.after_late:
+        # The reading after a late one is taken in the next month.
+        world.after_late = False
+        world.clock = _month_end(world.clock) + timedelta(minutes=10)
     if world.gap is not None:
         name, total = world.gap
         world.gap = None
-        amount = rng.randint(0, 40)
-        world.set(name, total + amount)
-        increase[name] += amount
+        if name not in world.totals:
+            world.set(name, total)
+            amount = rng.randint(0, 40)
+            world.spend(name, amount)
+            increase[name] += amount
     op = world.op = rng.choice(OPS)
     names = sorted(world.totals)
     if op == "spend":
         for name in rng.sample(names, k=min(len(names), rng.randint(1, 3))):
             amount = rng.randint(1, 40)
-            world.set(name, world.totals[name] + amount)
+            world.spend(name, amount)
             increase[name] += amount
     elif op in ("map", "unmap"):
-        target = rng.choice(list(PROJECTS)) if op == "map" else None
-        response = client.post(
+        targets = [*PROJECTS, NEW_PROJECT]
+        target = rng.choice(targets) if op == "map" else None
+        response = _api(
+            client,
             "/api/usage/unmatched-entities/map",
-            json={"view": "project", "subject_key": rng.choice(POOL), "entity_id": target},
+            {"view": "project", "subject_key": rng.choice(POOL), "entity_id": target},
         )
-        # A deleted project cannot be mapped to; an unmapped name not unmapped.
+        # A project not synced (or deleted) cannot be mapped to.
         assert response.status_code in (200, 400, 404), response.text
     elif op == "rename_feed":
         # The feed reports the project's usage under its new name first.
@@ -145,17 +262,16 @@ def _step(world: _World, client: TestClient, monkeypatch) -> tuple[dict[str, int
             new = f"{project['name']}-f{world.renames}"
             world.owner[new] = project_id
             total = world.totals[project["name"]]
+            world.moves.append((project["name"], new))
             world.drop(project["name"])
             world.set(new, total)
             world.pending_rename[project_id] = new
     elif op == "rename_sync":
-        # The sync learns a rename: one the feed reported first, or a new one
-        # the feed reports later.
         firsts = [k for k in world.pending_rename if not k.startswith("feed:")]
         if firsts:
             project_id = rng.choice(firsts)
             new = world.pending_rename.pop(project_id)
-            project = world.project(project_id) or world.saved_projects.get(project_id)
+            project = world.any_project(project_id)
             if project is not None:
                 project["name"] = new
         else:
@@ -167,7 +283,7 @@ def _step(world: _World, client: TestClient, monkeypatch) -> tuple[dict[str, int
                 project["name"] = new
                 world.pending_rename[f"feed:{project_id}"] = f"{old}|{new}"
     elif op == "delete":
-        project = world.project(rng.choice(list(PROJECTS)))
+        project = world.project(rng.choice([*PROJECTS, NEW_PROJECT]))
         if project is not None:
             world.tenant.projects.remove(project)
             world.saved_projects[project["id"]] = project
@@ -175,21 +291,30 @@ def _step(world: _World, client: TestClient, monkeypatch) -> tuple[dict[str, int
         project_id = rng.choice(sorted(world.saved_projects))
         world.tenant.projects.append(world.saved_projects.pop(project_id))
     elif op == "group":
-        tools = world.project("proj-tools") or world.saved_projects["proj-tools"]
-        groups = tools["groups"]
+        groups = world.any_project("proj-tools")["groups"]
         if "grp-payments" in groups:
             groups.remove("grp-payments")
         else:
             groups.append("grp-payments")
     elif op == "demo":
-        # Demo mode for a step, with spending meanwhile.
-        assert client.post("/api/ops/demo/seed").status_code == 200
+        assert _api(client, "/api/ops/demo/seed").status_code == 200
         name = rng.choice(names)
         amount = rng.randint(1, 40)
-        world.set(name, world.totals[name] + amount)
+        world.spend(name, amount)
         increase[name] += amount
     elif op == "rollover":
         world.clock = (world.clock.replace(day=1) + timedelta(days=32)).replace(day=2)
+    elif op == "late_read":
+        # Read ten minutes before the month ends, evaluated only after it.
+        late = _month_end(world.clock) - timedelta(minutes=10)
+        if late > world.clock:
+            world.clock = late - timedelta(minutes=5)  # _cycle adds 5
+            world.after_late = True
+            world.skip_evaluation = True
+            name = rng.choice(names)
+            amount = rng.randint(1, 40)
+            world.spend(name, amount)
+            increase[name] += amount
     elif op == "roll":
         name = rng.choice(names)
         world.set(name, max(0, world.totals[name] - rng.randint(1, 60)))
@@ -197,11 +322,57 @@ def _step(world: _World, client: TestClient, monkeypatch) -> tuple[dict[str, int
     elif op == "lookback":
         world.period = "last_90_days" if world.period == "last_year" else "last_year"
     elif op == "short":
-        _truncate_project_listings(monkeypatch)
+        _truncate_project_listings(mp)
     elif op == "gap":
         name = rng.choice(names)
         world.gap = (name, world.totals[name])
         world.drop(name)
+    elif op == "drift" and len(names) >= 2:
+        # The ranking shifts between page requests: one row is served twice,
+        # another not at all.
+        twice, lost = rng.sample(names, 2)
+        _serve(
+            mp,
+            lambda rows: (
+                [r for r in rows if r["name"] != lost] + [r for r in rows if r["name"] == twice],
+                len(rows),
+            ),
+        )
+    elif op == "dip":
+        name = rng.choice(names)
+        low = str(world.totals[name] // 3)
+        world.dipped = {name}
+        _serve(
+            mp,
+            lambda rows: (
+                [dict(r, creditsUsed=low) if r["name"] == name else r for r in rows],
+                len(rows) + 1,
+            ),
+        )
+    elif op == "new_project":
+        if world.any_project(NEW_PROJECT) is None:
+            world.tenant.add_project(project_id=NEW_PROJECT, name=NEW_NAME, group_ids=[])
+    elif op == "group_row":
+        if world.group_row is None:
+            # First reported with history in it.
+            world.group_row = rng.randint(100, 3000)
+        else:
+            world.group_row = None
+        world.group_grew = 0
+        world._set_row("group", "Payments", "grp-payments", world.group_row)
+    elif op == "app_row":
+        world.app_row = rng.randint(100, 3000) if world.app_row is None else None
+        world.app_grew = 0
+        world._set_row("application", "Payments", "app-payments", world.app_row)
+    elif op == "existing":
+        world.existing = not world.existing
+        limits_service.update_limit(
+            db,
+            limit=budgets["proj-web"],
+            changes={"count_existing_usage": world.existing},
+            actor=ACTOR,
+        )
+        db.commit()
     # The feed catching up with a rename the sync learnt first, now or later.
     for key in [k for k in world.pending_rename if k.startswith("feed:")]:
         if rng.random() < 0.5:
@@ -209,80 +380,105 @@ def _step(world: _World, client: TestClient, monkeypatch) -> tuple[dict[str, int
             if old in world.totals:
                 world.owner[new] = world.owner.get(old, "")
                 total = world.totals[old]
+                world.moves.append((old, new))
                 world.drop(old)
                 world.set(new, total)
-    return dict(increase), rolled
+    return {"increase": dict(increase), "rolled": rolled}
 
 
-def _cycle(db: Session, world: _World, client: TestClient) -> None:
-    """What the cycle does, on the world's clock (so periods can roll over)."""
-    cx = connection_service.get_client(db)
+def _month_end(moment: datetime) -> datetime:
+    return (moment.replace(day=1) + timedelta(days=32)).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+
+
+def _cycle(db: Session, world: _World, client: TestClient) -> bool:
+    """What the cycle does, on the world's clock. True when it read usage."""
     world.clock += timedelta(minutes=5)
+    _Clock.value = world.clock
+    cx = connection_service.get_client(db)
     if settings_store.demo_mode(db):
         evaluation.evaluate_all(db, now=world.clock)
         db.commit()
-        assert client.post("/api/ops/demo/clear").status_code == 200
-        return
+        assert _api(client, "/api/ops/demo/clear").status_code == 200
+        return False
     org_sync.sync_org_model(db, cx)
     db.commit()
     ingestion.ingest_usage(db, cx, period_param=world.period)
     db.commit()
-    evaluation.evaluate_all(db, now=world.clock)
-    db.commit()
+    if not world.skip_evaluation:
+        evaluation.evaluate_all(db, now=world.clock)
+        db.commit()
+    return True
 
 
-def _reading(db: Session) -> tuple[int | None, str | None, dict[str, str | None]]:
-    snapshot = ingestion.latest_live_snapshot(db, "project")
-    if snapshot is None:
-        return None, None, {}
-    return (
-        snapshot.id,
-        snapshot.period_param,
-        {
-            r.subject_key: r.entity_id
-            for r in db.scalars(select(UsageRecord).where(UsageRecord.snapshot_id == snapshot.id))
-        },
-    )
+class _Reading:
+    def __init__(self, db: Session, view: str) -> None:
+        snapshot = ingestion.latest_live_snapshot(db, view)
+        self.id = snapshot.id if snapshot else None
+        self.at = snapshot.collected_at if snapshot else None
+        self.period = snapshot.period_param if snapshot else None
+        self.rows: dict[str, str | None] = (
+            {
+                r.subject_key: r.entity_id
+                for r in db.scalars(
+                    select(UsageRecord).where(UsageRecord.snapshot_id == snapshot.id)
+                )
+            }
+            if snapshot
+            else {}
+        )
+
+    def has(self, entity_id: str) -> bool:
+        return entity_id in self.rows.values()
 
 
 def _feeds(db: Session) -> dict[str, set[str]]:
-    """Budget -> the projects that feed it now."""
+    """Budget -> the projects that feed it now (through the project view)."""
     groups: dict[str, set[str]] = defaultdict(set)
     for link in db.scalars(select(CxProjectGroup)):
         groups[link.group_id].add(link.project_id)
+    apps: dict[str, set[str]] = defaultdict(set)
+    for link in db.scalars(select(CxApplicationProject)):
+        apps[link.application_id].add(link.project_id)
     return {
         "proj-api": {"proj-api"},
         "proj-web": {"proj-web"},
         "proj-tools": {"proj-tools"},
+        NEW_PROJECT: {NEW_PROJECT},
         "grp-payments": groups["grp-payments"],
+        "app-payments": apps["app-payments"],
     }
 
 
-def _used(db: Session, limit, moment: datetime) -> Decimal:  # type: ignore[no-untyped-def]
-    db.expire_all()
-    state = db.scalar(
-        select(LimitPeriodState).where(
-            LimitPeriodState.limit_id == limit.id,
-            LimitPeriodState.period_key == current_window(limit, moment).key,
-        )
-    )
-    assert state is not None
-    return state.credits_used
+def _month(moment: datetime | None) -> str | None:
+    return moment.strftime("%Y-%m") if moment else None
 
 
 @pytest.mark.parametrize("seed", range(SEEDS))
 def test_random_sequences_keep_both_invariants(
     db: Session,
-    connected,  # noqa: F811
+    connected,
     admin_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     seed: int,
 ) -> None:
     rng = random.Random(seed)
+    start = base_module.utcnow().replace(day=3, hour=8, minute=0, second=0, microsecond=0)
+    _Clock.value = start
+    monkeypatch.setattr(base_module, "datetime", _Clock)
     tenant = live_tenant()
     tenant.consumption["project"] = []
+    # Other groups and applications with large rows of their own, so that one
+    # leaving its view is never a collapse the feed is doubted for.
+    tenant.consumption["group"] = []
+    tenant.set_entity_credits(view="group", name="AA-Platform", credits=100000)
     tenant.consumption["application"] = []
-    world = _World(tenant, rng)
+    tenant.add_application(application_id="app-filler", name="Filler", project_ids=[])
+    tenant.set_entity_credits(
+        view="application", name="Filler", credits=100000, entity_id="app-filler"
+    )
+    world = _World(tenant, rng, start)
     # Large totals, so that a roll-down is never a collapse the feed is doubted for.
     for name in [*PROJECTS.values(), *POOL]:
         world.set(name, 1000 + rng.randint(0, 500))
@@ -292,67 +488,101 @@ def test_random_sequences_keep_both_invariants(
         "proj-api": _limit(db, EntityType.PROJECT, "proj-api"),
         "proj-web": _limit(db, EntityType.PROJECT, "proj-web"),
         "proj-tools": _limit(db, EntityType.PROJECT, "proj-tools"),
+        NEW_PROJECT: _limit(db, EntityType.PROJECT, NEW_PROJECT),
         "grp-payments": _limit(db, EntityType.GROUP, "grp-payments"),
+        "app-payments": _limit(db, EntityType.APPLICATION, "app-payments"),
     }
     _cycle(db, world, admin_client)
-    lower = dict.fromkeys(budgets, 0)
-    upper = dict.fromkeys(budgets, 0)
-    last_id, last_period, last = _reading(db)
+    # (period, budget) -> bound
+    lower: dict[tuple[str, str], int] = defaultdict(int)
+    upper: dict[tuple[str, str], int] = defaultdict(int)
+    last = _Reading(db, "project")
+    last_group, last_app = _Reading(db, "group"), _Reading(db, "application")
     last_feeds = _feeds(db)
     increases: dict[str, int] = defaultdict(int)
     rolled: set[str] = set()
     history: list[str] = []
     for _ in range(STEPS):
-        monkeypatch.undo()
-        connected(tenant)
-        period_key = current_window(budgets["proj-api"], world.clock).key
-        step_increase, step_rolled = _step(world, admin_client, monkeypatch)
-        history.append(f"{world.op} {step_increase} rolled={sorted(step_rolled)}")
-        for name, amount in step_increase.items():
-            increases[name] += amount
-        rolled |= step_rolled
-        if current_window(budgets["proj-api"], world.clock).key != period_key:
-            # A new period: its usage starts from nothing. Usage observed by
-            # the next reading counts towards the period it is evaluated in.
-            lower = dict.fromkeys(budgets, 0)
-            upper = dict.fromkeys(budgets, 0)
-        _cycle(db, world, admin_client)
-        reading_id, period, now = _reading(db)
-        if reading_id == last_id:
-            continue  # no believed reading (demo mode): the next one carries it
-        history.append(f"  reading {now}")
+        with pytest.MonkeyPatch.context() as mp:
+            change = _step(world, db, admin_client, mp, budgets)
+            history.append(f"{world.clock:%m-%d %H:%M} {world.op} {change}")
+            for name, amount in change["increase"].items():
+                increases[name] += amount
+            rolled |= change["rolled"]
+            for old, new in world.moves:
+                # The feed reports the name's usage under its new name now.
+                if old in increases:
+                    increases[new] += increases.pop(old)
+                if old in rolled:
+                    rolled.discard(old)
+                    rolled.add(new)
+            group_grew, app_grew = world.group_grew, world.app_grew
+            read = _cycle(db, world, admin_client)
+        if not read:
+            continue
+        world.group_grew = world.app_grew = 0
+        now = _Reading(db, "project")
+        group, app = _Reading(db, "group"), _Reading(db, "application")
+        assert now.id != last.id, history
+        history.append(f"  reading {now.rows}")
         feeds = _feeds(db)
+        period = _month(now.at)
+        counts = _month(last.at) == period and last.period == now.period
+        seen = {name for name in now.rows if name not in world.dipped}
+        own = {
+            "grp-payments": ("grp-payments", last_group, group, group_grew),
+            "app-payments": ("app-payments", last_app, app, app_grew),
+        }
         for budget, projects in feeds.items():
+            if not counts:
+                continue
+            key = (period, budget)
+            if budget in own and own[budget][1].has(own[budget][0]):
+                # Fed by its own row: what it grew while in both readings.
+                entity, before_view, now_view, grew = own[budget]
+                if now_view.has(entity) and before_view.period == now_view.period:
+                    upper[key] += grew
+                    lower[key] += grew
+                continue
             members = projects | last_feeds[budget]
             for name, amount in increases.items():
-                before, after = last.get(name), now.get(name)
+                if name not in seen:
+                    continue
+                before, after = last.rows.get(name), now.rows.get(name)
                 if {before, after, world.owner.get(name)} & members:
-                    upper[budget] += amount
+                    upper[key] += amount
                 if (
-                    period == last_period
-                    and name in last
-                    and name in now
+                    name in last.rows
                     and before == after
                     and after in projects
                     and name not in rolled
                 ):
-                    lower[budget] += amount
-        # What a name absent from both readings added is still to be observed.
-        unseen = {name for name in increases if name not in last and name not in now}
-        increases = defaultdict(int, {name: increases[name] for name in unseen})
-        rolled = rolled & unseen
-        last_id, last_period, last, last_feeds = reading_id, period, now, feeds
+                    lower[key] += amount
+        # What a name absent from this reading (or reported lower than it is)
+        # added is still to be observed.
+        increases = defaultdict(int, {n: a for n, a in increases.items() if n not in seen})
+        rolled = {n for n in rolled if n not in seen}
+        last, last_group, last_app, last_feeds = now, group, app, feeds
+        if world.skip_evaluation:
+            continue
+        db.expire_all()
         for budget, limit in budgets.items():
-            used = _used(db, limit, world.clock)
-            assert lower[budget] <= used <= upper[budget], (
-                f"seed {seed}, {budget}: {lower[budget]} <= {used} <= {upper[budget]}\n"
-                + "\n".join(history)
-            )
+            if budget == "proj-web" and world.existing:
+                continue  # it counts reported totals while switched
+            for state in db.scalars(
+                select(LimitPeriodState).where(LimitPeriodState.limit_id == limit.id)
+            ):
+                key = (state.period_key, budget)
+                used = state.credits_used
+                assert lower[key] <= used <= upper[key], (
+                    f"seed {seed}, {budget} {state.period_key}: "
+                    f"{lower[key]} <= {used} <= {upper[key]}\n" + "\n".join(history)
+                )
 
 
 def test_a_retried_reading_counts_nothing_twice(
     db: Session,
-    connected,  # noqa: F811
+    connected,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tenant = live_tenant()

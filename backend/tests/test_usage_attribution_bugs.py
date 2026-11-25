@@ -29,6 +29,14 @@ from tests.fake_tenant import FakeTenant
 ACTOR = AuditActor.system("test")
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 
+
+@pytest.fixture(autouse=True)
+def _readings_in_august(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Readings are taken in the month these tests evaluate: the ledger counts
+    an increase towards the period it was observed in."""
+    monkeypatch.setattr(ingestion, "utcnow", lambda: datetime(2026, 8, 11, 11, 0, tzinfo=UTC))
+
+
 # The exact payload the tenant returned for viewBy=project. Note: no id field, and
 # the project is identified by name alone.
 REAL_PROJECT_ROW = {

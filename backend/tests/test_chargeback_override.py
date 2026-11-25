@@ -29,6 +29,15 @@ from tests.conftest import make_api_key
 from tests.fake_tenant import FakeTenant, populated_tenant
 
 ACTOR = AuditActor.system("test")
+
+
+@pytest.fixture(autouse=True)
+def _readings_in_august(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Readings are taken in the month these tests evaluate: the ledger counts
+    an increase towards the period it was observed in."""
+    monkeypatch.setattr(ingestion, "utcnow", lambda: datetime(2026, 8, 1, 23, 0, tzinfo=UTC))
+
+
 AUG_02 = datetime(2026, 8, 2, tzinfo=UTC)
 AUG_16 = datetime(2026, 8, 16, tzinfo=UTC)
 

@@ -23,6 +23,7 @@ def test_unmap_after_rollover_keeps_the_targets_own_usage(
     db: Session,
     connected,  # noqa: F811
     admin_client: TestClient,
+    monkeypatch,
 ) -> None:
     tenant = live_tenant()
     tenant.set_entity_credits(view="project", name=NAME, credits=870)
@@ -40,8 +41,16 @@ def test_unmap_after_rollover_keeps_the_targets_own_usage(
     next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=2)
     evaluation.evaluate_all(db, now=next_month)
     db.commit()
+    # Restated for the ledger (sixth review): usage counts towards the period
+    # it is read in, so the new period needs a reading of its own first (the
+    # interval from last month's last reading spans the rollover).
+    clock = [next_month]
+    monkeypatch.setattr(ingestion, "utcnow", lambda: clock[0])
+    ingestion.ingest_usage(db, connection_service.get_client(db))
+    db.commit()
     # The project itself spends 5 in the new period.
     tenant.set_entity_credits(view="project", name="payments/api", credits=13, entity_id="proj-api")
+    clock[0] += timedelta(minutes=30)
     ingestion.ingest_usage(db, connection_service.get_client(db))
     db.commit()
     evaluation.evaluate_all(db, now=next_month + timedelta(hours=1))

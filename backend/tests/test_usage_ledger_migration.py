@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session
 
 from alembic import command
@@ -144,4 +144,43 @@ def test_open_periods_keep_their_usage_and_returning_names_add_only_increases(
         session.expire_all()
         state = session.scalar(select(LimitPeriodState).where(LimitPeriodState.limit_id == 1))
         assert state.credits_used == Decimal("52.5")
+    engine.dispose()
+
+
+def test_a_database_at_the_replaced_anchor_revision_reaches_the_ledger(tmp_path: Path) -> None:
+    """f9c1e4b7a2d3 once added usage anchors (never released). A database
+    stamped with it still upgrades: the ledger migration removes that schema."""
+    url = _url(tmp_path)
+    config = alembic_config(url)
+    command.upgrade(config, "f9c1e4b7a2d3")
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        for table in ("usage_anchor", "usage_name_state"):
+            connection.execute(text(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)"))
+        for table, column, kind in [
+            ("usage_record", "attributed_credits", "NUMERIC(18, 4)"),
+            ("usage_record", "held_reason", "VARCHAR(16)"),
+            ("usage_record", "held_readings", "INTEGER"),
+            ("usage_record", "held_since", "TIMESTAMP"),
+            ("limit_period_state", "baseline_names", "TEXT"),
+            ("unresolved_subject", "automation_noticed_at", "TIMESTAMP"),
+        ]:
+            connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {kind}"))
+    command.upgrade(config, "head")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert not {"usage_anchor", "usage_name_state"} & tables
+    assert "usage_delta" in tables
+    record_columns = {c["name"] for c in inspector.get_columns("usage_record")}
+    assert not {"attributed_credits", "held_reason", "held_readings", "held_since"} & record_columns
+    assert "baseline_names" not in {c["name"] for c in inspector.get_columns("limit_period_state")}
+    assert "automation_noticed_at" in {
+        c["name"] for c in inspector.get_columns("unresolved_subject")
+    }
+    with engine.begin() as connection:
+        version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+    assert version == "b3e8d1f6a9c4"
+    # And back down the whole chain, and up again.
+    command.downgrade(config, BEFORE)
+    command.upgrade(config, "head")
     engine.dispose()

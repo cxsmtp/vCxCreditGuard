@@ -199,6 +199,7 @@ def test_correcting_an_automatic_match_moves_only_what_comes_after(
     db: Session,
     connected,  # noqa: F811
     admin_client: TestClient,
+    monkeypatch,
 ) -> None:
     from datetime import timedelta
 
@@ -224,8 +225,16 @@ def test_correcting_an_automatic_match_moves_only_what_comes_after(
     next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=2)
     evaluation.evaluate_all(db, now=next_month)
     db.commit()
+    # Restated for the ledger (sixth review): usage counts towards the period
+    # it is read in, so the new period needs a reading of its own first (the
+    # interval from last month's last reading spans the rollover).
+    clock = [next_month]
+    monkeypatch.setattr(ingestion, "utcnow", lambda: clock[0])
+    ingestion.ingest_usage(db, connection_client(db))
+    db.commit()
     tenant.set_user_credits(name="Dave Dawson", email="dave.dawson@example.com", credits=15)
     tenant.set_user_credits(name="cx-dave-dawson", credits=43)
+    clock[0] += timedelta(minutes=30)
     ingestion.ingest_usage(db, connection_client(db))
     db.commit()
     evaluation.evaluate_all(db, now=next_month + timedelta(hours=1))
@@ -247,6 +256,7 @@ def test_correcting_an_automatic_match_moves_only_what_comes_after(
     evaluation.evaluate_all(db, now=next_month + timedelta(hours=3))
     db.commit()
     tenant.set_user_credits(name="cx-dave-dawson", credits=50)
+    clock[0] += timedelta(minutes=30)
     ingestion.ingest_usage(db, connection_client(db))
     db.commit()
     evaluation.evaluate_all(db, now=next_month + timedelta(hours=4))
