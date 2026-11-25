@@ -87,6 +87,34 @@ def isolated_environment(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Iter
     reset_settings_cache()
 
 
+# Test modules written for the credit activity log as the usage source (the
+# default of a fresh install). Every other test was written for the
+# consumption summary and its old enforcement, which a fresh install no
+# longer has by default: they run with the usage source at "summary" and
+# restrictions from summary totals allowed, which is exactly that behaviour
+# (app/services/evaluation.py ``summary_hold``).
+ACTIVITY_DEFAULT_MODULES = (
+    "test_activity_source",
+    "test_activity_properties",
+    "test_review_activity_attacks",
+    "test_summary_hold",
+)
+
+
+@pytest.fixture(autouse=True)
+def legacy_usage_source(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import settings_store
+
+    if request.module.__name__.rsplit(".", 1)[-1] in ACTIVITY_DEFAULT_MODULES:
+        return
+    monkeypatch.setitem(
+        settings_store.DEFAULTS,
+        settings_store.KEY_USAGE_SOURCE,
+        settings_store.USAGE_SOURCE_SUMMARY,
+    )
+    monkeypatch.setitem(settings_store.DEFAULTS, settings_store.KEY_SUMMARY_RESTRICTS, True)
+
+
 @pytest.fixture
 def db() -> Iterator[Session]:
     session = db_session.get_session_factory()()
