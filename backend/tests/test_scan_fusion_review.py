@@ -51,7 +51,7 @@ from app.services.audit import AuditActor
 from tests.conftest import ADMIN_PASSWORD, make_api_key, postgres_only, sqlite_only
 from tests.test_cycle_transactions import _enforced_user_limit, _watch_for_write_locks
 from tests.test_cycle_transactions import tenant as tenant  # noqa: F401 - fixture
-from tests.test_resilience import AUGUST, PERIOD, _restricted, harsh_limit, synced
+from tests.test_resilience import AUGUST, PERIOD, _restricted, alice_limit, synced
 from tests.test_scan_fusion_findings import (
     _ctx,
     _in_threads,
@@ -308,12 +308,12 @@ def test_approving_a_request_lifts_without_a_write_lock(db: Session, tenant: Any
     assert cycle.run_cycle(trigger="manual", force_org_sync=True).status == RunStatus.SUCCESS
     _enforced_user_limit(db, credit_limit=1)
     cycle.run_cycle(trigger="manual")
-    tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+    tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
     cycle.run_cycle(trigger="manual")
     request = requests_service.create_request(
         db,
         data=requests_service.RequestInput(
-            entity_type=EntityType.USER, entity_id="user-harsh", requested_limit=100000
+            entity_type=EntityType.USER, entity_id="user-alice", requested_limit=100000
         ),
         actor=ACTOR,
     )
@@ -833,7 +833,7 @@ def _body(db: Session, title_like: str) -> str:
 class TestCheckmarxErrorsAreRedacted:
     def test_could_not_restrict(self, db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
         _tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         _refusing(client, monkeypatch, "DELETE", "role-mappings")
         outcome = enforcement.apply_enforcement(
             db, client, limit=limit, period_key=PERIOD, actor=ACTOR

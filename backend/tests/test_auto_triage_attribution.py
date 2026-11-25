@@ -530,7 +530,7 @@ class TestFailuresAndCaps:
         turn_on(db)
         run(force=True)
         set_project(tenant, "proj-api", "payments/api", 14)
-        scan(tenant, "scan-h1", HARSH)
+        scan(tenant, "scan-h1", ALICE)
         monkeypatch.setattr(auto_triage_attribution, "_observe", refuse)
         result = run()
 
