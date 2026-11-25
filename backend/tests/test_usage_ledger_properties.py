@@ -1,4 +1,4 @@
-"""Property tests for the usage ledger (fifth and sixth reviews of realfix).
+"""Property tests for the usage ledger (fifth to seventh reviews of realfix).
 
 Random sequences over a small synthetic tenant, on a clock the test controls:
 spending; mapping and unmapping; renames in either order; deletions and
@@ -8,7 +8,10 @@ their own appearing and leaving; demo mode on and off; plain, late-read and
 skipped-evaluation rollovers; the lookback window rolling past old usage; a
 change of lookback window; short org listings; names missing from a reading;
 page drift serving a row twice; a dip in a doubted reading and its recovery;
-budgets switched to counting existing usage and back. Every step runs an org
+budgets switched to counting existing usage and back; a project renamed back
+to a name it had; and all usage ageing out of the lookback window (the clock
+jumps past it, every name leaves the feed, and names come back with new
+usage only). Every step runs an org
 sync and a reading, and (unless the step skips it) an evaluation.
 
 The oracle follows each reading: an increase counts towards the period the
@@ -22,9 +25,12 @@ after every evaluation, for every budget and every period with a state:
   increase, or because the name is truly that project's), or of its own row;
 * I2: usage is never less than the new usage, observed in that period, of the
   names that counted towards one of its entities in both readings around the
-  increase (or of its own row present in both), less what is documented as
-  lost (a name moving, appearing or missing, a roll-down, a doubted reading, a
-  change of lookback window, an interval spanning a rollover).
+  increase (or of its own row present in both), and of a name back from a
+  gap of one reading towards the same entity when nothing else could be taken
+  for its rename (no other name of that entity remembered, none other left
+  within the window), less what is documented as lost (a name moving or
+  appearing, a roll-down, a doubted reading, a change of lookback window, an
+  interval spanning a rollover).
 
 And a retried or failed reading never counts anything twice.
 
@@ -95,6 +101,8 @@ OPS = [
     "group_row",
     "app_row",
     "existing",
+    *["rename_back"] * 2,
+    "age_out",
 ]
 
 
@@ -133,10 +141,16 @@ class _World:
         self.group_grew = 0
         self.app_grew = 0
         self.after_late = False
+        # Names that left the feed when all their usage aged out.
+        self.aged: set[str] = set()
         # Names the feed moved this step (old, new): their pending usage moves.
         self.moves: list[tuple[str, str]] = []
         self.skip_evaluation = False
         self.existing = False
+        # Names back from a gap of one reading this step.
+        self.gap_back: set[str] = set()
+        # Names whose total ever fell (a roll-down, or ageing out).
+        self.ever_fell: set[str] = set()
 
     def set(self, name: str, total: int) -> None:
         self.totals[name] = total
@@ -224,6 +238,7 @@ def _step(world: _World, db: Session, client: TestClient, mp: pytest.MonkeyPatch
         # The reading after a late one is taken in the next month.
         world.after_late = False
         world.clock = _month_end(world.clock) + timedelta(minutes=10)
+    world.gap_back = set()
     if world.gap is not None:
         name, total = world.gap
         world.gap = None
@@ -232,9 +247,22 @@ def _step(world: _World, db: Session, client: TestClient, mp: pytest.MonkeyPatch
             amount = rng.randint(0, 40)
             world.spend(name, amount)
             increase[name] += amount
+            world.gap_back.add(name)
     op = world.op = rng.choice(OPS)
     names = sorted(world.totals)
+    if len(names) < 2:
+        op = world.op = "spend"  # everything aged out: names come back first
     if op == "spend":
+        # Names that left the feed when their usage aged out come back with
+        # new usage only.
+        aged = [n for n in world.aged if n not in world.totals]
+        if aged and (len(names) < 2 or rng.random() < 0.5):
+            name = rng.choice(aged)
+            amount = rng.randint(1, 40)
+            world.aged.discard(name)
+            world.set(name, 0)
+            world.spend(name, amount)
+            increase[name] += amount
         for name in rng.sample(names, k=min(len(names), rng.randint(1, 3))):
             amount = rng.randint(1, 40)
             world.spend(name, amount)
@@ -319,6 +347,47 @@ def _step(world: _World, db: Session, client: TestClient, mp: pytest.MonkeyPatch
         name = rng.choice(names)
         world.set(name, max(0, world.totals[name] - rng.randint(1, 60)))
         rolled.add(name)
+        world.ever_fell.add(name)
+    elif op == "rename_back":
+        # A project renamed back to its original name, feed and sync together.
+        for project_id in rng.sample(list(PROJECTS), k=len(PROJECTS)):
+            project = world.project(project_id)
+            original = PROJECTS[project_id]
+            if (
+                project is not None
+                and project["name"] != original
+                and project["name"] in world.totals
+                and original not in world.totals
+                and project_id not in world.pending_rename
+                and f"feed:{project_id}" not in world.pending_rename
+            ):
+                current = project["name"]
+                total = world.totals[current]
+                world.owner[original] = project_id
+                world.moves.append((current, original))
+                world.drop(current)
+                world.set(original, total)
+                project["name"] = original
+                break
+    elif op == "age_out" and world.gap is None:
+        # Past the lookback window: every name's usage has aged out, so the
+        # feed lists none of them until they are used again.
+        days = 366 if world.period == "last_year" else 91
+        world.clock += timedelta(days=days)
+        for name in list(world.totals):
+            world.drop(name)
+            world.aged.add(name)
+            world.ever_fell.add(name)
+        world.pending_rename = {}
+        for kind in ("group", "app"):
+            if getattr(world, f"{kind}_row") is not None:
+                setattr(world, f"{kind}_row", None)
+                world._set_row(
+                    "group" if kind == "group" else "application",
+                    "Payments",
+                    "grp-payments" if kind == "group" else "app-payments",
+                    None,
+                )
     elif op == "lookback":
         world.period = "last_90_days" if world.period == "last_year" else "last_year"
     elif op == "short":
@@ -482,6 +551,9 @@ def test_random_sequences_keep_both_invariants(
     # Large totals, so that a roll-down is never a collapse the feed is doubted for.
     for name in [*PROJECTS.values(), *POOL]:
         world.set(name, 1000 + rng.randint(0, 500))
+    # A name in constant use, whose usage never ages out: the feed never
+    # collapses when everything else does.
+    tenant.set_entity_credits(view="project", name="example-org/filler", credits=200000)
     connected(tenant)
     _cycle(db, world, admin_client)
     budgets = {
@@ -497,11 +569,17 @@ def test_random_sequences_keep_both_invariants(
     lower: dict[tuple[str, str], int] = defaultdict(int)
     upper: dict[tuple[str, str], int] = defaultdict(int)
     last = _Reading(db, "project")
+    last2: _Reading | None = None
+    # When each name was last seen leaving the feed, and what it counted
+    # towards when last read.
+    left_at: dict[str, datetime] = {}
+    last_entity: dict[str, str | None] = dict(last.rows)
     last_group, last_app = _Reading(db, "group"), _Reading(db, "application")
     last_feeds = _feeds(db)
     increases: dict[str, int] = defaultdict(int)
     rolled: set[str] = set()
     history: list[str] = []
+    totals_periods: set[str | None] = set()
     for _ in range(STEPS):
         with pytest.MonkeyPatch.context() as mp:
             change = _step(world, db, admin_client, mp, budgets)
@@ -518,12 +596,16 @@ def test_random_sequences_keep_both_invariants(
                     rolled.add(new)
             group_grew, app_grew = world.group_grew, world.app_grew
             read = _cycle(db, world, admin_client)
+            if world.existing and not world.skip_evaluation:
+                # Evaluated from reported totals: that period is not the
+                # ledger's (and a closed period is never rewritten later).
+                totals_periods.add(_month(world.clock))
         if not read:
             continue
         world.group_grew = world.app_grew = 0
         now = _Reading(db, "project")
         group, app = _Reading(db, "group"), _Reading(db, "application")
-        assert now.id != last.id, history
+        assert now.id != last.id, "\n".join(history)
         history.append(f"  reading {now.rows}")
         feeds = _feeds(db)
         period = _month(now.at)
@@ -558,10 +640,41 @@ def test_random_sequences_keep_both_invariants(
                     and name not in rolled
                 ):
                     lower[key] += amount
+                elif (
+                    name in world.gap_back
+                    and last2 is not None
+                    and name in last2.rows
+                    and name not in last.rows
+                    and _month(last2.at) == period
+                    and last2.period == now.period
+                    and last2.rows[name] == after
+                    and after in projects
+                    and name not in world.ever_fell
+                    and set(last2.rows) - {name} <= set(last.rows)
+                    and set(last.rows) <= set(now.rows)
+                    and not any(
+                        other != name
+                        and other not in now.rows
+                        and (
+                            last_entity.get(other) == after or (now.at - when) <= timedelta(hours=2)
+                        )
+                        for other, when in left_at.items()
+                    )
+                ):
+                    # Back from one missing reading, nothing else it could be
+                    # a rename of: it counts what it added while away.
+                    lower[key] += amount
         # What a name absent from this reading (or reported lower than it is)
         # added is still to be observed.
         increases = defaultdict(int, {n: a for n, a in increases.items() if n not in seen})
         rolled = {n for n in rolled if n not in seen}
+        for name in last.rows:
+            if name not in now.rows:
+                left_at[name] = now.at
+        for name in now.rows:
+            left_at.pop(name, None)
+        last_entity.update(now.rows)
+        last2 = last
         last, last_group, last_app, last_feeds = now, group, app, feeds
         if world.skip_evaluation:
             continue
@@ -572,6 +685,8 @@ def test_random_sequences_keep_both_invariants(
             for state in db.scalars(
                 select(LimitPeriodState).where(LimitPeriodState.limit_id == limit.id)
             ):
+                if budget == "proj-web" and state.period_key in totals_periods:
+                    continue
                 key = (state.period_key, budget)
                 used = state.credits_used
                 assert lower[key] <= used <= upper[key], (

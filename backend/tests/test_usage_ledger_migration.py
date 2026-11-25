@@ -179,8 +179,71 @@ def test_a_database_at_the_replaced_anchor_revision_reaches_the_ledger(tmp_path:
     }
     with engine.begin() as connection:
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert version == "b3e8d1f6a9c4"
+    assert version == "e2a7c4f9b1d8"
     # And back down the whole chain, and up again.
     command.downgrade(config, BEFORE)
     command.upgrade(config, "head")
+    engine.dispose()
+
+
+def test_a_count_existing_budget_gets_its_period_increase_as_a_counter(tmp_path: Path) -> None:
+    """e2a7c4f9b1d8: the open period of a budget that counts existing usage is
+    seeded with what its entity's names grew by since the period's first
+    reading (a name that came to count meanwhile brings no history)."""
+    url = _url(tmp_path)
+    config = alembic_config(url)
+    command.upgrade(config, "b3e8d1f6a9c4")
+    now = utcnow()
+    window = current_window(
+        SimpleNamespace(period_type="monthly", custom_period_start=None, custom_period_end=None),
+        now,
+    )
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO credit_limit (id, entity_type, entity_id, credit_limit, period_type, "
+                "warning_threshold_pct, enforce, is_active, include_member_usage, "
+                "count_existing_usage, hold_until_released, created_at, updated_at) VALUES "
+                "(7, 'project', 'proj-1', 1000, 'monthly', 80, :no, :yes, :no, :yes, :no, "
+                ":now, :now)"
+            ),
+            {"no": False, "yes": True, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO limit_period_state (limit_id, period_key, period_start, period_end, "
+                "credits_used, baseline_credits, reported_total, baseline_at, usage_available, "
+                "status) VALUES (7, :k, :s, :e, 630, 0, 630, :now, :yes, 'ok')"
+            ),
+            {"k": window.key, "s": window.start, "e": window.end, "now": now, "yes": True},
+        )
+        ids = []
+        for at in (window.start + timedelta(minutes=5), now - timedelta(minutes=5)):
+            ids.append(
+                connection.execute(
+                    text(
+                        "INSERT INTO usage_snapshot (collected_at, view_by, period_param, "
+                        "total_credits, pages_fetched) VALUES (:at, 'project', 'last_year', 0, 1) "
+                        "RETURNING id"
+                    ),
+                    {"at": at},
+                ).scalar_one()
+            )
+        for snapshot, key, credits in [
+            (ids[0], "payments/web", 100),
+            (ids[1], "payments/web", 130),
+            (ids[1], "example-org/mapped-later", 500),
+        ]:
+            connection.execute(
+                text(
+                    "INSERT INTO usage_record (snapshot_id, view_by, subject_key, entity_type, "
+                    "entity_id, credits_used) VALUES (:s, 'project', :k, 'project', 'proj-1', :c)"
+                ),
+                {"s": snapshot, "k": key, "c": credits},
+            )
+    command.upgrade(config, "head")
+    with Session(engine) as session:
+        counter = session.scalar(select(BudgetUsage).where(BudgetUsage.limit_id == 7))
+        assert counter is not None and counter.credits == Decimal("30")
     engine.dispose()
