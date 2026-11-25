@@ -1,7 +1,7 @@
 """New installs start watching only, behind the readiness checklist
 
 Revision ID: b3e7f1a9c2d5
-Revises: a8d4f2c6e9b3
+Revises: d5b1e8a3c7f2
 Create Date: 2026-11-25
 
 A data migration. On an empty database (a new install: no app user, no
@@ -23,7 +23,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "b3e7f1a9c2d5"
-down_revision = "a8d4f2c6e9b3"
+down_revision = "d5b1e8a3c7f2"
 branch_labels = None
 depends_on = None
 
