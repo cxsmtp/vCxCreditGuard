@@ -49,6 +49,7 @@ const FEATURES: FeatureGroup[] = [
       "A pause switch stops new restrictions at once; warnings and giving access back carry on.",
       "Protected roles (ast-admin and iam-admin by default) are never restricted.",
       "A sudden fall in reported usage is held, not believed, until later readings confirm it.",
+      "Enforcement self-test: restricts a chosen user or project for real through the budget-breach code, reads it back (saying when a role kept through a group or composite means it cannot bite), restores it and checks every setting reads exactly as before. Refuses anything restricted, near a budget, protected or mid-scan; the restore always runs.",
     ],
   },
   {

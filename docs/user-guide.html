@@ -349,6 +349,7 @@
           <li>A pause switch stops new restrictions at once; warnings and giving access back carry on.</li>
           <li>Protected roles (<code>ast-admin</code> and <code>iam-admin</code> by default) are never restricted.</li>
           <li>A sudden fall in reported usage is held, not believed, until later readings confirm it.</li>
+          <li>Enforcement self-test: restricts a chosen user or project for real, reads it back, restores it and checks every setting reads exactly as before.</li>
         </ul></div>
         <div class="fcard"><h4>Watch and alert</h4><ul>
           <li>Reads each restriction back and puts it back if someone undid it in Checkmarx One.</li>
@@ -619,6 +620,9 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
         <span class="ico">↺</span>
         <div><span class="h">Everything is reversible.</span><p style="margin-top:0.2rem;">Before any change, the exact prior state is snapshotted onto the enforcement record — which roles the user held, the project's Auto Triage config, the prior severity list. <strong>Restore access</strong> replays that snapshot. A feature that was already off beforehand stays off on restore.</p></div>
       </div>
+      <h3>Proving it works: the enforcement self-test</h3>
+      <p>Settings → Enforcement → <strong>Enforcement self-test</strong> (admins only). Pick a user, a project or both, press <em>Check what it would change</em>, read exactly what will change and for how long (usually a few seconds), type each target's name and run it. For each target it reads the current state (a user's direct and effective roles; a project's Auto Triage, PR triage and remediation and Fusion settings), applies the restriction through the same code a budget breach uses, reads it back (and says when a user keeps an AI role through a group or a composite role, so a user budget cannot bite), restores it from its snapshot through the Restore path, and reads it back again: every setting must read exactly as before (roles in any order, but a role someone granted meanwhile is a difference). The result shows a before / restricted / restored diff per setting, pass or fail per step, and timings; the last 20 are kept and Diagnose shows the last one.</p>
+      <p>It refuses a target that is restricted now, is covered by a budget near its limit, is exempt, holds a protected role or is the API key's own account, and a project with a running scan, and says why. The restore always runs, whatever a check found. If the restore fails, the target stays a tracked restriction: you get a critical notification with <strong>Restore</strong> on it and the exact snapshot, and the next cycle retries the restore. Only one self-test runs at a time, and a cycle working on the same target waits for it. Everything is in the audit log. With enforcement paused or every budget on monitor only it still runs, and says budgets will not restrict anyone until enforcement is on. In demo mode it runs against a built-in demo tenant with made-up data, and says so.</p>
     </section>
 
     <!-- VIOLATIONS -->
@@ -718,7 +722,7 @@ podman compose -f docker-compose.yml logs -f app</code></pre>
         <li>Let it run for at least one full budget period. Are the figures what you expect? Is anyone showing as disputed or unmatched?</li>
         <li>Fix attribution first — an unmatched user is a budget that silently undercounts.</li>
         <li>Add exemptions for break-glass accounts and must-never-restrict projects.</li>
-        <li>Switch <strong>one</strong> limit to enforce, on an entity you control, and verify both the restriction and the restore end to end.</li>
+        <li>Run the <strong>enforcement self-test</strong> (Settings → Enforcement) on a user and a project you control. Then switch <strong>one</strong> limit to enforce, on an entity you control, and verify both the restriction and the restore end to end.</li>
         <li>Only then widen, using bulk edit.</li>
       </ol>
 

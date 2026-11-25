@@ -1057,3 +1057,117 @@ export interface ViolationList {
   /** Open violations to follow up (information rows are never counted). */
   open: number;
 }
+
+/* ------------------------------------------------ enforcement self-test */
+
+export type SelfTestStatus =
+  | "running"
+  | "passed"
+  | "warning"
+  | "failed"
+  | "restore_failed"
+  | "interrupted";
+
+export type SelfTestProjectAction = "auto_triage" | "pr_remediation" | "fusion";
+
+export interface SelfTestRefusal {
+  target_type: "user" | "project" | null;
+  target_id: string | null;
+  label: string | null;
+  code: string;
+  reason: string;
+}
+
+/** POST /api/settings/selftest/check: what a self-test would change, or why not. */
+export interface SelfTestPlan {
+  allowed: boolean;
+  busy: boolean;
+  demo: boolean;
+  targets: {
+    target_type: "user" | "project";
+    target_id: string;
+    label: string;
+    kinds: string[];
+    changes: string[];
+  }[];
+  refusals: SelfTestRefusal[];
+  warnings: string[];
+  notes: string[];
+  duration: string;
+}
+
+export interface SelfTestStep {
+  step: string;
+  label: string;
+  ok: boolean;
+  ms: number;
+  detail: string;
+}
+
+export interface SelfTestSettingRow {
+  setting: string;
+  before: unknown;
+  restricted: unknown;
+  restored: unknown;
+  changed: boolean;
+  restored_equal: boolean;
+  owned_by: string | null;
+  informational: boolean;
+}
+
+export interface SelfTestTargetReport {
+  target_type: "user" | "project";
+  target_id: string;
+  label: string;
+  status: SelfTestStatus;
+  summary: string;
+  ms: number;
+  kinds: { kind: string; outcome: string; detail: string; action_id?: number | null }[];
+  steps: SelfTestStep[];
+  settings: SelfTestSettingRow[];
+  cannot_bite: { role: string; via: string[] }[];
+  warnings: string[];
+  failures: string[];
+  restore: {
+    ok: boolean | null;
+    held: number[];
+    detail?: string;
+    actions: {
+      action_id: number;
+      kind: string;
+      needed: boolean;
+      restored: boolean;
+      detail: string;
+      held?: boolean;
+      snapshot?: Record<string, unknown>;
+    }[];
+  };
+}
+
+export interface SelfTestResult {
+  id: number;
+  started_at: string;
+  finished_at: string | null;
+  status: SelfTestStatus;
+  actor_name: string | null;
+  demo: boolean;
+  user_id: string | null;
+  user_label: string | null;
+  project_id: string | null;
+  project_label: string | null;
+  summary: string | null;
+  result: {
+    notes?: string[];
+    warnings?: string[];
+    targets?: SelfTestTargetReport[];
+  };
+}
+
+/** GET /api/settings/selftest */
+export interface SelfTestListing {
+  running: boolean;
+  demo: boolean;
+  notes: string[];
+  keep: number;
+  results: SelfTestResult[];
+}

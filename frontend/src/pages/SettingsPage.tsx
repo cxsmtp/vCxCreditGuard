@@ -44,6 +44,7 @@ import { LookPicker } from "../components/AppShell";
 import { StatTile } from "../components/StatTile";
 import { UpdatesPanel } from "../components/UpdatesPanel";
 import { CoveragePanel } from "../components/CoveragePanel";
+import { SelfTestPanel } from "../components/SelfTestPanel";
 import { EntityMappingCard } from "../components/EntityMappingCard";
 import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
@@ -722,6 +723,7 @@ export function SettingsPage({
           </Card>
           )}
           {section === "enforcement" && <CoveragePanel isAdmin={isAdmin} />}
+          {section === "enforcement" && <SelfTestPanel isAdmin={isAdmin} />}
           {section === "enforcement" && (
           <div id="enforcement-safety">
             <Card

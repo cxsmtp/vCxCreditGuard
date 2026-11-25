@@ -84,6 +84,12 @@ point links to the section below that explains it.
   restrictions at once; protected roles (`ast-admin`, `iam-admin` by default)
   are never restricted; a sudden fall in reported usage is held until later
   readings confirm it ([Enforcement safety](#enforcement-safety)).
+- Enforcement self-test (Settings → Enforcement, admins only): restricts a
+  chosen user and/or project for real, through the code a budget breach uses,
+  reads it back (and says when a user keeps an AI role through a group or a
+  composite role, so a restriction cannot bite), restores it from its snapshot
+  and checks every setting reads exactly as before, with a per-setting diff and
+  timings ([Enforcement self-test](#enforcement-self-test)).
 
 **Watch and alert**
 
@@ -1179,7 +1185,9 @@ backend/app/
                  evaluation, enforcement, role_sources (where a user's
                  roles come from), violations, usage_mix, limits_service,
                  notifications, settings_store, pacing (per-cycle budgets and
-                 rotation for large tenants), cycle
+                 rotation for large tenants), cycle, enforcement_selftest
+                 (Settings → Enforcement → Run self-test) with demo_tenant
+                 (the in-process tenant it uses in demo mode)
   updates/       in-app updates: GHCR client, release manifest and signature,
                  installed versions, check / install / rollback / auto-update
   scheduler.py   APScheduler wiring, reconfigurable at runtime
@@ -2158,6 +2166,68 @@ failure of this tool is restricting many people at once for a wrong reason.
   it unclear whether the tenant changed (a timeout, a dropped connection), the
   record says so and the next cycle checks the tenant rather than assuming.
 
+### Enforcement self-test
+
+Settings → Enforcement → **Enforcement self-test** (admins only; viewers get a
+403) proves on the live tenant that enforcement really works there. Pick a
+user, a project, or both (and, for a project, which of Auto Triage, PR triage
+and remediation and Fusion to test), press *Check what it would change*, read
+exactly what will be changed and for how long, type each target's name, and
+run it. For each target it:
+
+1. reads the current state: the user's direct client roles and effective roles
+   (with where each AI role comes from), or the project's settings;
+2. applies the restriction **through the same code a budget breach uses**
+   (`enforcement.apply_enforcement`, with a stand-in budget that exists for
+   that run only);
+3. reads it back and checks the roles are gone or the settings are off, and
+   for a user reports any AI role still held through a group or a composite
+   role: a restriction that cannot bite;
+4. restores it from the undo snapshot **through the Restore path**;
+5. reads it back again and compares with step 1, setting by setting. Lists are
+   compared regardless of order (Checkmarx may list roles in another order),
+   but exactly otherwise: a role someone granted meanwhile is a difference.
+   Writing Fusion back pins an inherited value on the project (no per-key
+   delete is known), which is shown as a warning, not a failure.
+
+The result has a before / restricted / restored diff per setting, pass or fail
+per step and the time each took. The last 20 results are kept, and Diagnose
+shows the last one (passed or failed, and when).
+
+Safety:
+
+- **Refusals.** A target that is restricted now (or may be, after an
+  unconfirmed write), covered by an active budget that has reached its warning
+  threshold (or is warned, breached or restricted this period), exempt, holding
+  a protected role, or the account the API key belongs to is refused, and so
+  is a project with a scan running or queued (if the scan list cannot be read,
+  that is a warning). The reasons are shown; nothing is changed, and the
+  refusal is audited.
+- **The restore always runs**, in a `finally`, whatever a check found or
+  raised. The restriction is an ordinary enforcement record (no budget, period
+  `selftest-<run>`). If its restore fails, or answers OK but does not read back,
+  it is marked as in doubt (`outcome_unknown`) and stays a tracked
+  restriction: a critical notification with *Restore* on it and the exact
+  snapshot is raised, the result shows the snapshot, and the next cycle lifts
+  it like any restriction whose budget is gone. A target is never left
+  restricted silently.
+- **No database transaction is held across a Checkmarx call**: what is about to
+  be done is committed first, as for every restriction.
+- **One at a time.** A second self-test is refused while one runs, and the
+  self-test holds the target's own lock (the one the cycle takes for each
+  target) from its checks to its last read, so a cycle working on the same
+  target waits for it (and it waits up to 30 seconds for the cycle).
+- **Audited**: start, every step, the restore and the outcome, in the
+  hash-chained audit log, next to the restriction's own entries. The
+  "restricted" and "restored" notifications the restriction code would raise
+  are not sent; the result says it instead.
+- With enforcement paused, or no budget set to enforce, the self-test still
+  runs (you asked for it) and says that budgets will not restrict anyone until
+  enforcement is on. In demo mode it runs against a small built-in demo tenant
+  (made-up data, nothing leaves the process), only on the demo users and
+  projects, and says so; one demo user keeps a Fusion role through a group, to
+  show a restriction that cannot bite.
+
 ### Accounts
 
 Each person's own page (their name, top right) changes their password and sets
@@ -2393,8 +2463,11 @@ person:
 3. Fix attribution first. An unmatched user is a budget that silently undercounts.
 4. Add exemptions for break glass accounts and any project that must never lose AI
    features.
-5. Switch **one** limit to enforce, on an entity you control, and verify the
-   restriction and the restore both work end to end.
+5. Run the **enforcement self-test** (Settings → Enforcement) on a user and a
+   project you control: it restricts them, reads it back, restores them and
+   checks they read exactly as before. Then switch **one** limit to enforce, on
+   an entity you control, and verify the restriction and the restore both work
+   end to end.
 6. Only then widen. Bulk edit can switch many limits at once, and switching them
    back to monitor only lifts every restriction they caused.
 
