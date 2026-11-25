@@ -1310,15 +1310,14 @@ class _UsageReader:
         rise is measured from: the reading pinned at the restriction, or, for
         a name that started to count towards the target later, its anchor
         (None: it had nothing, all of it is new). A name anchored with no
-        record of its actions is left out of both sides: nothing is claimed
-        about it."""
+        record of its actions is compared with its row in the pinned reading,
+        and left out of both sides when that is missing too: nothing is
+        claimed about it."""
         kept: list[UsageRecord] = []
         then: list = []
         for record in now:
             anchor = self.anchored_after(view, record, before)
-            if anchor is not None:
-                if anchor.reference_actions is None and Decimal(anchor.offset_credits or 0) > 0:
-                    continue
+            if anchor is not None and anchor.reference_actions is not None:
                 kept.append(record)
                 then.append(
                     SimpleNamespace(
@@ -1329,8 +1328,14 @@ class _UsageReader:
                 continue
             if (before.id, record.subject_key) not in self._by_key:
                 self.preload_keys(before.id, {record.subject_key})
+            then_row = self._by_key[(before.id, record.subject_key)]
+            if anchor is not None and then_row is None:
+                # Anchored after the restriction with no counts kept (a mapping
+                # from before the upgrade) and missing from the reading pinned
+                # at the restriction: nothing is known to compare with.
+                continue
             kept.append(record)
-            then.append(self._by_key[(before.id, record.subject_key)])
+            then.append(then_row)
         return kept, then
 
 

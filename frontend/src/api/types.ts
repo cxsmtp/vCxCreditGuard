@@ -380,6 +380,9 @@ export interface UnmatchedEntity {
   overridden_by?: string | null;
   /** After a mapping: where the name's usage counts from now on. */
   confirmation?: string | null;
+  /** Keyset paging: the next page starts after this row, from these readings. */
+  cursor?: string | null;
+  readings?: string | null;
 }
 
 /** Whether a user restriction can bite (GET /api/preview/coverage). */

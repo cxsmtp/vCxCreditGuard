@@ -64,8 +64,9 @@ def test_scale(
     mapping = time.perf_counter() - start
     assert r.status_code == 200, r.text
     event.remove(engine, "before_cursor_execute", count)
-    # One statement per row written, plus a handful: no query per name.
+    # One statement per row written (the rows, and once per unmatched name
+    # its state), plus a handful: no query per name.
     for view, _seconds, statements in timings:
         if view == "project":
-            assert statements < (N + 300) + 100, statements
+            assert statements < (N + 2 * 300) + 100, statements
     assert listing < 5 and mapping < 5, (listing, mapping)

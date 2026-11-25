@@ -435,16 +435,15 @@ def test_user_mapping_after_demo_mode_anchors_on_the_live_reading(
     assert _state(db, limit).credits_used == 0
 
 
-def test_a_name_that_starts_to_match_by_itself_counts_in_full(
+def test_a_name_that_starts_to_match_by_itself_is_not_this_periods_usage(
     db: Session,
     connected,  # noqa: F811
 ) -> None:
     """A project renamed in Checkmarx One to a name the feed already reported
-    separately, while unmatched. The third review settled this: a name that
-    counted nowhere and starts to match counts in full (as before realfix), so
-    that a project created and scanned before the next sync is never robbed of
-    its first usage; the two cannot be told apart without ids in the feed.
-    Its old name stays counted where it was (kept, see test_review_realfix3)."""
+    separately, while unmatched. Since the fourth review, an unmatched name
+    counts in full only when its entity was first synced after the name's
+    first unmatched reading (a project created and used before the sync); a
+    project that existed all along counts it from its last total."""
     tenant = live_tenant()
     tenant.set_entity_credits(view="project", name=NAME, credits=870)
     connected(tenant)
@@ -457,8 +456,12 @@ def test_a_name_that_starts_to_match_by_itself_counts_in_full(
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     cycle.run_cycle(trigger="manual")
     state = _state(db, project)
-    assert state.credits_used == 870, (state.credits_used, state.baseline_credits)
-    assert _anchor(db, NAME) is None
+    assert state.credits_used == 0, (state.credits_used, state.baseline_credits)
+    anchor = _anchor(db, NAME)
+    assert anchor.reason == ingestion.ANCHOR_MATCHED and anchor.offset_credits == 870
+    tenant.set_entity_credits(view="project", name=NAME, credits=880)
+    cycle.run_cycle(trigger="manual")
+    assert _state(db, project).credits_used == 10
 
 
 def test_a_new_name_counts_in_full_and_a_rolled_window_re_anchors(

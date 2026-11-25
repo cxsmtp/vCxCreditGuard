@@ -499,8 +499,8 @@ bills the wrong person, decides:
 | Confidence | Outcome |
 | ---------- | ------- |
 | **≥ 85%**, one clear winner | Attributed automatically and written to the audit log. Still overridable. |
-| **≥ 60%**, or an auto-worthy near-tie between two people | Left **uncounted** and raised as a *dispute* with ranked suggestions to confirm on the Settings page. |
-| below 60% | Unmatched, mapped by hand. Automation is told apart: handles with `[bot]`, and integration identities: no email, matching nobody, and a handle with a CI/SCM or build token as a whole part of it (`-bot`, `_bot`, `-ci`, `svc-`, `-svc`, `github-actions` in any case, `gitlab-ci`, `azure-pipelines`, `sonar`, `scanner`, `build`, `buildserver`, `pipeline`, `deploy`, ...), or a lowercase handle that is a product or build word, digits allowed (`jenkins`, `buildserver01`, `gitlab-runner`). Digits, hyphens and underscores alone say nothing, a token never matches inside a word, and words that are also surnames count only in lowercase: "jsmith2", "Jean-Luc", "mary_ann", "jenkinson", "Jenkins", "Runner", "Bob_Builder" (display names), "tokenaga", "Priya" and "张伟" stay people. It stays listed in the *Unmatched* tab, marked *Automation* and mappable, but is not chased as a person: no "could not be matched" notice, and one "new automation identity" notice instead, once per subject ever (`unresolved_subject.automation_noticed_at`; subjects already automation at the upgrade are marked without a notice). |
+| **≥ 60%**, or an auto-worthy near-tie between two people | Left **uncounted** and raised as a *dispute* with ranked suggestions to confirm on the Settings page. A subject that already counted towards a user and becomes disputed (a second person with the same name is synced) keeps counting there, flagged, until an admin resolves it. |
+| below 60% | Unmatched, mapped by hand. Automation is told apart: handles with `[bot]` or a known bot handle (`dependabot`, `renovate`, `snyk-bot`, ...), and integration identities: no email, matching nobody, and a CI phrase in any case (`github-actions`, `GitHub-Actions`, `gitlab-ci`, `azure-pipelines`), an automation token as a whole lowercase part (`-bot`, `_bot`, `-ci`, `svc-`, `-svc`, ...), or, unless the handle is written like a person's name (dotted parts or a Capitalised part: "Paul.Scanner", "lee.sonar", "Mary-Build"), a build word as a whole part (`sonar-scanner`, `build-agent`, `buildserver01`) or a lowercase product or build name (`jenkins`, `gitlab-runner`). Digits, hyphens and underscores alone say nothing, and a token never matches inside a word: "jsmith2", "Jean-Luc", "mary_ann", "jenkinson", "Jenkins", "Runner", "Bob_Builder", "tokenaga", "Priya" and "张伟" stay people. It stays listed in the *Unmatched* tab, marked *Automation* and mappable, but is not chased as a person: no "could not be matched" notice, and one "new automation identity" notice instead, once per subject ever (`unresolved_subject.automation_noticed_at`; subjects already automation at the upgrade are marked without a notice). |
 
 Nothing is ever dropped: every subject lands in `unresolved_subject` with its
 status, and the Settings page groups them into **Disputes**, **Auto-matched** and
@@ -519,75 +519,100 @@ shown as broken and ignored.
 
 **Where a name's usage counts, and from when.** The feed reports cumulative
 totals over its lookback window, by name. Each reading is attributed name by
-name (`ingestion._Anchors`):
+name (`ingestion._Anchors`); the rule is that a name's history never becomes a
+budget period's usage, and a period never loses usage it already counted.
 
-* **A name that counted nowhere and starts to match counts in full.** A project
-  or user created and used between two organisation syncs is unmatched at first;
-  when the sync brings it, its first usage is its own (as before forward-only
-  mapping). This cannot be told apart from an old name that a rename makes match
-  without ids in the feed, so that case counts in full too.
-* **A mapping, or a name that moves from one entity to another, counts forward
-  only.** When an admin maps a name (or a user subject), or a name that counted
-  towards one project starts to match another, the name is *anchored* at the total
-  it had reported (`usage_anchor.offset_credits`, with its per action counts in
-  `reference_actions`), and only what it reports beyond that counts towards the
-  target (`usage_record.attributed_credits`; null means all of it). The anchor is
-  taken once, in the mapping's own transaction, from the latest live reading
-  (never a demo one), under a lock the ingest takes too (a transaction-scoped
-  advisory lock on PostgreSQL, the write lock on SQLite), which neither holds
-  across a call to Checkmarx One. No budget's baseline is ever moved by a mapping,
-  so a mapping cannot race an evaluation or another mapping.
-* **A name that stops matching is kept where it counted.** If the sync learns a
-  rename before the feed does, the old name keeps counting towards its project
-  (`held_reason = "kept"`). If its entity was deleted, it is kept until a second
-  complete sync confirms the deletion, or for `attribution.hold_readings` readings
-  (default 8); then its anchor is released, and re-used unchanged if the entity
-  comes back. A disputed user match is never kept: it is uncounted on purpose.
-* **A name missing from a reading is carried.** A one-off gap in the feed, or a
-  rename the feed reports before the sync, would drop the entity's figure for a
-  reading and its period would lose its usage. The name's previous row is
-  carried (`held_reason = "carried"`) for up to `hold_readings` readings, unless
-  a name started to count towards the same entity from nowhere in that reading
-  (the renamed name took over). A rename therefore keeps the period's usage in
-  either order.
-* **An organisation sync never deletes after a short listing.** A projects or
-  applications listing is read to its reported total (`filteredTotalCount`, else
-  `totalCount`) even when the server caps its pages; without a total, a short page
-  is followed by one more request. A listing that still comes back short (an empty
-  page before the total, a repeated page, the page limit), or an IAM user listing
-  that reports a shortfall, soft-deletes nothing and keeps everyone's group and
-  application links, with a warning. Every complete listing is remembered
-  (`org_sync.complete_listings`), which is what confirms a deletion.
+* **A name keeps counting where it counted.** Towards the same entity as in the
+  last reading, in full or from its anchor. If it now matches nothing, it is
+  *kept* there (`usage_record.held_reason = "kept"`): for as long as the entity
+  exists (a rename the sync learnt before the feed), while a user match is
+  disputed (it keeps counting, flagged, until an admin resolves it; mapping it
+  back to the same user changes nothing), and for a deleted entity until the
+  hold may end. If the feed does not report it at all, its last row is
+  *carried* (`"carried"`) until the hold may end.
+* **A hold ends only on the organisation sync.** Never on readings alone: a
+  complete org sync must have listed the entity's kind since the hold began, a
+  deletion must be confirmed by a second complete listing, and at least
+  `attribution.hold_readings` readings (default 8) must have passed. A rename the
+  feed reports first is therefore carried however long the org refresh is (up to
+  7 days), and the renamed name takes over when the sync brings it.
+* **A mapping, or a move from one entity to another, counts forward only.** The
+  name is *anchored* at the total it had reported (`usage_anchor.offset_credits`,
+  with its per action counts in `reference_actions`), and only what it reports
+  beyond that counts (`usage_record.attributed_credits`; null means all of it).
+  The anchor is taken once, in the mapping's own transaction, from the latest
+  live reading (never a demo one), under a lock the ingest takes too (a
+  transaction-scoped advisory lock on PostgreSQL, the write lock on SQLite), which
+  neither holds across a call to Checkmarx One. No baseline is moved by a
+  mapping, so a mapping cannot race an evaluation or another mapping.
+* **A name that counted nowhere and starts to count** (`usage_name_state` keeps
+  what this needs):
+  - if it counted somewhere before it was released (a confirmed deletion, an
+    ended carry), it is anchored at its total then, wherever it now counts; a
+    total that rolled down meanwhile re-anchors lower. Its history never comes
+    back;
+  - if its entity's old name left the feed as it appeared, it is the renamed
+    name taking over: in full, and the old name stops;
+  - a name the feed never reported before counts in full: all of it is new;
+  - an unmatched name whose entity was first synced after the name's first
+    unmatched reading, within one org refresh plus an hour (a project or user
+    created and used before the sync brought it), counts in full, less any
+    history it had when CreditGuard first saw it (a name in the very first
+    reading may be history);
+  - any other unmatched name (its entity existed all along) counts from its last
+    total. A project renamed onto a name the feed already reported separately
+    falls here.
+* **An organisation sync never deletes after a short listing.** Listings are read
+  to their reported total (`filteredTotalCount`, else `totalCount`), rows told
+  apart by id, even when the server caps its pages; without a total, a short page
+  is followed by one more request. A listing that still comes back short, or an
+  IAM user listing that reports a shortfall, deletes nothing and keeps everyone's
+  group and application links, with a warning. Some servers report a total that
+  counts rows the key cannot see: the same short listing (same ids, same total)
+  three times in a row is then taken as everything the key can see, said once. A
+  repeated page or the page limit never is. Groups come in one IAM call with no
+  count: more than one group and more than a fifth of them missing at once is
+  acted on only when the next sync misses the same groups. Every complete listing
+  is remembered (`org_sync.complete_listings`).
 
 **Unmapping, mapping elsewhere and correcting a match take away only the
-period's usage.** Each budget period records what every name brought into its
-baseline (`limit_period_state.baseline_names`). When a name later stops counting
-towards the budget by an explicit move (an admin unmaps it, maps it elsewhere,
-corrects an automatic user match, or it moves to another entity by itself), or its
-anchor is taken afresh, the budget discounts what that name had brought into its
-baseline. The move then takes away exactly the name's usage within the current
-period: never what it added in earlier periods, and never the budget's own usage.
-The confirmation after a mapping and its audit entry say so. Periods opened
-before this existed behave as before.
+period's usage.** Each budget period records what the names that can move
+brought into it when its baseline was taken (`limit_period_state.baseline_names`:
+anchored, kept and carried names, and every user subject; a project or
+application matched by its own name never moves, so a budget over thousands of
+projects stores next to nothing). A name that stops counting towards the budget
+by an explicit move, or whose anchor is taken afresh while it still counts there,
+has what it brought in discounted, so the move takes away exactly its usage
+within the current period, never its earlier usage and never the budget's own. A
+name moved between two entities that both count towards a budget (two projects of
+a group or application, two members of a group) keeps its old position for that
+budget: nothing is lost or gained there. The confirmation after a mapping and its
+audit entry say so. Periods already open when this version is installed have no
+such record: until they roll over, an unmap there re-baselines as before (a
+backfill from the current reading could over-count, so none is made).
 
 **Limits of what can be known.** If the lookback window rolls past usage from
-before a name's anchor, so that the name reports less than its anchor, the anchor
-moves down to the new total, and whatever the name reported between the last
-reading and this one is not counted: the feed gives no dates. A name that simply
-stops being reported (its usage rolled out of the window) is carried for a few
-readings and then leaves its entity's figure, which re-baselines the period as
-before. *Design change:* budgets that count existing usage (lifetime, custom, or
-*count existing usage*) count everything reported under their own names, but a
-mapped (or moved) name only from the mapping on, like every other budget. Usage
-after a restriction compares each name counting towards the restricted person or
-project with the same name in the reading pinned at the restriction, or, for a
-name mapped or moved later, with the counts kept on its anchor (so thinning old
-readings loses nothing); the action mix in notifications, the Fusion price, and
+before a name's anchor, the anchor moves down to the new total, and whatever the
+name reported between the last reading and this one is not counted: the feed
+gives no dates. A name that leaves the feed because its usage rolled out is
+carried until the hold ends and then leaves its entity's figure, which
+re-baselines the period as before. A name in the very first reading CreditGuard
+took is treated as history wherever it later matches. Carried rows count towards
+budgets but are left out of the lists and sums shown by name (top consumers,
+breakdowns, the unmatched list); project and group figures include them while the
+hold lasts. *Design change:* budgets that count existing usage (lifetime, custom,
+or *count existing usage*) count everything reported under their own names, but a
+mapped or moved name only from then on, like every other budget. Usage after a
+restriction compares each name counting towards the restricted person or project
+with the same name in the reading pinned at the restriction, or, for a name
+mapped or moved later, with the counts kept on its anchor (an anchor from before
+this version, which has none, is compared with the pinned reading, and left out
+if the name is not in it); the action mix in notifications, the Fusion price and
 the Auto Triage credits charged to people who scan count a mapped name's forward
 amounts only. Mappings made before this version keep counting in full (anchored
-at 0, dated when they were mapped). Downgrading the database below this version
-drops every anchor, the forward-only figures and the period name figures: mapped
-names then count in full again.
+at 0, dated when they were mapped). Downgrading below this version drops every
+anchor, the name states, the forward-only figures and the period name figures:
+mapped names then count in full again.
 
 ## What the enforcement actions actually are
 

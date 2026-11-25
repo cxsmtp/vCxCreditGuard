@@ -22,7 +22,7 @@ from app.checkmarx.client import Listing
 from app.models import UnresolvedSubject, UsageAnchor, UsageRecord
 from app.models.enums import EntityType
 from app.models.org import CxApplication, CxProject
-from app.services import cycle, ingestion, org_sync
+from app.services import cycle, ingestion, org_sync, settings_store
 from app.services.subject_matching import is_integration_identity
 from tests.fake_tenant import FakeTenant
 from tests.test_real_tenant_usage import connected, live_tenant  # noqa: F401
@@ -174,6 +174,10 @@ def test_a_confirmed_deletion_releases_the_name_and_a_return_reuses_its_anchor(
     tenant = live_tenant()
     tenant.set_entity_credits(view="project", name=NAME, credits=870)
     connected(tenant)
+    # The hold ends once a complete sync confirmed the deletion and at least
+    # this many readings passed (here: as soon as it is confirmed).
+    settings_store.set_value(db, ingestion.HOLD_READINGS_KEY, 1)
+    db.commit()
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     _map(admin_client, "proj-tools")
     cycle.run_cycle(trigger="manual")
@@ -195,16 +199,9 @@ def test_a_confirmed_deletion_releases_the_name_and_a_return_reuses_its_anchor(
     anchor = db.scalar(select(UsageAnchor).where(UsageAnchor.subject_key == NAME))
     assert anchor.released_at is None
     assert (anchor.offset_credits, anchor.anchored_at) == (offset, anchored_at)
-    own = _own(tenant, "proj-tools")
-    assert ingestion.latest_totals(db, "project")["proj-tools"] == Decimal("30") + own
-
-
-def _own(tenant, project_id: str) -> Decimal:  # type: ignore[no-untyped-def]
-    name = next(p["name"] for p in tenant.projects if p["id"] == project_id)
-    for row in tenant.consumption["project"]:
-        if row["name"] == name:
-            return Decimal(str(row["creditsUsed"]))
-    return Decimal("0")
+    # Only the 30 reported since: the project's own name was released with it
+    # and, like the mapped name, never brings its history back.
+    assert ingestion.latest_totals(db, "project")["proj-tools"] == Decimal("30")
 
 
 # ------------------------------------------- correcting an automatic match
@@ -286,9 +283,12 @@ def _latest(db, limit):  # type: ignore[no-untyped-def]
         "GitHub-Actions",
         "sonar-scanner",
         "buildserver01",
-        "Build-Agent",
+        "build-agent",
         "gitlab-runner",
         "deploy-svc",
+        "dependabot",
+        "renovate",
+        "snyk-bot",
     ],
 )
 def test_build_identities_are_automation(name: str) -> None:
@@ -296,7 +296,20 @@ def test_build_identities_are_automation(name: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["Runner", "Builder", "Bob_Builder", "Mary-Runner", "Sonia", "Jenkins", "jsmith2"]
+    "name",
+    [
+        "Runner",
+        "Builder",
+        "Bob_Builder",
+        "Mary-Runner",
+        "Sonia",
+        "Jenkins",
+        "jsmith2",
+        "Paul.Scanner",
+        "Mary-Build",
+        "lee.sonar",
+        "Build-Agent",
+    ],
 )
 def test_names_like_build_words_stay_people(name: str) -> None:
     assert not is_integration_identity(name, None)

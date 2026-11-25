@@ -23,6 +23,7 @@ from app.models.usage import (
     SchedulerRun,
     UnresolvedSubject,
     UsageRecord,
+    UsageSnapshot,
 )
 from app.schemas.dashboard import (
     ActionBreakdownItem,
@@ -614,11 +615,18 @@ def list_unmatched_entities(
     db: DbSession,
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
     offset: Annotated[int, Query(ge=0)] = 0,
+    after: Annotated[str | None, Query(max_length=1024)] = None,
+    readings: Annotated[str | None, Query(max_length=256)] = None,
 ) -> list[UnmatchedEntityResponse]:
     """Project and application names in the latest readings that match no synced
-    project or application, and every name an admin has mapped. Largest first,
-    one page at a time (``limit``/``offset``), read page by page from the
-    database.
+    project or application, and every name an admin has mapped. Largest first
+    (credits, then dimension, then name), one page at a time, read page by
+    page from the database.
+
+    Pages follow each other by keyset: pass the last row's ``cursor`` as
+    ``after`` and the first page's ``readings`` back, so every page reads the
+    same readings and a cycle that re-ranks the names in between can neither
+    skip nor repeat one. (``offset`` still works, without that guarantee.)
 
     A mapping whose name is not in the latest reading is listed too (with no
     credits) after the names that are. One whose entity has since gone is
@@ -628,15 +636,14 @@ def list_unmatched_entities(
         (row.view_by, row.subject_key): row
         for row in db.scalars(select(EntityMapping).order_by(EntityMapping.id))
     }
-    snapshots = {
-        view: snapshot
-        for view in _ENTITY_VIEWS
-        if (snapshot := ingestion.latest_snapshot(db, view)) is not None
-    }
+    snapshots = _pinned_readings(db, readings)
+    pinned = ",".join(f"{view}:{snapshot.id}" for view, snapshot in sorted(snapshots.items()))
     listed = or_(
         *(
             and_(
                 UsageRecord.snapshot_id == snapshot.id,
+                # A carried row is no name the feed reported this time.
+                UsageRecord.held_reason.is_distinct_from(ingestion.HELD_CARRIED),
                 or_(
                     UsageRecord.entity_id.is_(None),
                     UsageRecord.subject_key.in_(
@@ -648,28 +655,45 @@ def list_unmatched_entities(
         ),
         false(),
     )
-    total_listed = db.scalar(select(func.count()).select_from(UsageRecord).where(listed)) or 0
-    records = list(
-        db.scalars(
-            select(UsageRecord)
-            .where(listed)
-            .order_by(UsageRecord.credits_used.desc(), UsageRecord.view_by, UsageRecord.subject_key)
-            .offset(offset)
-            .limit(limit)
+    segment, position = _parse_cursor(after)
+    rows: list[UnmatchedEntityResponse] = []
+    if segment != "m":
+        query = select(UsageRecord).where(listed)
+        if segment == "r" and position is not None:
+            credits, view, key = position
+            query = query.where(
+                or_(
+                    UsageRecord.credits_used < credits,
+                    and_(
+                        UsageRecord.credits_used == credits,
+                        or_(
+                            UsageRecord.view_by > view,
+                            and_(UsageRecord.view_by == view, UsageRecord.subject_key > key),
+                        ),
+                    ),
+                )
+            )
+        elif after is None:
+            query = query.offset(offset)
+        records = list(
+            db.scalars(
+                query.order_by(
+                    UsageRecord.credits_used.desc(), UsageRecord.view_by, UsageRecord.subject_key
+                ).limit(limit)
+            )
         )
-    )
-    rows = [
-        _entity_row(
-            db,
-            record.view_by,
-            record.subject_key,
-            record.subject_name or record.subject_key,
-            record.credits_used,
-            mappings.get((record.view_by, record.subject_key)),
-            record,
-        )
-        for record in records
-    ]
+        for record in records:
+            row = _entity_row(
+                db,
+                record.view_by,
+                record.subject_key,
+                record.subject_name or record.subject_key,
+                record.credits_used,
+                mappings.get((record.view_by, record.subject_key)),
+                record,
+            )
+            row.cursor = f"r:{record.credits_used}:{record.view_by}:{record.subject_key}"
+            rows.append(row)
     if len(rows) < limit:
         # Mappings of names not in the latest reading, after every listed name.
         mapped_keys = sorted({key for (_view, key) in mappings})
@@ -679,6 +703,7 @@ def list_unmatched_entities(
                 select(UsageRecord.view_by, UsageRecord.subject_key).where(
                     UsageRecord.snapshot_id.in_([s.id for s in snapshots.values()] or [-1]),
                     UsageRecord.subject_key.in_(mapped_keys or [""]),
+                    UsageRecord.held_reason.is_distinct_from(ingestion.HELD_CARRIED),
                 )
             )
         }
@@ -686,10 +711,56 @@ def list_unmatched_entities(
             (key for key in mappings if key not in seen and key[0] in _ENTITY_VIEWS),
             key=lambda key: (key[0], key[1]),
         )
-        start = max(0, offset - total_listed)
-        for view, key in absent[start : start + limit - len(rows)]:
-            rows.append(_entity_row(db, view, key, key, Decimal("0"), mappings[(view, key)], None))
+        if segment == "m" and position is not None:
+            absent = [key for key in absent if key > (position[1], position[2])]
+        elif after is None:
+            total_listed = (
+                db.scalar(select(func.count()).select_from(UsageRecord).where(listed)) or 0
+            )
+            absent = absent[max(0, offset - total_listed) :]
+        for view, key in absent[: limit - len(rows)]:
+            row = _entity_row(db, view, key, key, Decimal("0"), mappings[(view, key)], None)
+            row.cursor = f"m::{view}:{key}"
+            rows.append(row)
+    for row in rows:
+        row.readings = pinned
     return rows
+
+
+def _pinned_readings(db, readings: str | None) -> dict:  # type: ignore[no-untyped-def]
+    """The readings a page is read from: those the first page used, when they
+    are still there, else the latest."""
+    pinned: dict[str, int] = {}
+    for part in (readings or "").split(","):
+        view, _, snapshot_id = part.partition(":")
+        if view in _ENTITY_VIEWS and snapshot_id.isdigit():
+            pinned[view] = int(snapshot_id)
+    found = {}
+    for view in _ENTITY_VIEWS:
+        snapshot = db.get(UsageSnapshot, pinned[view]) if view in pinned else None
+        if snapshot is None or snapshot.view_by != view or snapshot.held_reason is not None:
+            snapshot = ingestion.latest_snapshot(db, view)
+        if snapshot is not None:
+            found[view] = snapshot
+    return found
+
+
+def _parse_cursor(after: str | None) -> tuple[str | None, tuple | None]:
+    """("r", (credits, view, name)) after a listed name, ("m", (None, view,
+    name)) after a mapping not in the reading, (None, None) for none."""
+    if not after:
+        return None, None
+    segment, _, rest = after.partition(":")
+    credits, _, rest = rest.partition(":")
+    view, _, key = rest.partition(":")
+    if segment == "r":
+        try:
+            return "r", (Decimal(credits), view, key)
+        except (ArithmeticError, ValueError):
+            return None, None
+    if segment == "m":
+        return "m", (None, view, key)
+    return None, None
 
 
 def _entity_row(db, view, key, name, credits, mapping, record) -> UnmatchedEntityResponse:  # type: ignore[no-untyped-def]

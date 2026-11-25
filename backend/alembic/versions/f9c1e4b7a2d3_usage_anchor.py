@@ -12,6 +12,8 @@ Create Date: 2026-11-24
   its entity (null: all of it).
 * ``usage_record.held_reason``/``held_readings`` - a name kept on the entity
   it counted towards while it briefly does not match it (or is missing).
+* ``usage_name_state`` - since when a name has counted nowhere, and where it
+  last counted (see the model).
 * ``limit_period_state.baseline_names`` - what each name counted towards a
   budget when its baseline was taken.
 * ``unresolved_subject.automation_noticed_at`` - the "new automation identity"
@@ -87,6 +89,21 @@ def upgrade() -> None:
         sa.Column("removed_at", sa.DateTime(timezone=True), nullable=True),
         sa.UniqueConstraint("view_by", "subject_key", name="usage_anchor_subject"),
     )
+    if "usage_name_state" in sa.inspect(bind).get_table_names():
+        op.drop_table("usage_name_state")
+    op.create_table(
+        "usage_name_state",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("view_by", sa.String(16), nullable=False),
+        sa.Column("subject_key", sa.String(320), nullable=False),
+        sa.Column("first_unmatched_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("first_unmatched_credits", sa.Numeric(18, 4), nullable=True),
+        sa.Column("first_seen_new", sa.Boolean(), nullable=False, server_default=sa.false()),
+        sa.Column("last_entity_id", sa.String(64), nullable=True),
+        sa.Column("last_credits", sa.Numeric(18, 4), nullable=True),
+        sa.Column("left_at", sa.DateTime(timezone=True), nullable=True),
+        sa.UniqueConstraint("view_by", "subject_key", name="usage_name_state_subject"),
+    )
     record_columns = _columns(bind, "usage_record")
     with op.batch_alter_table("usage_record") as batch:
         if "attributed_credits" not in record_columns:
@@ -95,6 +112,8 @@ def upgrade() -> None:
             batch.add_column(sa.Column("held_reason", sa.String(16), nullable=True))
         if "held_readings" not in record_columns:
             batch.add_column(sa.Column("held_readings", sa.Integer(), nullable=True))
+        if "held_since" not in record_columns:
+            batch.add_column(sa.Column("held_since", sa.DateTime(timezone=True), nullable=True))
     if "baseline_names" not in _columns(bind, "limit_period_state"):
         with op.batch_alter_table("limit_period_state") as batch:
             batch.add_column(sa.Column("baseline_names", sa.JSON(), nullable=True))
@@ -167,7 +186,9 @@ def downgrade() -> None:
     with op.batch_alter_table("unresolved_subject") as batch:
         batch.drop_column("automation_noticed_at")
     with op.batch_alter_table("usage_record") as batch:
+        batch.drop_column("held_since")
         batch.drop_column("held_readings")
         batch.drop_column("held_reason")
         batch.drop_column("attributed_credits")
+    op.drop_table("usage_name_state")
     op.drop_table("usage_anchor")

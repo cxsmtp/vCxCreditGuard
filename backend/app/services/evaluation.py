@@ -177,6 +177,12 @@ class UsageIndex:
         self.projects = ingestion.totals_of(self.names[str(UsageView.PROJECT)])
         self.groups = ingestion.totals_of(self.names[str(UsageView.GROUP)])
         self._ids: dict[tuple[str, str], list[str]] = {}
+        # (view, entity id) -> the names counting towards it.
+        self._by_entity: dict[tuple[str, str], list[ingestion.NameRow]] = {}
+        for view, rows in self.names.items():
+            for row in rows.values():
+                if row.entity_id is not None:
+                    self._by_entity.setdefault((view, row.entity_id), []).append(row)
         self.project_dimension = ingestion.dimension_supported(session, UsageView.PROJECT)
         self.group_dimension = ingestion.dimension_supported(session, UsageView.GROUP)
         self.application_dimension = ingestion.dimension_supported(session, UsageView.APPLICATION)
@@ -372,64 +378,93 @@ class UsageIndex:
             return found
         return set()
 
-    def name_figures(self, limit: CreditLimit) -> dict[str, object]:
-        """What each name counts towards this budget now, for a new baseline:
-        ``{"names": {"<view>|<name>": [credits, anchored_at, removed_at]}}``."""
-        feeding = self.feeding(limit)
+    def name_figures(self, limit: CreditLimit) -> dict[str, object] | None:
+        """What the names that can later move counted towards this budget now,
+        for a new baseline: ``{"names": {"<view>|<name>": [credits,
+        anchored_at, removed_at, offset]}}``.
+
+        Only names that can move are kept: anchored (mapped or moved), held
+        (kept or carried), and every user subject (a match can be corrected or
+        disputed). A project or application name that matches its entity by
+        name never moves (a real match always wins), so a budget over thousands
+        of projects stores next to nothing.
+        """
+        user = str(UsageView.USER)
         names: dict[str, list] = {}
-        for view, rows in self.names.items():
-            for row in rows.values():
-                if row.entity_id is None or (view, row.entity_id) not in feeding:
-                    continue
-                if row.counted <= 0:
+        for view, entity_id in self.feeding(limit):
+            for row in self._by_entity.get((view, entity_id), ()):
+                if view != user and row.anchor_entity is None and row.held_reason is None:
                     continue
                 names[f"{view}|{row.key}"] = [
                     str(row.counted),
                     row.anchored_at.isoformat() if row.anchored_at else None,
                     row.removed_at.isoformat() if row.removed_at else None,
+                    str(row.offset) if row.offset is not None and row.anchor_live else "0",
                 ]
-        return {"names": names}
+        return {"names": names} if names else None
 
     def effective_baseline(self, limit: CreditLimit, state: LimitPeriodState) -> Decimal:
-        """The period's baseline, less what names since moved away had in it.
+        """The period's baseline, adjusted for names that moved since it was taken.
 
-        A name unmapped, mapped elsewhere, or whose anchor was taken afresh
-        after the baseline was taken no longer brings into the total what it
-        had brought into the baseline. Discounting exactly that keeps the
-        budget's own usage, and the name's usage within the period is all
-        that the move takes away. Names that simply stop being reported are
-        left to the usual re-baselining.
+        * A name that stops counting towards the budget by an explicit move
+          (unmapped, mapped elsewhere, a corrected match, a move by itself), or
+          whose anchor is taken afresh while it still counts here (mapped again
+          after an unmap, the window rolled past its offset), no longer brings
+          into the total what it brought into the baseline: that is discounted,
+          so the move takes away only the name's usage within the period.
+        * A name moved between two entities that both count towards the budget
+          (two projects of one group or application, two members of a group)
+          kept counting here throughout: its old position is carried over, so
+          the budget neither loses nor gains anything by the move.
+
+        Names that simply stop being reported are left to the usual
+        re-baselining. May be negative (a carried-over position).
         """
         baseline = Decimal(state.baseline_credits or 0)
         captured = (state.baseline_names or {}).get("names") if state.baseline_names else None
-        if not captured or baseline <= 0:
+        if not captured:
             return baseline
+        # Only a budget that discounts usage already reported has the names'
+        # figures in its baseline; one that counts it all has a baseline of 0.
+        in_baseline = baseline > 0
         feeding = self.feeding(limit)
-        discount = Decimal("0")
+        adjust = Decimal("0")
         for name, figures in captured.items():
             view, _, key = name.partition("|")
             row = self.names.get(view, {}).get(key)
             if row is None:
                 continue
-            credits, anchored_at, removed_at = (list(figures) + [None, None, None])[:3]
+            credits, anchored_at, removed_at, offset = (list(figures) + [None] * 4)[:4]
             now_anchored = row.anchored_at.isoformat() if row.anchored_at else None
             now_removed = row.removed_at.isoformat() if row.removed_at else None
             feeds = row.entity_id is not None and (view, row.entity_id) in feeding
             if feeds:
-                moved = (
+                if not (
                     row.anchor_live
                     and row.anchor_entity == row.entity_id
                     and now_anchored != anchored_at
-                )
-            else:
-                moved = (
+                ):
+                    continue
+                within = (
                     now_removed is not None
                     and now_removed != removed_at
+                    and now_removed == now_anchored
                     and (view, row.removed_from) in feeding
                 )
-            if moved:
-                discount += Decimal(str(credits))
-        return max(Decimal("0"), baseline - discount)
+                if within:
+                    # One move between two entities of this budget: the name's
+                    # count carries on from its old offset.
+                    adjust += Decimal(str(row.offset or 0)) - Decimal(str(offset or 0))
+                elif in_baseline:
+                    adjust += Decimal(str(credits))
+            elif (
+                in_baseline
+                and now_removed is not None
+                and now_removed != removed_at
+                and (view, row.removed_from) in feeding
+            ):
+                adjust += Decimal(str(credits))
+        return baseline - adjust
 
     def reported_total(self, limit: CreditLimit) -> tuple[Decimal, bool]:
         if limit.entity_type == EntityType.USER:
@@ -1628,7 +1663,7 @@ def _evaluate_one(
             limit.entity_id,
         )
         state.baseline_credits = reported_total
-        state.baseline_names = index.name_figures(limit) if reported_total > 0 else None
+        state.baseline_names = index.name_figures(limit)
         baseline = reported_total
 
     state.reported_total = reported_total
@@ -1917,7 +1952,7 @@ def _get_or_create_state(
         period_end=window.end,
         baseline_credits=baseline,
         # What each name brought into the baseline (see effective_baseline).
-        baseline_names=index.name_figures(limit) if index is not None and baseline > 0 else None,
+        baseline_names=index.name_figures(limit) if index is not None else None,
         baseline_at=moment or utcnow(),
         reported_total=reported_total,
         credits_used=Decimal("0"),

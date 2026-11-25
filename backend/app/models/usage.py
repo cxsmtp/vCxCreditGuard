@@ -118,6 +118,9 @@ class UsageRecord(Base):
     # one-off gap). ``held_readings`` counts the readings in a row it was held.
     held_reason: Mapped[str | None] = mapped_column(String(16))
     held_readings: Mapped[int | None] = mapped_column(Integer)
+    # When the hold began. It ends only once a complete org sync has listed
+    # the entity's kind since (and held_readings is a minimum on top).
+    held_since: Mapped[datetime | None] = mapped_column(UTCDateTime)
     # The row as the feed sent it. Kept for a week (RAW_KEEP_DAYS in
     # app/services/retention.py), and for as long as the snapshot is one a
     # reader needs it on (the latest, the readings a period's usage breakdown
@@ -254,6 +257,38 @@ class UsageAnchor(Base):
     removed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     __table_args__ = (UniqueConstraint("view_by", "subject_key", name="usage_anchor_subject"),)
+
+
+class UsageNameState(Base):
+    """What is remembered about a reported name between readings, beyond its
+    row: since when it has counted nowhere, and where it last counted.
+
+    * ``first_unmatched_at`` / ``first_unmatched_credits``: the first reading
+      of the current stretch in which the name counted nowhere, and its total
+      then. ``first_seen_new`` is true when that reading was the name's first
+      ever and an earlier reading lacked it (all of its total was new usage).
+      A name that starts to match an entity first synced after that reading
+      (a project created and scanned before the sync brought it) counts in
+      full; any other unmatched name starts to count from its last total.
+    * ``last_entity_id`` / ``last_credits``: where the name last counted, and
+      its total, when it stopped (its entity's deletion confirmed, or its
+      carry ended). Should it count there (or anywhere) again, it is anchored
+      at that total: its history never comes back as new usage.
+    """
+
+    __tablename__ = "usage_name_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    view_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    first_unmatched_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    first_unmatched_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    first_seen_new: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_entity_id: Mapped[str | None] = mapped_column(String(64))
+    last_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    left_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+    __table_args__ = (UniqueConstraint("view_by", "subject_key", name="usage_name_state_subject"),)
 
 
 class AutoTriageCharge(Base):

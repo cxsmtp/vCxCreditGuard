@@ -230,6 +230,10 @@ class UnmatchedEntityResponse(BaseModel):
     overridden_by: str | None = None
     # After a mapping: where the name's usage counts from now on.
     confirmation: str | None = None
+    # Keyset paging: pass the last row's cursor as ``after``, and ``readings``
+    # back, for the next page.
+    cursor: str | None = None
+    readings: str | None = None
 
 
 class MapEntityRequest(StrictModel):

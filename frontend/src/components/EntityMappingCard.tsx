@@ -28,12 +28,13 @@ const PAGE = 200;
 
 export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
   const toast = useToast();
-  // One page from the server at a time: "Show more" asks for the next one
-  // (by offset), so the list is never asked for more than a page at once.
+  // One page from the server at a time: "Show more" asks for the rows after
+  // the last one shown (keyset), from the same readings as the first page, so
+  // a cycle that re-ranks the names in between skips or repeats none.
   const rows = useResource<UnmatchedEntity[]>(
     (signal) =>
       isAdmin
-        ? api.get("/api/usage/unmatched-entities", { limit: PAGE, offset: 0 }, signal)
+        ? api.get("/api/usage/unmatched-entities", { limit: PAGE }, signal)
         : Promise.resolve([]),
     [isAdmin],
   );
@@ -44,9 +45,12 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
   async function showMore() {
     setLoadingMore(true);
     try {
+      const shown = [...(rows.data ?? []), ...more];
+      const last = shown[shown.length - 1];
       const page = await api.get<UnmatchedEntity[]>("/api/usage/unmatched-entities", {
         limit: PAGE,
-        offset: (rows.data?.length ?? 0) + more.length,
+        after: last?.cursor ?? undefined,
+        readings: shown[0]?.readings ?? undefined,
       });
       setMore((current) => [...current, ...page]);
       setLastPageFull(page.length >= PAGE);

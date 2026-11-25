@@ -64,6 +64,16 @@ _BOT_NAMES = frozenset(
         "mergify",
         "mergify[bot]",
         "greenkeeper",
+        "snyk",
+        "snyk[bot]",
+        "imgbot",
+        "allcontributors",
+        "pre-commit-ci",
+        "pre-commit-ci[bot]",
+        "sonarcloud",
+        "sonarcloud[bot]",
+        "github-advanced-security",
+        "copilot",
     }
 )
 
@@ -236,6 +246,18 @@ _LOWERCASE_BUILD_TOKENS = frozenset({"runner", "builder", "deployer"})
 _PHRASES = frozenset({"github-actions", "gitlab-ci", "azure-pipelines", "bitbucket-pipelines"})
 
 
+def _person_like(text: str) -> bool:
+    """A handle written like a person's name: dotted parts ("lee.sonar",
+    "paul.scanner") or a Capitalised part ("Paul-Scanner", "Mary-Build")."""
+    if "." in text:
+        return True
+    return any(
+        part[:1].isupper() and any(char.islower() for char in part[1:])
+        for part in re.split(r"[-_]+", text)
+        if part
+    )
+
+
 def is_integration_identity(name: str | None, email: str | None) -> bool:
     """True for a consumption subject that looks like an integration, not a person.
 
@@ -243,13 +265,22 @@ def is_integration_identity(name: str | None, email: str | None) -> bool:
     single handle with no email anywhere: an SCM or CI integration's identity.
     A bare name with no email is not enough ("Priya", "José", "jsmith2",
     "Jean-Luc", "mary_ann" or a departed person's login are people). With no
-    email, the handle must also carry "[bot]", a CI/SCM token as a whole part
-    of it ("-bot", "_bot", "-ci", "svc-", "-svc", "github-actions",
-    "gitlab-ci", "azure-pipelines", ...), or be a CI/SCM product's own
-    lowercase name ("jenkins"). Digits, hyphens and underscores alone say
-    nothing, and a token is never matched inside a word. It is applied only
-    once nothing matched (see ``classify``), and stays mappable to a person
-    under Settings → Attribution.
+    email, the handle must also:
+
+    * carry "[bot]", or be a known bot handle ("dependabot", "renovate", ...);
+    * contain a CI phrase in any case ("github-actions", "GitHub-Actions",
+      "gitlab-ci", "azure-pipelines");
+    * have an automation token as a whole, lowercase part ("-bot", "_bot",
+      "-ci", "svc-", "-svc", "-integration", ...);
+    * or, unless it is written like a person's name (dotted parts, or a
+      Capitalised part: "lee.sonar", "Paul.Scanner", "Mary-Build"), have a
+      build word as a whole part ("sonar-scanner", "build-agent",
+      "buildserver01"), or be a CI/SCM product's or build word's own lowercase
+      name ("jenkins", "gitlab-runner").
+
+    Digits, hyphens and underscores alone say nothing, and a token is never
+    matched inside a word. It is applied only once nothing matched (see
+    ``classify``), and stays mappable to a person under Settings → Attribution.
     """
     if email and email.strip():
         return False
@@ -257,22 +288,22 @@ def is_integration_identity(name: str | None, email: str | None) -> bool:
     if not text or "@" in text or any(char.isspace() for char in text):
         return False
     low = text.lower()
-    if "[bot]" in low:
+    if "[bot]" in low or low in _BOT_NAMES:
         return True
     if not text.isascii():
         return False
+    tokens = [token for token in re.split(r"[-_.]+", low) if token]
     if any(phrase in low for phrase in _PHRASES):
         return True
-    tokens = [token for token in re.split(r"[-_.]+", low) if token]
+    parts = [part for part in re.split(r"[-_.]+", text) if part]
+    if len(parts) > 1 and any(part in _AUTOMATION_TOKENS for part in parts):
+        return True
+    if _person_like(text):
+        return False
     # "buildserver01" is "buildserver": trailing digits number instances.
     stems = [token.rstrip("0123456789") for token in tokens]
-    if len(tokens) > 1 and any(
-        token in _AUTOMATION_TOKENS or stem in _BUILD_TOKENS
-        for token, stem in zip(tokens, stems, strict=True)
-    ):
+    if len(tokens) > 1 and any(stem in _BUILD_TOKENS for stem in stems):
         return True
-    # A product's own name (or a build word), as a whole token, only in a
-    # handle written in lowercase: an identity, not a person's display name.
     lowercase_words = _PRODUCT_TOKENS | _BUILD_TOKENS | _LOWERCASE_BUILD_TOKENS
     return text == low and any(
         token in lowercase_words or stem in lowercase_words
