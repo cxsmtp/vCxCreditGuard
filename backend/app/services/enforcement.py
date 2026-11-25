@@ -40,6 +40,7 @@ from app.checkmarx.errors import (
     CheckmarxResponseError,
 )
 from app.db.base import utcnow
+from app.models.activity import is_subject_entity
 from app.models.audit import AuditLogEntry
 from app.models.enums import (
     LEGACY_PROJECT_ACTIONS,
@@ -562,6 +563,10 @@ def plan_targets(
     """
     chosen = set(LEGACY_PROJECT_ACTIONS if project_actions is None else project_actions)
     if entity_type == EntityType.USER:
+        if is_subject_entity(entity_id):
+            # A budget on an integration account that is no IAM user: there is
+            # nobody to restrict, so it is monitor only.
+            return []
         if is_exempt(session, entity_type=EntityType.USER, entity_id=entity_id):
             return []
         if protection_reason(session, entity_id, protected_roles=protected_roles) is not None:

@@ -40,6 +40,26 @@ KEY_SCHEDULER_ENABLED = "scheduler.enabled"
 # Ingestion
 KEY_USAGE_PERIOD = "usage.period_param"
 KEY_USAGE_PAGE_SIZE = "usage.page_size"
+# Where period budgets of projects, users and applications get their usage:
+# "activity" (the default) reads the per-action credit log (GET
+# /api/credits/activity) and falls back to the consumption summary while the
+# log cannot be read; "summary" reads the summary only, as before the log was
+# used. See app/services/activity_source.py.
+KEY_USAGE_SOURCE = "usage.source"
+USAGE_SOURCE_ACTIVITY = "activity"
+USAGE_SOURCE_SUMMARY = "summary"
+USAGE_SOURCES: tuple[str, ...] = (USAGE_SOURCE_ACTIVITY, USAGE_SOURCE_SUMMARY)
+# At most this many pages of the activity log are read in one cycle (a
+# normal cycle reads the last couple of hours; more is read after downtime,
+# and the daily reconciliation reads the whole window). 0: no cap.
+KEY_ACTIVITY_MAX_PAGES = "usage.activity_max_pages_per_cycle"
+# With the usage source at "summary": whether usage the summary ledger counted
+# may start a restriction of a period budget (the behaviour before the
+# activity log). Off by default: from running totals the summary cannot always
+# tell a glitch from a real fall, so a period budget then warns and is not
+# restricted. Usage the activity log counted always may. Budgets that count
+# current totals (lifetime, custom, count existing usage) are not affected.
+KEY_SUMMARY_RESTRICTS = "usage.summary_restricts"
 
 # Retention
 KEY_RETENTION_DAYS = "retention.days"
@@ -141,6 +161,13 @@ KEY_AUTO_TRIAGE_TO_INITIATOR = "attribution.auto_triage_to_scan_initiator"
 # stamp: credits that arrived while it was off are history (estimated), never
 # a single "observed" rise. Not part of the configuration backup.
 KEY_AUTO_TRIAGE_OBSERVATION_EPOCH = "attribution.auto_triage_observation_epoch"
+# Names (case-insensitive) of integration accounts the activity log reports
+# usage under, besides the ones recognised by themselves ("[bot]" accounts,
+# Auto-triage, Auto-remediation): an SCM or CI integration's account, for
+# example. Usage of an integration account counts towards no user budget when
+# its project had an active project budget (app/services/activity_source.py).
+KEY_INTEGRATION_ACCOUNTS = "attribution.integration_accounts"
+INTEGRATION_ACCOUNTS_MAX = 200
 
 # Pacing for large tenants (app/services/pacing.py). Each is a per-cycle budget;
 # 0 means no budget: everything, every cycle (see pacing.py for how that
@@ -238,6 +265,10 @@ DEFAULTS: dict[str, Any] = {
     KEY_ORG_REFRESH_MINUTES: 30,
     KEY_USAGE_PERIOD: DEFAULT_PERIOD,
     KEY_USAGE_PAGE_SIZE: 100,
+    KEY_USAGE_SOURCE: USAGE_SOURCE_ACTIVITY,
+    KEY_ACTIVITY_MAX_PAGES: 40,
+    KEY_SUMMARY_RESTRICTS: False,
+    KEY_INTEGRATION_ACCOUNTS: [],
     KEY_RETENTION_DAYS: 365,
     KEY_RETENTION_THIN_SNAPSHOTS: True,
     KEY_SMTP_PORT: 587,
@@ -647,6 +678,50 @@ def schedule_config(session: Session) -> ScheduleConfig:
 def usage_period(session: Session) -> str:
     value = get_value(session, KEY_USAGE_PERIOD)
     return value if isinstance(value, str) and value.strip() else DEFAULT_PERIOD
+
+
+def usage_source(session: Session) -> str:
+    """ "activity" (the default) or "summary"; anything else reads as the default."""
+    value = get_value(session, KEY_USAGE_SOURCE, DEFAULTS[KEY_USAGE_SOURCE])
+    return value if value in USAGE_SOURCES else USAGE_SOURCE_ACTIVITY
+
+
+def summary_restricts(session: Session) -> bool:
+    """Whether summary-counted usage may start a restriction of a period
+    budget: only with the usage source at "summary" and the opt-in on."""
+    if usage_source(session) != USAGE_SOURCE_SUMMARY:
+        return False
+    return get_value(session, KEY_SUMMARY_RESTRICTS, DEFAULTS[KEY_SUMMARY_RESTRICTS]) is True
+
+
+def activity_max_pages(session: Session) -> int:
+    """Pages of the activity log one cycle may read; 0 means no cap."""
+    value = get_value(session, KEY_ACTIVITY_MAX_PAGES, DEFAULTS[KEY_ACTIVITY_MAX_PAGES])
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return int(DEFAULTS[KEY_ACTIVITY_MAX_PAGES])
+    return min(value, 100_000)
+
+
+def normalise_account_names(value: Any) -> list[str]:
+    """A list of account names, stripped, without duplicates (case-insensitive),
+    from a list or a comma or newline separated string."""
+    if isinstance(value, str):
+        entries: list[Any] = value.replace("\n", ",").split(",")
+    elif isinstance(value, list):
+        entries = value
+    else:
+        return []
+    names: dict[str, str] = {}
+    for entry in entries:
+        name = entry.strip() if isinstance(entry, str) else ""
+        if name and len(name) <= 320:
+            names.setdefault(name.lower(), name)
+    return list(names.values())[:INTEGRATION_ACCOUNTS_MAX]
+
+
+def integration_accounts(session: Session) -> list[str]:
+    """The extra integration account names an admin listed."""
+    return normalise_account_names(get_value(session, KEY_INTEGRATION_ACCOUNTS, []))
 
 
 def usage_page_size(session: Session) -> int:

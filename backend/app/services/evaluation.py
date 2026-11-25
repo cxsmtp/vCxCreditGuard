@@ -119,6 +119,9 @@ class EvaluationResult:
     # Breached, enforcing limits whose restriction was not applied because
     # enforcement is paused (by an admin, or by the safety ceiling).
     deferred: int = 0
+    # Breached, enforcing period budgets not restricted because their usage
+    # over the limit was counted from the consumption summary (summary_hold).
+    summary_held: int = 0
     # Why new restrictions are not being applied this cycle, or None if they are.
     enforcement_paused: str | None = None
     errors: list[str] = field(default_factory=list)
@@ -138,6 +141,7 @@ class EvaluationResult:
             "breached": self.breached,
             "enforced": self.enforced,
             "monitor_only": self.monitor_only,
+            "summary_held": self.summary_held,
             "restored": self.restored,
             "usage_unavailable": self.unavailable,
             "deferred": self.deferred,
@@ -171,10 +175,16 @@ class UsageIndex:
         self.application_dimension = ingestion.dimension_supported(session, UsageView.APPLICATION)
         self.user_dimension = ingestion.dimension_supported(session, UsageView.USER)
         self._attribution: auto_triage_attribution.AttributionModel | None = None
+        # The activity source's integration-account rule for auto-triage
+        # charges (None: nothing to skip), read on first use.
+        self._initiator_skip: object = False
         # Read on first use, once for every limit (reports and previews ask
         # about hundreds of limits in one request).
         self._states: dict[str, dict[int, LimitPeriodState]] = {}
         self._counters: dict[str, dict[int, BudgetUsage]] = {}
+        # What the activity log counted, per period (activity_source).
+        self._log_counted: dict[str, dict[int, Decimal]] = {}
+        self._restriction_hold: object = False
         self._exempt: set[tuple[str, str]] | None = None
 
     def counter(self, limit_id: int, period_key: str) -> tuple[Decimal, dict[str, int]] | None:
@@ -189,6 +199,22 @@ class UsageIndex:
             }
         row = self._counters[period_key].get(limit_id)
         return (Decimal(row.credits or 0), dict(row.actions or {})) if row is not None else None
+
+    def log_counter(self, limit_id: int, period_key: str) -> Decimal:
+        """What the activity log counted towards a budget in a period."""
+        if period_key not in self._log_counted:
+            from app.services import activity_source
+
+            self._log_counted[period_key] = activity_source.log_counted(self._session, period_key)
+        return self._log_counted[period_key].get(limit_id, Decimal("0"))
+
+    @property
+    def restriction_hold(self) -> dict[str, object] | None:
+        if self._restriction_hold is False:
+            from app.services import activity_source
+
+            self._restriction_hold = activity_source.restriction_hold(self._session)
+        return self._restriction_hold  # type: ignore[return-value]
 
     def period_state(self, limit_id: int, period_key: str) -> LimitPeriodState | None:
         """The stored state of a limit's period, read for every limit at once."""
@@ -273,12 +299,17 @@ class UsageIndex:
         else:
             # No period yet: the first evaluation takes its baseline now.
             since = moment
+        if self._initiator_skip is False:
+            from app.services import activity_source
+
+            self._initiator_skip = activity_source.initiator_skip(self._session)
         return auto_triage_attribution.attributed_usage(
             self.attribution,
             user_ids=user_ids,
             exclude_projects=exclude,
             counts_existing=counts_all,
             since=since,
+            skip=self._initiator_skip,  # type: ignore[arg-type]
         )
 
     def project_total(self, project_id: str) -> tuple[Decimal, bool]:
@@ -388,6 +419,12 @@ def evaluate_all(
     # Periods already over whose counters grew since they were last evaluated
     # (an increase observed before the rollover, evaluated after it).
     _settle_closed_periods(session, moment)
+    # What the project budgets are now, recorded before any limit is judged:
+    # the integration-account rule for auto-triage charges reads it, and a
+    # past charge's outcome must never change (app/services/activity_source.py).
+    from app.services import activity_source
+
+    activity_source.observe_budgets(session, moment)
     index = UsageIndex(session)
     resolver = enforcement.RoleResolver(client) if client is not None else None
     budget: enforcement.EnforcementBudget | None = None
@@ -1649,6 +1686,17 @@ def _evaluate_one(
     exempt = enforcement.is_exempt(
         session, entity_type=limit.entity_type, entity_id=limit.entity_id
     )
+    on_summary = summary_hold(
+        session,
+        limit=limit,
+        window=window,
+        index=index,
+        credits_used=state.credits_used,
+        attributed=attributed.counted if attributed is not None else None,
+    )
+    if on_summary is not None and restriction_started(session, limit.id, window.key):
+        # A restriction already in force (or started) stays in force.
+        on_summary = None
 
     if state.credits_used >= Decimal(limit.credit_limit):
         state.status = LimitStatus.BREACHED
@@ -1656,12 +1704,26 @@ def _evaluate_one(
             state.breached_at = moment
             evaluation.newly_breached = True
             result.breached += 1
-            _notify_breach(session, limit, state, window, exempt=exempt, paused=hold is not None)
+            _notify_breach(
+                session,
+                limit,
+                state,
+                window,
+                exempt=exempt,
+                paused=hold is not None,
+                on_summary=on_summary,
+            )
         if exempt:
             evaluation.note = "Exempt from enforcement."
         elif not limit.enforce:
             result.monitor_only += 1
             evaluation.note = "Monitor only, no action taken."
+        elif on_summary is not None:
+            # Over budget on summary totals: warned, never restricted.
+            result.summary_held += 1
+            evaluation.note = (
+                f"Over budget on summary totals; not restricted, because {on_summary}."
+            )
         elif client is None:
             evaluation.note = "No Checkmarx connection available, enforcement deferred."
         elif hold is not None:
@@ -1673,6 +1735,11 @@ def _evaluate_one(
         elif to_enforce is not None:
             # Applied after every lift of the cycle (evaluate_all).
             to_enforce.append(limit.id)
+            if not evaluation.newly_breached:
+                # Breached earlier without a restriction (held on summary
+                # totals, say): the restriction now starting is announced.
+                # Raised once per period (the notice is deduplicated).
+                _notify_breach(session, limit, state, window, exempt=False)
         # RESTRICTED means "a restriction from this limit is in force for this
         # period", not "a restriction was newly applied this cycle". Deriving it
         # from the action rows keeps it true on every later cycle of the period,
@@ -1755,6 +1822,25 @@ def _in_force_count(session: Session, limit_id: int, period_key: str) -> int:
     )
 
 
+def restriction_started(session: Session, limit_id: int, period_key: str) -> bool:
+    """A restriction of this period is in force, or may be: applied, or
+    pending (being rolled out, or written with an unknown outcome). Carrying
+    it on is not a new restriction (``summary_hold``); a failed one is not in
+    force, and trying it again would be."""
+    return any(
+        enforcement.may_be_in_force(action)
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.limit_id == limit_id,
+                EnforcementAction.period_key == period_key,
+                EnforcementAction.status.in_(
+                    (EnforcementStatus.APPLIED, EnforcementStatus.PENDING)
+                ),
+            )
+        )
+    )
+
+
 def _has_active_enforcement(session: Session, limit_id: int, period_key: str) -> bool:
     return (
         session.scalar(
@@ -1810,6 +1896,45 @@ def counts_from_totals(session: Session, limit: CreditLimit, window: PeriodWindo
     return settings_store.demo_mode(session) and str(limit.entity_id).startswith(
         demo_service.DEMO_PREFIX
     )
+
+
+def summary_hold(
+    session: Session,
+    *,
+    limit: CreditLimit,
+    window: PeriodWindow,
+    index: UsageIndex,
+    credits_used: Decimal,
+    attributed: Decimal | None,
+) -> str | None:
+    """Why a breach of this budget may not start a restriction, or None.
+
+    A period budget's counter holds what the activity log counted and what
+    the summary ledger counted (after a fallback to the summary, or from a
+    group's own summary row). From running totals the summary cannot always
+    tell a glitch from a real fall, so only the log's part may start a new
+    restriction; summary-counted usage warns. So do the auto-triage credits
+    charged to the person who started the scan: they always derive from the
+    summary's project readings (they still count towards the figure). Not for a
+    budget that counts current totals (lifetime, custom, count existing
+    usage, a demo budget), and not when the admin chose the summary only and
+    allowed restrictions from it (``usage.summary_restricts``). A restriction
+    already in force is not affected (the caller checks)."""
+    if credits_used < Decimal(limit.credit_limit):
+        return None
+    if counts_from_totals(session, limit, window):
+        return None
+    if settings_store.summary_restricts(session):
+        return None
+    if index.log_counter(limit.id, window.key) >= Decimal(limit.credit_limit):
+        return None
+    hold = index.restriction_hold
+    if hold is None:
+        return (
+            "the usage over the limit was counted from the consumption summary, "
+            "not the activity log"
+        )
+    return str(hold["reason"])
 
 
 def counts_existing_usage(limit: CreditLimit, *, window: PeriodWindow) -> bool:
@@ -2090,10 +2215,19 @@ def _notify_breach(
     *,
     exempt: bool,
     paused: bool = False,
+    on_summary: str | None = None,
 ) -> None:
     entity = limit.entity_label or limit.entity_id
     if exempt:
         tail = "This entity is on the exemption list, so no action was taken."
+        severity = Severity.WARNING
+        dedupe = notifications.monitor_only_key(limit.id, window.key)
+    elif limit.enforce and on_summary is not None:
+        tail = (
+            f"Over budget on summary totals; not restricted, because {on_summary}. Only "
+            "usage counted from the credit activity log starts a restriction of a monthly "
+            "or quarterly budget."
+        )
         severity = Severity.WARNING
         dedupe = notifications.monitor_only_key(limit.id, window.key)
     elif limit.enforce and paused:

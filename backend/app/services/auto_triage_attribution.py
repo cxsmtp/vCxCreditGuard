@@ -91,6 +91,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
@@ -741,14 +742,20 @@ def attributed_usage(
     exclude_projects: set[str] | frozenset[str] = frozenset(),
     counts_existing: bool,
     since: datetime | None,
+    skip: Callable[[AttributedPart], bool] | None = None,
 ) -> AttributedUsage:
-    """Sum the parts for these people, under the limit's period rule."""
+    """Sum the parts for these people, under the limit's period rule.
+
+    ``skip``: parts no user budget counts (the integration-account rule of the
+    activity source, app/services/activity_source.py ``initiator_skip``)."""
     grouped: dict[tuple[str, str, str], list[Decimal]] = {}
     counted_total = ZERO
     window_total = ZERO
     for user_id in user_ids:
         for part in model.parts_for(user_id):
             if part.project_id in exclude_projects:
+                continue
+            if skip is not None and skip(part):
                 continue
             counts = counts_existing or (
                 part.basis == BASIS_OBSERVED

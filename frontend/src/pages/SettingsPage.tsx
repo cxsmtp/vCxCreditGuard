@@ -12,6 +12,7 @@ import type {
   RestoreResult,
   SchedulerStatus,
   UnresolvedSubject,
+  UsageSourceStatus,
   UtilityAccount,
   WatchdogStatus,
 } from "../api/types";
@@ -32,6 +33,7 @@ import {
   Spinner,
   Table,
   Td,
+  Textarea,
   Th,
   Toggle,
 } from "../components/ui";
@@ -464,6 +466,46 @@ export function SettingsPage({
           description="How the consumption endpoint is queried. Budget periods are derived from a baseline, so this window only has to be at least as wide as your widest budget period."
         >
           <div className="flex flex-col gap-5">
+            <Field
+              label="Usage source"
+              hint="Activity log (default): project, user and application budgets count each billed action from Checkmarx One's credit activity log, by project and application id, in the period it happened in; the consumption summary takes over while the log cannot be read. Summary only: usage comes from the consumption summary, matched by name, as before. At each switch the first reading of the new source counts nothing, so the usage of a cycle or two around it is not counted."
+            >
+              <Select
+                value={value("usage_source") ?? "activity"}
+                disabled={!isAdmin}
+                onChange={(event) =>
+                  set({ usage_source: event.target.value as AppSettings["usage_source"] })
+                }
+              >
+                <option value="activity">Activity log (default)</option>
+                <option value="summary">Summary only</option>
+              </Select>
+            </Field>
+            {(value("usage_source") ?? "activity") === "summary" && (
+              <Toggle
+                checked={value("summary_restricts") ?? false}
+                disabled={!isAdmin}
+                onChange={(next) => set({ summary_restricts: next })}
+                label="Allow restrictions from summary totals (less accurate)"
+                description="Off (the default): with the summary only, a monthly or quarterly budget over its limit is warned, not restricted, because from running totals the summary cannot always tell a glitch from a real fall. On: it restricts as before the activity log was used. Lifetime, custom and count-existing budgets restrict either way."
+              />
+            )}
+            <UsageSourceNote status={current.usage_source_status ?? null} />
+            <Field
+              label="Activity log pages per cycle (most)"
+              hint="A normal cycle reads the last couple of hours of the log (a page or two). After downtime more is read, over several cycles if needed: a cycle that stops early counts only what it read completely and says so. 0: no cap."
+            >
+              <Input
+                type="number"
+                min={0}
+                max={100000}
+                value={String(value("activity_max_pages_per_cycle") ?? 40)}
+                disabled={!isAdmin}
+                onChange={(event) =>
+                  set({ activity_max_pages_per_cycle: Number(event.target.value) })
+                }
+              />
+            </Field>
             <Field
               label="Lookback window"
               hint="How far back the consumption endpoint reports. It must be at least as wide as your widest budget period, or consumption inside a period but outside the window is invisible."
@@ -956,6 +998,14 @@ export function SettingsPage({
             />
           )}
           {section === "attribution" && (
+            <IntegrationAccountsCard
+              isAdmin={isAdmin}
+              saved={current.integration_accounts ?? []}
+              edited={draft.integration_accounts !== undefined}
+              onChange={(next) => set({ integration_accounts: next })}
+            />
+          )}
+          {section === "attribution" && (
             <AttributionCard
               isAdmin={isAdmin}
               subjects={unresolved.data ?? []}
@@ -990,6 +1040,91 @@ export function SettingsPage({
         </div>
       )}
     </>
+  );
+}
+
+/* ------------------------------------------------------------ usage source */
+
+function UsageSourceNote({ status }: { status: UsageSourceStatus | null }) {
+  if (!status || status.setting !== "activity") return null;
+  const reconciliation = status.reconciliation;
+  let text: string;
+  if (status.status === "active") {
+    text = `The activity log is the source${
+      status.last_success_at ? `, last read ${formatRelative(status.last_success_at)}` : ""
+    }.`;
+    if (status.failing_since) {
+      text += ` It has failed since ${formatDateTime(status.failing_since)}: nothing new is counted until it answers.`;
+    }
+    if (reconciliation?.status === "match") {
+      text += ` Its sum matched the summary (${reconciliation.summary_credits} credits, ${reconciliation.period?.replace(/_/g, " ")}).`;
+    } else if (reconciliation?.status === "mismatch") {
+      text += ` Its sum (${reconciliation.activity_credits}) did not match the summary (${reconciliation.summary_credits}): see Diagnose.`;
+    }
+  } else if (status.status === "fallback") {
+    text = `The activity log could not be read (${status.last_error ?? "unknown error"}); the consumption summary is the source until it answers again.`;
+  } else {
+    text = status.last_error
+      ? `The activity log is not available on this tenant (${status.last_error}); the consumption summary is used.`
+      : "The activity log becomes the source at the next cycle.";
+  }
+  return <InfoNote>{text}</InfoNote>;
+}
+
+function IntegrationAccountsCard({
+  isAdmin,
+  saved,
+  edited,
+  onChange,
+}: {
+  isAdmin: boolean;
+  saved: string[];
+  edited: boolean;
+  onChange: (next: string[]) => void;
+}) {
+  const savedText = saved.join("\n");
+  const [text, setText] = useState(savedText);
+  useEffect(() => {
+    // Back to the saved list once it is saved or the draft is discarded.
+    if (!edited) setText(savedText);
+  }, [savedText, edited]);
+  return (
+    <Card
+      title="Integration accounts"
+      description="Accounts the credit activity log reports usage under that are automation, not people."
+    >
+      <InfoNote>
+        Usage of an integration account always counts towards its project&apos;s budget, and the
+        project&apos;s groups and application. It counts towards a user budget only when its project had
+        no active project budget when it happened: Auto-triage and Auto-remediation then count
+        towards the person who started the scan (when charging auto-triage to the scan initiator is
+        on), and any other account towards the person an admin maps it to below, or towards a user
+        budget set on the account itself (pick it under Budgets). An event is never charged to two
+        user budgets. Recognised by themselves: [bot] accounts and known bots, Auto-triage,
+        Auto-remediation, and handles that name a CI or SCM integration.
+      </InfoNote>
+      <div className="mt-4">
+        <Field
+          label="More integration accounts"
+          hint="One name per line (or comma separated), as the activity log reports it; case does not matter."
+        >
+          <Textarea
+            rows={4}
+            value={text}
+            disabled={!isAdmin}
+            onChange={(event) => {
+              setText(event.target.value);
+              onChange(
+                event.target.value
+                  .split(/[\n,]/)
+                  .map((name) => name.trim())
+                  .filter(Boolean),
+              );
+            }}
+          />
+        </Field>
+      </div>
+    </Card>
   );
 }
 
@@ -1496,6 +1631,13 @@ function AttributionCard({
 
       <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
         {TAB_BLURB[tab]}
+      </p>
+      <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
+        Automation (a [bot] account, Auto-triage, an integration such as an SCM connector) counts
+        towards nobody&apos;s user budget when its project had an active project budget at the time:
+        the project budget is where it is governed. Otherwise map it to the person it acts for, or
+        leave it unmapped and set a user budget on the account itself. One event is never charged to
+        two user budgets.
       </p>
 
       {loading ? (

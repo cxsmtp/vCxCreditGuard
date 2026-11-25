@@ -409,6 +409,7 @@ def record_reading(
     suspect: bool = False,
     own: dict[str, set[str]] | None = None,
     collapse: bool = False,
+    feed: bool = True,
 ) -> LedgerResult:
     """Turn one stored live reading into ledger increases and budget counters.
 
@@ -420,6 +421,9 @@ def record_reading(
     groups and applications with a row of their own (``own_figures``), taken
     once per ingest. ``collapse``: the whole feed fell and the fall is
     accepted only because it persisted; a fall in it keeps a ceiling.
+    ``feed`` False: the increases are recorded but no budget
+    counter is fed (the activity log is the source of this view's usage, see
+    app/services/activity_source.py).
     """
     from app.services import ingestion
 
@@ -484,6 +488,11 @@ def record_reading(
         earlier = previous_rows[key]
         shifts.leave(earlier.entity_id, earlier)
         row = kept.get(key)
+        if row is not None and row.kind == REBASE:
+            # Not yet rebased by a believed reading: its last totals may be a
+            # glitch, so it stays to start from what it reports on return.
+            row.missing_since = now
+            continue
         if row is None:
             row = UsageMissingName(view_by=view, subject_key=key)
             session.add(row)
@@ -564,8 +573,12 @@ def record_reading(
             continue
         if row is not None and row.kind == REBASE:
             # Missing when the lookback window changed: its old total is in
-            # another window, so it starts from what it reports now.
-            _drop(session, row)
+            # another window, so it starts from what it reports now. Not from
+            # a reading the completeness checks doubt (its total may be a
+            # glitch, and the recovery would count): it stays to be rebased by
+            # the next believed reading, counting nothing meanwhile.
+            if not suspect:
+                _drop(session, row)
             record.last_rise_at = now
             continue
         if row is not None and row.kind in HELD_KINDS:
@@ -719,8 +732,9 @@ def record_reading(
     claimed = _claims(session, view, records, window, now)
     result.claimed = len(claimed)
     attributed = [d for d in deltas if d.entity_id is not None]
-    _feed(session, view, attributed, result, own)
-    _feed(session, view, claimed, result, own, claimed=True)
+    if feed:
+        _feed(session, view, attributed, result, own)
+        _feed(session, view, claimed, result, own, claimed=True)
     shifts.save(now)
     session.flush()
     return result

@@ -17,6 +17,10 @@ const FEATURES: FeatureGroup[] = [
     title: "Measure and attribute",
     items: [
       "Reads AI credit use from Checkmarx One on a schedule (every 15 minutes by default) for every user, group, project and application.",
+      "Counts each billed action from Checkmarx One's credit activity log in the period it happened in, against its project and application by id and its person by email or username (the default usage source). Identical actions in the same second are each counted, never merged.",
+      "Falls back to the consumption summary (totals matched by name) while the activity log cannot be read, and never counts the same usage from both. Settings → Schedule & data can use the summary only.",
+      "Once a day, checks that the activity log adds up to the summary's total over the same 30 days, and shows a mismatch in Diagnose.",
+      "Integration accounts (bots, Auto-triage, Auto-remediation, accounts you list) count towards their project's budgets, and towards a person's budget only when their project had no active project budget at the time: never towards two user budgets.",
       "Matches each usage row to a Checkmarx user: exactly where it can, by name similarity where not. Unsure matches wait for an admin to confirm.",
       "Shows the usage that counts towards no budget, and why: automation (Auto Triage, bots, integrations without an email), people it could not match, and project or application names that match no project (an admin can map them).",
       "Can also charge a project's Auto Triage credits to the person whose scan set it off (off by default).",
@@ -183,14 +187,58 @@ const LIMITATIONS: Limitation[] = [
     ),
   },
   {
+    title: "Monthly and quarterly budgets restrict only on usage the activity log counted.",
+    group: "enforcement",
+    meaning: (
+      <>
+        Usage the consumption summary counts (after a fallback to it, from a
+        group&apos;s own summary row, or with the summary only), and auto-triage
+        charged to the person who started a scan, still count and warn, but
+        never start a new restriction of a monthly or quarterly
+        budget: from running totals the summary cannot always tell a glitch
+        from a real fall. Such a budget over its limit is warned, not
+        restricted, and Overview, Budgets and Diagnose show that restrictions
+        are paused. Without the activity log, monthly and quarterly budgets
+        restrict only with Summary only and &ldquo;Allow restrictions from
+        summary totals&rdquo; on. Restrictions already in force stay; lifetime,
+        custom and count-existing budgets restrict as before.
+      </>
+    ),
+  },
+  {
+    title: "A few cycles of usage are not counted when the usage source switches.",
+    group: "data",
+    meaning: (
+      <>
+        When the activity log becomes the source (the setting turned on, or
+        the log back after failing), its first read only records what it holds,
+        so what happened since the summary&apos;s last reading is not counted.
+        When the summary takes over (the setting turned off, the log refused or
+        malformed, or failing for more than an hour), its first two readings
+        count nothing, so about two to three cycles are not counted, and a name
+        missing from the summary across the switch counts nothing when it
+        returns. A group budget the log takes over from the group&apos;s own
+        summary row counts no event dated before the takeover, and two group
+        readings count nothing when the row takes it back. While the log
+        fails for less than an hour nothing new is counted; it is counted when
+        the log answers again. A row that reaches the log more than about two
+        hours late is counted only by the daily full read, and only if it is
+        dated after the switch. Rows of the same second that meet at a page
+        boundary wait for a later cycle.
+      </>
+    ),
+  },
+  {
     title: "Figures only cover Checkmarx's lookback window.",
     group: "data",
     meaning: (
       <>
-        Checkmarx reports totals over a window (at most the last year), not
-        individual events. "Lifetime" means everything in that window. Monthly
-        and quarterly budgets do not count credits spent before the period
-        opened, unless the budget is set to.
+        The consumption summary reports totals over a window (at most the last
+        year), and the activity log covers the last 30 days. "Lifetime",
+        custom and count-existing budgets read the summary's totals, so they
+        mean everything in that window. Monthly and quarterly budgets do not
+        count credits spent before the period opened (or before the budget was
+        created), unless the budget is set to.
       </>
     ),
   },
@@ -201,10 +249,13 @@ const LIMITATIONS: Limitation[] = [
       <>
         Credits reported under a name that matches no Checkmarx user, or an
         unconfirmed match, count towards no person's budget until an admin maps
-        them (Settings → Attribution). Automation (bots, integrations without an
-        email) never does. Project usage reported under a repository name that
-        is no project counts towards no project, group or application budget
-        until mapped. All of it is shown on the Overview.
+        them (Settings → Attribution); a mapping counts from then on. Automation
+        counts towards a person only by the integration-account rule (and
+        Auto-remediation towards nobody: no scan initiator is traced for it).
+        With the summary as the source, project usage reported under a
+        repository name that is no project counts towards no project, group or
+        application budget until mapped; the activity log names projects by id.
+        All of it is shown on the Overview.
       </>
     ),
   },

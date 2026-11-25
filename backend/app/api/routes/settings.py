@@ -18,7 +18,7 @@ from app.schemas.dashboard import (
     SettingsResponse,
     SettingsUpdateRequest,
 )
-from app.services import delivery, pacing, role_sources, settings_store
+from app.services import activity_source, delivery, pacing, role_sources, settings_store
 from app.services.audit import record_audit
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,10 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "org_refresh_minutes": settings_store.KEY_ORG_REFRESH_MINUTES,
     "usage_period_param": settings_store.KEY_USAGE_PERIOD,
     "usage_page_size": settings_store.KEY_USAGE_PAGE_SIZE,
+    "usage_source": settings_store.KEY_USAGE_SOURCE,
+    "summary_restricts": settings_store.KEY_SUMMARY_RESTRICTS,
+    "activity_max_pages_per_cycle": settings_store.KEY_ACTIVITY_MAX_PAGES,
+    "integration_accounts": settings_store.KEY_INTEGRATION_ACCOUNTS,
     "retention_days": settings_store.KEY_RETENTION_DAYS,
     "retention_thin_snapshots": settings_store.KEY_RETENTION_THIN_SNAPSHOTS,
     "notify_min_severity": settings_store.KEY_NOTIFY_MIN_SEVERITY,
@@ -105,6 +109,12 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         org_refresh_minutes=int(values.get(settings_store.KEY_ORG_REFRESH_MINUTES, 30)),
         usage_period_param=str(values.get(settings_store.KEY_USAGE_PERIOD) or "last_year"),
         usage_page_size=int(values.get(settings_store.KEY_USAGE_PAGE_SIZE, 100)),
+        usage_source=settings_store.usage_source(db),
+        summary_restricts=bool(values.get(settings_store.KEY_SUMMARY_RESTRICTS) is True),
+        allowed_usage_sources=list(settings_store.USAGE_SOURCES),
+        activity_max_pages_per_cycle=settings_store.activity_max_pages(db),
+        integration_accounts=settings_store.integration_accounts(db),
+        usage_source_status=activity_source.describe(db),
         retention_days=int(values.get(settings_store.KEY_RETENTION_DAYS, 365)),
         retention_thin_snapshots=settings_store.thin_snapshots(db),
         notify_min_severity=values.get(settings_store.KEY_NOTIFY_MIN_SEVERITY) or Severity.WARNING,
@@ -196,6 +206,22 @@ def update_settings(
                     ),
                 },
             )
+
+    if "usage_source" in changes and changes["usage_source"] not in settings_store.USAGE_SOURCES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_usage_source",
+                "message": (
+                    f"{changes['usage_source']!r} is not a usage source. "
+                    f"Choose one of: {', '.join(settings_store.USAGE_SOURCES)}."
+                ),
+            },
+        )
+    if "integration_accounts" in changes:
+        changes["integration_accounts"] = settings_store.normalise_account_names(
+            changes["integration_accounts"] or []
+        )
 
     if "ui_accent" in changes:
         accent = str(changes["ui_accent"])

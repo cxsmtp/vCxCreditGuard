@@ -287,8 +287,12 @@ def search_entities(
     q: str = Query(default="", max_length=200),
     limit: int = Query(default=25, ge=1, le=100),
     include_deleted: bool = False,
+    include_subjects: bool = False,
 ) -> list[OrgEntity]:
-    """Entity picker for the Limits page, backed by the synced org model."""
+    """Entity picker for the Limits page, backed by the synced org model.
+
+    ``include_subjects``: also integration accounts that are no user, for a
+    user budget set on one (never offered where a person is wanted)."""
     model = _ENTITY_MODELS[entity_type]
     query = select(model)
     if not include_deleted:
@@ -352,8 +356,55 @@ def search_entities(
                 is_deleted=row.is_deleted,
             )
         )
+    if entity_type == EntityType.USER and include_subjects and not include_deleted:
+        entities.extend(_integration_subjects(db, term, limit))
     entities.sort(key=lambda entity: entity.label.lower())
     return entities
+
+
+def _integration_subjects(db, term: str, limit: int) -> list[OrgEntity]:  # type: ignore[no-untyped-def]
+    """Integration accounts (a bot, an SCM integration's handle) the activity
+    log reports usage under and nobody mapped to a person: a user budget can be
+    set on one itself (monitor only, see app/services/activity_source.py)."""
+    from app.models.activity import subject_entity_id
+    from app.models.usage import UnresolvedSubject
+    from app.services.ingestion import is_synthetic_subject
+
+    query = select(UnresolvedSubject).where(
+        UnresolvedSubject.is_bot.is_(True), UnresolvedSubject.mapped_user_id.is_(None)
+    )
+    if term:
+        pattern = f"%{term}%"
+        query = query.where(
+            or_(
+                UnresolvedSubject.subject_key.ilike(pattern),
+                UnresolvedSubject.subject_name.ilike(pattern),
+            )
+        )
+    rows = [
+        row
+        for row in db.scalars(query.order_by(UnresolvedSubject.subject_key).limit(limit))
+        if not is_synthetic_subject(row.subject_key)
+    ]
+    ids = {row.subject_key: subject_entity_id(row.subject_key) for row in rows}
+    limited = set(
+        db.scalars(
+            select(CreditLimit.entity_id).where(
+                CreditLimit.entity_type == EntityType.USER,
+                CreditLimit.entity_id.in_(list(ids.values())),
+            )
+        )
+    )
+    return [
+        OrgEntity(
+            entity_type=EntityType.USER,
+            entity_id=ids[row.subject_key],
+            label=f"{row.subject_name or row.subject_key} (integration account)",
+            secondary="Not a person: counts its own activity-log usage, monitor only",
+            has_limit=ids[row.subject_key] in limited,
+        )
+        for row in rows
+    ]
 
 
 @router.get("/audit", response_model=AuditListResponse)
@@ -906,6 +957,24 @@ def usage_dimensions(ctx: CurrentUser, db: DbSession) -> dict[str, object]:
             UsageView.PROJECT,
             UsageView.GROUP,
         )
+    }
+
+
+@router.get("/usage/source")
+def usage_source(ctx: CurrentUser, db: DbSession) -> dict[str, object]:
+    """Where period budgets get their usage, and whether new restrictions of
+    period budgets are held (summary-counted usage warns but never restricts:
+    app/services/evaluation.py ``summary_hold``). Error text is for admins."""
+    from app.services import activity_source
+
+    info = activity_source.describe(db)
+    hold = info.get("restrictions_held")
+    if isinstance(hold, dict) and not ctx.is_admin:
+        hold = {**hold, "reason": None}
+    return {
+        "setting": info.get("setting"),
+        "status": info.get("status"),
+        "restrictions_held": hold,
     }
 
 

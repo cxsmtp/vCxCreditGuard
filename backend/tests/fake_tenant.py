@@ -148,6 +148,22 @@ class FakeTenant:
         ]
     )
 
+    # GET /api/credits/activity rows, as the API returns them (dates as ISO
+    # strings). None: the endpoint answers 404, as on a tenant without it.
+    activity: list[dict[str, Any]] | None = None
+    # Answer the activity log with this status instead.
+    activity_status: int | None = None
+    # Called with the page number before each activity page is served: lets a
+    # test change the log between two page requests (drift).
+    activity_hook: Callable[[int], None] | None = None
+    # Serve at most this many rows per activity page, whatever size is asked.
+    activity_page_cap: int | None = None
+    # Reorders rows of the same date differently on every request.
+    activity_tie_shuffle: Any = None
+    # Serves the activity log newest first, ignoring sort_order.
+    activity_ignore_sort: bool = False
+    activity_requests: list[dict[str, list[str]]] = field(default_factory=list)
+
     # Test controls
     unsupported_views: set[str] = field(default_factory=set)
     # Mirrors the real endpoint: an unrecognised viewBy answers 200 with this
@@ -555,6 +571,9 @@ class FakeTenant:
         if path.endswith("/api/credits/consumption"):
             return self._consumption_response(params)
 
+        if path.endswith("/api/credits/activity"):
+            return self._activity_response(params)
+
         if path.endswith("/api/credits/info"):
             if self.credit_info is None:
                 return httpx.Response(404, json={"message": "no credit info for this tenant"})
@@ -698,6 +717,77 @@ class FakeTenant:
         if self.empty_from_page is not None and page >= self.empty_from_page:
             window = []
         total_pages = max(1, -(-len(rows) // size)) if rows else 1
+        return httpx.Response(
+            200,
+            json={
+                "items": window,
+                "totalItems": len(rows),
+                "totalPages": total_pages,
+                "currentPage": page,
+            },
+        )
+
+    def add_activity(
+        self,
+        *,
+        date: str,
+        credits: str | int | float,
+        project_id: str | None,
+        user: str = "",
+        email: str = "",
+        application_id: str | None = None,
+        action: str = "Triage",
+        scan_id: str | None = None,
+        scanner: str = "sast",
+    ) -> dict[str, Any]:
+        """Append one row of the credit activity log (never merged with an
+        identical one: identical rows are distinct events)."""
+        row: dict[str, Any] = {
+            "date": date,
+            "action": action,
+            "creditsUsed": str(credits),
+            "user": user,
+            "userEmail": email,
+            "projects": [f"name-of-{project_id}"] if project_id else [],
+            "projectIds": [project_id] if project_id else [],
+            "applications": [f"name-of-{application_id}"] if application_id else [],
+            "applicationIds": [application_id] if application_id else [],
+            "scanner": scanner,
+            "risks": [],
+            "environments": [],
+            "environmentIds": [],
+            "scans": [scan_id] if scan_id else [],
+            "scanIds": [scan_id] if scan_id else [],
+        }
+        if self.activity is None:
+            self.activity = []
+        self.activity.append(row)
+        return row
+
+    def _activity_response(self, params: dict[str, list[str]]) -> httpx.Response:
+        self.activity_requests.append(params)
+        if self.activity_status is not None:
+            return httpx.Response(self.activity_status, json={"message": "forced failure"})
+        if self.activity is None:
+            return httpx.Response(404, json={"message": "no fake route for activity"})
+        page = int(params.get("page", ["1"])[0])
+        if self.activity_hook is not None:
+            self.activity_hook(page)
+        size = int(params.get("size", ["100"])[0])
+        if self.activity_page_cap:
+            size = min(size, self.activity_page_cap)
+        # A stable sort by date: rows of one date keep the order they were
+        # added in, unless a shuffle reorders them for this request.
+        rows = list(self.activity)
+        if self.activity_tie_shuffle is not None:
+            self.activity_tie_shuffle.shuffle(rows)
+        rows.sort(key=lambda row: _parse(row["date"]))
+        descending = params.get("sort_order", ["desc"])[0] != "asc" or self.activity_ignore_sort
+        if descending:
+            rows.reverse()
+        start = (page - 1) * size
+        window = rows[start : start + size]
+        total_pages = -(-len(rows) // size) if rows else 0
         return httpx.Response(
             200,
             json={

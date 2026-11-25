@@ -1,7 +1,7 @@
 """Enforcement self-test results
 
 Revision ID: a8d4f2c6e9b3
-Revises: c9f2a6e1d4b7
+Revises: d1e5a7c3b9f2
 Create Date: 2026-11-25
 
 ``enforcement_selftest`` keeps the last few runs of Settings → Enforcement →
@@ -13,12 +13,6 @@ restrictions a self-test makes are ordinary ``enforcement_action`` rows.
 A partial unique index on ``status = 'running'`` lets the database itself
 refuse a second run in progress (SQLite and PostgreSQL both support partial
 indexes), whichever process or worker starts it.
-
-Merge note: the ``activity-feed`` branch adds its own migration
-``c9f2b6d4e8a1`` on top of the same parent (``c9f2a6e1d4b7``). Whichever of the
-two branches is merged second must re-chain its migration onto the other's
-(set its ``down_revision`` to the other revision) so the history keeps a
-single head. The two touch different tables, so the order does not matter.
 """
 
 from __future__ import annotations
@@ -28,7 +22,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "a8d4f2c6e9b3"
-down_revision = "c9f2a6e1d4b7"
+down_revision = "d1e5a7c3b9f2"
 branch_labels = None
 depends_on = None
 
