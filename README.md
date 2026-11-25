@@ -125,11 +125,11 @@ telemetry, no analytics, and nothing else is contacted.
 | **It acts once a cycle**, not the moment credits are spent. | Usage is read and budgets judged once a cycle (every 15 minutes by default), and Checkmarx can report credits a little after they are spent. Usage in between can take a budget past its limit before the restriction lands, so leave some headroom. A large group or application is restricted over several cycles (at most 1,000 changes a cycle by default; [Sizing and scale](#sizing-and-scale)). |
 | **It restricts access, it does not meter credits.** | It removes roles and turns settings off; it cannot stop an action already running or cap a budget to the exact credit. |
 | **Only roles held directly are removed.** | An AI role a person holds through a group or a composite role stays in effect. CreditGuard says so once and never changes the group or role, because that would affect everyone in it. Remove it there in Checkmarx One, or exempt the person ([Restricting a user, in detail](#what-the-enforcement-actions-actually-are)). |
-| **User budgets may not bite at all.** | On a live tenant `ast-admin`, held by 274 of 296 users, is a composite role containing all three default AI roles, and it is protected: a user restriction would have reached almost nobody. Check *Enforcement coverage* (Simulation or Settings → Enforcement) before relying on user budgets; project, group and application budgets still turn AI features off on projects. |
+| **User budgets may not bite at all.** | A user budget cannot stop someone who gets Fusion through a composite role: `ast-admin` (held by 274 of 296 users on a live tenant, and protected) and `scan-fusion` both contain `create-fusion-scan`, so removing the direct mapping takes nothing away. The fix is on the tenant: give people `ast-scanner` or `ast-risk-manager` (which contain no AI role) plus `create-fusion-scan` directly where they should run Fusion. Check *Enforcement coverage* (Simulation or Settings → Enforcement) before relying on user budgets. Project, group and application budgets do not depend on roles: they turn AI features off on the projects. |
 | **A project budget does not stop people's own AI Triage and AI Remediation.** | Turning project features off leaves what people start themselves working; only a user budget stops that ([What the breach and restriction messages say](#what-the-breach-and-restriction-messages-say)). |
 | **Account-wide Auto Triage may override a project.** | If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project. |
 | **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
-| **The general Risk Management roles are used for now.** | AI Triage and AI Remediation are reached through them today, so a restricted person also loses the Risk Management pages and dashboard. When Checkmarx One's dedicated AI permissions reach your tenant, swap them in under Settings → Enforcement, *Roles a user restriction removes*. |
+| **A user restriction removes the Fusion and LLM roles.** | By default `create-fusion-scan` (the role that spends credits), `manage-fusion`, `update-llm-scan-mode` and `manage-llm-configuration`. The composites `scan-fusion` and `fusion-manager` are left alone, because removing them would also take ordinary scanning or tenant-settings rights, and `ai-triage-assist` can never be chosen: removing it breaks Auto Triage. An install that had chosen other roles keeps them (Settings → Enforcement, *Roles a user restriction removes*). |
 | **Figures only cover Checkmarx's lookback window.** | Checkmarx reports totals over a window (at most the last year), not individual events. "Lifetime" means everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened, unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
 | **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution). Automation (bots, integrations without an email) never does. Project usage reported under a repository name that is no project (87% of project credits on a live tenant) counts towards no project, group or application budget until mapped. All of it is shown on the Overview. |
 | **Credits per action are measured, not quoted.** | Checkmarx's listed rate is not what a Fusion or DAST correlation action costs (on a live tenant about 109 credits per Opus 5.5 Fusion scan against a rate of 2). Where they disagree, messages price an action at the feed's average over the lookback window and say so; it is an average, not the cost of one scan. |
@@ -650,7 +650,7 @@ is remembered (`org_sync.complete_listings`).
 
 | Level breached | What changes |
 | -------------- | ------------ |
-| User | The AI roles are unmapped from the user on the `ast-app` client: the list under Settings → Enforcement (*Roles a user restriction removes*, API field `ai_roles`), by default `view-risk-management`, `view-risk-management-dashboard`, `view-risk-management-tab`. Only roles mapped to the user **directly** can be removed; one held through a group or a composite role is reported, not taken (see below). Nothing else is touched: whether the user can view scans (`view-scans`) stays whatever their Checkmarx permission says |
+| User | The AI roles are unmapped from the user on the `ast-app` client: the list under Settings → Enforcement (*Roles a user restriction removes*, API field `ai_roles`), by default `create-fusion-scan`, `manage-fusion`, `update-llm-scan-mode`, `manage-llm-configuration`. Only roles mapped to the user **directly** can be removed; one held through a group or a composite role is reported, not taken (see below). Nothing else is touched: whether the user can view scans (`view-scans`) stays whatever their Checkmarx permission says |
 | Project | What the limit's **What to turn off for projects** choice selects (`project_actions`): **Auto Triage** is disabled via `PUT /api/ai-agents-coordinator/projects/{id}/configuration`; **PR triage and remediation** is disabled by clearing `remediationSeverities` via `PATCH /api/repos-manager/repo/{repo_id}?projectId={id}`; **Fusion** is turned off by writing `scan.config.ai.fusionEnabled` = `"false"` via `PATCH /api/configuration/project?project-id={id}` and, for a project with a repository, `fusionScanConfig.enabled` = `false` via the same repos-manager `PATCH` |
 | Group | The chosen project actions, on every project in the group |
 | Application | The chosen project actions, on every project in the application |
@@ -677,9 +677,17 @@ restore never resets branches, severity levels or the Fusion model.
 
 **Restricting a user, in detail.**
 
-* **Which roles.** The default three are *general* Risk Management roles: AI
-  Triage and AI Remediation are reached through them today, so a person
-  restricted also loses the Risk Management pages and dashboard. Settings →
+* **Which roles.** The default is the four plain (non-composite) `ast-app`
+  roles that gate spending AI credits: `create-fusion-scan` (*trigger a Fusion
+  scan*: the one that spends credits), `manage-fusion` (Fusion in the account
+  and project settings), `update-llm-scan-mode` (Fast/Targeted/Full) and
+  `manage-llm-configuration` (LLM opt-in / opt-out). The composites that
+  contain them are not on the list: `scan-fusion` also carries the ordinary
+  scanning roles (`create-scan`, `create-project`, `view-results`, …) and
+  `fusion-manager` also carries `update-tenant-params`, so removing either
+  would over-restrict. `ai-triage-assist`, the built-in role of the AI Triage
+  system user, is refused on save (`forbidden_ai_roles`) and never removed by
+  any restriction, whatever is stored: removing it breaks Auto Triage. Settings →
   Enforcement, *Roles a user restriction removes* (setting
   `enforcement.ai_roles`, API field `ai_roles`), changes the list. Names are
   checked against the roles the tenant actually has on `ast-app`
@@ -691,18 +699,40 @@ restore never resets branches, severity levels or the Fusion model.
   the same way). A role that looks like an administration role (`*admin*`,
   `manage-*`, `realm-*`, `iam-*`) is saved only with an explicit confirmation
   (API field `confirm_admin_roles: true`; the picker marks such roles and asks
-  first). An upgrade changes nothing: the default is the three roles above.
-* **10 January.** Checkmarx One is to ship dedicated AI Triage and AI
-  Remediation permissions and roles on 10 January. When they are on your
-  tenant, add them to the list and remove the general ones: no code change is
-  needed.
+  first); the default roles never count as such, though two match `manage-*`.
+* **Upgrading from the Risk Management default.** Until 2026-11 the default
+  was `view-risk-management`, `view-risk-management-dashboard` and
+  `view-risk-management-tab`, which do not gate spending AI credits. An install
+  on the default gets the new one; a list an admin chose is kept as it is. A
+  stored list that is exactly the old default, same names in the same order
+  (what *Back to the default* saved), is moved to the new default by migration
+  `c9f2a6e1d4b7`; downgrading moves exactly the new default back. Restrictions
+  in force keep, and give back, the roles they recorded.
+* **Who a user budget cannot stop.** Someone who gets Fusion through a
+  composite role keeps it: `ast-admin` (protected by default, and on a live
+  tenant held by 274 of 296 users) contains all four default roles directly,
+  and `scan-fusion` contains `create-fusion-scan`. *Enforcement coverage* shows
+  them as kept through a composite. The fix is on the tenant: give people
+  `ast-scanner` or `ast-risk-manager` (neither contains an AI role) plus
+  `create-fusion-scan` directly where they should run Fusion. Project, group
+  and application budgets do not depend on roles.
 * **A change applies to restrictions made from then on.** Every user
   restriction records the list it used (`ai_roles` on its undo snapshot).
   Restore gives back exactly the roles that restriction recorded as removed; the
   drift check looks for those roles only; and the pass that returns roles an
   earlier version should not have taken (`view-scans`, once) goes by the
-  recorded list too, the default one for a restriction made before the list
-  was a setting. Protected roles work as before.
+  recorded list too, the Risk Management three for a restriction made before
+  the list was a setting (never today's default). Protected roles work as
+  before.
+* **More credits give the roles back.** Raising a restricted user's budget
+  above their usage (Limits, a bulk edit, a CSV import) or approving a credit
+  request that does so lifts the restriction at once (reason
+  `credit_increased`; the next cycle finishes it if Checkmarx One could not be
+  reached): exactly the roles the restriction recorded as removed are mapped
+  back, whatever the setting says now, and it is audited
+  (`enforcement.reversed`). A role an admin already mapped back by hand is
+  simply mapped again (Keycloak ignores a mapping that exists). Another limit
+  still restricting the user keeps them restricted until it is lifted too.
 * **Where each role comes from.** Before restricting, CreditGuard reads, best
   effort: the user's direct client role mappings (as before), their effective
   client roles (`GET .../users/{id}/role-mappings/clients/{clientUuid}/composite`),
@@ -748,9 +778,9 @@ restore never resets branches, severity levels or the Fusion model.
   restriction* violation.
 * **Simulation.** The Simulation page and the blast radius in the limit form
   show, for each user who would be restricted, the roles that would be removed
-  (with what each grants: its composite children, and for the default three
-  *Risk Management pages and dashboard; AI Triage/Remediation are reached from
-  here*), the roles that would stay effective and where from, and what could
+  (with what each grants: its composite children, and for each default role a
+  short description, such as *Trigger a Fusion scan: the role that spends AI
+  credits*), the roles that would stay effective and where from, and what could
   not be read. Admins only: a viewer sees which roles a restriction removes,
   and no IAM read is made for them. The tenant is read best effort for the
   request: at most 50 users per preview (the page says when it stopped there),
@@ -2075,8 +2105,9 @@ failure of this tool is restricting many people at once for a wrong reason.
   story. Limits keep being judged on the last believed reading meanwhile, and
   each cycle that holds one reports it as a warning in its result.
 - **Roles a user restriction removes.** The client roles a user restriction
-  takes (API field `ai_roles`; default the three Risk Management roles), picked
-  from the tenant's own roles. Applies to restrictions made from then on. See
+  takes (API field `ai_roles`; default `create-fusion-scan`, `manage-fusion`,
+  `update-llm-scan-mode`, `manage-llm-configuration`), picked from the
+  tenant's own roles; `ai-triage-assist` is refused. Applies to restrictions made from then on. See
   [Restricting a user, in detail](#what-the-enforcement-actions-actually-are).
 - **Fusion lock.** *Lock Fusion against per-scan override* (on by default, API
   field `fusion_lock_override`): when a limit turns Fusion off, also set

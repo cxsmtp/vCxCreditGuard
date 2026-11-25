@@ -179,7 +179,7 @@ def test_a_database_at_the_replaced_anchor_revision_reaches_the_ledger(tmp_path:
     }
     with engine.begin() as connection:
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert version == "b3e8d1f6a9c4"
+    assert version == "c9f2a6e1d4b7"
     # And back down the whole chain, and up again.
     command.downgrade(config, BEFORE)
     command.upgrade(config, "head")

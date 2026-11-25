@@ -17,7 +17,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.checkmarx.iam import DEFAULT_AI_ROLE_NAMES
+from app.checkmarx.iam import DEFAULT_AI_ROLE_NAMES, never_removed
 from app.checkmarx.usage import DEFAULT_PERIOD
 from app.core.crypto import (
     PURPOSE_SMTP_PASSWORD,
@@ -119,10 +119,11 @@ KEY_PROTECTED_ROLES = "enforcement.protected_roles"
 # tenant that rejects the lock still gets Fusion turned off without it.
 KEY_FUSION_LOCK = "enforcement.fusion_lock_override"
 # The client roles (on the platform client, ast-app) a user restriction removes.
-# The default is the three general Risk Management roles AI Triage and AI
-# Remediation are reached through, so an upgrade changes nothing. A change
-# applies to restrictions made from then on: each restriction records the list
-# it used, and its Restore and drift check go by that record.
+# The default is the Fusion and LLM roles that gate spending AI credits
+# (iam.DEFAULT_AI_ROLE_NAMES). A change applies to restrictions made from then
+# on: each restriction records the list it used, and its Restore and drift check
+# go by that record. ``ai-triage-assist`` is never one of them
+# (iam.NEVER_AI_ROLE_NAMES).
 KEY_AI_ROLES = "enforcement.ai_roles"
 AI_ROLES_MAX = 50
 
@@ -417,8 +418,15 @@ ADMIN_ROLE_PATTERNS: tuple[str, ...] = ("*admin*", "manage-*", "realm-*", "iam-*
 
 
 def admin_like_role(name: str) -> bool:
-    """Whether a role name matches one of ADMIN_ROLE_PATTERNS (case ignored)."""
+    """Whether a role name matches one of ADMIN_ROLE_PATTERNS (case ignored).
+
+    The default AI roles never do: ``manage-fusion`` and
+    ``manage-llm-configuration`` match ``manage-*`` but are known to govern
+    only Fusion and LLM settings.
+    """
     lowered = name.strip().lower()
+    if lowered in DEFAULT_AI_ROLE_NAMES:
+        return False
     return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in ADMIN_ROLE_PATTERNS)
 
 
@@ -448,9 +456,15 @@ def ai_role_names(session: Session) -> tuple[str, ...]:
     """The client roles a user restriction removes from now on.
 
     Falls back to the default list when unset or unusable, so a stray stored
-    value can never make a restriction remove nothing.
+    value can never make a restriction remove nothing. A role a restriction
+    must never remove (``iam.NEVER_AI_ROLE_NAMES``) is left out, however it got
+    stored (the Settings page refuses it).
     """
-    names = normalise_role_names(get_value(session, KEY_AI_ROLES, DEFAULTS[KEY_AI_ROLES]))
+    names = [
+        name
+        for name in normalise_role_names(get_value(session, KEY_AI_ROLES, DEFAULTS[KEY_AI_ROLES]))
+        if not never_removed(name)
+    ]
     return tuple(names[:AI_ROLES_MAX]) or DEFAULT_AI_ROLE_NAMES
 
 

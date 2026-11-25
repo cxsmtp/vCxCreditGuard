@@ -6,11 +6,14 @@ composite role or a group, and it never touches a user who holds a protected
 role. On a live tenant (2026-11) that left almost nobody restrictable:
 
 * ``ast-admin``, held by 274 of 296 users, is a composite role containing all
-  three default AI roles (so are ``ast-risk-manager``, ``manage-project`` and
-  ``scan-fusion``);
+  four default AI roles (``create-fusion-scan``, ``manage-fusion``,
+  ``update-llm-scan-mode``, ``manage-llm-configuration``), and ``scan-fusion``
+  contains ``create-fusion-scan``: their holders keep Fusion through the
+  composite whatever is removed directly;
 * ``ast-admin`` is also a protected role, so 93% of users are never restricted;
-* the tenant had dedicated AI roles (``ai-triage-assist``, ``create-fusion-scan``,
-  ``scan-fusion``, ``fusion-manager``, ``manage-fusion``).
+* ``ast-scanner``, ``ast-risk-manager`` and ``manage-project`` contain none of
+  the default AI roles, so people who have those plus ``create-fusion-scan``
+  directly are the ones a user budget can stop.
 
 This module measures that, so an admin sees it before relying on a user budget.
 It works from what the organisation sync already stored (each user's roles and
@@ -34,6 +37,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.checkmarx import iam
 from app.checkmarx.client import CheckmarxClient
 from app.db.base import utcnow
 from app.models.org import CxGroup, CxGroupMembership, CxUser
@@ -58,16 +62,18 @@ MAX_GROUP_READS = 60
 # Below this share of AI-role holders a user restriction can reach, the page
 # says plainly that user budgets will not bite.
 LOW_COVERAGE = 0.5
-# Roles a tenant may have for AI features alone (seen on a live tenant), and
-# the name fragments that suggest one.
+# Roles a tenant may have for AI features (seen on a live tenant), and the name
+# fragments that suggest one. Only plain roles are ever suggested for the list:
+# a composite (``scan-fusion``, ``fusion-manager``) carries ordinary rights as
+# well, and ``ai-triage-assist`` belongs to the AI Triage system user and is
+# never removed (iam.NEVER_AI_ROLE_NAMES).
 KNOWN_AI_ROLES: tuple[str, ...] = (
-    "ai-triage-assist",
-    "create-fusion-scan",
+    *iam.DEFAULT_AI_ROLE_NAMES,
     "scan-fusion",
     "fusion-manager",
-    "manage-fusion",
+    "ai-triage-assist",
 )
-_AI_FRAGMENTS = ("fusion", "ai-triage", "ai-remediation", "ai-assist")
+_AI_FRAGMENTS = ("fusion", "llm", "ai-triage", "ai-remediation", "ai-assist")
 
 
 @dataclass
@@ -169,6 +175,12 @@ class Coverage:
         )
         if self.unknown:
             text += f" The roles of {self.unknown} more could not be read."
+        if self.via_composite_or_group:
+            text += (
+                " The fix is on the tenant: give people ast-scanner or ast-risk-manager (which "
+                "contain no AI role), plus create-fusion-scan directly where they should run "
+                "Fusion, rather than ast-admin or scan-fusion."
+            )
         if self.dedicated_roles:
             text += (
                 " This tenant has roles dedicated to AI features "
@@ -481,8 +493,10 @@ def compute(session: Session, client: CheckmarxClient | None) -> Coverage:
 
     report.dedicated_roles = sorted(
         name
-        for name in (set(client_roles) if client_roles else set())
+        for name, role in client_roles.items()
         if name not in wanted
+        and not role.composite
+        and not iam.never_removed(name)
         and (name in KNOWN_AI_ROLES or any(fragment in name for fragment in _AI_FRAGMENTS))
     )
     return report

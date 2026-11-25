@@ -686,14 +686,19 @@ def snapshot_ai_roles(snapshot: dict[str, Any] | None) -> frozenset[str]:
     """The roles a user restriction counted as AI roles when it was made.
 
     Recorded on every user restriction since the list became a setting; one
-    made before that used the default list. A restriction keeps going by its own
-    record (drift, returning roles it should not have taken), so changing the
-    setting only affects restrictions made afterwards.
+    made before that used the default of the time (the Risk Management roles,
+    ``iam.LEGACY_AI_ROLE_NAMES``), never today's default. A restriction keeps
+    going by its own record (drift, returning roles it should not have taken),
+    so changing the setting, or the default, only affects restrictions made
+    afterwards. A role a restriction must never remove
+    (``iam.NEVER_AI_ROLE_NAMES``) is never counted, whatever was recorded.
     """
     recorded = (snapshot or {}).get("ai_roles")
     if isinstance(recorded, list) and recorded:
-        return frozenset(name for name in recorded if isinstance(name, str) and name)
-    return frozenset(iam.DEFAULT_AI_ROLE_NAMES)
+        names = {name for name in recorded if isinstance(name, str) and name}
+    else:
+        names = set(iam.LEGACY_AI_ROLE_NAMES)
+    return frozenset(name for name in names if not iam.never_removed(name))
 
 
 # ------------------------------------------------------------------- enforcing

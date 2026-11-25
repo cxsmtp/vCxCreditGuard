@@ -2,7 +2,7 @@
 
 Synthetic tenant shaped like the live one (2026-11): a protected composite role
 (``ast-admin``) holding every default AI role and held by most users, another
-composite (``ast-risk-manager``), a group granting an AI role, and dedicated AI
+composite (``scan-fusion``), a group granting an AI role, and dedicated AI
 roles on the tenant.
 """
 
@@ -27,10 +27,15 @@ AI = list(DEFAULT_AI_ROLE_NAMES)
 def shaped_tenant() -> FakeTenant:
     tenant = FakeTenant()
     tenant.add_client_role("ast-admin", contains=[*AI, "view-projects"])
-    tenant.add_client_role("ast-risk-manager", contains=AI)
-    for name in ("ai-triage-assist", "scan-fusion", "fusion-manager"):
-        tenant.add_client_role(name, contains=[])
-    tenant.add_group(group_id="g-ai", name="AI Users", roles=["view-risk-management"])
+    # On the live tenant scan-fusion holds create-fusion-scan with ordinary
+    # scanning roles, and fusion-manager holds manage-fusion with tenant params.
+    tenant.add_client_role("scan-fusion", contains=["create-fusion-scan", "view-projects"])
+    tenant.add_client_role("fusion-manager", contains=["manage-fusion", "update-tenant-params"])
+    tenant.add_client_role("update-tenant-params")
+    tenant.add_client_role("ai-triage-assist", contains=["view-projects"])
+    # A plain AI role not on the list: the kind worth suggesting.
+    tenant.add_client_role("ai-remediation-run")
+    tenant.add_group(group_id="g-ai", name="AI Users", roles=["create-fusion-scan"])
     # Roles as /users/v2 reports them: everything held, composites expanded.
     for index in range(7):
         tenant.add_user(
@@ -39,11 +44,15 @@ def shaped_tenant() -> FakeTenant:
             email=f"admin{index}@example.com",
             roles=["ast-admin", *AI, "view-projects"],
         )
-    tenant.add_user(user_id="risk", username="risk@example.com", roles=["ast-risk-manager", *AI])
+    tenant.add_user(
+        user_id="fusion",
+        username="fusion@example.com",
+        roles=["scan-fusion", "create-fusion-scan", "view-projects"],
+    )
     tenant.add_user(
         user_id="grouped",
         username="grouped@example.com",
-        roles=["view-risk-management"],
+        roles=["create-fusion-scan"],
         groups=["AI Users"],
     )
     tenant.join_group("grouped", "g-ai")
@@ -78,13 +87,20 @@ def test_who_a_user_restriction_can_reach(db: Session, connected: FakeTenant) ->
     assert report.unknown == 0
     assert report.composites["ast-admin"] == sorted(AI)
     assert report.composite_holders["ast-admin"] == 7
+    # Fusion through scan-fusion is kept through a composite.
+    assert report.composites["scan-fusion"] == ["create-fusion-scan"]
+    assert report.composite_holders["scan-fusion"] == 1
     assert report.groups_granting == ["AI Users"]
-    assert report.dedicated_roles == ["ai-triage-assist", "fusion-manager", "scan-fusion"]
+    # Only plain roles are suggested: not the composites (they over-restrict),
+    # never ai-triage-assist (removing it breaks Auto Triage).
+    assert report.dedicated_roles == ["ai-remediation-run"]
     assert report.low
     warning = report.warning()
     assert warning is not None
     assert "will not bite" in warning and "only 1 of the 10" in warning
-    assert "ai-triage-assist" in warning and "never changes the list" in warning
+    assert "ai-remediation-run" in warning and "never changes the list" in warning
+    assert "ai-triage-assist" not in warning
+    assert "ast-scanner or ast-risk-manager" in warning and "create-fusion-scan" in warning
 
 
 def test_it_only_reads_and_never_changes_the_role_list(db: Session, connected: FakeTenant) -> None:

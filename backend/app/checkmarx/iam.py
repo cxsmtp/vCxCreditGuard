@@ -37,31 +37,68 @@ MAX_PAGES = 500
 PLATFORM_CLIENT_ID = "ast-app"
 
 # The roles a user restriction removes unless an admin chose others (Settings →
-# Enforcement, ``enforcement.ai_roles``). They are the general Risk Management
-# roles, through which AI Triage and AI Remediation are reached today: a person
-# restricted loses the Risk Management pages too. When Checkmarx One ships
-# dedicated AI permissions, the setting is changed to name them instead; this
-# default stays, so an upgrade never changes what a restriction removes.
+# Enforcement, ``enforcement.ai_roles``): the ast-app client roles that gate
+# spending AI credits on Fusion and choosing how the LLM scans run. Each is a
+# plain (non-composite) role, so removing it takes nothing else.
 #
-# The scan-viewing role ("view-scans") is deliberately not here. A credit
-# budget governs AI features; whether someone may look at scans is decided by
-# the permission they hold in Checkmarx One, and a restriction leaves it alone.
+# * ``create-fusion-scan`` - trigger a Fusion scan: the role that spends credits.
+# * ``manage-fusion`` - configure Fusion in the account and project settings.
+# * ``update-llm-scan-mode`` - choose the LLM scan mode (Fast/Targeted/Full).
+# * ``manage-llm-configuration`` - LLM opt-in / opt-out.
+#
+# The composites that contain them are deliberately not here: ``scan-fusion``
+# also carries the ordinary scanning roles (create-scan, create-project,
+# view-results...) and ``fusion-manager`` tenant parameters, so removing either
+# would take far more than AI. Someone who gets a Fusion role through a
+# composite (``ast-admin``, ``scan-fusion``) keeps it whatever is removed
+# directly; the coverage report counts them.
+#
+# The scan-viewing role ("view-scans") is not here either. A credit budget
+# governs AI features; whether someone may look at scans is decided by the
+# permission they hold in Checkmarx One, and a restriction leaves it alone.
 DEFAULT_AI_ROLE_NAMES: tuple[str, ...] = (
+    "create-fusion-scan",
+    "manage-fusion",
+    "update-llm-scan-mode",
+    "manage-llm-configuration",
+)
+# The default before 2026-11: the general Risk Management roles, which do not
+# gate spending AI credits. A restriction recorded without its own list was
+# made with these and keeps going by them (``enforcement.snapshot_ai_roles``).
+# An install that had exactly this list stored is moved to the new default by
+# migration c9f2a6e1d4b7; any other stored list is kept as it is.
+LEGACY_AI_ROLE_NAMES: tuple[str, ...] = (
     "view-risk-management",
     "view-risk-management-dashboard",
     "view-risk-management-tab",
 )
+# Roles a user restriction never removes, whatever the setting says.
+# ``ai-triage-assist`` is the built-in role of the AI Triage system user:
+# taking it away breaks Auto Triage.
+NEVER_AI_ROLE_NAMES: frozenset[str] = frozenset({"ai-triage-assist"})
 # The name earlier versions used. It is the default list, not the configured one:
 # what a restriction removes is ``settings_store.ai_role_names``.
 AI_ROLE_NAMES = DEFAULT_AI_ROLE_NAMES
 
+
+def never_removed(name: str) -> bool:
+    """Whether a user restriction must leave this role alone (case ignored)."""
+    return name.strip().lower() in NEVER_AI_ROLE_NAMES
+
+
 # What the default roles give a person, in words, for the Simulation page. A
 # static description (Checkmarx One's own role descriptions are shown as well
 # when the tenant provides them).
-ROLE_DESCRIPTIONS: dict[str, str] = dict.fromkeys(
-    DEFAULT_AI_ROLE_NAMES,
-    "Risk Management pages and dashboard; AI Triage/Remediation are reached from here",
-)
+ROLE_DESCRIPTIONS: dict[str, str] = {
+    "create-fusion-scan": "Trigger a Fusion scan: the role that spends AI credits",
+    "manage-fusion": "Configure Fusion in the account and project settings",
+    "update-llm-scan-mode": "Change the LLM scan mode (Fast, Targeted or Full)",
+    "manage-llm-configuration": "Turn the LLM opt-in / opt-out settings on or off",
+    **dict.fromkeys(
+        LEGACY_AI_ROLE_NAMES,
+        "Risk Management pages and dashboard (the default AI roles before 2026-11)",
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,7 +431,16 @@ def fetch_client_role_composites(
 def remove_user_client_roles(
     client: CheckmarxClient, *, user_id: str, client_uuid: str, roles: list[RoleRef]
 ) -> None:
-    """Unmap roles from a user. No-op when ``roles`` is empty."""
+    """Unmap roles from a user. No-op when ``roles`` is empty.
+
+    A role in NEVER_AI_ROLE_NAMES is never unmapped, whoever asks: the role
+    list and every restriction record already leave it out, and this is the
+    last line.
+    """
+    never = [role.name for role in roles if never_removed(role.name)]
+    if never:
+        logger.warning("Not removing %s from user %s", ", ".join(never), user_id)
+        roles = [role for role in roles if not never_removed(role.name)]
     if not roles:
         return
     client.request(
