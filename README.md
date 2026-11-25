@@ -531,32 +531,60 @@ Checkmarx One, so a failed reading leaves nothing behind and the next one is
 measured from the last reading that was stored.
 
 * **A name's increase** is its total now minus its total in the previous live
-  reading of the same view (per action type too). A fall (the lookback window
-  rolled past older usage) adds nothing, and the name continues from its new
-  total. A name missing from a reading is remembered with its last total
+  reading of the same view (per action type too). The same row served on two
+  pages (the ranking shifting between page requests) is read once, never added
+  up; different rows of one subject (a person under their email and under their
+  name) are added up.
+* **A fall** adds nothing. In a reading the completeness checks believe, it is
+  the lookback window rolling past older usage, and the name continues from its
+  new total. In a reading they doubt (a row served twice, or fewer distinct rows
+  than the feed says it has), the fall is not believed: the name continues from
+  its previous total (`usage_missing_name`, kind `dip`) until it recovers, or a
+  believed reading confirms the fall. A real roll-down reported first in a
+  doubted reading therefore costs what the name adds until it is confirmed.
+* **A name missing from a reading** is remembered with its last total
   (`usage_missing_name`), so when it returns only what it reported since counts.
+  It is forgotten once older than the lookback window: nothing of that total can
+  be left in the window, so its return counts in full.
 * **A name never seen before counts in full**: it reported nothing in the
-  previous reading, so all of its total is new. Except when names left the feed
-  as it appeared, in the same reading or within one org refresh plus an hour (a
-  rename the feed reported first, its total maybe rolled down meanwhile): it
-  may be any of them, so it starts from the highest of their last totals (per
-  action type too). That can under-count a really new name or renames landing
-  together, never over-count.
+  previous reading, so all of its total is new. Unless it may be a rename: when
+  it counts towards an entity, it starts from the highest last total of that
+  entity's remembered names (however long ago they left, within the lookback
+  window) and of unmatched names that left within one org refresh plus an hour
+  (a rename the sync learnt first); when it counts towards nothing, from the
+  highest of any names that left within one org refresh plus an hour. Per action
+  type too. This applies whenever a project's or user's name changes, or another
+  name leaves the feed as an unmatched one appears; it can under-count a really
+  new name in that reading, never over-count.
   The very first reading, and a reading taken over another lookback window,
-  count nothing: every total in them is history.
+  count nothing: every total in them is history. A name missing at a change of
+  lookback window starts from whatever it reports when it returns.
 * **Each increase counts towards the entity the name counts towards at that
   moment** (`usage_delta`, one row per reading and name, unique, so a retried
   reading cannot count twice), and is added to the counter (`budget_usage`) of
-  every active budget that entity feeds at that moment: a user's, and the user's
-  groups' that include members' usage; a project's, its groups' and its
-  applications' (when the group or application has no figure of its own). The
-  next evaluation moves these into the period it evaluates; a new period starts
-  from zero. A budget switched off counts nothing while it is off.
+  every active budget that entity feeds at that moment, for the period the
+  reading was taken in: a user's, and the user's groups' that include members'
+  usage; a project's, its groups' and its applications'. A group or application
+  with a row of its own in its view's latest reading is fed by that row, and
+  otherwise by its projects, decided once per ingest before any view is read; a
+  group's or application's own row that is new, or back after missing readings,
+  counts nothing in that reading (its projects fed the budget meanwhile).
+  Every active budget is fed, whatever its period type: one that counts usage
+  already reported reads its totals instead, so switching it back mid-period
+  loses nothing. A budget switched off counts nothing while it is off.
+* **An increase whose interval spans a budget's period start** (the reading
+  before it was taken in an earlier period: downtime, demo mode or a skipped
+  cycle across a rollover) cannot be split, so that budget counts none of it.
+  An increase read before the rollover and evaluated after it counts towards the
+  period it was read in; that period's figure is brought up to date when the
+  next evaluation runs.
 * **Usage observed while a name counts towards nothing** (unmatched, deleted,
-  disputed) is kept unattributed. It is claimed by the entity the name first
-  counts towards if that entity was synced after the usage (within one org
-  refresh plus an hour of it): a project or user created and used before the
-  sync brought it keeps its first usage. Otherwise it stays counted nowhere.
+  disputed) is kept unattributed. It is claimed by the entity the name comes to
+  match by its own name, only for what was observed in the org refresh plus an
+  hour before that entity was first synced: a project or user created and used
+  before the sync brought it keeps its first usage. A mapping, or resolving a
+  dispute, settles it instead: it is never claimed, and the name counts from
+  then on.
 
 So a mapping, an unmapping, a correction, a rename in either order, a deletion
 and return, a group or application membership change and demo mode only ever
@@ -567,33 +595,42 @@ there." A disputed user match counts towards nobody until an admin resolves it;
 what it counted before stays.
 
 **Budgets that count usage already reported** (lifetime, custom, or *count
-existing usage*), and demo budgets in demo mode, are not ledger budgets: they
-count the current totals of the names that count towards them now, history
-included, by definition. Mapping a name to such a budget's entity brings its
-history in, and unmapping it takes it out again.
+existing usage*), and demo budgets in demo mode, read the current totals of the
+names that count towards them now, history included, by definition. Mapping a
+name to such a budget's entity brings its history in, and unmapping it takes it
+out again.
 
 **What the ledger cannot know.** The feed gives no dates, so these are lost, by
 construction, and never guessed: usage a name reported between its last reading
-under one name and its first under a new one that could not be paired; increases
-hidden by the lookback window rolling past older usage in the same interval;
-usage in the reading after a change of lookback window; and usage observed while
-a name counted towards nothing that no new entity claims; and what a new name
-adds in the reading where it first appears, when other names left the feed just
-before.
+under one name and its first under a new one that could not be paired; what a
+new name adds in the reading where it first appears, when it may be a rename;
+increases hidden by the lookback window rolling past older usage in the same
+interval; what a name adds while a doubted fall of it waits for confirmation,
+when the fall is real; usage in the reading after a change of lookback window;
+an interval that spans a budget's period start; the reading in which a group's
+or application's own row leaves its view; and usage observed while a name
+counted towards nothing that no new entity claims.
 
 The same increases drive the rest: usage after a restriction is the restricted
 user's or project's increases since the restriction (each action type since its
-own restriction, Fusion priced from the increases' Fusion models); the action mix
-in notifications is the period counter's (or, when an action's count stopped
-rising while another rose, the readings'); and Auto Triage credits charged to
-people who scan use each project's readings shifted by what names joining or
-leaving it brought (`usage_entity_offset`). Ledger rows older than the retention
-window are pruned, except those of an entity with a restriction in force.
+own restriction, Fusion priced from the increases' Fusion models). An increase is
+read between two readings and cannot be split, so the first one after a
+restriction includes what was used between the reading before it and the
+restriction itself (normally the seconds between a cycle's reading and its
+enforcement). The action mix in notifications is the period counter's (or, when
+an action's count stopped rising while another rose, the readings'); and Auto
+Triage credits charged to people who scan use each project's readings shifted by
+what names joining or leaving it brought (`usage_entity_offset`). Ledger rows
+older than the retention window are pruned, except those of an entity with a
+restriction in force; budget counters are pruned with their period states.
 
-**Upgrading** seeds the counter of every budget period still open with the usage
-it shows (its `credits_used`, less the Auto Triage credits charged to people,
-which are added separately), so no open period jumps or loses anything, and the
-ledger starts from the latest live reading. **Downgrading** drops the ledger
+**Upgrading** (migration `b3e8d1f6a9c4`) seeds the counter of every budget
+period still open with the usage it shows (its `credits_used`, less the Auto
+Triage credits charged to people, which are added separately), so no open period
+jumps or loses anything, remembers the names earlier readings had and the latest
+lacks, and starts the ledger from the latest live reading. A database at the
+unreleased usage-anchor revision `f9c1e4b7a2d3` (now an empty placeholder) loses
+that schema's tables and columns on the way. **Downgrading** drops the ledger
 tables; period budgets then count from the baseline their period opened with.
 
 **An organisation sync never deletes after a short listing.** Listings are read
