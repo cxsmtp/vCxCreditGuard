@@ -186,8 +186,9 @@ const LIMITATIONS: Limitation[] = [
     meaning: (
       <>
         Usage the consumption summary counts (after a fallback to it, from a
-        group&apos;s own summary row, or with the summary only) still counts and
-        warns, but never starts a new restriction of a monthly or quarterly
+        group&apos;s own summary row, or with the summary only), and auto-triage
+        charged to the person who started a scan, still count and warn, but
+        never start a new restriction of a monthly or quarterly
         budget: from running totals the summary cannot always tell a glitch
         from a real fall. Such a budget over its limit is warned, not
         restricted, and Overview, Budgets and Diagnose show that restrictions

@@ -144,7 +144,7 @@ telemetry, no analytics, and nothing else is contacted.
 | **Account-wide Auto Triage may override a project.** | If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project. |
 | **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
 | **The general Risk Management roles are used for now.** | AI Triage and AI Remediation are reached through them today, so a restricted person also loses the Risk Management pages and dashboard. When Checkmarx One's dedicated AI permissions reach your tenant, swap them in under Settings → Enforcement, *Roles a user restriction removes*. |
-| **Monthly and quarterly budgets restrict only on usage the activity log counted.** | Usage the consumption summary counts (after a fallback to it, from a group's own summary row, or with *Usage source: Summary only*) still counts, warns and shows everywhere, but never starts a new restriction of a monthly or quarterly budget: from running totals the summary cannot always tell a glitch from a real fall. Such a budget over its limit gets a warning (*over budget on summary totals; not restricted*), and the Overview and Budgets pages show *Restrictions paused for period budgets* while the log is unavailable; so does Diagnose. On a tenant without the activity log no monthly or quarterly budget restricts unless you choose *Summary only* and turn on *Allow restrictions from summary totals (less accurate)* (an install that had chosen *Summary only* before this keeps restricting: the upgrade turns it on). Restrictions already in force stay; lifting works as before; lifetime, custom and count-existing budgets restrict on summary totals as before ([Restrictions from summary totals](#restrictions-from-summary-totals)). |
+| **Monthly and quarterly budgets restrict only on usage the activity log counted.** | Usage the consumption summary counts (after a fallback to it, from a group's own summary row, or with *Usage source: Summary only*), and auto-triage charged to the person who started a scan, still count, warn and show everywhere, but never start a new restriction of a monthly or quarterly budget: from running totals the summary cannot always tell a glitch from a real fall. Such a budget over its limit gets a warning (*over budget on summary totals; not restricted*), and the Overview and Budgets pages show *Restrictions paused for period budgets* while the log is unavailable; so does Diagnose. On a tenant without the activity log no monthly or quarterly budget restricts unless you choose *Summary only* and turn on *Allow restrictions from summary totals (less accurate)* (an install that had chosen *Summary only* before this keeps restricting: the upgrade turns it on). Restrictions already in force stay; lifting works as before; lifetime, custom and count-existing budgets restrict on summary totals as before ([Restrictions from summary totals](#restrictions-from-summary-totals)). |
 | **A few cycles of usage are not counted when the usage source switches.** | When the activity log becomes the source (the setting turned on, or the log back after failing), its first read only records what it holds: what happened since the summary's last reading is not counted. When the summary takes over (the setting turned off, the log refused or malformed, or failing for more than an hour), its first two readings count nothing: about two to three cycles are not counted, and a name missing from the summary across the switch counts nothing when it returns. While the log fails for less than an hour nothing new is counted; it is counted when the log answers again. A row reaching the log more than about two hours late is counted only by the daily full read, and only if dated after the switch; rows of the same second that meet at a page boundary wait for a later cycle. A group budget taken over by the log from its own summary row counts no event dated before the takeover, and two group readings count nothing when the row takes it back ([Switching source](#switching-source-and-what-is-not-counted)). |
 | **Figures only cover Checkmarx's lookback window.** | The consumption summary reports totals over a window (at most the last year), and the activity log covers the last 30 days. "Lifetime", custom and count-existing budgets read the summary's totals, so they mean everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened (or before the budget was created), unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
 | **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution); a mapping counts from then on. Automation counts towards a person only by the [integration-account rule](#integration-accounts) (Auto-remediation towards nobody: no scan initiator is traced for it). With the summary as the source, project usage reported under a repository name that is no project (87% of project credits on a live tenant) counts towards no project, group or application budget until mapped; the activity log names projects by id. All of it is shown on the Overview. |
@@ -442,9 +442,11 @@ The same usage is never counted from both sources:
   lasting more than an hour, or a failure of the activity step itself lasting
   as long): the summary's first two readings of each covered view count
   nothing, and the following ones count increases as before. Those two
-  readings also rebase the ledger's memory of names of the covered views: a
-  name missing, or holding a fall or a ceiling, continues from what it reports
-  then, never from a total from before or during the log's era. **Not
+  readings also rebase the ledger's memory of names of the covered views:
+  every name it remembers (missing, or holding a fall or a ceiling) starts
+  from what it reports in the next reading the completeness checks believe
+  (a return in a doubted reading counts nothing, nor does its recovery),
+  never from a total from before or during the log's era. **Not
   counted:** what happened between the log's last fetch and the summary's third
   reading (two to three cycles), and what a name missing across the switch
   used until it returns. This assumes the summary reports an event no later
@@ -472,8 +474,10 @@ The same usage is never counted from both sources:
 Only usage counted from the activity log can start a new restriction of a
 monthly or quarterly budget. Each counter keeps the log's own part
 (`usage_activity_counter`); evaluation, the Simulation and the safety ceilings
-decide a *new* restriction on that part, plus the auto-triage credits charged
-to the person (which never come from the counter). Usage the summary ledger
+decide a *new* restriction on that part alone. Auto-triage credits charged to
+the person who started the scan always derive from the summary's project
+readings, so they count towards the figure and warn, but never start a
+restriction either. Usage the summary ledger
 counted still lands in the counter, so the figures, reports and warnings are
 unchanged: a budget over its limit only because of it gets a warning
 notification (*over budget on summary totals; not restricted, because the
@@ -492,6 +496,15 @@ real fall, so it can occasionally over-count; the log cannot.
   (`usage.summary_restricts`, off by default), which restores the earlier
   behaviour exactly. Migration `d1e5a7c3b9f2` turns it on for an install that
   had explicitly chosen *Summary only*, so it keeps restricting.
+* A restriction already started for the period (applied, or pending: being
+  rolled out, or written with an unknown outcome) is carried on; a failed one
+  is not in force and is not retried on summary totals. A budget held on
+  summary totals that the log later takes over its limit is restricted then,
+  and the restriction is announced (the earlier warning does not suppress it).
+* The first cycle with the activity log as the source (after an upgrade,
+  too) raises one notification saying so and what it means for restrictions,
+  and, when the log is not available, how to restrict from summary totals as
+  before.
 * While restrictions are held this way, the Overview and Budgets pages show
   *Restrictions paused for period budgets* with since when, and Diagnose shows
   it under *Usage source*.
