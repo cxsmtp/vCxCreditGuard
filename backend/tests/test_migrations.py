@@ -33,6 +33,7 @@ EXPECTED_TABLES = {
     "usage_delta",
     "usage_activity_key",
     "usage_activity_state",
+    "usage_budget_interval",
     "usage_missing_name",
     "budget_usage",
     "usage_entity_offset",

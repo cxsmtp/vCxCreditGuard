@@ -123,7 +123,7 @@ class TestParser:
         )
         assert event is not None and event.subject_key == "jane@example.com"
 
-    def test_identical_rows_share_a_key_and_any_field_changes_it(self) -> None:
+    def test_identical_rows_share_a_key_and_an_immutable_field_changes_it(self) -> None:
         first = activity_api.parse_event(dict(self.ROW))
         second = activity_api.parse_event(dict(self.ROW), index=7)
         assert first is not None and second is not None
@@ -132,15 +132,26 @@ class TestParser:
             ("date", "2026-11-25T10:21:29Z"),
             ("action", "Triage"),
             ("creditsUsed", "144"),
-            ("user", "someone"),
-            ("userEmail", "x@example.com"),
             ("projectIds", [P_WEB]),
-            ("applicationIds", [APP_PAY]),
             ("scanIds", ["5ca00000-0000-4000-8000-000000000002"]),
             ("scanner", "sca"),
         ):
             other = activity_api.parse_event({**self.ROW, name: value})
             assert other is not None and other.key != first.key, name
+
+    def test_fields_filled_in_later_do_not_change_the_key(self) -> None:
+        """Who and the application may be filled in or changed for a past
+        action (review): they are not part of its identity."""
+        first = activity_api.parse_event(dict(self.ROW))
+        assert first is not None
+        for name, value in (
+            ("user", "someone"),
+            ("userEmail", "x@example.com"),
+            ("applicationIds", [APP_PAY]),
+        ):
+            other = activity_api.parse_event({**self.ROW, name: value})
+            assert other is not None and other.key == first.key, name
+            assert other.variant != first.variant, name
 
     def test_credits_written_differently_are_the_same_figure(self) -> None:
         one = activity_api.parse_event({**self.ROW, "creditsUsed": "144.50"})
@@ -752,13 +763,17 @@ class TestSwitching:
         spend(-5, 5)
         _ingest(env)
         assert counter(env.db, limit) == Decimal(11)
-        # 3. The log is gone (404): the summary takes over, its first reading
-        # counts nothing.
+        # 3. The log is gone (404): the summary takes over, its first two
+        # readings count nothing (SUMMARY_PAUSE_READINGS, review).
         env.tenant.activity_status = 404
         tick(env)
         spend(-5, 7)
         result = _ingest(env)
         assert result.activity is not None and not result.activity.source_active
+        assert counter(env.db, limit) == Decimal(11)
+        tick(env)
+        spend(-5, 2)
+        _ingest(env)
         assert counter(env.db, limit) == Decimal(11)
         tick(env)
         spend(-5, 1)
@@ -813,12 +828,16 @@ class TestSwitching:
         tick(env)
         _summary_rows(env, {P_API: 15})
         _ingest(env)
-        # The first summary reading after the log counts nothing.
+        # The first two summary readings after the log count nothing.
         assert counter(env.db, limit) == 0
         tick(env)
         _summary_rows(env, {P_API: 16})
         _ingest(env)
-        assert counter(env.db, limit) == Decimal(1)
+        assert counter(env.db, limit) == 0
+        tick(env)
+        _summary_rows(env, {P_API: 18})
+        _ingest(env)
+        assert counter(env.db, limit) == Decimal(2)
         assert state(env).status == activity_source.OFF
 
 
@@ -849,3 +868,140 @@ class TestReconciliation:
             c for c in diagnostics.run_diagnostics(env.db).checks if c.key == "activity_source"
         )
         assert check.status == diagnostics.WARN and "25" in check.detail
+
+
+# ------------------------------------------------------- review follow-ups
+
+
+class TestReviewFixes:
+    def test_rows_of_one_identity_naming_different_people_charge_nobody(
+        self, env: SimpleNamespace
+    ) -> None:
+        """Two rows with the same date, action, credits, project, scans and
+        scanner, one naming Alice and one Cara: which one is new cannot be
+        told, so the new event counts towards the project only."""
+        project = budget(env.db, EntityType.PROJECT, P_API, created_at=START)
+        alice = budget(env.db, EntityType.USER, U_ALICE, created_at=START)
+        cara = budget(env.db, EntityType.USER, U_CARA, created_at=START)
+        seeded(env)
+        env.tenant.add_activity(
+            date=at(1), credits="5", project_id=P_API, user="A", email="alice@example.com"
+        )
+        tick(env)
+        run(env)
+        assert counter(env.db, alice) == Decimal(5)
+        env.tenant.add_activity(
+            date=at(1), credits="5", project_id=P_API, user="C", email="cara@example.com"
+        )
+        tick(env)
+        result = run(env)
+        assert result.user_outcomes == {"ambiguous": 1}
+        assert counter(env.db, project) == Decimal(10)
+        assert counter(env.db, alice) == Decimal(5)
+        assert counter(env.db, cara) == 0
+
+    def test_a_persistent_bug_falls_back_after_the_grace(
+        self, env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seeded(env)
+
+        def broken(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise ValueError("a bug")
+
+        monkeypatch.setattr(activity_source, "_analyse", broken)
+        tick(env)
+        first = run(env)
+        assert first.source_active and first.read_failed
+        assert state(env).failing_since is not None
+        for _ in range(4):
+            tick(env)
+            result = run(env)
+        assert not result.source_active
+        assert state(env).status == activity_source.FALLBACK
+
+    def test_a_sweep_stopped_by_the_time_budget_is_tried_again(
+        self, env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.services import pacing
+
+        seeded(env)
+        monkeypatch.setattr(pacing, "out_of_time", lambda: True)
+        tick(env)
+        result = run(env)
+        assert result.sweep and result.partial
+        assert state(env).last_sweep_at is None
+        tick(env)
+        assert not run(env).sweep  # the tail, this time
+        monkeypatch.setattr(pacing, "out_of_time", lambda: False)
+        tick(env)
+        assert run(env).sweep
+        assert state(env).last_sweep_at is not None
+
+    def test_a_project_budget_switched_off_and_on_never_changes_a_past_outcome(
+        self, env: SimpleNamespace
+    ) -> None:
+        project = budget(env.db, EntityType.PROJECT, P_API, created_at=START - timedelta(days=1))
+        seeded(env)
+        skip_then = activity_source.initiator_skip(env.db)
+
+        def part(minutes: int) -> auto_triage_attribution.AttributedPart:
+            return auto_triage_attribution.AttributedPart(
+                user_id=U_ALICE,
+                project_id=P_API,
+                basis=auto_triage_attribution.BASIS_OBSERVED,
+                credits=Decimal(2),
+                initiator="alice@example.com",
+                observed_at=START + timedelta(minutes=minutes),
+            )
+
+        assert skip_then is not None and skip_then(part(10))
+        # Switched off at +30; an evaluation sees it; then on again at +90.
+        env.clock.value = START + timedelta(minutes=30)
+        project.is_active = False
+        env.db.commit()
+        activity_source.observe_budgets(env.db)
+        env.db.commit()
+        env.clock.value = START + timedelta(minutes=60)
+        activity_source.observe_budgets(env.db)
+        env.db.commit()
+        off = activity_source.initiator_skip(env.db)
+        assert off is not None and off(part(10)) and not off(part(45))
+        env.clock.value = START + timedelta(minutes=90)
+        project.is_active = True
+        env.db.commit()
+        activity_source.observe_budgets(env.db)
+        env.db.commit()
+        on = activity_source.initiator_skip(env.db)
+        # Before, while off (decided as such at +60) and after: unchanged.
+        assert on is not None and on(part(10)) and not on(part(45)) and on(part(100))
+
+    def test_a_group_budget_taken_back_by_its_row_pauses_the_group_view(
+        self, env: SimpleNamespace
+    ) -> None:
+        group = budget(env.db, EntityType.GROUP, G_PAY, created_at=START - timedelta(days=1))
+        env.tenant.set_entity_credits(view="project", name="payments/api", credits=100)
+        env.tenant.set_entity_credits(view="group", name="someone-else", credits=100000)
+
+        def ingest_groups() -> None:
+            ingestion.ingest_usage(env.db, env.client, views=(UsageView.PROJECT, UsageView.GROUP))
+            env.db.commit()
+
+        ingest_groups()  # seed; the group has no row: the log feeds it
+        tick(env)
+        env.tenant.add_activity(date=iso(env.clock.value), credits="5", project_id=P_API)
+        tick(env)
+        ingest_groups()
+        assert counter(env.db, group) == Decimal(5)
+        # The group's own row appears (with the 5 the log counted).
+        env.tenant.set_entity_credits(view="group", name="payments", credits=105)
+        for total in (105, 110):
+            tick(env)
+            env.tenant.set_entity_credits(view="group", name="payments", credits=total)
+            ingest_groups()
+        # The row's first reading (new, and the hand-back) and the next one
+        # count nothing; then its increases count again.
+        assert counter(env.db, group) == Decimal(5)
+        tick(env)
+        env.tenant.set_entity_credits(view="group", name="payments", credits=112)
+        ingest_groups()
+        assert counter(env.db, group) == Decimal(7)

@@ -57,6 +57,10 @@ from tests.activity_world import (
 )
 
 SEEDS = int(os.environ.get("CXCG_PROPERTY_SEEDS", "12"))
+# The review's moves (a group's own row leaving and coming back, a project
+# missing from the summary across a handover) are part of the normal run;
+# CXCG_REVIEW_MOVES=0 leaves them out.
+REVIEW_MOVES = os.environ.get("CXCG_REVIEW_MOVES", "1") != "0"
 STEPS = 25
 START = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
 OPS = [
@@ -72,6 +76,7 @@ OPS = [
     "switch",
     "rollover",
     "budget",
+    *(["group_row", "hide_project"] if REVIEW_MOVES else []),
 ]
 PEOPLE = [
     ("Alice E", "alice@example.com"),
@@ -132,16 +137,23 @@ class _World:
         # budget id -> events added after this moment may count towards it.
         self.counted_from: dict[int, datetime] = {}
         self.previous_step = START - timedelta(days=1)
+        # The group's own row is missing from the summary's group view.
+        self.group_hidden = False
+        self.pending_hide = False
+        # Readings for which the summary's project view leaves P_API out.
+        self.project_hidden_for = 0
 
     @property
     def now(self) -> datetime:
         return self.clock.value
 
-    def add(self, *, date: datetime, person: tuple[str, str] | None = None, project=None) -> None:  # type: ignore[no-untyped-def]
+    def add(
+        self, *, date: datetime, person: tuple[str, str] | None = None, project=None, credits=None
+    ) -> None:  # type: ignore[no-untyped-def]
         user, email = person or self.rng.choice(PEOPLE)
         project = project or self.rng.choice(PROJECTS)
         application = APP_PAY if self.rng.random() < 0.2 else None
-        credits = Decimal(self.rng.choice(["1", "1", "2", "3.5", "5"]))
+        credits = Decimal(credits or self.rng.choice(["1", "1", "2", "3.5", "5"]))
         row = self.tenant.add_activity(
             date=iso(date),
             credits=str(credits),
@@ -170,8 +182,29 @@ class _World:
             self.tenant.set_entity_credits(
                 view="project", name=PROJECT_NAMES[project], credits=float(total)
             )
+        if REVIEW_MOVES:
+            # A large other row, so that a row left out is no collapse.
+            self.tenant.set_entity_credits(view="project", name="zz-other", credits=1_000_000)
+            if self.project_hidden_for > 0:
+                self.project_hidden_for -= 1
+                self.tenant.consumption["project"] = [
+                    row
+                    for row in self.tenant.consumption.get("project", [])
+                    if row["name"] != PROJECT_NAMES[P_API]
+                ]
         for (user, email), total in by_person.items():
             self.tenant.set_user_credits(name=user, email=email or None, credits=float(total))
+        if REVIEW_MOVES:
+            group_total = sum(
+                (event.credits for event in self.events if event.project in (P_API, P_WEB)),
+                Decimal(0),
+            )
+            rows = [{"name": "someone-else", "creditsUsed": "100000", "percentOfTotal": 1.0}]
+            if not self.group_hidden:
+                rows.append(
+                    {"name": "payments", "creditsUsed": str(group_total), "percentOfTotal": 1.0}
+                )
+            self.tenant.consumption["group"] = rows
 
     def age_out(self) -> None:
         """The log holds the last 30 days only."""
@@ -309,13 +342,35 @@ def _run(db: Session, monkeypatch: pytest.MonkeyPatch, seed: int) -> None:
             following = periods.next_month_start(world.now)
             clock.value = following - timedelta(minutes=rng.randint(1, 20))
             world.add(date=world.now - timedelta(seconds=1))
+        elif op == "group_row":
+            # The group's own row leaves (or comes back to) the group view.
+            # Leaving: sometimes during a short log outage that began a cycle
+            # earlier, with a large spend on a group project in that cycle.
+            if world.group_hidden or rng.random() < 0.4:
+                world.group_hidden = not world.group_hidden
+            else:
+                world.tenant.activity_status = 503
+                world.add(date=world.now - timedelta(minutes=1), project=P_API, credits="500")
+                world.pending_hide = True
+        elif op == "hide_project":
+            world.project_hidden_for = rng.randint(1, 4)
+            if rng.random() < 0.5:
+                world.add(date=world.now - timedelta(minutes=1), project=P_API, credits="300")
         elif op == "budget" and not tools_budget:
             tools_budget = True
             limit = budget(db, EntityType.PROJECT, P_TOOLS, created_at=world.now)
             world.counted_from[limit.id] = world.previous_step
+        if world.pending_hide and op != "group_row":
+            # Second cycle of the outage: the group's row has left the view.
+            world.pending_hide = False
+            world.group_hidden = True
+            world.tenant.activity_status = 503
         world.age_out()
         world.summary()
-        ingestion.ingest_usage(db, world.client, views=(UsageView.PROJECT, UsageView.USER))
+        views = (UsageView.PROJECT, UsageView.USER)
+        if REVIEW_MOVES:
+            views = (UsageView.PROJECT, UsageView.USER, UsageView.GROUP)
+        ingestion.ingest_usage(db, world.client, views=views)
         db.commit()
         _check(world, step, op)
 
