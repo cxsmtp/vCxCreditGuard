@@ -98,6 +98,9 @@ class DryRunRowResponse(BaseModel):
     # How much of credits_used is auto-triage charged to the person from their
     # scans. Null when that setting is off or the limit is not fed by a person.
     auto_triage_attributed: Decimal | None = None
+    # A new restriction of a monthly or quarterly budget: it starts only if a
+    # direct recount of the activity log agrees (not run by the preview).
+    recount_required: bool = False
 
 
 class DryRunResponse(BaseModel):

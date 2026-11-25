@@ -197,6 +197,17 @@ def test_the_opt_in_restores_restrictions_from_summary_totals(
     assert held.enforced == 0 and held.summary_held == 1  # summary only, opt-in off
     settings_store.set_value(db, settings_store.KEY_SUMMARY_RESTRICTS, True)
     db.commit()
+    # The recount before a new restriction reads the activity log directly
+    # (app/services/recount.py): its rows match what the summary counted.
+    world.tenant.activity = []
+    for _ in range(3):
+        world.tenant.add_activity(
+            date=iso(world.clock.value - timedelta(minutes=1)),
+            credits="4",
+            project_id="proj-api",
+            user="Alice Archer",
+            email=EMAIL,
+        )
     assert world.evaluate().enforced == 1
     assert world.restricted() and world.state(limit).status == LimitStatus.RESTRICTED
     assert activity_source.restriction_hold(db) is None

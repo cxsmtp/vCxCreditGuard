@@ -105,6 +105,17 @@ _REMEDIATION: dict[tuple[str, str], str] = {
         "If it keeps failing, put it back in Checkmarx One by hand from the snapshot shown "
         "on Settings → Enforcement."
     ),
+    ("recount", WARN): (
+        "A new restriction of a monthly or quarterly budget starts only when a direct recount "
+        "of the Checkmarx activity log is also at or over the limit. Compare the budget's "
+        "usage with the activity log; if the recount could not be done, check that the API "
+        "key can read the log and that the activity page cap is high enough. The next cycle "
+        "recounts again."
+    ),
+    ("readiness", WARN): (
+        "Open Settings → Enforcement: the Readiness card says what each red item needs and "
+        "links to where to fix it."
+    ),
     ("dimensions", FAIL): (
         "This tenant does not report per-user consumption. Govern with project, application, "
         "or group limits instead, or ask Checkmarx to enable per-user reporting."
@@ -170,6 +181,8 @@ def run_diagnostics(
     activity = _activity_check(session, moment)
     if activity is not None:
         checks.append(activity)
+    checks.append(_recount_check(session, moment))
+    checks.append(_readiness_check(session, moment))
     if settings_store.auto_triage_to_initiator(session):
         # Only while charging auto triage to scan initiators is on, so the
         # report is unchanged for everyone who has not turned it on.
@@ -594,6 +607,62 @@ def _selftest_check(session: Session, moment: datetime) -> Check | None:
         WARN,
         f"Last self-test {row.status.replace('_', ' ')}{where}{demo}, {when}.",
     )
+
+
+RECOUNT_RECENT = timedelta(days=7)
+
+
+def _recount_check(session: Session, moment: datetime) -> Check:
+    """The recounts before new restrictions that refused one: the latest, or
+    "no disagreements"."""
+    from app.services import recount
+
+    label = "Recount before restricting"
+    entries = recount.records(session)
+    if not entries:
+        return Check("recount", label, OK, "No disagreements.")
+    lines = []
+    for entry in entries[:3]:
+        what = f"{entry.get('entity_type')} {entry.get('entity_label')}, {entry.get('period_key')}"
+        if entry.get("kind") == recount.DISAGREE:
+            lines.append(
+                f"{what}: CreditGuard counted {entry.get('counted')}, the activity log "
+                f"{entry.get('recount')} (limit {entry.get('credit_limit')}); not restricted"
+            )
+        else:
+            lines.append(
+                f"{what}: no recount ({entry.get('reason')}); CreditGuard counted "
+                f"{entry.get('counted')}; not restricted"
+            )
+    try:
+        latest = datetime.fromisoformat(str(entries[0].get("at")))
+    except ValueError:
+        latest = None
+    recent = latest is not None and moment - latest < RECOUNT_RECENT
+    when = f" Latest {_ago(moment, latest)}." if latest is not None else ""
+    return Check("recount", label, WARN if recent else OK, "; ".join(lines) + "." + when)
+
+
+def _readiness_check(session: Session, moment: datetime) -> Check:
+    """The readiness checklist, as one line: red items warn."""
+    from app.services import readiness
+
+    current = readiness.report(session, now=moment)
+    label = "Readiness"
+    if current.all_green:
+        return Check("readiness", label, OK, "Every readiness item is green.")
+    parts = [f"{item.label}: {item.status} ({item.detail})" for item in current.not_green()]
+    # Red warns while a new install watches only, and when an item that was
+    # green has turned red (drift); otherwise the checklist is information.
+    drifted = readiness.drifted(session, current)
+    red = current.gate_active and any(item.status == readiness.RED for item in current.items)
+    if current.gate_active:
+        prefix = "Watch-only until these are green or overridden. "
+    elif drifted:
+        prefix = "No longer green: " + ", ".join(item.label for item in drifted) + ". "
+    else:
+        prefix = ""
+    return Check("readiness", label, WARN if red or drifted else OK, prefix + "; ".join(parts))
 
 
 def _pending_enforcement_check(session: Session) -> Check:

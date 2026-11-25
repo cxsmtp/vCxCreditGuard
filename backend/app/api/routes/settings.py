@@ -18,7 +18,14 @@ from app.schemas.dashboard import (
     SettingsResponse,
     SettingsUpdateRequest,
 )
-from app.services import activity_source, delivery, pacing, role_sources, settings_store
+from app.services import (
+    activity_source,
+    delivery,
+    pacing,
+    readiness,
+    role_sources,
+    settings_store,
+)
 from app.services.audit import record_audit
 
 logger = logging.getLogger(__name__)
@@ -261,6 +268,31 @@ def update_settings(
 
     before = _read(db).model_dump(exclude={"current_schedule_description"})
     audited_changes: dict[str, object] = {}
+    if (
+        changes.get("enforcement_paused") is False
+        and settings_store.enforcement_guard(db).paused
+        and readiness.gate_active(db)
+    ):
+        # Leaving watch-only on a new install: every readiness item green, or
+        # the typed override on the Readiness card (POST /api/readiness/enable).
+        current = readiness.report(db)
+        if not current.all_green:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "readiness_not_green",
+                    "message": (
+                        "Enforcement is in watch-only onboarding and not every readiness item "
+                        "is green. Fix them, or use Turn enforcement on in the Readiness card "
+                        f"and type {readiness.OVERRIDE_WORD}."
+                    ),
+                    "items": [
+                        {"key": item.key, "label": item.label, "status": item.status}
+                        for item in current.not_green()
+                    ],
+                },
+            )
+        readiness.apply_leave(db, actor=ctx.actor, current=current, override=False)
 
     for field, value in changes.items():
         if field in _SECRET_FIELDS:

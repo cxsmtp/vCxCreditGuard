@@ -1,5 +1,5 @@
-import { useCallback } from "react";
-import { api } from "../api/client";
+import { useCallback, useState } from "react";
+import { ApiError, api } from "../api/client";
 import type { BlastRadius, DryRunResult, DryRunRow, UserRolesPreview } from "../api/types";
 import { ExportMenu } from "../components/ExportMenu";
 import { StatTile } from "../components/StatTile";
@@ -20,6 +20,7 @@ import {
 import { FilterNote, Pager, usePaged, useTableView, type ViewColumn } from "../components/tableView";
 import { CoveragePanel } from "../components/CoveragePanel";
 import { useResource } from "../hooks/useResource";
+import { useToast } from "../lib/ui-context";
 import { entityLabel, formatCredits, formatDateTime, formatPercent } from "../lib/format";
 
 const STATUS_TONE: Record<string, BadgeTone> = {
@@ -45,6 +46,20 @@ export function PreviewPage({ isAdmin = false }: { isAdmin?: boolean }) {
   );
 
   const reload = useCallback(() => void dryRun.reload(), [dryRun]);
+  const toast = useToast();
+  const [reviewing, setReviewing] = useState(false);
+  // Readiness: an admin marks the dry run reviewed (after the last budget change).
+  async function markReviewed() {
+    setReviewing(true);
+    try {
+      await api.post("/api/readiness/reviewed");
+      toast.success("Marked reviewed for the readiness checklist.");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setReviewing(false);
+    }
+  }
   const data = dryRun.data;
   const view = useTableView(data?.rows ?? [], DRY_RUN_VIEW);
   const paged = usePaged(view.rows, 100);
@@ -86,6 +101,17 @@ export function PreviewPage({ isAdmin = false }: { isAdmin?: boolean }) {
             >
               Refresh
             </button>
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={() => void markReviewed()}
+                disabled={reviewing || !data}
+                className="cg-btn sm primary"
+                title="Readiness: confirm you have looked at what the next cycle would restrict"
+              >
+                Reviewed
+              </button>
+            )}
           </>
         }
       />

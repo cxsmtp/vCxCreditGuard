@@ -30,6 +30,11 @@ def _world(db: Session, monkeypatch: pytest.MonkeyPatch, source: str) -> World:
         settings_store.set_value(db, settings_store.KEY_SUMMARY_RESTRICTS, True)
         db.commit()
     world = World(db, monkeypatch, log=source == "log")
+    if source == "summary_opt_in":
+        # The summary is the usage source, but the recount before a new
+        # restriction reads the activity log directly (app/services/recount.py):
+        # it holds the same spending (``spend``).
+        world.tenant.activity = []
     world.totals = {"user-alice": 3, "user-bob": 5}  # type: ignore[attr-defined]
     return world
 

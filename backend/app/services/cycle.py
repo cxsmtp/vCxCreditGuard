@@ -640,6 +640,15 @@ def _execute_tenant_steps(
 
     _run_step(session, result, "violations", detect_violations, degrades_run=False)
 
+    # The readiness checklist: an item that turns red once enforcement is on
+    # raises a warning. It never changes enforcement.
+    def readiness_drift() -> None:
+        from app.services import readiness
+
+        result.steps["readiness"] = {"drifted": readiness.check_drift(session)}
+
+    _run_step(session, result, "readiness", readiness_drift, degrades_run=False)
+
     # Step 4: push notifications out. A delivery failure is never allowed to affect
     # the cycle's own status: the Notification Center already has the record, and an
     # unreachable SMTP server is not a governance failure.

@@ -199,6 +199,7 @@ def get_dry_run(ctx: CurrentUser, db: DbSession) -> DryRunResponse:
                 ),
                 note=row.note,
                 auto_triage_attributed=row.auto_triage_attributed,
+                recount_required=row.recount_required,
             )
             for row in result.rows
         ],
