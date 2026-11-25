@@ -587,7 +587,10 @@ def tenant_client_roles(session: Session, *, fresh: bool = False) -> ClientRoleL
         logger.info("Could not list the tenant's client roles: %s", exc)
         failed = ClientRoleListing(
             available=False,
-            message=f"The tenant's roles could not be read from Checkmarx One: {exc}",
+            message=(
+                "The tenant's roles could not be read from Checkmarx One: "
+                f"{error_text.public_error(exc)}"
+            ),
         )
         # Remembered briefly, so a refused key does not ask for a token on
         # every page that lists roles.

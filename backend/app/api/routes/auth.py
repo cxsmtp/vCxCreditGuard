@@ -264,6 +264,9 @@ def reset_password(
             detail={"code": "rate_limited", "message": str(exc)},
             headers={"Retry-After": str(exc.retry_after_seconds)},
         ) from exc
+    # Counted for good, and its lock released, before the redemption: a weak
+    # password rolls that back, and must not hand the attempt back with it.
+    db.commit()
     try:
         auth_service.complete_password_reset(
             db, token=payload.token, new_password=payload.new_password, ip_address=ip

@@ -1432,7 +1432,9 @@ success, entities in warning, entities restricted, unresolved subjects).
 
 React, TypeScript and Tailwind, built by Vite into `backend/app/static` and served
 by the same origin as the API. No CORS in production, no separate deployment, and
-one artefact.
+one artefact. (For a dev server on another origin, `CXCG_ALLOWED_ORIGINS` takes
+exact origins, `scheme://host[:port]`, comma separated; a wildcard is refused at
+start-up.)
 
 | Page | What it does |
 | ---- | ------------ |
@@ -1603,12 +1605,21 @@ the **raw** body before parsing, and reject a timestamp that is too old. The
 timestamp is inside the signed material precisely so a captured request cannot be
 replayed later with a fresh header.
 
-One deliberate limitation: the webhook target is only checked against the cloud
-metadata addresses and literal link-local addresses. It is not a general egress
-control. Resolving DNS here would add a live lookup to every delivery, turn a DNS
-blip into a delivery failure, and still leave a gap between the check and the
-connection. Posting to an internal host is a supported deployment, so private
-ranges are allowed. Only an Admin can set the URL.
+One deliberate limitation: the webhook target (and the mail server) is only
+refused when it is a cloud metadata or platform address (AWS, GCP, Azure,
+Alibaba Cloud), a link-local address, the unspecified address (`0.0.0.0`, `::`)
+or, for the webhook, a loopback address (a mail relay on the same host is
+allowed). It is not a general egress control: posting to an internal host is a
+supported deployment, so private ranges are allowed. Only an Admin can set the
+URL. The check covers every spelling of an address (`2852039166`, `0xa9fea9fe`,
+`[::ffff:169.254.169.254]`, 6to4, NAT64) and is made again when the request is
+sent and the connection opened, against the addresses the name resolves to at
+that moment; the connection goes to one of exactly those, so a name that
+resolves somewhere harmless when it is saved and to the metadata address later
+(DNS rebinding) is refused. Redirects are not followed. Through an HTTP proxy
+from the environment (`HTTPS_PROXY`) the name is still resolved and checked
+before the request is handed to the proxy; a name this host cannot resolve is
+left to the proxy, whose own egress rules then apply.
 
 ## Data retention
 
@@ -1709,8 +1720,12 @@ change behaviour most:
    `X-CSRF-Token` and compared against the digest on the session row. The check
    lives inside the authentication dependency, so a new state changing route
    cannot ship without it.
-5. **RBAC.** Admin has full control. Viewer is read only. The last active Admin
-   cannot be demoted, disabled or deleted, and no one can demote themselves.
+5. **RBAC.** Admin has full control. A viewer reads, and changes only their own
+   things: their account (password, two factor) and, when an admin has turned
+   self-service on, their own credit requests. Marking the shared
+   notifications read is an Admin action. The last active Admin
+   cannot be demoted, disabled or deleted, and no one can demote themselves;
+   two such changes made at the same moment are taken one after the other.
 6. **Login abuse.** Lockout with exponential backoff per username and source
    address, a slower account-wide counter that catches guessing spread across
    many addresses (an address the account has signed in from before is exempt,

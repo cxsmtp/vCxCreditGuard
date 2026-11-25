@@ -852,7 +852,9 @@ class TestImplicitTls:
             def __init__(self, host, port, timeout, context) -> None:
                 made.update(host=host, port=port, context=context)
 
-        monkeypatch.setattr(smtplib, "SMTP_SSL", FakeSmtps)
+        # The factory builds SMTP_SSL through its address-guarded subclass.
+        assert issubclass(delivery._GuardedSMTPSSL, smtplib.SMTP_SSL)
+        monkeypatch.setattr(delivery, "_GuardedSMTPSSL", FakeSmtps)
         delivery._default_smtp_factory("smtp.example.com", 465, 5.0)
         assert made["port"] == 465
         assert isinstance(made["context"], ssl.SSLContext)

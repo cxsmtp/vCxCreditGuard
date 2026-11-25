@@ -12,7 +12,10 @@ dependencies = [
     "pydantic-settings>=2.3",
     "sqlalchemy>=2.0.30",
     "alembic>=1.13",
-    "httpx>=0.27",
+    # Bounded: the webhook guard (app/services/delivery.py) sits in httpx's
+    # connection pool and proves it at run time; a new minor is checked first.
+    "httpx>=0.27,<0.29",
+    "httpcore>=1.0,<1.1",
     "cryptography>=42.0",
     "argon2-cffi>=23.1",
     "pyotp>=2.9",

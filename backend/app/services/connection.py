@@ -220,7 +220,7 @@ def warn_if_untrusted(session: Session) -> bool:
     """
     from app.checkmarx.regions import UntrustedHostError
     from app.models.enums import Severity
-    from app.services import notifications
+    from app.services import error_text, notifications
 
     connection = get_connection(session)
     if connection is None:
@@ -231,7 +231,7 @@ def warn_if_untrusted(session: Session) -> bool:
     except UntrustedHostError as exc:
         logger.error("The Checkmarx One connection is blocked: %s", exc)
         connection.status = ConnectionStatus.FAILED
-        connection.last_error = str(exc)[:2000]
+        connection.last_error = error_text.public_error(exc)[:2000]
         connection.last_failure_at = utcnow()
         notifications.notify(
             session,
@@ -239,7 +239,8 @@ def warn_if_untrusted(session: Session) -> bool:
             severity=Severity.CRITICAL,
             title="The Checkmarx One connection is blocked",
             body=(
-                f"{exc}\n\nNothing is being synchronised, evaluated or enforced until this "
+                f"{error_text.public_error(exc)}\n\nNothing is being synchronised, evaluated "
+                "or enforced until this "
                 "is resolved."
             ),
             dedupe_key=f"untrusted-host:{utcnow().strftime('%Y-%m-%d')}",

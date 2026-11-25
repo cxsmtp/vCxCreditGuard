@@ -1127,7 +1127,10 @@ def _enforce_target(
             category=notifications.CATEGORY_ENFORCEMENT,
             severity=Severity.ERROR,
             title=f"Could not restrict {target.target_label}",
-            body=f"{exc}\n\n{_permission_hint(exc)}It will be tried again on the next cycle.",
+            body=(
+                f"{error_text.public_error(exc)}\n\n{_permission_hint(exc)}"
+                "It will be tried again on the next cycle."
+            ),
             entity_type=limit.entity_type,
             entity_id=limit.entity_id,
             entity_label=limit.entity_label,
@@ -3165,7 +3168,8 @@ def _restore_action_locked(
             severity=Severity.ERROR,
             title=f"Could not restore {action.target_label}",
             body=(
-                f"{exc}\n\n{_permission_hint(exc)}It will be tried again on the next cycle. "
+                f"{error_text.public_error(exc)}\n\n{_permission_hint(exc)}"
+                "It will be tried again on the next cycle. "
                 "If it keeps failing, "
                 "restore it directly in Checkmarx One; the snapshot of the previous state "
                 "is on the audit entry."

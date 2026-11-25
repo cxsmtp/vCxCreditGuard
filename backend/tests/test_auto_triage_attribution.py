@@ -514,6 +514,39 @@ class TestFailuresAndCaps:
         assert len(scan_calls) == get_settings().cx_max_retries + 1
         assert charges(db) == []
 
+    def test_a_checkmarx_error_is_redacted_where_it_is_shown(
+        self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The warning goes to the Notification Center (viewers read it) and out
+        by mail and webhook: a Checkmarx error is redacted there like everywhere
+        else (Fusion scan, auto_triage_attribution.py:933)."""
+        from app.checkmarx.errors import CheckmarxResponseError
+
+        token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzZWNyZXQtdXNlciJ9.c2lnbmF0dXJl"
+
+        def refuse(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise CheckmarxResponseError(f"GET /api/scans returned 400: echoed {token}")
+
+        turn_on(db)
+        run(force=True)
+        set_project(tenant, "proj-api", "payments/api", 14)
+        scan(tenant, "scan-h1", HARSH)
+        monkeypatch.setattr(auto_triage_attribution, "_observe", refuse)
+        result = run()
+
+        [warning] = result.steps["auto_triage_attribution"]["warnings"]
+        assert "could not be read" in warning and "returned 400" in warning
+        assert token not in warning
+        db.expire_all()
+        notice = db.scalar(
+            select(Notification).where(
+                Notification.title.like("Auto-triage credits could not all%")
+            )
+        )
+        assert notice is not None and token not in (notice.body or "")
+        state = db.get(AutoTriageProjectState, "proj-api")
+        assert state is not None and token not in (state.last_error or "")
+
     def test_per_cycle_cap_defers_to_the_next_cycle_and_keeps_it_on_the_project(
         self, db: Session, tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
     ) -> None:
