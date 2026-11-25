@@ -698,6 +698,8 @@ export interface AppSettings {
   /** Where project, user and application budgets get their usage: the credit
    * activity log (with the summary as fallback) or the summary only. */
   usage_source: "activity" | "summary";
+  /** With the summary only: whether summary totals may restrict period budgets. */
+  summary_restricts: boolean;
   allowed_usage_sources?: string[];
   /** Pages of the activity log one cycle may read (0 = no cap). */
   activity_max_pages_per_cycle: number;

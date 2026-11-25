@@ -13,6 +13,7 @@ import type {
   ProjectAction,
 } from "../api/types";
 import { BlastDetails, BlastSummary } from "./PreviewPage";
+import { UsageSourceBanner } from "../components/UsageSourceBanner";
 import { EntityPicker } from "../components/EntityPicker";
 import { ExportMenu } from "../components/ExportMenu";
 import type { ExportColumn } from "../lib/export";
@@ -456,6 +457,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
           </>
         }
       />
+      <UsageSourceBanner />
 
       <Card padded={false}>
         <div className="flex flex-wrap items-center gap-3 px-5 pt-4">

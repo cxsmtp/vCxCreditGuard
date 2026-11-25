@@ -478,6 +478,15 @@ export function SettingsPage({
                 <option value="summary">Summary only</option>
               </Select>
             </Field>
+            {(value("usage_source") ?? "activity") === "summary" && (
+              <Toggle
+                checked={value("summary_restricts") ?? false}
+                disabled={!isAdmin}
+                onChange={(next) => set({ summary_restricts: next })}
+                label="Allow restrictions from summary totals (less accurate)"
+                description="Off (the default): with the summary only, a monthly or quarterly budget over its limit is warned, not restricted, because from running totals the summary cannot always tell a glitch from a real fall. On: it restricts as before the activity log was used. Lifetime, custom and count-existing budgets restrict either way."
+              />
+            )}
             <UsageSourceNote status={current.usage_source_status ?? null} />
             <Field
               label="Activity log pages per cycle (most)"

@@ -181,6 +181,24 @@ const LIMITATIONS: Limitation[] = [
     ),
   },
   {
+    title: "Monthly and quarterly budgets restrict only on usage the activity log counted.",
+    group: "enforcement",
+    meaning: (
+      <>
+        Usage the consumption summary counts (after a fallback to it, from a
+        group&apos;s own summary row, or with the summary only) still counts and
+        warns, but never starts a new restriction of a monthly or quarterly
+        budget: from running totals the summary cannot always tell a glitch
+        from a real fall. Such a budget over its limit is warned, not
+        restricted, and Overview, Budgets and Diagnose show that restrictions
+        are paused. Without the activity log, monthly and quarterly budgets
+        restrict only with Summary only and &ldquo;Allow restrictions from
+        summary totals&rdquo; on. Restrictions already in force stay; lifetime,
+        custom and count-existing budgets restrict as before.
+      </>
+    ),
+  },
+  {
     title: "A few cycles of usage are not counted when the usage source switches.",
     group: "data",
     meaning: (

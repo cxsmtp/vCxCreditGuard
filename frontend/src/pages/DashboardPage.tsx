@@ -15,6 +15,7 @@ import { StatTile } from "../components/StatTile";
 import { DiagnosticsPanel } from "../components/DiagnosticsPanel";
 import { Button, Card, ErrorNote, InfoNote, PageHeader, Spinner, Tabs } from "../components/ui";
 import { useInterval, useResource } from "../hooks/useResource";
+import { UsageSourceBanner } from "../components/UsageSourceBanner";
 import { formatCredits, formatDateTime, formatNumber, formatRelative } from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
@@ -113,6 +114,7 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
           )
         }
       />
+      <UsageSourceBanner />
 
       <div className="mb-5">
         <DiagnosticsPanel />
