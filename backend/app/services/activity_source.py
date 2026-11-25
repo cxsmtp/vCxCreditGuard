@@ -15,12 +15,20 @@ Counting without row ids
 ------------------------
 The log has no row id, and identical rows are distinct events (two triage
 actions in the same second): nothing is ever deduplicated. A row's identity is
-every identifying field (``event_key``), and ``usage_activity_key`` keeps how
-many rows of each identity have been seen. A fetch holding ``n`` rows of one
-identity counts ``max(0, n - seen)`` new events and raises ``seen`` to ``n``,
-in the transaction that adds them to the budget counters, under the
-attribution lock. ``seen`` never falls, so an event is counted at most once as
-long as no fetch shows more rows of an identity than the log holds.
+the fields that describe the action itself and are assumed never to change for
+a past action - date, action, credits, project ids, scan ids, scanner
+(``event_key``) - and ``usage_activity_key`` keeps how many rows of each
+identity have been seen. A fetch holding ``n`` rows of one identity counts
+``max(0, n - seen)`` new events and raises ``seen`` to ``n``, in the
+transaction that adds them to the budget counters, under the attribution lock.
+``seen`` never falls, so an event is counted at most once as long as no fetch
+shows more rows of an identity than the log holds. Who (user, email) and the
+application may be filled in or changed later for the same action, so they are
+not part of the identity; the new events of an identity count towards a person
+or an application only when every row of it in the read names the same one
+(``_count``), else only towards its project and what the project belongs to.
+Keys are pruned once older than the window, and nothing older than the highest
+cutoff ever used is counted, even if the clock goes back.
 
 Fetching so that no row is read twice
 -------------------------------------
@@ -70,14 +78,30 @@ The same usage is never counted from both sources:
   the same cycle. Lost: what happened between the summary's last reading and
   that first fetch (one cycle).
 * When the log stops being the source (the setting turned off, a 403 or 404,
-  a malformed answer, or an outage longer than ``OUTAGE_GRACE``), the summary
-  feed's first reading of each covered view counts nothing (``summary_paused``)
-  and the next ones count increases as before. Lost: what happened between the
-  log's last fetch and that second reading (one to two cycles). This assumes
-  the summary reports an event no later than a cycle after the log does (they
-  are the same data: their sums matched exactly).
+  a malformed answer, or an outage - or a failure of this step itself - longer
+  than ``OUTAGE_GRACE``), the summary feed's first ``SUMMARY_PAUSE_READINGS``
+  (2) readings of each covered view count nothing (``summary_paused``), and
+  they rebase the ledger's memory of names of those views: a name it
+  remembers (missing, or holding a fall or a ceiling) continues from what it
+  reports then, never from a total from before or during the log's era. Lost:
+  what happened between the log's last fetch and the third reading (two to
+  three cycles), and the usage of a name missing across the handover until it
+  returns. This assumes the summary reports an event no later than about two
+  cycles after the log does (they are the same data: their sums matched
+  exactly).
 * During a shorter outage the log stays the source and nothing is counted;
   what happened meanwhile is counted when it answers again.
+
+Group budgets
+-------------
+The summary's group view is not covered by the log: a plain group budget whose
+group has a row of its own there is fed by that row, otherwise (and always with
+member usage) the log feeds it through its projects and members. The log takes
+a budget over from the row's reading on (``group_feeds``), and then counts
+towards it only events dated from that moment: never one the row counted
+before. When the row takes a budget back that the log fed, the group view's
+next two readings count nothing. Lost: events dated before a takeover that the
+log counts after it, and two group readings at a hand-back.
 
 Who it counts towards
 ---------------------
@@ -94,7 +118,10 @@ Integration accounts (``is_integration_account``: "[bot]" accounts, known bots,
 Auto-triage, Auto-remediation, the names listed in the setting
 ``attribution.integration_accounts``, and handles the matcher takes for an
 integration) count towards their project as any usage does. Towards a person
-only when their project had no active project budget at the event's date:
+only when their project had no active project budget at the event's date (by
+``BudgetHistory``, which records when each project budget may have been active
+and never changes its answer for a past date; a budget switched off and on
+between two observations counts as active throughout):
 Auto-triage and Auto-remediation then through the existing auto-triage
 attribution (the scan initiator, when that setting is on and it resolves one;
 nobody otherwise), any other account through an admin's mapping, or towards a
@@ -265,41 +292,156 @@ def source_active(session: Session) -> bool:
     return state is not None and state.status == ACTIVE
 
 
+# After the log stops being a view's source (or stops feeding a group budget
+# through its projects), this many summary readings of the view count
+# nothing: a summary that reports an event up to about two cycles after the
+# log did cannot count it again.
+SUMMARY_PAUSE_READINGS = 2
+
+
 def summary_feeds(session: Session, view: str, snapshot: UsageSnapshot) -> bool:
     """Whether a summary reading of ``view`` feeds budget counters. Call
     under the attribution lock, with the new reading stored.
 
-    Not while the log is the source of the view, nor in the first reading
-    after it stopped being the source (its increase spans usage the log may
-    have counted)."""
+    Not while the log is the source of the view, nor in the first
+    ``SUMMARY_PAUSE_READINGS`` readings after it stopped being the source
+    (their increases span usage the log may have counted). The same pause
+    applies to the group view after the log stopped feeding a group budget
+    through its projects (``group_feeds``)."""
     view = str(view)
-    if view not in COVERED_VIEWS:
-        return True
     state = _state(session)
     if state is None:
         return True
-    if state.status == ACTIVE:
+    if view in COVERED_VIEWS and state.status == ACTIVE:
         return False
+    if view == UsageView.GROUP.value and _groups_taken_back(session, state, snapshot):
+        # A group's own row is back for a budget the log fed through its
+        # projects: this reading and the next count nothing.
+        from app.services import ingestion
+
+        previous = ingestion.latest_live_snapshot(session, view, excluding=snapshot.id)
+        paused_views = dict(state.summary_paused or {})
+        paused_views[view] = previous.id if previous is not None else 0
+        state.summary_paused = paused_views
     paused = (state.summary_paused or {}).get(view)
     if not isinstance(paused, int):
         return True
-    from app.services import ingestion
-
-    previous = ingestion.latest_live_snapshot(session, view, excluding=snapshot.id)
-    return previous is not None and previous.id > paused
+    return _readings_since(session, view, paused, snapshot.id) >= SUMMARY_PAUSE_READINGS
 
 
-def note_summary_reading(session: Session, view: str, snapshot: UsageSnapshot) -> None:
-    """Remember a summary reading taken while the log was the source."""
+def _own_rows(session: Session, snapshot: UsageSnapshot) -> set[str]:
+    from app.models.usage import UsageRecord
+
+    return {
+        str(entity_id)
+        for entity_id in session.scalars(
+            select(UsageRecord.entity_id).where(
+                UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.is_not(None)
+            )
+        )
+    }
+
+
+def _plain_group_entries(
+    session: Session, state: ActivitySourceState, own: set[str]
+) -> list[tuple[str, dict]]:
+    """The log's group-feed entries of plain group budgets whose group has a
+    row of its own in ``own``: the group view feeds them from now on."""
+    feeds = state.group_feeds or {}
+    if not feeds or not own:
+        return []
+    found = []
+    for limit in session.scalars(
+        select(CreditLimit).where(
+            CreditLimit.entity_type == EntityType.GROUP.value,
+            CreditLimit.include_member_usage.is_(False),
+        )
+    ):
+        entry = feeds.get(str(limit.id))
+        if isinstance(entry, dict) and str(limit.entity_id) in own:
+            found.append((str(limit.id), entry))
+    return found
+
+
+def _groups_taken_back(session: Session, state: ActivitySourceState, snapshot) -> bool:  # type: ignore[no-untyped-def]
+    entries = _plain_group_entries(session, state, _own_rows(session, snapshot))
+    return any(entry.get("fed") for _key, entry in entries)
+
+
+def _readings_since(session: Session, view: str, paused: int, current: int) -> int:
+    """Live readings of the view after ``paused``, the current one aside."""
+    from sqlalchemy import func
+
+    return int(
+        session.scalar(
+            select(func.count())
+            .select_from(UsageSnapshot)
+            .where(
+                UsageSnapshot.view_by == view,
+                UsageSnapshot.id > paused,
+                UsageSnapshot.id != current,
+                UsageSnapshot.held_reason.is_(None),
+                UsageSnapshot.period_param.is_distinct_from(settings_store.DEMO_PERIOD_PARAM),
+            )
+        )
+        or 0
+    )
+
+
+def after_summary_reading(
+    session: Session, view: str, snapshot: UsageSnapshot, records: list, *, fed: bool
+) -> None:
+    """After the ledger read a summary reading. Call under the attribution
+    lock, in its transaction.
+
+    While the log is the source of a covered view, remember the reading: the
+    summary's next readings count nothing once the log stops. A reading
+    paused for a handover is also a rebase for the ledger's per-name memory
+    of the view: every name it remembers (missing, a held dip, or any other
+    kind) last reported a total from before or during the log's era, so a
+    name present now continues from what it reports now (its memory is
+    dropped), and a name still missing starts, when it returns, from what it
+    reports then (kind "rebase"), as after a reading in another lookback
+    window. Otherwise its return would count, as one increase, usage the log
+    already counted."""
     view = str(view)
-    if view not in COVERED_VIEWS:
-        return
     state = _state(session)
-    if state is None or state.status != ACTIVE:
+    if state is None:
         return
-    paused = dict(state.summary_paused or {})
-    paused[view] = snapshot.id
-    state.summary_paused = paused
+    if view == UsageView.GROUP.value:
+        # A group with a row of its own in this reading is fed by the group
+        # view from now on: the log stops feeding it, and takes it over again
+        # (from a later date) only if the row leaves.
+        taken = _plain_group_entries(session, state, _own_rows(session, snapshot))
+        if taken:
+            feeds = dict(state.group_feeds or {})
+            for key, _entry in taken:
+                feeds.pop(key, None)
+            state.group_feeds = feeds
+    if view in COVERED_VIEWS and state.status == ACTIVE:
+        paused = dict(state.summary_paused or {})
+        paused[view] = snapshot.id
+        state.summary_paused = paused
+        return
+    if fed or not isinstance((state.summary_paused or {}).get(view), int):
+        return
+    _rebase_names(session, view, snapshot, records)
+
+
+def _rebase_names(session: Session, view: str, snapshot: UsageSnapshot, records: list) -> None:
+    from app.models.usage import UsageMissingName
+    from app.services import ledger
+
+    present = {record.subject_key for record in records}
+    for row in list(
+        session.scalars(select(UsageMissingName).where(UsageMissingName.view_by == view))
+    ):
+        if row.subject_key in present:
+            session.delete(row)
+        else:
+            row.kind = ledger.REBASE
+            row.period_param = snapshot.period_param
+    session.flush()
 
 
 def _start_era(state: ActivitySourceState, now: datetime) -> None:
@@ -321,6 +463,9 @@ def _end_era(state: ActivitySourceState, now: datetime) -> None:
 def _stop(state: ActivitySourceState, status: str, now: datetime) -> None:
     if state.status == ACTIVE:
         _end_era(state, now)
+    # The summary feeds the group budgets the log fed through their
+    # projects again, after its pause of the covered views.
+    state.group_feeds = None
     state.status = status
     state.resume_at = None
     state.resume_position = None
@@ -353,8 +498,10 @@ def listed_extras(session: Session) -> frozenset[str]:
 def initiator_skip(session: Session) -> Callable[[object], bool] | None:
     """For evaluation: the auto-triage charges to scan initiators that the
     integration-account rule keeps off user budgets - those observed while
-    the log was the source, on a project that had an active project budget
-    then. None when there are none (the log was never the source)."""
+    the log was the source, on a project that may have had an active project
+    budget then (``ProjectBudgetInterval``, observed by ``observe_budgets``:
+    the answer for a past charge never changes). None when there are none
+    (the log was never the source)."""
     state = _state(session)
     eras: list[tuple[datetime, datetime | None]] = []
     for era in (state.eras or []) if state is not None else []:
@@ -362,8 +509,8 @@ def initiator_skip(session: Session) -> Callable[[object], bool] | None:
             eras.append((_parse(era[0]), _parse(era[1])))  # type: ignore[arg-type]
     if not eras:
         return None
-    since = _project_budget_since(session)
-    if not since:
+    governed = BudgetHistory(session, utcnow(), persist=False)
+    if not governed.intervals:
         return None
 
     def skip(part: object) -> bool:
@@ -373,27 +520,107 @@ def initiator_skip(session: Session) -> Callable[[object], bool] | None:
             return False
         if not any(start <= when and (end is None or when < end) for start, end in eras):
             return False
-        created = since.get(str(project_id))
-        return created is not None and created <= when
+        return governed.covers(str(project_id), when)
 
     return skip
 
 
-def _project_budget_since(session: Session) -> dict[str, datetime]:
-    """project id -> when its earliest active project budget was created."""
-    found: dict[str, datetime] = {}
-    for entity_id, created_at in session.execute(
-        select(CreditLimit.entity_id, CreditLimit.created_at).where(
-            CreditLimit.entity_type == EntityType.PROJECT.value,
-            CreditLimit.is_active.is_(True),
+class BudgetHistory:
+    """When each project's budgets may have been active (``usage_budget_interval``),
+    brought up to date with what is true at ``now``.
+
+    An interval starts when its budget was created (or, for a budget seen
+    active again, when it was last seen inactive) and ends when it is first
+    seen inactive or gone. Every observation is made before any decision
+    that uses it, so a date found outside every interval of a project is
+    never inside one later: a decision about a past event never changes. It
+    can only err towards a project budget having been active (a budget off
+    and on again between two observations), which keeps usage off user
+    budgets: an under-count, never an over-count."""
+
+    def __init__(self, session: Session, now: datetime, *, persist: bool) -> None:
+        from app.models.activity import ProjectBudgetInterval
+
+        self.intervals: dict[str, list[tuple[datetime, datetime | None]]] = defaultdict(list)
+        latest: dict[int, ProjectBudgetInterval] = {}
+        rows = list(
+            session.scalars(select(ProjectBudgetInterval).order_by(ProjectBudgetInterval.id))
         )
-    ):
-        if created_at is None:
-            continue
-        key = str(entity_id)
-        if key not in found or created_at < found[key]:
-            found[key] = created_at
-    return found
+        for row in rows:
+            latest[row.limit_id] = row
+        made: list[ProjectBudgetInterval] = []
+        limits = {
+            limit.id: limit
+            for limit in session.scalars(
+                select(CreditLimit).where(CreditLimit.entity_type == EntityType.PROJECT.value)
+            )
+        }
+        for limit_id, limit in limits.items():
+            row = latest.get(limit_id)
+            created = limit.created_at or now
+            if limit.is_active:
+                if row is None:
+                    made.append(_interval(limit, created, None, now))
+                elif row.end_at is not None:
+                    # Seen inactive until row.checked_at: active again since.
+                    made.append(_interval(limit, row.checked_at, None, now))
+            elif row is None:
+                made.append(_interval(limit, created, created, now))
+            elif row.end_at is None:
+                if persist:
+                    row.end_at = now
+                    row.checked_at = now
+                else:
+                    rows[rows.index(row)] = _interval(limit, row.start_at, now, now)
+            elif persist:
+                row.checked_at = now
+        for limit_id, row in latest.items():
+            if limit_id not in limits and row.end_at is None:
+                # Deleted: it ends now.
+                if persist:
+                    row.end_at = now
+                    row.checked_at = now
+                else:
+                    rows[rows.index(row)] = ProjectBudgetInterval(
+                        limit_id=row.limit_id,
+                        project_id=row.project_id,
+                        start_at=row.start_at,
+                        end_at=now,
+                        checked_at=now,
+                    )
+        if persist:
+            for row in made:
+                session.add(row)
+            session.flush()
+        for row in [*rows, *made]:
+            if row.end_at is None or row.end_at > row.start_at:
+                self.intervals[row.project_id].append((row.start_at, row.end_at))
+
+    def covers(self, project_id: str | None, when: datetime) -> bool:
+        if not project_id:
+            return False
+        return any(
+            start <= when and (end is None or when < end)
+            for start, end in self.intervals.get(project_id, ())
+        )
+
+
+def _interval(limit: CreditLimit, start: datetime, end: datetime | None, now: datetime):  # type: ignore[no-untyped-def]
+    from app.models.activity import ProjectBudgetInterval
+
+    return ProjectBudgetInterval(
+        limit_id=limit.id,
+        project_id=str(limit.entity_id)[:64],
+        start_at=start,
+        end_at=end,
+        checked_at=now,
+    )
+
+
+def observe_budgets(session: Session, now: datetime | None = None) -> None:
+    """Record what the project budgets are now (evaluation calls this before
+    it judges any limit; every activity-log write does too)."""
+    BudgetHistory(session, now or utcnow(), persist=True)
 
 
 # ----------------------------------------------------------------- reading
@@ -442,9 +669,13 @@ def _plan(session: Session, state: ActivitySourceState | None, now: datetime) ->
     # than asked (``page_size`` is only set then).
     server = state.page_size if state is not None else None
     size = min(requested, server) if server else requested
+    # A sweep the cycle's time budget stopped is tried again, every other
+    # cycle: the cycles between read the tail as usual.
+    timed_out = bool(stats.get("sweep")) and "stopped_by_time_budget" in (stats.get("issues") or [])
     sweep = (
         not seed
         and state is not None
+        and not timed_out
         and (state.last_sweep_at is None or now - state.last_sweep_at >= SWEEP_EVERY)
     )
     cap = settings_store.activity_max_pages(session) or None
@@ -571,8 +802,8 @@ def _summary_total(client: CheckmarxClient, view: str) -> Decimal:
 
 @dataclass
 class _Analysis:
-    # key -> (rows of it in this read, one of them)
-    counts: dict[str, tuple[int, ActivityEvent]]
+    # key -> (rows of it in this read, those rows)
+    counts: dict[str, tuple[int, list[ActivityEvent]]]
     uncertain: set[datetime]
     # Of those, dates met at a page boundary (the others: the last date of a
     # read the cap or time budget stopped).
@@ -618,14 +849,15 @@ def _analyse(read: _Read, plan: _Plan) -> _Analysis:
     if read.partial and filled:
         # The last date read may continue on the page not read.
         uncertain.add(filled[-1].events[-1].date)
-    counts: dict[str, tuple[int, ActivityEvent]] = {}
+    counts: dict[str, tuple[int, list[ActivityEvent]]] = {}
     positions: list[tuple[int, datetime]] = []
     credits = ZERO
     for page in pages:
         for event in page.events:
             key = event.key
-            seen, sample = counts.get(key, (0, event))
-            counts[key] = (seen + 1, sample)
+            seen, rows_of = counts.get(key, (0, []))
+            rows_of.append(event)
+            counts[key] = (seen + 1, rows_of)
             positions.append(((page.number - 1) * size + event.index, event.date))
             credits += event.credits
     rows = sum(page.rows for page in pages)
@@ -669,19 +901,28 @@ def horizon(now: datetime) -> datetime:
 class _Targets:
     """Which budgets an event counts towards, read once per write."""
 
-    def __init__(self, session: Session, now: datetime) -> None:
-        from app.services import ingestion, ledger
+    def __init__(
+        self,
+        session: Session,
+        now: datetime,
+        history: BudgetHistory,
+        group_floors: dict[int, datetime],
+    ) -> None:
+        from app.services import ingestion
 
         self.session = session
         self.now = now
         self.by_target: dict[tuple[str, str], list[CreditLimit]] = defaultdict(list)
         for limit in session.scalars(select(CreditLimit).where(CreditLimit.is_active.is_(True))):
             self.by_target[(str(limit.entity_type), str(limit.entity_id))].append(limit)
-        self.project_budget_since = _project_budget_since(session)
-        # A group budget its own summary row feeds is not fed by its projects
-        # (the summary's group view is not covered by the log).
-        self.groups_own = ledger.own_figures(session).get(UsageView.GROUP.value, set())
+        self.history = history
+        # The group budgets the log feeds through their projects (and members),
+        # and the date from which (``_observe_groups``).
+        self.group_floors = group_floors
+        self.fed_groups: set[int] = set()
         self.index = ingestion.build_user_index(session)
+        # One matching per reported name and fetch.
+        self._outcomes: dict[tuple[str, str, str], object] = {}
         self.extras = listed_extras(session)
         self.project_groups: dict[str, list[str]] = defaultdict(list)
         self.project_apps: dict[str, list[str]] = defaultdict(list)
@@ -713,21 +954,24 @@ class _Targets:
         key = event.subject_key
         if not key:
             return None, "no_user"
-        outcome = self.index.resolve_detailed(
-            subject_key=key,
-            name=event.user or None,
-            email=event.user_email or None,
-            integrations=True,
-        )
+        cache = (key, event.user, event.user_email)
+        outcome = self._outcomes.get(cache)
+        if outcome is None:
+            outcome = self.index.resolve_detailed(
+                subject_key=key,
+                name=event.user or None,
+                email=event.user_email or None,
+                integrations=True,
+            )
+            self._outcomes[cache] = outcome
         integration = is_integration_account(event.user, event.user_email, self.extras) or (
             outcome.is_bot and outcome.counted_user_id is None
         )
         if integration:
-            project = event.project_id
-            since = self.project_budget_since.get(project) if project else None
-            if since is not None and since <= event.date:
-                # Its project had an active project budget: that is where it
-                # counts, never also against a person.
+            if self.history.covers(event.project_id, event.date):
+                # Its project had (or may have had) an active project budget at
+                # the event's date: that is where it counts, never also
+                # against a person.
                 return None, "project_budget"
             if is_synthetic_subject(event.user) or is_synthetic_subject(key):
                 # Auto-triage and Auto-remediation: the scan initiator, through
@@ -776,8 +1020,15 @@ class _Targets:
             )
         )
 
-    def budgets(self, event: ActivityEvent, user_id: str | None) -> list[CreditLimit]:
+    def budgets(
+        self, event: ActivityEvent, user_id: str | None, application_id: str | None
+    ) -> list[CreditLimit]:
         found: dict[int, CreditLimit] = {}
+        floors = self.group_floors
+
+        def via_log(limit: CreditLimit) -> bool:
+            since = floors.get(limit.id)
+            return since is not None and event.date >= since
 
         def add(entity_type: str, entity_id: str, keep=lambda _limit: True) -> None:  # type: ignore[no-untyped-def]
             for limit in self.by_target.get((entity_type, entity_id), []):
@@ -789,28 +1040,80 @@ class _Targets:
         if project:
             add(EntityType.PROJECT.value, project)
             for group_id in self.project_groups.get(project, []):
-                add(
-                    EntityType.GROUP.value,
-                    group_id,
-                    lambda limit, g=group_id: (
-                        limit.include_member_usage or g not in self.groups_own
-                    ),
-                )
+                add(EntityType.GROUP.value, group_id, via_log)
             apps.update(self.project_apps.get(project, []))
-        if event.application_id:
-            apps.add(event.application_id)
+        if application_id:
+            apps.add(application_id)
         for app_id in sorted(apps):
             add(EntityType.APPLICATION.value, app_id)
         if user_id:
             add(EntityType.USER.value, user_id)
             if not is_subject_entity(user_id):
                 for group_id in self.user_groups.get(user_id, []):
-                    add(EntityType.GROUP.value, group_id, lambda limit: limit.include_member_usage)
-        return [
+                    add(
+                        EntityType.GROUP.value,
+                        group_id,
+                        lambda limit: limit.include_member_usage and via_log(limit),
+                    )
+        chosen = [
             limit
             for limit in found.values()
             if limit.created_at is None or limit.created_at <= event.date
         ]
+        self.fed_groups.update(
+            limit.id for limit in chosen if limit.entity_type == EntityType.GROUP.value
+        )
+        return chosen
+
+
+def _observe_groups(
+    session: Session, state: ActivitySourceState, now: datetime
+) -> dict[int, datetime]:
+    """The group budgets the log feeds through their projects, and from when.
+
+    A plain group budget with a row of its own in the summary's group view is
+    fed by that row (the group view is not covered by the log); otherwise,
+    and always with member usage, the log feeds it through its projects (and
+    members). Which one is decided from the latest group reading, here, at
+    every write. When the log takes a budget over, it feeds it only events
+    dated from that moment on: what the group's row counted before is never
+    counted again by the log, whenever its events reach the log (a backlog
+    after an outage, a row of an uncertain date, a late row found by the
+    daily sweep). Lost: events dated before the takeover that the log counts
+    after it. When the group's row takes a budget back from the log, and the
+    log fed it anything, the group view's next ``SUMMARY_PAUSE_READINGS``
+    readings feed nothing (for every group: the pause is per view)."""
+    from app.services import ingestion, ledger
+
+    own = ledger.own_figures(session).get(UsageView.GROUP.value, set())
+    previous = dict(state.group_feeds or {})
+    current: dict[str, dict[str, object]] = {}
+    handed_back = False
+    for limit in session.scalars(
+        select(CreditLimit).where(CreditLimit.entity_type == EntityType.GROUP.value)
+    ):
+        key = str(limit.id)
+        entry = previous.get(key)
+        if not limit.is_active:
+            if entry is not None:
+                current[key] = entry
+            continue
+        if limit.include_member_usage or str(limit.entity_id) not in own:
+            current[key] = entry if isinstance(entry, dict) else {"since": _iso(now), "fed": False}
+        elif isinstance(entry, dict) and entry.get("fed"):
+            handed_back = True
+    if handed_back:
+        snapshot = ingestion.latest_live_snapshot(session, UsageView.GROUP.value)
+        paused = dict(state.summary_paused or {})
+        paused[UsageView.GROUP.value] = snapshot.id if snapshot is not None else 0
+        state.summary_paused = paused
+    state.group_feeds = current
+    floors: dict[int, datetime] = {}
+    for key, entry in current.items():
+        since = _parse(entry.get("since")) if isinstance(entry, dict) else None
+        if since is not None:
+            floors[int(key)] = since
+    return floors
 
 
 def _actions(event: ActivityEvent, count: int) -> dict[str, int]:
@@ -845,13 +1148,28 @@ def ingest_activity(session: Session, client: CheckmarxClient) -> ActivityResult
     except Exception as exc:  # noqa: BLE001 - never stops the summary feed
         session.rollback()
         logger.exception("The credit activity step failed")
-        return ActivityResult(
-            enabled=True,
-            status=INACTIVE,
-            source_active=source_active(session),
-            read_failed=source_active(session),
-            error=f"The credit activity step failed: {exc}",
-        )
+        # A failure like an outage: while the log is the source it counts
+        # nothing (and neither does the summary for its views), and once it
+        # has lasted OUTAGE_GRACE the summary takes over. A bug that persists
+        # thus falls back instead of counting nothing for ever.
+        result = ActivityResult(enabled=True)
+        try:
+            return _failed(
+                session,
+                result,
+                utcnow(),
+                RuntimeError(f"The credit activity step failed: {exc}"),
+                structural=False,
+            )
+        except Exception:  # noqa: BLE001 - the database itself is failing
+            session.rollback()
+            logger.exception("The credit activity step could not record its failure")
+            active = source_active(session)
+            result.status = ACTIVE if active else INACTIVE
+            result.source_active = active
+            result.read_failed = active
+            result.error = f"The credit activity step failed: {exc}"
+            return result
 
 
 def _ingest(session: Session, client: CheckmarxClient) -> ActivityResult:
@@ -889,11 +1207,11 @@ def _ingest(session: Session, client: CheckmarxClient) -> ActivityResult:
     except (CheckmarxNotFoundError, CheckmarxPermissionError, CheckmarxResponseError) as exc:
         # Refused, absent or not the log: the summary takes over at once.
         session.rollback()
-        return _failed(session, result, plan, exc, structural=True)
+        return _failed(session, result, plan.now, exc, structural=True)
     except CheckmarxError as exc:
         # An outage, a rate limit, a token problem: expected to pass.
         session.rollback()
-        return _failed(session, result, plan, exc, structural=False)
+        return _failed(session, result, plan.now, exc, structural=False)
 
     ingestion.attribution_lock(session)
     state = _state_for_write(session)
@@ -916,14 +1234,13 @@ def _ingest(session: Session, client: CheckmarxClient) -> ActivityResult:
 def _failed(
     session: Session,
     result: ActivityResult,
-    plan: _Plan,
+    now: datetime,
     exc: Exception,
     *,
     structural: bool,
 ) -> ActivityResult:
     from app.services import ingestion
 
-    now = plan.now
     message = str(exc)[:2000]
     ingestion.attribution_lock(session)
     state = _state_for_write(session)
@@ -986,7 +1303,14 @@ def _write(
             "since the consumption summary's last reading is not counted."
         )
     floor = state.floor_at or now
+    # Never below a cutoff already used: keys older than it may be gone.
     cutoff = horizon(now)
+    if state.cutoff_at is not None and state.cutoff_at > cutoff:
+        cutoff = state.cutoff_at
+    state.cutoff_at = cutoff
+    # Observed before anything is decided with them (see BudgetHistory).
+    history = BudgetHistory(session, now, persist=True)
+    group_floors = _observe_groups(session, state, now)
     result.status = ACTIVE
     result.source_active = True
     result.pages = len(read.pages)
@@ -1023,12 +1347,15 @@ def _write(
     if not analysis.regression:
         new_events = _reconcile(session, analysis, plan, floor, cutoff, now, result)
     if new_events:
-        _count(session, new_events, now, result)
+        _count(session, new_events, now, result, history, group_floors, state)
 
     session.execute(delete(ActivityEventCount).where(ActivityEventCount.event_at < cutoff))
 
     _move_cursor(state, plan, read, analysis, cutoff)
-    if plan.sweep:
+    result.sweep = plan.sweep
+    if plan.sweep and not (read.partial and read.stopped_by == "time budget"):
+        # A sweep the page cap stopped (a log too large to read in a cycle)
+        # is not tried again until the next day.
         state.last_sweep_at = now
         state.reconciliation = _reconciliation(read, analysis, now)
     state.page_size = analysis.size if analysis.size < plan.size else None
@@ -1054,17 +1381,20 @@ def _reconcile(
     cutoff: datetime,
     now: datetime,
     result: ActivityResult,
-) -> list[tuple[ActivityEvent, int]]:
+) -> list[tuple[list[ActivityEvent], int]]:
     """Raise each identity's seen count to what this read holds; the rise is
-    the new events (none in a seed, none dated before the floor)."""
-    wanted: dict[str, tuple[int, ActivityEvent]] = {}
-    for key, (count, event) in analysis.counts.items():
+    the new events (none in a seed, none dated before the floor), with every
+    row of the identity in this read (``_count`` decides what of them is
+    certain)."""
+    wanted: dict[str, tuple[int, list[ActivityEvent]]] = {}
+    for key, (count, rows) in analysis.counts.items():
+        event = rows[0]
         if event.date in analysis.uncertain:
             result.uncertain_rows += count
             continue
         if event.date < cutoff:
             continue
-        wanted[key] = (count, event)
+        wanted[key] = (count, rows)
     keys = sorted(wanted)
     stored: dict[str, ActivityEventCount] = {}
     for start in range(0, len(keys), 500):
@@ -1074,9 +1404,10 @@ def _reconcile(
             )
         ):
             stored[row.key_hash] = row
-    new_events: list[tuple[ActivityEvent, int]] = []
+    new_events: list[tuple[list[ActivityEvent], int]] = []
     for key in keys:
-        count, event = wanted[key]
+        count, rows = wanted[key]
+        event = rows[0]
         row = stored.get(key)
         before = row.seen if row is not None else 0
         if count <= before:
@@ -1089,37 +1420,55 @@ def _reconcile(
             row.seen = count
             row.updated_at = now
         if not plan.seed and event.date >= floor:
-            new_events.append((event, count - before))
+            new_events.append((rows, count - before))
     return new_events
 
 
 def _count(
     session: Session,
-    new_events: list[tuple[ActivityEvent, int]],
+    new_events: list[tuple[list[ActivityEvent], int]],
     now: datetime,
     result: ActivityResult,
+    history: BudgetHistory,
+    group_floors: dict[int, datetime],
+    state: ActivitySourceState,
 ) -> None:
     """Add the new events to the month's and the quarter's counter, of the
-    period each happened in, of every budget it counts towards."""
+    period each happened in, of every budget it counts towards.
+
+    The rows of one identity (same date, action, credits, project, scans and
+    scanner) can differ in the fields that may change later (who, the
+    application). Which of them are the new ones cannot be told, so the new
+    events of an identity count towards a person or an application only when
+    every row of it in this read names the same one; otherwise only towards
+    what the identity itself fixes (its project, the project's groups and
+    applications). A budget is then charged at most as many events of the
+    identity as rows naming it were read at once: never more than there
+    are."""
     from app.services.periods import current_window
 
-    targets = _Targets(session, now)
-    resolved: list[tuple[ActivityEvent, int, str | None]] = []
-    for event, count in new_events:
-        user_id, outcome = targets.user_entity(event)
+    targets = _Targets(session, now, history, group_floors)
+    resolved: list[tuple[ActivityEvent, int, str | None, str | None]] = []
+    for rows, count in new_events:
+        event = rows[0]
+        if all(row.variant == event.variant for row in rows):
+            user_id, outcome = targets.user_entity(event)
+            application_id = event.application_id
+        else:
+            user_id, outcome, application_id = None, "ambiguous", None
         result.user_outcomes[outcome] = result.user_outcomes.get(outcome, 0) + count
-        resolved.append((event, count, user_id))
+        resolved.append((event, count, user_id, application_id))
     targets.load_links(
-        {event.project_id for event, _c, _u in resolved if event.project_id},
-        {user_id for _e, _c, user_id in resolved if user_id and not is_subject_entity(user_id)},
+        {event.project_id for event, _c, _u, _a in resolved if event.project_id},
+        {user_id for _e, _c, user_id, _a in resolved if user_id and not is_subject_entity(user_id)},
     )
     adds: dict[tuple[int, str], tuple[Decimal, dict[str, int]]] = {}
-    for event, count, user_id in resolved:
+    for event, count, user_id, application_id in resolved:
         credits = event.credits * count
         result.events_counted += count
         result.credits_counted += credits
         actions = _actions(event, count)
-        for limit in targets.budgets(event, user_id):
+        for limit in targets.budgets(event, user_id, application_id):
             for granularity in _GRANULARITIES:
                 period = current_window(
                     SimpleNamespace(period_type=granularity, created_at=limit.created_at),  # type: ignore[arg-type]
@@ -1127,6 +1476,12 @@ def _count(
                 )
                 total, counts = adds.get((limit.id, period.key), (ZERO, {}))
                 adds[(limit.id, period.key)] = (total + credits, _add_counts(counts, actions))
+    if targets.fed_groups:
+        feeds = {key: dict(value) for key, value in (state.group_feeds or {}).items()}
+        for limit_id in targets.fed_groups:
+            if str(limit_id) in feeds:
+                feeds[str(limit_id)]["fed"] = True
+        state.group_feeds = feeds
     if not adds:
         return
     limit_ids = sorted({limit_id for limit_id, _key in adds})

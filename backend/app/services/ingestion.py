@@ -978,7 +978,7 @@ def _store_dimension(
     counted = ledger.record_reading(
         session, view, snapshot, stored, suspect=fetched.suspect, own=own, feed=feeds
     )
-    activity_source.note_summary_reading(session, str(view), snapshot)
+    activity_source.after_summary_reading(session, str(view), snapshot, stored, fed=feeds)
     result.doubted_falls = counted.dips
 
     snapshot.total_credits = total

@@ -396,6 +396,12 @@ def evaluate_all(
     # Periods already over whose counters grew since they were last evaluated
     # (an increase observed before the rollover, evaluated after it).
     _settle_closed_periods(session, moment)
+    # What the project budgets are now, recorded before any limit is judged:
+    # the integration-account rule for auto-triage charges reads it, and a
+    # past charge's outcome must never change (app/services/activity_source.py).
+    from app.services import activity_source
+
+    activity_source.observe_budgets(session, moment)
     index = UsageIndex(session)
     resolver = enforcement.RoleResolver(client) if client is not None else None
     budget: enforcement.EnforcementBudget | None = None

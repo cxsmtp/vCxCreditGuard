@@ -88,9 +88,17 @@ class ActivityEvent:
 
     @property
     def key(self) -> str:
-        """Every identifying field: two rows with the same key cannot be told
-        apart, so how many of them there are is all that can be known."""
+        """The fields that cannot change once the action happened: rows with
+        the same key are counted as a multiset (how many there are is all
+        that can be known)."""
         return event_key(self)
+
+    @property
+    def variant(self) -> tuple[str, str, tuple[str, ...]]:
+        """The fields Checkmarx may fill in or change later for the same
+        action (who, by name and email, and the application): not part of
+        the key, so a row re-rendered with them is not a new event."""
+        return (self.user, self.user_email.lower(), self.application_ids)
 
 
 def _canonical_credits(value: Decimal) -> str:
@@ -99,14 +107,17 @@ def _canonical_credits(value: Decimal) -> str:
 
 
 def event_key(event: ActivityEvent) -> str:
+    """The identity of a row: its date, action, credits, project ids, scan
+    ids and scanner, which describe the action itself and are assumed never
+    to change for a past action. ``user``, ``userEmail`` and
+    ``applicationIds`` are left out: they may be filled in or changed later
+    (an email added to the account, the project added to an application),
+    and a row must not become a new event when they do."""
     fields = [
         event.date.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f"),
         event.action,
         _canonical_credits(event.credits),
-        event.user,
-        event.user_email.lower(),
         list(event.project_ids),
-        list(event.application_ids),
         list(event.scan_ids),
         event.scanner,
     ]

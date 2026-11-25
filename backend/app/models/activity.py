@@ -20,7 +20,8 @@ from app.db.types import JSONColumn, UTCDateTime
 class ActivityEventCount(Base):
     """How many rows with one identity the log has been seen to hold.
 
-    The identity is every identifying field of a row (``event_key``), hashed.
+    The identity is the fields of a row that cannot change once it happened
+    (``event_key``: date, action, credits, project, scans, scanner), hashed.
     A fetch that holds ``n`` such rows counts ``max(0, n - seen)`` new events
     and raises ``seen`` to ``n``; ``seen`` never falls. Pruned once older
     than the log's window (and never counted again after that).
@@ -68,6 +69,14 @@ class ActivitySourceState(Base):
     retry_after: Mapped[datetime | None] = mapped_column(UTCDateTime)
     last_error: Mapped[str | None] = mapped_column(Text)
     last_sweep_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # The highest pruning cutoff ever used: an event older than it is never
+    # counted, even when the clock goes back (its key may be gone).
+    cutoff_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # {group budget id: {"since": ISO time, "fed": bool}}: the group budgets the
+    # log feeds through their projects (not by their own summary row), since
+    # when, and whether it fed them anything. Only events dated from "since"
+    # on count towards them from the log.
+    group_feeds: Mapped[dict | None] = mapped_column(JSONColumn)
     # {view: id of the last summary snapshot read while the log was the
     # source}: the summary feed's next reading of that view counts nothing.
     summary_paused: Mapped[dict | None] = mapped_column(JSONColumn)
@@ -77,6 +86,32 @@ class ActivitySourceState(Base):
     reconciliation: Mapped[dict | None] = mapped_column(JSONColumn)
     # What the last fetch did, for Diagnose and the cycle record.
     last_stats: Mapped[dict | None] = mapped_column(JSONColumn)
+
+
+class ProjectBudgetInterval(Base):
+    """When a project budget may have been active, as observed.
+
+    The integration-account rule asks whether an event's project had an
+    active project budget at the event's date, and the answer for a past
+    event must never change. Each observation (every activity-log write and
+    every evaluation) extends or closes these intervals: an interval starts
+    when the budget was created, or when it was last seen inactive before it
+    was seen active again, and ends when it is first seen inactive or gone.
+    So an interval covers at least the time the budget was really active,
+    and a date once outside every interval of a project at an observation
+    stays outside.
+    """
+
+    __tablename__ = "usage_budget_interval"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Not a foreign key: the history outlives a deleted budget.
+    limit_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    start_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    end_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # The last observation that agreed with this row.
+    checked_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
 
 
 # A user budget can target an integration account that is no synced user (an

@@ -10,7 +10,12 @@ Create Date: 2026-11-25
   of each identity's count, never by deduplicating.
 * ``usage_activity_state`` - the activity source's state (one row): whether
   it is the source, where the next read starts, the floor before which
-  nothing is counted from it, and its last reconciliation with the summary.
+  nothing is counted from it, the highest pruning cutoff, the group budgets
+  it feeds through their projects and since when, and its last
+  reconciliation with the summary.
+* ``usage_budget_interval`` - when each project budget may have been active,
+  as observed, so the integration-account rule decides a past event the
+  same way every time.
 
 Nothing is seeded: the first fetch after the upgrade only records what the
 log holds, and counts nothing.
@@ -23,6 +28,11 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "c9f2b6d4e8a1"
+# MERGE: on the branch merged with realfix, whose head is c9f2a6e1d4b7 (the
+# AI-roles data migration, after e2a7c4f9b1d8), this line must read
+#     down_revision = "c9f2a6e1d4b7"
+# so the chain stays single-headed. On activity-feed alone that revision does
+# not exist yet, so it points at e2a7c4f9b1d8 here.
 down_revision = "e2a7c4f9b1d8"
 branch_labels = None
 depends_on = None
@@ -58,15 +68,35 @@ def upgrade() -> None:
             sa.Column("retry_after", sa.DateTime(timezone=True), nullable=True),
             sa.Column("last_error", sa.Text(), nullable=True),
             sa.Column("last_sweep_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("cutoff_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("group_feeds", sa.JSON(), nullable=True),
             sa.Column("summary_paused", sa.JSON(), nullable=True),
             sa.Column("eras", sa.JSON(), nullable=True),
             sa.Column("reconciliation", sa.JSON(), nullable=True),
             sa.Column("last_stats", sa.JSON(), nullable=True),
             sa.PrimaryKeyConstraint("id", name=op.f("pk_usage_activity_state")),
         )
+    if "usage_budget_interval" not in tables:
+        op.create_table(
+            "usage_budget_interval",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("limit_id", sa.Integer(), nullable=False),
+            sa.Column("project_id", sa.String(length=64), nullable=False),
+            sa.Column("start_at", sa.DateTime(timezone=True), nullable=False),
+            sa.Column("end_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("checked_at", sa.DateTime(timezone=True), nullable=False),
+            sa.PrimaryKeyConstraint("id", name=op.f("pk_usage_budget_interval")),
+        )
+        op.create_index("ix_usage_budget_interval_limit_id", "usage_budget_interval", ["limit_id"])
+        op.create_index(
+            "ix_usage_budget_interval_project_id", "usage_budget_interval", ["project_id"]
+        )
 
 
 def downgrade() -> None:
+    op.drop_index("ix_usage_budget_interval_project_id", table_name="usage_budget_interval")
+    op.drop_index("ix_usage_budget_interval_limit_id", table_name="usage_budget_interval")
+    op.drop_table("usage_budget_interval")
     op.drop_table("usage_activity_state")
     op.drop_index("ix_usage_activity_key_event_at", table_name="usage_activity_key")
     op.drop_table("usage_activity_key")
