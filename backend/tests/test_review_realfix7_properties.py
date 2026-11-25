@@ -522,10 +522,13 @@ def test_random_sequences_keep_both_invariants(
     upper: dict[tuple[str, str], int] = defaultdict(int)
     last = _Reading(db, "project")
     last_group, last_app = _Reading(db, "group"), _Reading(db, "application")
+    last2_group: _Reading | None = None
+    last2_app: _Reading | None = None
     last_feeds = _feeds(db)
     increases: dict[str, int] = defaultdict(int)
     rolled: set[str] = set()
     history: list[str] = []
+    totals_periods: set[str | None] = set()
     for _ in range(STEPS):
         with pytest.MonkeyPatch.context() as mp:
             change = _step(world, db, admin_client, mp, budgets)
@@ -542,6 +545,10 @@ def test_random_sequences_keep_both_invariants(
                     rolled.add(new)
             group_grew, app_grew = world.group_grew, world.app_grew
             read = _cycle(db, world, admin_client)
+            if world.existing and not world.skip_evaluation:
+                # Evaluated from reported totals: that period is not the
+                # ledger's, and a closed period is never rewritten later.
+                totals_periods.add(_month(world.clock))
         if not read:
             continue
         world.group_grew = world.app_grew = 0
@@ -554,8 +561,8 @@ def test_random_sequences_keep_both_invariants(
         counts = _month(last.at) == period and last.period == now.period
         seen = {name for name in now.rows if name not in world.dipped}
         own = {
-            "grp-payments": ("grp-payments", last_group, group, group_grew),
-            "app-payments": ("app-payments", last_app, app, app_grew),
+            "grp-payments": ("grp-payments", last_group, group, group_grew, last2_group),
+            "app-payments": ("app-payments", last_app, app, app_grew, last2_app),
         }
         for budget, projects in feeds.items():
             if not counts:
@@ -563,10 +570,13 @@ def test_random_sequences_keep_both_invariants(
             key = (period, budget)
             if budget in own and own[budget][1].has(own[budget][0]):
                 # Fed by its own row: what it grew while in both readings.
-                entity, before_view, now_view, grew = own[budget]
+                entity, before_view, now_view, grew, before2_view = own[budget]
                 if now_view.has(entity) and before_view.period == now_view.period:
                     upper[key] += grew
-                    lower[key] += grew
+                    if before2_view is not None and before2_view.has(entity):
+                        # A row's second reading counts nothing (eighth
+                        # review): only from its third does it.
+                        lower[key] += grew
                 continue
             members = projects | last_feeds[budget]
             for name, amount in increases.items():
@@ -586,6 +596,7 @@ def test_random_sequences_keep_both_invariants(
         # added is still to be observed.
         increases = defaultdict(int, {n: a for n, a in increases.items() if n not in seen})
         rolled = {n for n in rolled if n not in seen}
+        last2_group, last2_app = last_group, last_app
         last, last_group, last_app, last_feeds = now, group, app, feeds
         if world.skip_evaluation:
             continue
@@ -596,6 +607,8 @@ def test_random_sequences_keep_both_invariants(
             for state in db.scalars(
                 select(LimitPeriodState).where(LimitPeriodState.limit_id == limit.id)
             ):
+                if budget == "proj-web" and state.period_key in totals_periods:
+                    continue
                 key = (state.period_key, budget)
                 used = state.credits_used
                 assert lower[key] <= used <= upper[key], (

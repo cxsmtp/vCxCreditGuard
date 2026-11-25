@@ -179,6 +179,11 @@ class TestDoubtedFallsAreSurfacedAndBounded:
     def test_a_fall_doubted_reading_after_reading_is_believed_in_the_end(
         self, db: Session, connected, monkeypatch
     ) -> None:
+        """Restated in the eighth review: a fall doubted for longer than the
+        bound stops being reported, but the total before it stays a ceiling
+        (an outlasting glitch must not be counted when it ends). In readings
+        that stay doubted, the name's usage counts again only above that
+        ceiling: 400 -> 450 counts nothing (a documented under-count)."""
         tenant = _tenant()
         connected(tenant)
         run = _Run(db, monkeypatch, datetime(2027, 1, 5, 6, tzinfo=UTC))
@@ -190,15 +195,23 @@ class TestDoubtedFallsAreSurfacedAndBounded:
         _doubted(monkeypatch, "payments/web", reported)
         for _ in range(ledger.DIP_MAX_DOUBTS):
             run.step(hours=0.25)
-        assert db.scalar(select(UsageMissingName)) is None
-        # What it spends after the fall is believed counts.
+        held = db.scalar(select(UsageMissingName))
+        assert (held.kind, held.last_total) == (ledger.CEILING, 1000)
+        # Still under the ceiling: nothing counts.
         reported[0] = 450
         run.step()
-        assert run.used(web) == 50
+        assert run.used(web) == 0
+        # Above it, only what is above it.
+        reported[0] = 1030
+        run.step()
+        assert run.used(web) == 30
 
     def test_a_doubt_older_than_its_bound_is_believed(
         self, db: Session, connected, monkeypatch
     ) -> None:
+        """Restated in the eighth review: past its bound a doubted fall is no
+        longer reported, and its total stays a ceiling until a believed
+        reading confirms the lower total."""
         tenant = _tenant()
         connected(tenant)
         run = _Run(db, monkeypatch, datetime(2027, 1, 5, 6, tzinfo=UTC))
@@ -208,6 +221,14 @@ class TestDoubtedFallsAreSurfacedAndBounded:
         run.step()
         assert db.scalar(select(UsageMissingName)) is not None
         run.step(hours=ledger.DIP_MAX_AGE.total_seconds() / 3600 + 0.5)
+        assert db.scalar(select(UsageMissingName)).kind == ledger.CEILING
+        assert all(c.key != "doubted_falls" for c in diagnostics.run_diagnostics(db).checks)
+        # A believed reading at the lower total confirms it.
+        monkeypatch.undo()
+        connected(tenant)
+        monkeypatch.setattr(ingestion, "utcnow", lambda: run.clock[0])
+        tenant.set_entity_credits(view="project", name="payments/web", credits=400)
+        run.step()
         assert db.scalar(select(UsageMissingName)) is None
 
 

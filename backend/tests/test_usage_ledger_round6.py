@@ -156,10 +156,20 @@ class TestAggregateRows:
         )
         cycle.run_cycle(trigger="manual")
         assert _state(db, app_limit).credits_used == 36
-        # From then on its own row feeds it, and its projects do not.
+        # Its own row's second reading counts nothing either (restated in the
+        # eighth review: the application is read before its projects, so what
+        # it adds by then overlaps what the projects already fed; a
+        # documented under-count of one reading).
         tenant.set_entity_credits(view="project", name="payments/web", credits=45)
         tenant.set_entity_credits(
             view="application", name="Payments", credits=53, entity_id="app-payments"
+        )
+        cycle.run_cycle(trigger="manual")
+        assert _state(db, app_limit).credits_used == 36
+        # From then on its own row feeds it, and its projects do not.
+        tenant.set_entity_credits(view="project", name="payments/web", credits=50)
+        tenant.set_entity_credits(
+            view="application", name="Payments", credits=58, entity_id="app-payments"
         )
         cycle.run_cycle(trigger="manual")
         assert _state(db, app_limit).credits_used == 41
@@ -367,10 +377,11 @@ class TestRememberedNamesAge:
         clock[0] += timedelta(minutes=5)
         _drive(db, client, clock)
         assert db.scalar(select(UsageMissingName)) is not None
-        # Back after more than the lookback window (a year): nothing of its old
-        # total can be left in the window, so everything it reports is new.
+        # Back after more than the lookback window (a year, and the two days'
+        # margin added in the eighth review): nothing of its old total can be
+        # left in the window, so everything it reports is new.
         tenant.set_entity_credits(view="project", name="payments/web", credits=7)
-        clock[0] += timedelta(days=366)
+        clock[0] += timedelta(days=368)
         _drive(db, client, clock)
         db.expire_all()
         assert db.scalar(select(UsageMissingName)) is None

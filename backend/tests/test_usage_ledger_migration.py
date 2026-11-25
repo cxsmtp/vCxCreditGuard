@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session
 
@@ -186,7 +187,10 @@ def test_a_database_at_the_replaced_anchor_revision_reaches_the_ledger(tmp_path:
     engine.dispose()
 
 
-def test_a_count_existing_budget_gets_its_period_increase_as_a_counter(tmp_path: Path) -> None:
+@pytest.mark.parametrize("active", [True, False])
+def test_a_count_existing_budget_gets_its_period_increase_as_a_counter(
+    tmp_path: Path, active: bool
+) -> None:
     """e2a7c4f9b1d8: the open period of a budget that counts existing usage is
     seeded with what its entity's names grew by since the period's first
     reading (a name that came to count meanwhile brings no history)."""
@@ -205,10 +209,10 @@ def test_a_count_existing_budget_gets_its_period_increase_as_a_counter(tmp_path:
                 "INSERT INTO credit_limit (id, entity_type, entity_id, credit_limit, period_type, "
                 "warning_threshold_pct, enforce, is_active, include_member_usage, "
                 "count_existing_usage, hold_until_released, created_at, updated_at) VALUES "
-                "(7, 'project', 'proj-1', 1000, 'monthly', 80, :no, :yes, :no, :yes, :no, "
+                "(7, 'project', 'proj-1', 1000, 'monthly', 80, :no, :active, :no, :yes, :no, "
                 ":now, :now)"
             ),
-            {"no": False, "yes": True, "now": now},
+            {"no": False, "yes": True, "now": now, "active": active},
         )
         connection.execute(
             text(
@@ -245,5 +249,9 @@ def test_a_count_existing_budget_gets_its_period_increase_as_a_counter(tmp_path:
     command.upgrade(config, "head")
     with Session(engine) as session:
         counter = session.scalar(select(BudgetUsage).where(BudgetUsage.limit_id == 7))
-        assert counter is not None and counter.credits == Decimal("30")
+        if active:
+            assert counter is not None and counter.credits == Decimal("30")
+        else:
+            # Only active budgets are seeded (eighth review).
+            assert counter is None
     engine.dispose()
