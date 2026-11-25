@@ -229,6 +229,17 @@ KEY_UPDATE_REPORTED_EVENTS = "updates.reported_events"
 # How far the retention job has cleared old raw consumption rows (an ISO
 # timestamp: snapshots collected before it are done). Bookkeeping.
 KEY_RETENTION_RAW_CLEARED_UNTIL = "retention.raw_cleared_until"
+# The recounts before a new restriction that refused it (app/services/recount.py):
+# a disagreement with the activity log, or no recount possible. Bookkeeping.
+KEY_RECOUNT_RECORDS = "recount.records"
+# Onboarding (app/services/readiness.py). ``gate`` is set by the data migration
+# on a new install only: leaving watch-only then needs a green readiness
+# checklist or an admin's typed override. Cleared once enforcement is on.
+KEY_READINESS_GATE = "readiness.gate"
+# When an admin last marked the dry run / Simulation reviewed, and who.
+KEY_READINESS_REVIEWED = "readiness.dry_run_reviewed"
+# Each checklist item's last state, to warn when one turns red later.
+KEY_READINESS_LAST = "readiness.last_states"
 # Rows kept in app_setting that are state rather than settings.
 INTERNAL_KEYS: frozenset[str] = frozenset(
     {
@@ -237,6 +248,10 @@ INTERNAL_KEYS: frozenset[str] = frozenset(
         KEY_VIOLATION_SCAN_CURSORS,
         KEY_UPDATE_REPORTED_EVENTS,
         KEY_RETENTION_RAW_CLEARED_UNTIL,
+        KEY_RECOUNT_RECORDS,
+        KEY_READINESS_GATE,
+        KEY_READINESS_REVIEWED,
+        KEY_READINESS_LAST,
     }
 )
 

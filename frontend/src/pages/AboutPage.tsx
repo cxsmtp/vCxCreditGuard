@@ -49,6 +49,8 @@ const FEATURES: FeatureGroup[] = [
       "Gives access back by itself when usage drops under budget, the budget is raised or a new period starts (unless the budget is set to hold until released).",
       "Simulation: a dry run of the next cycle showing who would be warned and restricted, before anything happens.",
       "Enforcement coverage: how many of the people holding an AI role a user restriction could actually take it from, and why not the rest (composite roles, groups, protected roles), with a warning when user budgets will not bite. It never changes the role list.",
+      "Recount before restricting (always on): before a new restriction of a monthly or quarterly budget, CreditGuard recounts the budget's period straight from the Checkmarx activity log, independently of its own counters, and restricts only if that recount is also at or over the limit. If the counts disagree, or the recount cannot be done, it warns instead and Diagnose shows it.",
+      "Readiness checklist (Settings → Enforcement and Diagnose): connection, activity log, counts matching Checkmarx, a passed self-test on a user and a project, and a reviewed dry run. A new install starts watch-only and turns enforcement on once every item is green, or with an audited override typed by an admin.",
       "Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users and projects restricts nobody and pauses itself.",
       "A pause switch stops new restrictions at once; warnings and giving access back carry on.",
       "Protected roles (ast-admin and iam-admin by default) are never restricted.",
@@ -202,6 +204,40 @@ const LIMITATIONS: Limitation[] = [
         restrict only with Summary only and &ldquo;Allow restrictions from
         summary totals&rdquo; on. Restrictions already in force stay; lifetime,
         custom and count-existing budgets restrict as before.
+      </>
+    ),
+  },
+  {
+    title: "A new period-budget restriction needs the activity log to agree.",
+    group: "enforcement",
+    meaning: (
+      <>
+        Before a new restriction of a monthly or quarterly budget, the
+        budget&apos;s period is recounted from the Checkmarx activity log
+        (read afresh: the last 30 days, or the last 90 for a quarter or an
+        older month, within the activity page cap and the cycle&apos;s time
+        budget). When the log cannot be read, the read is cut short, or the
+        recount is under the limit, nothing new is restricted and a warning
+        says why; this applies with Summary only too. The last day or two of a
+        92-day quarter fall outside the 90-day window, so a recount late in
+        such a quarter can fall short and hold a restriction back. Simulation
+        does not run the recount: it marks such rows &ldquo;would restrict if
+        the recount agrees&rdquo;. Restrictions in force, lifts, and lifetime,
+        custom and count-existing budgets are unaffected.
+      </>
+    ),
+  },
+  {
+    title: "A new install watches only until it is ready.",
+    group: "enforcement",
+    meaning: (
+      <>
+        A new install starts with enforcement paused (watch-only): it warns
+        but restricts nobody until the readiness checklist is green or an
+        admin overrides it by typing ENFORCE (audited). An existing install
+        keeps its setting and sees the checklist for information. Once
+        enforcement is on the checklist never turns it off; an item that turns
+        red raises a warning.
       </>
     ),
   },

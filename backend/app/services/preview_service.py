@@ -36,7 +36,7 @@ from app.models.enums import (
     LimitStatus,
 )
 from app.models.limits import CreditLimit, EnforcementAction, effective_project_actions
-from app.services import enforcement, evaluation, role_sources, settings_store
+from app.services import enforcement, evaluation, recount, role_sources, settings_store
 from app.services.periods import PeriodError, current_window
 
 
@@ -523,6 +523,9 @@ class DryRunRow:
     # How much of credits_used is auto-triage charged from scans; None when that
     # setting is off or the limit is not fed by a person's usage.
     auto_triage_attributed: Decimal | None = None
+    # A new restriction of a monthly or quarterly budget: it starts only if the
+    # independent recount of the activity log agrees (app/services/recount.py).
+    recount_required: bool = False
 
 
 @dataclass(slots=True)
@@ -683,6 +686,7 @@ def _project_one(
     blast: BlastRadius | None = None
     would_enforce = False
     note: str | None = None
+    recount_required = False
     on_summary = (
         evaluation.summary_hold(
             session,
@@ -731,6 +735,9 @@ def _project_one(
                     "Would breach and enforce, but no Checkmarx connection is configured, "
                     "so the restriction would be deferred until one is."
                 )
+            if would_enforce and recount.applies(session, limit, window):
+                recount_required = True
+                note = f"{note} {recount.PREVIEW_NOTE}" if note else recount.PREVIEW_NOTE
 
     return DryRunRow(
         limit_id=limit.id,
@@ -749,4 +756,5 @@ def _project_one(
         note=note,
         period_key=window.key,
         auto_triage_attributed=auto_triage,
+        recount_required=recount_required,
     )

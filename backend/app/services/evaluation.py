@@ -83,6 +83,7 @@ from app.services import (
     ledger,
     notifications,
     pacing,
+    recount,
     settings_store,
     usage_mix,
 )
@@ -122,6 +123,10 @@ class EvaluationResult:
     # Breached, enforcing period budgets not restricted because their usage
     # over the limit was counted from the consumption summary (summary_hold).
     summary_held: int = 0
+    # Breached, enforcing period budgets whose new restriction was not applied
+    # because the independent recount of the activity log did not confirm it
+    # (app/services/recount.py).
+    recount_held: int = 0
     # Why new restrictions are not being applied this cycle, or None if they are.
     enforcement_paused: str | None = None
     errors: list[str] = field(default_factory=list)
@@ -142,6 +147,7 @@ class EvaluationResult:
             "enforced": self.enforced,
             "monitor_only": self.monitor_only,
             "summary_held": self.summary_held,
+            "recount_held": self.recount_held,
             "restored": self.restored,
             "usage_unavailable": self.unavailable,
             "deferred": self.deferred,
@@ -429,6 +435,9 @@ def evaluate_all(
     resolver = enforcement.RoleResolver(client) if client is not None else None
     budget: enforcement.EnforcementBudget | None = None
     config: pacing.Pacing | None = None
+    # The independent recount before every new restriction of a period budget
+    # (app/services/recount.py): the log is read at most once per cycle.
+    recounter = recount.Recounter(client, now=moment) if client is not None else None
 
     if client is not None:
         config = pacing.pacing(session)
@@ -448,7 +457,9 @@ def evaluate_all(
         # may apply new restrictions or none of it may. Giving access back is
         # never held up by this.
         try:
-            result.enforcement_paused = _enforcement_hold(session, moment=moment, actor=actor)
+            result.enforcement_paused = _enforcement_hold(
+                session, moment=moment, actor=actor, recounter=recounter
+            )
         except Exception as exc:  # noqa: BLE001 - the safety check failing must fail safe
             session.rollback()
             logger.exception("The enforcement safety check failed")
@@ -563,7 +574,11 @@ def evaluate_all(
     # limits' enforcement below.
     budget.verify_ids = frozenset()
 
-    # Pass 3: new restrictions, small limits first, then large rollouts.
+    # Pass 3: new restrictions, small limits first, then large rollouts. The
+    # activity log is read for the recounts first, with nothing open in the
+    # database.
+    if result.enforcement_paused is None and to_enforce and recounter is not None:
+        _prepare_recount(session, recounter, to_enforce, moment=moment)
     if result.enforcement_paused is None and to_enforce:
         _enforce_pending(
             session,
@@ -574,6 +589,7 @@ def evaluate_all(
             resolver=resolver,
             result=result,
             budget=budget,
+            recounter=recounter,
         )
     if result.postponed and result.enforcement_paused is None:
         budget.postpone_large = None
@@ -587,6 +603,7 @@ def evaluate_all(
             resolver=resolver,
             result=result,
             budget=budget,
+            recounter=recounter,
         )
 
     # Pass 4: restrictions that could not be read back are written again to
@@ -1123,12 +1140,17 @@ def _enforce_pending(
     resolver: enforcement.RoleResolver | None,
     result: EvaluationResult,
     budget: enforcement.EnforcementBudget,
+    recounter: recount.Recounter | None = None,
 ) -> None:
     """Apply the restrictions of breached limits, each in its own transaction.
 
     Called once with ``budget.postpone_large`` set (a limit needing more writes
     than that is postponed, so every small limit goes first), then again for
     the postponed ones with whatever budget is left.
+
+    A new restriction of a monthly or quarterly budget is applied only when
+    the independent recount of the activity log is also at or over the limit
+    (``recount.gate``); otherwise it stays BREACHED, warned and recorded.
     """
     by_limit = {evaluation.limit.id: evaluation for evaluation in result.evaluations}
     for position, limit_id in enumerate(limit_ids):
@@ -1151,6 +1173,25 @@ def _enforce_pending(
                 )
             )
             if state is None or state.status not in (LimitStatus.BREACHED, LimitStatus.RESTRICTED):
+                continue
+            held = (
+                recount.gate(
+                    session,
+                    recounter,
+                    limit=limit,
+                    window=window,
+                    counted=Decimal(state.credits_used or 0),
+                    moment=moment,
+                )
+                if recounter is not None
+                else None
+            )
+            if held is not None:
+                result.recount_held += 1
+                evaluation = by_limit.get(limit.id)
+                if evaluation is not None:
+                    evaluation.note = held
+                session.commit()
                 continue
             outcome = enforcement.apply_enforcement(
                 session,
@@ -1191,6 +1232,29 @@ def _enforce_pending(
             result.errors.append(f"limit {limit_id}: {error_text.public_error(exc)}")
 
 
+def _prepare_recount(
+    session: Session,
+    recounter: recount.Recounter,
+    limit_ids: list[int],
+    *,
+    moment: datetime,
+) -> None:
+    """Read the activity log windows the new restrictions' recounts need,
+    once, before any of them (the session's transaction is ended first)."""
+    periods: set[str] = set()
+    for limit_id in limit_ids:
+        limit = session.get(CreditLimit, limit_id)
+        if limit is None:
+            continue
+        try:
+            window = current_window(limit, moment)
+        except PeriodError:
+            continue
+        if recount.applies(session, limit, window):
+            periods.add(recount.period_for(window, moment))
+    recounter.prepare(session, periods)
+
+
 def _count_deferred(
     session: Session, limit_ids: list[int], *, moment: datetime, result: EvaluationResult
 ) -> None:
@@ -1223,7 +1287,13 @@ def _manual_pause(session: Session) -> str | None:
     return reason if isinstance(reason, str) and reason else "Paused by an administrator."
 
 
-def _enforcement_hold(session: Session, *, moment: datetime, actor: AuditActor) -> str | None:
+def _enforcement_hold(
+    session: Session,
+    *,
+    moment: datetime,
+    actor: AuditActor,
+    recounter: recount.Recounter | None = None,
+) -> str | None:
     """Why no new restriction may be applied this cycle, or None if they may.
 
     Two things hold enforcement: an admin pausing it, and the safety ceilings.
@@ -1249,6 +1319,14 @@ def _enforcement_hold(session: Session, *, moment: datetime, actor: AuditActor) 
     limits_starting, targets_starting = _about_to_start_restricting(session, moment)
     over_limits = 0 < guard.max_new_per_cycle < len(limits_starting)
     over_targets = 0 < guard.max_new_targets_per_cycle < len(targets_starting)
+    if (over_limits or over_targets) and recounter is not None:
+        # Only what the recount would let start counts towards the ceiling
+        # (the log is read only when the ceiling would trip without it).
+        limits_starting, targets_starting = _about_to_start_restricting(
+            session, moment, recounter=recounter
+        )
+        over_limits = 0 < guard.max_new_per_cycle < len(limits_starting)
+        over_targets = 0 < guard.max_new_targets_per_cycle < len(targets_starting)
     if not over_limits and not over_targets:
         return None
 
@@ -1354,8 +1432,13 @@ def _would_start_restricting(session: Session, limit: CreditLimit, period_key: s
     return bool(_starting_targets(session, limit.id, period_key, targets))
 
 
-def _about_to_start_restricting(session: Session, moment: datetime) -> tuple[list[str], set[str]]:
-    """What this cycle would newly restrict: limit labels, and distinct targets."""
+def _about_to_start_restricting(
+    session: Session, moment: datetime, *, recounter: recount.Recounter | None = None
+) -> tuple[list[str], set[str]]:
+    """What this cycle would newly restrict: limit labels, and distinct targets.
+
+    With a ``recounter``, a row that needs the recount counts only when the
+    recount agrees (it is read, silently: the gate itself warns)."""
     from app.services import preview_service
 
     limits_starting: list[str] = []
@@ -1374,7 +1457,25 @@ def _about_to_start_restricting(session: Session, moment: datetime) -> tuple[lis
         )
         if state.status in (LimitStatus.BREACHED, LimitStatus.RESTRICTED)
     }
-    for row in preview_service.dry_run(session, now=moment, light=True).rows:
+    rows = preview_service.dry_run(session, now=moment, light=True).rows
+    if recounter is not None:
+        needed = [row for row in rows if row.would_enforce and row.recount_required]
+        limits = {row.limit_id: session.get(CreditLimit, row.limit_id) for row in needed}
+        windows = {
+            limit_id: current_window(limit, moment)
+            for limit_id, limit in limits.items()
+            if limit is not None
+        }
+        recounter.prepare(
+            session, {recount.period_for(window, moment) for window in windows.values()}
+        )
+        refused: set[int] = set()
+        for limit_id, window in windows.items():
+            limit = session.get(CreditLimit, limit_id)
+            if limit is None or not recounter.check(session, limit, window).agrees:
+                refused.add(limit_id)
+        rows = [row for row in rows if row.limit_id not in refused]
+    for row in rows:
         if not row.would_enforce or row.blast is None or row.period_key is None:
             continue
         starting = _starting_targets(

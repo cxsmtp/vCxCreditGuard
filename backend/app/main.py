@@ -25,6 +25,7 @@ from app.api.routes import (
     notifications,
     ops,
     preview,
+    readiness,
     reports,
     requests,
     selftest,
@@ -151,6 +152,7 @@ def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) 
     api.include_router(notifications.router)
     api.include_router(ops.router)
     api.include_router(selftest.router)
+    api.include_router(readiness.router)
     api.include_router(settings_routes.router)
     api.include_router(dashboard.router)
     api.include_router(violations.router)

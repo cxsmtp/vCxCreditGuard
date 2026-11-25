@@ -3,6 +3,7 @@ import { api } from "../api/client";
 import type { Diagnostics, DiagnosticStatus } from "../api/types";
 import { useResource } from "../hooks/useResource";
 import { formatRelative } from "../lib/format";
+import { ReadinessPanel } from "./ReadinessPanel";
 import { Spinner, type BadgeTone } from "./ui";
 
 const STATUS_TONE: Record<DiagnosticStatus, BadgeTone> = {
@@ -118,6 +119,9 @@ export function DiagnosticsPanel() {
                   </li>
                 ))}
               </ul>
+              <div className="mt-4">
+                <ReadinessPanel isAdmin={false} compact />
+              </div>
               <div className="mt-4 flex items-center justify-between border-t border-hairline pt-3">
                 <span className="text-xs" style={{ color: "var(--text-muted)" }}>
                   Checked {formatRelative(data.generated_at)}

@@ -1021,6 +1021,8 @@ export interface DryRunRow {
   note: string | null;
   /** The auto-triage part of credits_used, when charged to scan initiators. */
   auto_triage_attributed?: string | null;
+  /** A new period-budget restriction: it starts only if a direct recount of the activity log agrees. */
+  recount_required?: boolean;
 }
 
 export interface DryRunResult {
@@ -1198,4 +1200,26 @@ export interface SelfTestListing {
   notes: string[];
   keep: number;
   results: SelfTestResult[];
+}
+
+// ---- Readiness checklist (Settings → Enforcement, Diagnose) ----
+
+export type ReadinessStatus = "green" | "amber" | "red";
+
+export interface ReadinessItem {
+  key: string;
+  label: string;
+  status: ReadinessStatus;
+  detail: string;
+  hint: string;
+  link: string;
+}
+
+export interface Readiness {
+  items: ReadinessItem[];
+  gate_active: boolean;
+  enforcement_on: boolean;
+  all_green: boolean;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
 }

@@ -98,6 +98,18 @@ point links to the section below that explains it.
   restrictions at once; protected roles (`ast-admin`, `iam-admin` by default)
   are never restricted; a sudden fall in reported usage is held until later
   readings confirm it ([Enforcement safety](#enforcement-safety)).
+- Recount before restricting (always on): just before a new restriction of a
+  monthly or quarterly budget, the budget's period is recounted straight from
+  the Checkmarx activity log, independently of CreditGuard's own counters, and
+  the restriction is applied only if that recount is also at or over the
+  limit. When the counts disagree, or the recount cannot be done, nothing new
+  is restricted: a warning says why and Diagnose shows it
+  ([Recount before restricting](#recount-before-restricting)).
+- Readiness checklist (Settings → Enforcement and Diagnose): connected,
+  activity log readable, counts match Checkmarx, self-test passed on a user and
+  a project, dry run reviewed. A new install starts watch-only and turns
+  enforcement on once every item is green, or with an override an admin types
+  (audited) ([Readiness checklist](#readiness-checklist)).
 - Enforcement self-test (Settings → Enforcement, admins only): restricts a
   chosen user and/or project for real, through the code a budget breach uses,
   reads it back (and says when a user keeps an AI role through a group or a
@@ -151,6 +163,8 @@ telemetry, no analytics, and nothing else is contacted.
 | **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
 | **A user restriction removes the Fusion and LLM roles.** | By default `create-fusion-scan` (the role that spends credits), `manage-fusion`, `update-llm-scan-mode` and `manage-llm-configuration`. The composites `scan-fusion` and `fusion-manager` are left alone, because removing them would also take ordinary scanning or tenant-settings rights, and `ai-triage-assist` can never be chosen: removing it breaks Auto Triage. An install that had chosen other roles keeps them (Settings → Enforcement, *Roles a user restriction removes*). |
 | **Monthly and quarterly budgets restrict only on usage the activity log counted.** | Usage the consumption summary counts (after a fallback to it, from a group's own summary row, or with *Usage source: Summary only*), and auto-triage charged to the person who started a scan, still count, warn and show everywhere, but never start a new restriction of a monthly or quarterly budget: from running totals the summary cannot always tell a glitch from a real fall. Such a budget over its limit gets a warning (*over budget on summary totals; not restricted*), and the Overview and Budgets pages show *Restrictions paused for period budgets* while the log is unavailable; so does Diagnose. On a tenant without the activity log no monthly or quarterly budget restricts unless you choose *Summary only* and turn on *Allow restrictions from summary totals (less accurate)* (an install that had chosen *Summary only* before this keeps restricting: the upgrade turns it on). Restrictions already in force stay; lifting works as before; lifetime, custom and count-existing budgets restrict on summary totals as before ([Restrictions from summary totals](#restrictions-from-summary-totals)). |
+| **A new period-budget restriction needs the activity log to agree.** | Before a new restriction of a monthly or quarterly budget, its period is recounted from the Checkmarx activity log, read afresh (the last 30 days, or the last 90 for a quarter or a month that began more than 30 days ago), within the activity page cap and the cycle's time budget. If the log cannot be read, the read is cut short, or the recount is under the limit, nothing new is restricted and a warning says why; this holds with *Summary only* too. The last day or two of a 92-day quarter fall outside the 90-day window, so late in such a quarter the recount can fall short and hold a restriction back (never the other way). The Simulation does not run the recount: it marks such rows *would restrict if the recount agrees*. Restrictions in force, lifts, and lifetime, custom and count-existing budgets are unaffected ([Recount before restricting](#recount-before-restricting)). |
+| **A new install watches only until it is ready.** | A new install starts with enforcement paused (watch-only): it warns but restricts nobody until the readiness checklist is green, or an admin overrides it by typing ENFORCE (audited, with the items that were not green). An existing install keeps its setting and sees the checklist for information. Once enforcement is on the checklist never turns it off; an item that turns red raises a warning ([Readiness checklist](#readiness-checklist)). |
 | **A few cycles of usage are not counted when the usage source switches.** | When the activity log becomes the source (the setting turned on, or the log back after failing), its first read only records what it holds: what happened since the summary's last reading is not counted. When the summary takes over (the setting turned off, the log refused or malformed, or failing for more than an hour), its first two readings count nothing: about two to three cycles are not counted, and a name missing from the summary across the switch counts nothing when it returns. While the log fails for less than an hour nothing new is counted; it is counted when the log answers again. A row reaching the log more than about two hours late is counted only by the daily full read, and only if dated after the switch; rows of the same second that meet at a page boundary wait for a later cycle. A group budget taken over by the log from its own summary row counts no event dated before the takeover, and two group readings count nothing when the row takes it back ([Switching source](#switching-source-and-what-is-not-counted)). |
 | **Figures only cover Checkmarx's lookback window.** | The consumption summary reports totals over a window (at most the last year), and the activity log covers the last 30 days. "Lifetime", custom and count-existing budgets read the summary's totals, so they mean everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened (or before the budget was created), unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
 | **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution); a mapping counts from then on. Automation counts towards a person only by the [integration-account rule](#integration-accounts) (Auto-remediation towards nobody: no scan initiator is traced for it). With the summary as the source, project usage reported under a repository name that is no project (87% of project credits on a live tenant) counts towards no project, group or application budget until mapped; the activity log names projects by id. All of it is shown on the Overview. |
@@ -514,6 +528,53 @@ real fall, so it can occasionally over-count; the log cannot.
 * While restrictions are held this way, the Overview and Budgets pages show
   *Restrictions paused for period budgets* with since when, and Diagnose shows
   it under *Usage source*.
+
+#### Recount before restricting
+
+The fail-safe on top of the rule above (`app/services/recount.py`, always on,
+no setting). Just before the evaluation applies a **new** restriction of a
+monthly or quarterly budget (pass 3 of the cycle, `_enforce_pending`), the
+budget's usage in the period is counted again, independently: straight from
+the raw rows of `GET /api/credits/activity`, never from `budget_usage`,
+`usage_delta` or the log's own counter. The restriction is applied only when
+that recount is also at or over the limit (the evaluation's own threshold).
+
+* **Where the rows come from.** CreditGuard keeps no raw rows (only how many
+  of each identity it has seen), so the log is read afresh, at most once per
+  cycle and window: `period=last_30_days` for a month that began within the
+  last 30 days, `last_90_days` otherwise and for a quarter. It is read from
+  page 1 to the end after the cycle's transaction has been committed (nothing
+  is held open in the database across the calls), capped by the activity page
+  cap (`activity.max_pages_per_cycle`; 400 pages when that is 0) and the
+  cycle's time budget. Rows of a date met on both sides of a page boundary are
+  counted at most as often as one page shows them: the recount can fall short,
+  never count a row twice.
+* **Who a row counts towards** is the activity source's own mapping: a project
+  by id; an application by id and through the project's synced applications;
+  a person by email or username through the existing resolver, following the
+  [integration-account rule](#integration-accounts); a group through all its
+  projects (and members, with member usage), whichever feed the ledger used. A row counts
+  towards a person or an application only when every row of its identity names
+  the same one, as in the ledger. Only rows dated inside the period, and after
+  the budget was created, count.
+* **When they disagree** nothing is restricted, the budget stays BREACHED, a
+  WARNING (once per budget and period) says *Counts disagree: CreditGuard's
+  count is X, a direct recount of the Checkmarx activity log is Y; not
+  restricted. See Diagnose.*, and the disagreement is recorded (the newest 50,
+  `recount.records`) for Diagnose's *Recount before restricting* check, which
+  otherwise reads *No disagreements.*
+* **When the recount cannot be done** (the log refuses or fails, the page cap
+  or the time budget stops the read, anything errors) nothing new is
+  restricted either, with a warning: the rule fails safe towards not
+  restricting. The next cycle recounts again.
+* **The same gate** applies to the safety ceilings (only what the recount
+  would let start counts towards them; the log is read for that only when the
+  ceiling would trip otherwise). The Simulation and the dry run do not read the
+  log: they mark such a row *Would restrict if the recount agrees*
+  (`recount_required` in `GET /api/preview/dry-run`).
+* **Not affected:** restrictions already in force or started (re-asserted and
+  lifted exactly as before), lifts and credit-increase restores, and lifetime,
+  custom, count-existing and demo budgets, which keep today's rule.
 
 #### Integration accounts
 
@@ -2393,6 +2454,36 @@ failure of this tool is restricting many people at once for a wrong reason.
   it unclear whether the tenant changed (a timeout, a dropped connection), the
   record says so and the next cycle checks the tenant rather than assuming.
 
+### Readiness checklist
+
+Settings → Enforcement and Diagnose show a **Readiness** card, each item green,
+amber (pending) or red, with a one-line fix and a link to where to fix it
+(`app/services/readiness.py`, `GET /api/readiness`). Every item is computed
+from data the app already has:
+
+1. **Connected to Checkmarx One**: the connection check passes.
+2. **Activity log readable**: the activity log is the usage source and its
+   last read succeeded.
+3. **Counts match Checkmarx**: the latest daily reconciliation of the log's sum
+   with the summary's total is within 0.5% (pending until the first one).
+4. **Self-test passed**: a passed self-test on a user and one on a project in
+   the last 30 days (kinds that were not applicable do not count against it;
+   demo runs do not count).
+5. **Dry run reviewed**: an admin clicked **Reviewed** on the Simulation page
+   after the last budget change.
+
+A **new install** starts watch-only: the data migration `b3e7f1a9c2d5` finds
+an empty database (no account, budget or connection) and leaves enforcement
+paused with the readiness gate set. Turning enforcement on (the Readiness
+card's *Turn enforcement on*, or the pause switch) then needs every item
+green, or an admin's explicit override: typing `ENFORCE`, audited as
+`readiness.override` with the items that were not green. Once enforcement is
+on the gate is gone; the checklist never turns enforcement off again, and an
+item that turns from green to red raises a WARNING and shows on Diagnose.
+**Existing installs** are unchanged: enforcement stays as it was and the
+checklist is information only. Viewers see the checklist; only admins mark the
+dry run reviewed or turn enforcement on.
+
 ### Enforcement self-test
 
 Settings → Enforcement → **Enforcement self-test** (admins only; viewers get a
@@ -2705,8 +2796,10 @@ look identical from the outside:
 
 ## Runbook: turning enforcement on for the first time
 
-Recommended order, because the failure mode of this tool is restricting the wrong
-person:
+A new install starts watch-only and shows the
+[readiness checklist](#readiness-checklist) on Settings → Enforcement: the
+steps below turn it green. Recommended order, because the failure mode of this
+tool is restricting the wrong person:
 
 1. Connect with a **read only** API key and leave every limit on its monitor only
    default. Nothing can be restricted, and the write permissions are not needed.
