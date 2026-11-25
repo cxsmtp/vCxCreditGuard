@@ -1858,12 +1858,13 @@ def _settle_closed_periods(session: Session, moment: datetime) -> int:
     budget's settings later never rewrites a period already counted (nor
     pushes a restricted one under its limit)."""
     rows = session.execute(
-        select(LimitPeriodState, BudgetUsage)
+        select(LimitPeriodState, BudgetUsage, CreditLimit.period_type)
         .join(
             BudgetUsage,
             (BudgetUsage.limit_id == LimitPeriodState.limit_id)
             & (BudgetUsage.period_key == LimitPeriodState.period_key),
         )
+        .join(CreditLimit, CreditLimit.id == LimitPeriodState.limit_id)
         .where(
             LimitPeriodState.period_end.is_not(None),
             LimitPeriodState.period_end <= moment,
@@ -1874,7 +1875,15 @@ def _settle_closed_periods(session: Session, moment: datetime) -> int:
         )
     ).all()
     settled = 0
-    for state, counter in rows:
+    for state, counter, period_type in rows:
+        # Only a period of the budget's own type: the month states of a budget
+        # now quarterly (or the reverse) stay as they were last counted.
+        quarterly = "-Q" in state.period_key
+        if period_type not in (PeriodType.MONTHLY, PeriodType.QUARTERLY) or quarterly != (
+            period_type == PeriodType.QUARTERLY
+        ):
+            state.last_evaluated_at = moment
+            continue
         used = Decimal(counter.credits or 0) + Decimal(state.attributed_credits or 0)
         if used > state.credits_used:
             state.credits_used = used

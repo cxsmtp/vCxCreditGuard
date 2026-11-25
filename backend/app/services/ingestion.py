@@ -622,6 +622,8 @@ def _fetch_dimension(
     # subject -> row identity -> the row.
     parts: dict[str, dict[tuple, usage_api.ParsedUsageItem]] = {}
     repeated = 0
+    # Display-name-only user rows by name: (page, identity) of each.
+    display_rows: dict[str, list[tuple[int, tuple]]] = {}
     total_items: int | None = None
     total_pages: int | None = None
     pages = 0
@@ -644,6 +646,17 @@ def _fetch_dimension(
         for item in page.items:
             rows_of = parts.setdefault(item.subject_key, {})
             identity = _row_identity(view, item)
+            if identity[0] == "display":
+                # A user row with a display name only. Two on one page are two
+                # people who share the name: added up. One on a later page
+                # whose name an earlier page already had is the ranking
+                # shifting between page requests: a repeat of the higher one.
+                earlier = [i for page_no, i in display_rows.get(identity[1], []) if page_no < pages]
+                if earlier:
+                    identity = max(earlier, key=lambda i: rows_of[i].credits_used)
+                else:
+                    identity = (*identity, pages, len(display_rows.get(identity[1], [])))
+                    display_rows.setdefault(identity[1], []).append((pages, identity))
             seen = rows_of.get(identity)
             if seen is None:
                 rows_of[identity] = item
@@ -705,12 +718,12 @@ def _row_identity(view: UsageView, item: usage_api.ParsedUsageItem) -> tuple:
     them; the same row served twice does not). A project's, application's or
     group's name is unique; a person's display name is not, so a user row with
     no id and no email is a row of its own (two people who share a display
-    name are added up, as they always were, and never taken for a repeat)."""
+    name are added up when they come on one page; see _fetch_dimension)."""
     raw = item.raw if isinstance(item.raw, dict) else {}
     if item.reported_id:
         return ("id", item.reported_id)
     if view == UsageView.USER and not item.subject_email:
-        return ("unique", id(item))
+        return ("display", item.subject_key)
     return (
         "row",
         *(
@@ -784,6 +797,26 @@ def _hold_reason(
     )
 
 
+def _collapsed(session: Session, *, view: UsageView, period_param: str, total: Decimal) -> bool:
+    """True when ``total`` is a collapse ``_hold_reason`` would hold (below
+    HOLD_DROP_RATIO of the last believed total of the same window)."""
+    previous = session.scalar(
+        select(UsageSnapshot)
+        .where(
+            UsageSnapshot.view_by == str(view),
+            UsageSnapshot.period_param == period_param,
+            UsageSnapshot.held_reason.is_(None),
+        )
+        .order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc())
+        .limit(1)
+    )
+    return (
+        previous is not None
+        and previous.total_credits > 0
+        and total < previous.total_credits * HOLD_DROP_RATIO
+    )
+
+
 def _similar(first: Decimal, second: Decimal) -> bool:
     """Two held totals tell the same story: both nothing, or within 2x of each other."""
     low, high = sorted((first, second))
@@ -811,6 +844,11 @@ def _store_dimension(
     now = utcnow()
     merged = fetched.merged
     held_reason = _hold_reason(
+        session, view=view, period_param=period_param, total=fetched.total_credits
+    )
+    # A collapse of the whole feed, believed only because it persisted: the
+    # ledger keeps each fallen name's total before it as a ceiling.
+    collapse = held_reason is None and _collapsed(
         session, view=view, period_param=period_param, total=fetched.total_credits
     )
     snapshot = UsageSnapshot(
@@ -941,7 +979,7 @@ def _store_dimension(
     # The increases since the last live reading, attributed to where each name
     # counts now, and added to the budgets fed now (see app/services/ledger.py).
     counted = ledger.record_reading(
-        session, view, snapshot, stored, suspect=fetched.suspect, own=own
+        session, view, snapshot, stored, suspect=fetched.suspect, own=own, collapse=collapse
     )
     result.doubted_falls = counted.dips
 

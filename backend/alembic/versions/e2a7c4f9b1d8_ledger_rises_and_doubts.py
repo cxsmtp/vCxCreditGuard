@@ -10,15 +10,17 @@ Create Date: 2026-11-25
   remembered names take the time they were last read, which forgets them no
   sooner than before.
 * ``usage_missing_name.doubts`` - how many doubted readings a held fall has
-  lasted through (it is believed after a few).
+  lasted through (after a few it is kept as a ceiling, no longer reported).
 * ``ix_usage_delta_observed`` - for the retention prune.
-* The open period of a budget that counts usage already reported gets a
-  counter, if it has none, seeded with what its entity reported since the
-  first live reading of the period, name by name (names present in both
-  readings only, so no history comes in), so turning "count existing usage"
-  off keeps the period's usage from before the upgrade. Budgets fed by a
-  roll-up (a group's projects or members, an application's projects) and
-  periods with no reading since they began start from zero.
+* The open period of an active budget that counts usage already reported
+  gets a counter, if it has none, seeded with what the rows of its own entity
+  grew by between the first and the latest live reading of the period, name by
+  name (names present in both readings only, so no history comes in), and only
+  over the readings since the lookback window last changed (totals read over
+  different windows are not comparable). Turning "count existing usage" off
+  then keeps the period's usage from before the upgrade. A budget fed by a
+  roll-up (a group's projects or members, an application's projects), or with
+  fewer than two such readings in its period, gets a counter at zero.
 """
 
 from __future__ import annotations
@@ -88,7 +90,8 @@ def _seed_count_existing(bind) -> None:  # type: ignore[no-untyped-def]
         sa.text(
             "SELECT l.id, l.entity_type, l.entity_id, s.period_key, s.period_start, "
             "s.period_end FROM credit_limit l JOIN limit_period_state s ON s.limit_id = l.id "
-            "WHERE l.count_existing_usage = :yes AND l.period_type IN ('monthly', 'quarterly')"
+            "WHERE l.count_existing_usage = :yes AND l.is_active = :yes "
+            "AND l.period_type IN ('monthly', 'quarterly')"
         ),
         {"yes": True},
     ).all()
@@ -123,12 +126,19 @@ def _reported_since(bind, entity_type: str, entity_id: str, start: datetime) -> 
         return Decimal(0)
     snapshots = bind.execute(
         sa.text(
-            "SELECT id, collected_at FROM usage_snapshot WHERE view_by = :v "
+            "SELECT id, collected_at, period_param FROM usage_snapshot WHERE view_by = :v "
             "AND held_reason IS NULL AND period_param <> :demo ORDER BY collected_at, id"
         ),
         {"v": view, "demo": DEMO_PERIOD_PARAM},
     ).all()
-    in_period = [row[0] for row in snapshots if (_when(row[1]) or start) >= start]
+    # Only the run of readings since the lookback window last changed: totals
+    # read over different windows are not comparable.
+    run: list = []
+    for row in snapshots:
+        if run and row[2] != run[-1][2]:
+            run = []
+        run.append(row)
+    in_period = [row[0] for row in run if (_when(row[1]) or start) >= start]
     if len(in_period) < 2:
         return Decimal(0)
 

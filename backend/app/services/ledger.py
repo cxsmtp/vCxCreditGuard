@@ -15,10 +15,13 @@ in the same transaction that stores the reading:
   once older than the lookback window), so a return adds only what it reported
   since. A fall adds nothing: in a believed reading the name continues from its
   new total (the window rolled past old usage); in one the completeness checks
-  doubt (``suspect``), the fall is held (kind "dip") until the name recovers, a
-  believed reading confirms it, or it outlasts DIP_MAX_DOUBTS readings or
-  DIP_MAX_AGE. A remembered name is forgotten once its total last rose
-  (``last_rise_at``) before the lookback window began. A name back after
+  doubt (``suspect``), the fall is held (kind "dip") until the name recovers or
+  a believed reading confirms it; past DIP_MAX_DOUBTS readings or DIP_MAX_AGE
+  it is no longer reported but stays a ceiling (kind "ceiling"), as does every
+  fall in a collapse of the whole feed accepted only because it persisted
+  (kind "collapse"): only usage above it counts. A remembered name is
+  forgotten once its total last rose, or fell to a non-zero total
+  (``last_rise_at``), before the lookback window (plus HORIZON_MARGIN) began. A name back after
   missing readings starts from the highest of its own last total and those of
   the names it may have been meanwhile (a rename and a rename back).
 * A name never seen before counts in full: a name absent from the previous
@@ -30,7 +33,8 @@ in the same transaction that stores the reading:
   another lookback window, are history: nothing is counted from them, and a
   name missing then starts from what it reports when it returns (kind
   "rebase").
-* A group's or application's own row that is new, or back, counts nothing: its
+* A group's or application's own row that is new, or back, counts nothing,
+  in that reading and the next (kind "fresh"): its
   projects fed its budget while it was not there (``own_figures``, decided once
   per ingest, says which feeds a group or application budget).
 * Each increase is attributed to the entity the name counts towards at that
@@ -96,6 +100,21 @@ ZERO = Decimal("0")
 MISSING = "missing"
 DIP = "dip"
 REBASE = "rebase"
+# A held fall that outlasted its doubt bound: the name's usage counts again
+# only above the total it had before the fall. Cleared by a believed reading
+# that confirms a lower total, by rising above it, or at the lookback horizon.
+CEILING = "ceiling"
+# The same after a collapse of the whole feed that was accepted only because
+# it persisted (ingestion._hold_reason): cleared only by rising above it or at
+# the lookback horizon, never by a reading of the same collapse.
+COLLAPSE = "collapse"
+# A group's or application's own row in its second reading: counts nothing
+# either (the overlap between the reads of one ingest).
+FRESH = "fresh"
+HELD_KINDS = (DIP, CEILING, COLLAPSE)
+# A couple of days beyond the lookback window before a total is forgotten:
+# calendar-year and day-granular windows reach that far.
+HORIZON_MARGIN = timedelta(days=2)
 # A doubted fall is believed after this many doubted readings in a row, or
 # once it has been doubted this long, whichever comes first.
 DIP_MAX_DOUBTS = 3
@@ -389,6 +408,7 @@ def record_reading(
     *,
     suspect: bool = False,
     own: dict[str, set[str]] | None = None,
+    collapse: bool = False,
 ) -> LedgerResult:
     """Turn one stored live reading into ledger increases and budget counters.
 
@@ -398,7 +418,8 @@ def record_reading(
     was stored). ``suspect``: the completeness checks doubt the listing (a
     short or repeated page), so a fall in it is not believed yet. ``own``: the
     groups and applications with a row of their own (``own_figures``), taken
-    once per ingest.
+    once per ingest. ``collapse``: the whole feed fell and the fall is
+    accepted only because it persisted; a fall in it keeps a ceiling.
     """
     from app.services import ingestion
 
@@ -420,7 +441,7 @@ def record_reading(
         for record in records:
             record.last_rise_at = now
         for row in kept.values():
-            if row.kind == DIP or row.subject_key in present:
+            if row.kind != MISSING or row.subject_key in present:
                 _drop(session, row)
             else:
                 row.kind = REBASE
@@ -431,7 +452,7 @@ def record_reading(
     then = previous.collected_at
     # A name whose total last rose before the lookback window began has
     # nothing left in it: forgotten, it counts in full when it reports again.
-    horizon = now - _lookback(snapshot.period_param)
+    horizon = now - _lookback(snapshot.period_param) - HORIZON_MARGIN
     for key, row in list(kept.items()):
         rose = row.last_rise_at or row.last_seen_at
         if rose is None or rose < horizon:
@@ -467,8 +488,8 @@ def record_reading(
             row = UsageMissingName(view_by=view, subject_key=key)
             session.add(row)
             kept[key] = row
-        if row.kind != DIP:
-            # A held dip keeps the higher total it was held at.
+        if row.kind not in HELD_KINDS:
+            # A held fall keeps the higher total it was held at.
             row.last_total = credits
             row.last_actions = counts
             row.last_seen_at = then
@@ -518,9 +539,26 @@ def record_reading(
             record.last_rise_at = now
         if aggregate and key not in before:
             # A group's or application's own row, new or back: its projects fed
-            # the budget while it was not there, so its total is not new usage.
-            if row is not None:
-                _drop(session, row)
+            # the budget while it was not there, so its total is not new usage;
+            # nor is what it adds by its next reading (the projects fed the
+            # budget up to their own read of this ingest, after this one).
+            fresh = row or UsageMissingName(view_by=view, subject_key=key)
+            if row is None:
+                session.add(fresh)
+            fresh.kind = FRESH
+            fresh.doubts = 0
+            fresh.last_total = credits_now
+            fresh.last_actions = counts_now
+            fresh.last_seen_at = now
+            fresh.last_rise_at = now
+            fresh.missing_since = now
+            fresh.period_param = snapshot.period_param
+            fresh.entity_id = record.entity_id
+            record.last_rise_at = now
+            result.held += 1
+            continue
+        if row is not None and row.kind == FRESH:
+            _drop(session, row)
             record.last_rise_at = now
             result.held += 1
             continue
@@ -530,26 +568,35 @@ def record_reading(
             _drop(session, row)
             record.last_rise_at = now
             continue
-        if row is not None and row.kind == DIP:
+        if row is not None and row.kind in HELD_KINDS:
             start_credits, start_counts = Decimal(row.last_total or 0), dict(row.last_actions or {})
             since = row.last_seen_at
             if credits_now >= start_credits:
+                # Back at (or above) the total before the fall: what is above
+                # it is new.
                 _drop(session, row)
-            elif (
-                suspect
-                and (row.doubts or 0) + 1 < DIP_MAX_DOUBTS
-                and now - row.missing_since < DIP_MAX_AGE
-            ):
-                row.doubts = (row.doubts or 0) + 1
+            elif row.kind == DIP and suspect:
+                if (row.doubts or 0) + 1 < DIP_MAX_DOUBTS and now - row.missing_since < DIP_MAX_AGE:
+                    row.doubts = (row.doubts or 0) + 1
+                    result.dips.append(key)
+                else:
+                    # The doubt outlasted its bound: no longer reported, but
+                    # the total before the fall stays the ceiling.
+                    row.kind = CEILING
+                    result.dips_accepted += 1
                 result.held += 1
-                result.dips.append(key)
+                continue
+            elif row.kind in (DIP, CEILING) and not suspect:
+                # A believed reading confirms the lower total: the name
+                # continues from it, and its usage may still be in the window.
+                _drop(session, row)
+                if credits_now > 0:
+                    record.last_rise_at = now
                 continue
             else:
-                # A believed reading confirms the fall, or the doubt has lasted
-                # too long to be a glitch: the name continues from its new total.
-                if suspect:
-                    result.dips_accepted += 1
-                _drop(session, row)
+                # Still under the ceiling (a doubted reading, or the collapse
+                # it was taken in): nothing counts.
+                result.held += 1
                 continue
         elif key in before:
             start_credits, start_counts = before[key]
@@ -587,7 +634,25 @@ def record_reading(
                     # figure: its history is handled as a new project's.
                     shifts.join(record.entity_id, earlier)
         credits = credits_now - start_credits
-        if credits < 0 and suspect and own_start is not None and credits_now < own_start:
+        falls = own_start is not None and credits_now < own_start
+        if credits < 0 and collapse and not suspect and falls:
+            # The whole feed collapsed and the collapse was accepted only
+            # because it persisted: the total before it stays the ceiling.
+            hold = returning or UsageMissingName(view_by=view, subject_key=key)
+            if returning is None:
+                session.add(hold)
+            hold.kind = COLLAPSE
+            hold.doubts = 0
+            hold.last_total = start_credits
+            hold.last_actions = start_counts
+            hold.last_seen_at = since
+            hold.last_rise_at = record.last_rise_at
+            hold.missing_since = now
+            hold.period_param = snapshot.period_param
+            hold.entity_id = record.entity_id
+            result.held += 1
+            continue
+        if credits < 0 and suspect and falls:
             # A fall in a listing the completeness checks doubt: not believed
             # yet. The name continues from the higher total until it recovers,
             # a believed reading confirms the fall, or the doubt outlasts its
@@ -613,8 +678,12 @@ def record_reading(
         if credits < 0:
             # The window rolled past older usage: nothing can be told apart,
             # nothing is added, and the name continues from its new total.
+            # Usage spent meanwhile may be in that total: the name is
+            # remembered from now, as if it had just risen.
             credits = ZERO
             increase: dict[str, int] = {}
+            if credits_now > 0:
+                record.last_rise_at = now
         else:
             increase = _increase(counts_now, start_counts)
             plain_now, plain_start = plain_actions(counts_now), plain_actions(start_counts)
