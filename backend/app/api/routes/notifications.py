@@ -297,7 +297,20 @@ def restore_access(action_id: int, ctx: AdminUser, db: DbSession) -> dict[str, o
         ) from exc
 
     db.commit()
+    label = action.target_label or action.target_id
+    if enforcement_selftest.is_selftest_action(action):
+        holding = enforcement_selftest.budgets_still_restricting(db, action)
+        if holding:
+            budgets = ", ".join(sorted({row.entity_label or row.entity_id for row in holding}))
+            return {
+                "restored": False,
+                "message": (
+                    f"The self-test's change was undone, but a real budget still restricts "
+                    f"{label} ({budgets}), so access was not given back. It is given back when "
+                    "that budget lifts its restriction, or with Restore on that restriction."
+                ),
+            }
     return {
         "restored": restored,
-        "message": f"Access restored for {action.target_label or action.target_id}.",
+        "message": f"Access restored for {label}.",
     }

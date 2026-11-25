@@ -330,6 +330,36 @@ class TestProject:
         assert tenant.fusion_setting("proj-api")["originLevel"] == "Tenant"
         assert row.status == "warning"
 
+    def test_an_inherited_ai_agent_configuration_is_not_tested(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        original = tenant._auto_triage_response
+
+        def tenant_scope(request: httpx.Request, path: str):  # type: ignore[no-untyped-def]
+            response = original(request, path)
+            if request.method != "GET":
+                return response
+            payload = response.json()
+            payload["scope"] = "tenant"
+            return httpx.Response(200, json=payload)
+
+        tenant._auto_triage_response = tenant_scope  # type: ignore[method-assign]
+        check = selftest.check(
+            db, client, request_for(project="proj-api", actions=["auto_triage"]), demo=False
+        )
+        assert "it is inherited" in " ".join(check.targets[0]["changes"])
+        assert "it is inherited" in " ".join(check.warnings)
+
+        row = run(db, client, project="proj-api", actions=["auto_triage", "pr_remediation"])
+        report = target_report(row, "project")
+        outcomes = {item["kind"]: item["outcome"] for item in report["kinds"]}
+        assert outcomes == {
+            "disable_pr_remediation": "applied",
+            "disable_auto_triage": "not_applicable",
+        }
+        assert not tenant.auto_triage_puts
+        assert "it is inherited" in " ".join(report["warnings"])
+        assert row.status == "warning", row.summary
+
     def test_a_change_in_where_fusion_is_set_is_a_failure(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
         original = tenant._project_config_response
@@ -1046,6 +1076,9 @@ class TestCleanup:
 
         response = admin_client.post(f"/api/notifications/enforcements/{held.id}/restore")
         assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["restored"] is False
+        assert "a real budget still restricts Alice Archer" in body["message"]
         db.expire_all()
         held = db.get(EnforcementAction, held.id)
         real = db.scalar(select(EnforcementAction).where(EnforcementAction.limit_id == limit.id))

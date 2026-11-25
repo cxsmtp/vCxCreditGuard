@@ -2196,7 +2196,10 @@ there for good (see [Remaining unknowns](#remaining-unknowns) #6). So when the
 read in step 1 shows the project inherits Fusion, the self-test leaves Fusion
 (and the repository's Fusion setting, which goes with it) alone, marks it *not
 applicable* and says so on the check and in the result; the other settings are
-tested as usual.
+tested as usual. The same goes for Auto Triage when the project's AI agent
+configuration is read with a scope other than `project` (it is inherited):
+writing it back would pin the configuration on the project, so nothing is
+written for it.
 
 The result has a before / restricted / restored diff per setting, pass or fail
 per step and the time each took. The last 20 results are kept, and Diagnose
@@ -2223,7 +2226,8 @@ Safety:
   its restrictions (the sweep, or *Restore* on its alert) uses the
   `selftest_cleanup` reason, never the admin's: if a real budget restricts the
   same target by then, what the self-test recorded is handed over to that
-  restriction, which stays in force.
+  restriction, which stays in force, and *Restore* says so instead of
+  "Access restored".
 - **No database transaction is held across a Checkmarx call**: what is about to
   be done is committed first, as for every restriction.
 - **One at a time.** A second self-test is refused while one runs: in the

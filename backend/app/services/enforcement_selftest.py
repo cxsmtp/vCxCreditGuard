@@ -63,7 +63,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -273,6 +273,28 @@ def restore_reason_for(action: EnforcementAction, requested: str) -> str:
     return SELFTEST_CLEANUP_REASON if is_selftest_action(action) else requested
 
 
+def budgets_still_restricting(
+    session: Session, action: EnforcementAction
+) -> list[EnforcementAction]:
+    """Real budgets' restrictions of the same kind still in force on this
+    action's target: lifting a self-test restriction hands over to them and
+    gives nothing back while one holds."""
+    rows = session.scalars(
+        select(EnforcementAction)
+        .where(
+            EnforcementAction.target_type == action.target_type,
+            EnforcementAction.target_id == action.target_id,
+            EnforcementAction.kind == action.kind,
+            EnforcementAction.id != action.id,
+            EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES),
+        )
+        .execution_options(populate_existing=True)
+    )
+    return [
+        row for row in rows if not enforcement.is_selftest(row) and enforcement.may_be_in_force(row)
+    ]
+
+
 # Said wherever Fusion is skipped because the project inherits it.
 FUSION_INHERITED = (
     "Fusion is inherited from the tenant; the self-test does not change it, because "
@@ -283,6 +305,46 @@ FUSION_INHERITED = (
 
 def _fusion_inherited(reading: Reading | None) -> bool:
     return reading is not None and reading.settings.get("Fusion: set on the project") is False
+
+
+def _auto_triage_inherited_words(reading: Reading | None) -> str | None:
+    """Why Auto Triage is skipped, when the project's AI agent configuration
+    was not read at the project scope (it is inherited): writing it would pin
+    the whole configuration on the project. None when it may be tested."""
+    if reading is None or "AI agent configuration: scope" not in reading.settings:
+        return None
+    scope = reading.settings["AI agent configuration: scope"]
+    if isinstance(scope, str) and scope.strip().lower() == "project":
+        return None
+    shown = "not given" if scope == ABSENT else f"“{scope}”"
+    return (
+        f"Auto Triage is not set on the project (the AI agent configuration's scope is "
+        f"{shown}, not “project”): it is inherited. The self-test does not change it, "
+        "because writing it back would pin the configuration on the project."
+    )
+
+
+def _skipped_kinds(kinds: list[str], reading: Reading | None) -> dict[str, str]:
+    """Kinds the self-test leaves alone on this project, with the reason: what
+    the project inherits, which a restore could only pin on the project."""
+    skipped: dict[str, str] = {}
+    if _fusion_inherited(reading):
+        for kind in kinds:
+            if kind in (EnforcementKind.DISABLE_FUSION, EnforcementKind.DISABLE_REPO_FUSION):
+                skipped[kind] = FUSION_INHERITED
+    triage = _auto_triage_inherited_words(reading)
+    if triage is not None and EnforcementKind.DISABLE_AUTO_TRIAGE in kinds:
+        skipped[EnforcementKind.DISABLE_AUTO_TRIAGE.value] = triage
+    return skipped
+
+
+# The project action each project kind belongs to (what a limit is told to turn off).
+_ACTION_OF_KIND = {
+    EnforcementKind.DISABLE_AUTO_TRIAGE.value: ProjectAction.AUTO_TRIAGE.value,
+    EnforcementKind.DISABLE_PR_REMEDIATION.value: ProjectAction.PR_REMEDIATION.value,
+    EnforcementKind.DISABLE_FUSION.value: ProjectAction.FUSION.value,
+    EnforcementKind.DISABLE_REPO_FUSION.value: ProjectAction.FUSION.value,
+}
 
 
 # ---------------------------------------------------------------- refusals
@@ -790,6 +852,10 @@ def _plan_lines(
     for kind in kinds:
         words = _KIND_WORDS.get(kind, kind)
         if kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
+            triage = _auto_triage_inherited_words(reading)
+            if triage is not None:
+                lines.append(f"{words}: not tested. {triage}")
+                continue
             now = settings.get("Auto Triage: on")
             lines.append(
                 f"{words}: on → off, then turned back on with the configuration read "
@@ -910,12 +976,9 @@ def check(
                 live = _live_protection(session, target, reading)
                 if live is not None:
                     refusals.append(live)
-            if (
-                not target.is_user
-                and EnforcementKind.DISABLE_FUSION in kinds
-                and _fusion_inherited(reading)
-            ):
-                warnings.append(f"{target.label}: {FUSION_INHERITED}")
+            if not target.is_user:
+                for reason in dict.fromkeys(_skipped_kinds(kinds, reading).values()):
+                    warnings.append(f"{target.label}: {reason}")
             if not target.is_user:
                 session.commit()  # nothing open while the scans are listed
                 refusal, warning = _scan_check(client, target)
@@ -1388,31 +1451,23 @@ def _test_target_locked(
         # Nothing was changed: no restriction was attempted.
         return
 
-    # What is applied: every kind read, except Fusion when the project
-    # inherits it (restoring it would pin it on the project). It is still read
-    # before and after, which shows it was left alone.
+    # What is applied: every kind read, except what the project inherits
+    # (Fusion, or an AI agent configuration not set at the project scope):
+    # restoring it would pin it on the project. It is still read before and
+    # after, which shows it was left alone.
     apply_actions = [] if target.is_user else list(request.project_actions)
     apply_kinds = list(kinds)
     skipped: list[dict[str, Any]] = []
-    if not target.is_user and _fusion_inherited(before):
-        fusion_kinds = [
-            kind
-            for kind in kinds
-            if kind in (EnforcementKind.DISABLE_FUSION, EnforcementKind.DISABLE_REPO_FUSION)
+    left_alone = {} if target.is_user else _skipped_kinds(kinds, before)
+    if left_alone:
+        dropped = {_ACTION_OF_KIND[kind] for kind in left_alone}
+        apply_actions = [action for action in apply_actions if action not in dropped]
+        apply_kinds = [kind for kind in kinds if _ACTION_OF_KIND.get(kind) not in dropped]
+        skipped = [
+            {"kind": kind, "action_id": None, "outcome": "not_applicable", "detail": reason}
+            for kind, reason in left_alone.items()
         ]
-        if fusion_kinds:
-            apply_actions = [a for a in apply_actions if a != ProjectAction.FUSION]
-            apply_kinds = [kind for kind in kinds if kind not in fusion_kinds]
-            skipped = [
-                {
-                    "kind": kind,
-                    "action_id": None,
-                    "outcome": "not_applicable",
-                    "detail": FUSION_INHERITED,
-                }
-                for kind in fusion_kinds
-            ]
-            report["warnings"].append(FUSION_INHERITED)
+        report["warnings"].extend(dict.fromkeys(left_alone.values()))
     report["kinds"] = [
         {"kind": kind, "outcome": "planned", "detail": ""} for kind in apply_kinds
     ] + skipped
@@ -2065,11 +2120,14 @@ def unsettled_in_force(session: Session) -> list[EnforcementAction]:
     """Restrictions that are not "applied" but may be in force: a write (or a
     self-test's restore) whose outcome is in doubt. Counted with the applied
     ones wherever restrictions in force are counted."""
+    # Narrowed in the database to rows whose snapshot is marked in doubt (few,
+    # and usually none): the rest of the check needs the snapshot itself.
     return [
         action
         for action in session.scalars(
             select(EnforcementAction).where(
-                EnforcementAction.status.in_((EnforcementStatus.PENDING, EnforcementStatus.FAILED))
+                EnforcementAction.status.in_((EnforcementStatus.PENDING, EnforcementStatus.FAILED)),
+                EnforcementAction.undo_snapshot[enforcement.OUTCOME_UNKNOWN].as_boolean() == true(),
             )
         )
         if enforcement.may_be_in_force(action)
