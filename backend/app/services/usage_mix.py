@@ -52,7 +52,7 @@ from app.models.enums import (
 from app.models.limits import CreditLimit, LimitPeriodState
 from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
 from app.models.usage import UsageRecord, UsageSnapshot
-from app.services import ingestion, settings_store
+from app.services import ingestion, ledger, settings_store
 from app.services.periods import PeriodWindow, describe_window
 
 logger = logging.getLogger(__name__)
@@ -311,20 +311,12 @@ def _actions(session: Session, snapshot: UsageSnapshot | None, ids: list[str]) -
     totals: dict[str, int] = {}
     if snapshot is None or not ids:
         return totals
-    records = list(
-        session.scalars(
-            select(UsageRecord).where(
-                UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.in_(ids)
-            )
+    for actions in session.scalars(
+        select(UsageRecord.actions).where(
+            UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.in_(ids)
         )
-    )
-    anchors = ingestion.anchors_for(
-        session,
-        snapshot.view_by,
-        [r.subject_key for r in records if r.attributed_credits is not None],
-    )
-    for record in records:
-        for action, count in ingestion.forward_actions(record, anchors).items():
+    ):
+        for action, count in (actions or {}).items():
             if isinstance(count, int | float):
                 key = bucket(action)
                 totals[key] = totals.get(key, 0) + int(count)
@@ -559,6 +551,14 @@ def _counts_everything(limit: CreditLimit) -> bool:
     )
 
 
+def _demo_totals(session: Session, limit: CreditLimit) -> bool:
+    from app.services import demo_service
+
+    return settings_store.demo_mode(session) and str(limit.entity_id).startswith(
+        demo_service.DEMO_PREFIX
+    )
+
+
 def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> UsageMix | None:
     """The period's usage for this limit, by action type, as far as the feed says."""
     if not state.usage_available:
@@ -570,7 +570,23 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
     from_window = False
     since = state.baseline_at or state.period_start
     everything = _counts_everything(limit)
-    for view, ids in _sources(session, limit):
+    ledgered = not everything and not _demo_totals(session, limit)
+    if ledgered:
+        _credits, counts = ledger.period_usage(session, limit.id, state.period_key)
+        if ledger.slid(counts):
+            # Some increase came with another action falling: which action its
+            # credits went on cannot be told; say so, as from the window.
+            ledgered = False
+    if ledgered:
+        # A period budget: its counter holds exactly the period's increases,
+        # per action and per Fusion model (app/services/ledger.py).
+        _credits, counts = ledger.period_usage(session, limit.id, state.period_key)
+        latest = {}
+        for action, count in ledger.plain_actions(counts).items():
+            key = bucket(action)
+            latest[key] = latest.get(key, 0) + count
+        latest_models = ledger.fusion_models(counts)
+    for view, ids in [] if ledgered else _sources(session, limit):
         newest = ingestion.latest_snapshot(session, view)
         for action, count in _actions(session, newest, ids).items():
             latest[action] = latest.get(action, 0) + count
@@ -604,7 +620,9 @@ def compute(session: Session, limit: CreditLimit, state: LimitPeriodState) -> Us
     in_feed = {action for action, count in latest.items() if count > 0} | {
         action for action, count in baseline.items() if count > 0
     }
-    masked = not from_window and bool(in_feed - set(transactions))
+    # The ledger's increases are per name and per action: nothing a slide of
+    # the window could hide behind another action's count.
+    masked = not ledgered and not from_window and bool(in_feed - set(transactions))
 
     attributed = state.attributed_credits or Decimal("0")
     own = max(Decimal("0"), state.credits_used - attributed)

@@ -60,7 +60,6 @@ from app.services import (
 from app.services import dashboard as dashboard_service
 from app.services import notifications as notification_service
 from app.services.audit import record_audit
-from app.services.usage_mix import format_credits
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["dashboard"])
@@ -514,10 +513,10 @@ def map_unresolved(
                 },
             )
 
-    # Forward only: the subject is anchored at what it has reported so far, so
-    # only its usage from now on counts towards the user. No budget period's
-    # baseline moves, so this cannot race an evaluation; the lock orders it
-    # against the ingest and other mappings, and what is read below is current.
+    # Usage counts where it is observed (the usage ledger), so only what the
+    # subject reports from now on counts towards the user, and nothing counted
+    # before moves. The lock orders this against the ingest and other
+    # mappings, and what is read below is current.
     ingestion.attribution_lock(db)
     db.refresh(row)
     before = {"mapped_user_id": row.mapped_user_id}
@@ -548,8 +547,7 @@ def map_unresolved(
         after={
             "mapped_user_id": row.mapped_user_id,
             "reported_credits": str(move.reported),
-            "removed_from": move.previous_entity if move.removed else None,
-            "removed_credits": str(move.removed),
+            "previous_entity": move.previous_entity,
         },
         detail=confirmation,
     )
@@ -570,8 +568,9 @@ def _user_label(db, user_id: str | None) -> str | None:  # type: ignore[no-untyp
 def _move_words(move: ingestion.SubjectMove, *, target: str | None, previous: str | None) -> str:
     """The confirmation an admin reads after mapping (or unmapping) a name.
 
-    One amount per name: budgets are never listed one by one, so nothing is
-    counted twice when a name feeds several of them.
+    Usage counts where it is observed (the usage ledger), so a mapping moves
+    only what the name reports from now on: what it already counted where it
+    counted stays there, and nothing it reported before comes along.
     """
     name = move.name
     if not move.followed:
@@ -582,25 +581,13 @@ def _move_words(move: ingestion.SubjectMove, *, target: str | None, previous: st
         )
     if not move.changed:
         return f"{name} already counts towards {target or 'nothing'}; nothing changed."
-    parts: list[str] = []
     if target is not None:
-        parts.append(
-            f"Credits reported under {name} from now on count towards {target}. "
-            f"The {format_credits(move.reported)} credits it has already reported do not."
-        )
+        text = f"Usage reported under {name} from now on counts towards {target}."
     else:
-        parts.append(f"Credits reported under {name} no longer count towards anything.")
+        text = f"Usage reported under {name} from now on counts towards nothing."
     if move.previous_entity is not None and previous and previous != target:
-        if move.removed > 0:
-            parts.append(
-                f"It no longer adds to {previous}: of the {format_credits(move.removed)} "
-                f"credits it had added there, each of {previous}'s budgets takes off only "
-                "what it added within the budget's current period. What it added before "
-                "stays counted where it was, and the budget's own usage is never touched."
-            )
-        else:
-            parts.append(f"It had added nothing to {previous} since it started counting there.")
-    return " ".join(parts)
+        text += f" What it already counted towards {previous} stays there."
+    return text
 
 
 _ENTITY_VIEWS = {
@@ -642,8 +629,6 @@ def list_unmatched_entities(
         *(
             and_(
                 UsageRecord.snapshot_id == snapshot.id,
-                # A carried row is no name the feed reported this time.
-                UsageRecord.held_reason.is_distinct_from(ingestion.HELD_CARRIED),
                 or_(
                     UsageRecord.entity_id.is_(None),
                     UsageRecord.subject_key.in_(
@@ -703,7 +688,6 @@ def list_unmatched_entities(
                 select(UsageRecord.view_by, UsageRecord.subject_key).where(
                     UsageRecord.snapshot_id.in_([s.id for s in snapshots.values()] or [-1]),
                     UsageRecord.subject_key.in_(mapped_keys or [""]),
-                    UsageRecord.held_reason.is_distinct_from(ingestion.HELD_CARRIED),
                 )
             )
         }
@@ -796,11 +780,11 @@ def map_unmatched_entity(
     """Count usage reported under a name that matches no project (or application)
     towards the one it belongs to; a null ``entity_id`` clears the mapping.
 
-    Forward only: the name is anchored at what it has reported so far, and only
-    what it reports from now on counts towards the entity, whenever the mapping
-    is made. Unmapping takes away exactly what it added since. Takes effect at
-    once on the latest reading, and every later reading honours it. A real name
-    match always wins over a mapping.
+    Only what the name reports from now on counts towards the entity (usage
+    counts where it is observed: the usage ledger), and what it counted before
+    stays where it was, for a mapping, an unmapping or a change alike. Shown at
+    once on the latest reading, and every later reading honours it. A real
+    name match always wins over a mapping.
     """
     entity_type, model = _ENTITY_VIEWS[payload.view]
     key = payload.subject_key.strip().lower()
@@ -872,8 +856,7 @@ def map_unmatched_entity(
         after={
             "entity_id": payload.entity_id,
             "reported_credits": str(move.reported),
-            "removed_from": move.previous_entity if move.removed else None,
-            "removed_credits": str(move.removed),
+            "previous_entity": move.previous_entity,
         },
         detail=f"The {payload.view} name {move.name}: {confirmation}",
     )

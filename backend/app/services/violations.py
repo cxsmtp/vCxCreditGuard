@@ -43,14 +43,12 @@ Checkmarx call, and one project's failure never stops the others.
 
 from __future__ import annotations
 
-import bisect
 import logging
 import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
-from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import func, select
@@ -64,7 +62,6 @@ from app.checkmarx.errors import CheckmarxAuthError, CheckmarxError, CheckmarxNo
 from app.db.base import utcnow
 from app.models.enums import ActionType, EnforcementKind, EnforcementStatus, Severity, UsageView
 from app.models.limits import CreditLimit, EnforcementAction
-from app.models.usage import UsageAnchor, UsageRecord, UsageSnapshot
 from app.models.violations import (
     INFO_KINDS,
     KIND_AI_SCAN,
@@ -77,7 +74,7 @@ from app.models.violations import (
     STATUS_RESOLVED,
     PolicyViolation,
 )
-from app.services import error_text, ingestion, notifications, pacing, settings_store, usage_mix
+from app.services import error_text, ledger, notifications, pacing, settings_store, usage_mix
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -1142,201 +1139,13 @@ _STOPS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _records_for(session: Session, snapshot: UsageSnapshot, entity_id: str) -> list[UsageRecord]:
-    """Every row of a reading that counts towards one entity: its own name and
-    any name mapped to it (a person's email and display name, say)."""
-    return list(
-        session.scalars(
-            select(UsageRecord)
-            .where(UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id == entity_id)
-            .order_by(UsageRecord.id)
-        )
-    )
-
-
-def _bucketed(records: list[UsageRecord | None] | UsageRecord | None) -> dict[str, int]:
-    if not isinstance(records, list):
-        records = [records]
+def _bucketed(counts: dict | None) -> dict[str, int]:
     totals: dict[str, int] = {}
-    for record in records:
-        for action, count in ((record.actions if record else None) or {}).items():
-            if isinstance(count, int) and not isinstance(count, bool):
-                key = usage_mix.bucket(action)
-                totals[key] = totals.get(key, 0) + count
+    for action, count in ledger.plain_actions(counts).items():
+        if isinstance(count, int) and not isinstance(count, bool):
+            key = usage_mix.bucket(action)
+            totals[key] = totals.get(key, 0) + count
     return totals
-
-
-def _credits(records: list[UsageRecord | None]) -> Decimal:
-    return sum((Decimal(r.credits_used or 0) for r in records if r is not None), Decimal("0"))
-
-
-class _UsageReader:
-    """The consumption readings ``_detect_usage`` compares, read in bulk.
-
-    The same answers as ``ingestion.latest_snapshot``, ``usage_mix._snapshot_at``
-    and ``_records_for``, but one query per view and per snapshot rather than
-    several per restricted target: a large tenant has thousands of them.
-    """
-
-    def __init__(self, session: Session) -> None:
-        self.session = session
-        self._latest: dict[str, UsageSnapshot | None] = {}
-        # view -> believed snapshots (collected_at, id), oldest first.
-        self._timeline: dict[str, list[tuple[datetime, int]]] = {}
-        # (snapshot, entity) -> the rows counting towards it.
-        self._records: dict[tuple[int, str], list[UsageRecord]] = {}
-        # (snapshot, reported name) -> its row, or None.
-        self._by_key: dict[tuple[int, str], UsageRecord | None] = {}
-        self._anchors: dict[str, dict[str, UsageAnchor]] = {}
-
-    def latest(self, view: str) -> UsageSnapshot | None:
-        if view not in self._latest:
-            self._latest[view] = ingestion.latest_snapshot(self.session, view)
-        return self._latest[view]
-
-    def prepare(self, view: str, moments: list[datetime]) -> None:
-        """Load the snapshots that can be the reading at any of these moments."""
-        if not moments:
-            return
-        first = usage_mix._snapshot_at(self.session, view, min(moments))
-        query = select(UsageSnapshot.collected_at, UsageSnapshot.id).where(
-            UsageSnapshot.view_by == view,
-            UsageSnapshot.held_reason.is_(None),
-            UsageSnapshot.collected_at > min(moments),
-            UsageSnapshot.collected_at <= max(moments),
-        )
-        if not settings_store.demo_mode(self.session):
-            query = query.where(
-                UsageSnapshot.period_param.is_distinct_from(settings_store.DEMO_PERIOD_PARAM)
-            )
-        timeline = [(row.collected_at, row.id) for row in self.session.execute(query)]
-        if first is not None:
-            timeline.append((first.collected_at, first.id))
-        timeline.sort()
-        self._timeline[view] = timeline
-
-    def baseline(self, view: str, action: EnforcementAction) -> UsageSnapshot | None:
-        """The reading a rise since this restriction is measured from.
-
-        The snapshot pinned when it was applied (``baseline_snapshot_id``), or,
-        for a restriction from before that existed (or whose snapshot is gone),
-        the newest believed snapshot at or before ``applied_at``, as before.
-        """
-        if action.baseline_snapshot_id is not None:
-            pinned = self.session.get(UsageSnapshot, action.baseline_snapshot_id)
-            if pinned is not None and pinned.view_by == view and pinned.held_reason is None:
-                return pinned
-        if action.applied_at is None:
-            return None
-        return self.at(view, action.applied_at)
-
-    def at(self, view: str, moment: datetime) -> UsageSnapshot | None:
-        """The newest believed snapshot taken at or before ``moment``."""
-        timeline = self._timeline.get(view)
-        if timeline is None:
-            return usage_mix._snapshot_at(self.session, view, moment)
-        position = bisect.bisect_right(timeline, (moment, math.inf))
-        if position == 0:
-            return None
-        return self.session.get(UsageSnapshot, timeline[position - 1][1])
-
-    def preload(self, snapshot: UsageSnapshot | None, entity_ids: set[str]) -> None:
-        if snapshot is None:
-            return
-        wanted = sorted(eid for eid in entity_ids if (snapshot.id, eid) not in self._records)
-        for start in range(0, len(wanted), 1000):
-            chunk = wanted[start : start + 1000]
-            for eid in chunk:
-                self._records[(snapshot.id, eid)] = []
-            for record in self.session.scalars(
-                select(UsageRecord)
-                .where(UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.in_(chunk))
-                .order_by(UsageRecord.id)
-            ):
-                self._records[(snapshot.id, record.entity_id)].append(record)
-                self._by_key[(snapshot.id, record.subject_key)] = record
-
-    def preload_keys(self, snapshot_id: int | None, keys: set[str]) -> None:
-        if snapshot_id is None:
-            return
-        wanted = sorted(key for key in keys if (snapshot_id, key) not in self._by_key)
-        for start in range(0, len(wanted), 1000):
-            chunk = wanted[start : start + 1000]
-            for key in chunk:
-                self._by_key[(snapshot_id, key)] = None
-            for record in self.session.scalars(
-                select(UsageRecord).where(
-                    UsageRecord.snapshot_id == snapshot_id, UsageRecord.subject_key.in_(chunk)
-                )
-            ):
-                self._by_key[(snapshot_id, record.subject_key)] = record
-
-    def records(self, snapshot: UsageSnapshot, entity_id: str) -> list[UsageRecord]:
-        key = (snapshot.id, entity_id)
-        if key not in self._records:
-            self._records[key] = _records_for(self.session, snapshot, entity_id)
-        return self._records[key]
-
-    def anchors(self, view: str) -> dict[str, UsageAnchor]:
-        if view not in self._anchors:
-            self._anchors[view] = {
-                anchor.subject_key: anchor
-                for anchor in self.session.scalars(
-                    select(UsageAnchor).where(UsageAnchor.view_by == view)
-                )
-            }
-        return self._anchors[view]
-
-    def anchored_after(
-        self, view: str, record: UsageRecord, before: UsageSnapshot
-    ) -> UsageAnchor | None:
-        """The name's anchor, when it started to count towards the record's
-        entity only after ``before`` (mapped or moved since): its rise there is
-        measured from what it had reported then, kept on the anchor itself."""
-        anchor = self.anchors(view).get(record.subject_key)
-        if (
-            anchor is not None
-            and anchor.released_at is None
-            and anchor.entity_id == record.entity_id
-            and anchor.anchored_at > before.collected_at
-        ):
-            return anchor
-        return None
-
-    def pairs(
-        self, view: str, now: list[UsageRecord], before: UsageSnapshot
-    ) -> tuple[list[UsageRecord], list]:
-        """Each name's row now, and what the same name had reported where its
-        rise is measured from: the reading pinned at the restriction, or, for
-        a name that started to count towards the target later, its anchor
-        (None: it had nothing, all of it is new). A name anchored with no
-        record of its actions is compared with its row in the pinned reading,
-        and left out of both sides when that is missing too: nothing is
-        claimed about it."""
-        kept: list[UsageRecord] = []
-        then: list = []
-        for record in now:
-            anchor = self.anchored_after(view, record, before)
-            if anchor is not None and anchor.reference_actions is not None:
-                kept.append(record)
-                then.append(
-                    SimpleNamespace(
-                        actions=anchor.reference_actions or {},
-                        credits_used=Decimal(anchor.offset_credits or 0),
-                    )
-                )
-                continue
-            if (before.id, record.subject_key) not in self._by_key:
-                self.preload_keys(before.id, {record.subject_key})
-            then_row = self._by_key[(before.id, record.subject_key)]
-            if anchor is not None and then_row is None:
-                # Anchored after the restriction with no counts kept (a mapping
-                # from before the upgrade) and missing from the reading pinned
-                # at the restriction: nothing is known to compare with.
-                continue
-            kept.append(record)
-            then.append(then_row)
-        return kept, then
 
 
 def _detect_usage(session: Session, result: DetectionResult) -> None:
@@ -1351,32 +1160,6 @@ def _detect_usage(session: Session, result: DetectionResult) -> None:
     ):
         if str(action.kind) in _STOPS:
             groups.setdefault((action.target_type, action.target_id), []).append(action)
-    reader = _UsageReader(session)
-    for view, target_type in ((UsageView.USER.value, "cx_user"), (UsageView.PROJECT.value, None)):
-        mine = {
-            key: actions
-            for key, actions in groups.items()
-            if (key[0] == "cx_user") == (target_type == "cx_user")
-        }
-        if not mine:
-            continue
-        reader.prepare(
-            view, [a.applied_at for actions in mine.values() for a in actions if a.applied_at]
-        )
-        ids = {key[1] for key in mine}
-        latest = reader.latest(view)
-        reader.preload(latest, ids)
-        keys = (
-            {r.subject_key for eid in ids for r in reader.records(latest, eid)}
-            if latest is not None
-            else set()
-        )
-        baselines = {
-            reader.baseline(view, a) for actions in mine.values() for a in actions if a.applied_at
-        }
-        for snapshot in baselines:
-            if snapshot is not None:
-                reader.preload_keys(snapshot.id, keys)
     session.commit()
     for (target_type, target_id), actions in groups.items():
         if any(
@@ -1390,7 +1173,7 @@ def _detect_usage(session: Session, result: DetectionResult) -> None:
             # usage is not acting against the restriction.
             continue
         try:
-            outcome = _usage_for_target(session, target_type, target_id, actions, reader=reader)
+            outcome = _usage_for_target(session, target_type, target_id, actions)
             if outcome == "detected":
                 result.detected += 1
             elif outcome == "updated":
@@ -1407,25 +1190,22 @@ def _usage_for_target(
     target_type: str,
     target_id: str,
     actions: list[EnforcementAction],
-    *,
-    reader: _UsageReader | None = None,
 ) -> str | None:
     """ "detected", "updated", or None when there is nothing (new) to say.
 
-    Each action type is measured from its own restriction: Fusion restricted
-    after Auto Triage is compared with the reading before *Fusion* was
-    restricted, so Fusion used legitimately in between is not reported.
+    What the restriction is meant to stop, observed after it: the usage
+    ledger's increases attributed to the target since the restriction was
+    applied (app/services/ledger.py). Each action type is measured from its own
+    restriction: Fusion restricted after Auto Triage counts only Fusion
+    observed after *Fusion* was restricted. A name that only started to count
+    towards the target later (mapped, renamed) brings no history: only its
+    increases from then on are in the ledger.
     """
     first = actions[0]
     view = UsageView.USER.value if target_type == "cx_user" else UsageView.PROJECT.value
-    reader = reader or _UsageReader(session)
-    latest = reader.latest(view)
-    if latest is None:
-        return None
-    # Every row counting towards the target, each compared with the same
-    # name's row in the earlier reading (like for like).
-    now_records = reader.records(latest, target_id)
-    if not now_records:
+    earliest = min(action.applied_at for action in actions if action.applied_at)
+    increases = ledger.entity_increases(session, view, target_id, earliest)
+    if not increases:
         return None
 
     # The earliest applied restriction that stops each action type (actions
@@ -1435,42 +1215,39 @@ def _usage_for_target(
         for stop in _STOPS[str(action.kind)]:
             since_by_type.setdefault(stop, action)
     rises: dict[str, int] = {}
-    baselines: dict[str, UsageSnapshot] = {}
     for action_type in sorted(since_by_type):
-        restricted = since_by_type[action_type]
-        before = reader.baseline(view, restricted)
-        if before is None or before.id == latest.id:
-            continue
-        now_rows, then_rows = reader.pairs(view, now_records, before)
-        now_counts = _bucketed(list(now_rows))
-        then_counts = _bucketed(then_rows)
-        rise = now_counts.get(action_type, 0) - then_counts.get(action_type, 0)
-        if rise < 0:
-            # Older transactions left the lookback window: new ones cannot be
-            # told apart from them, so nothing is claimed.
-            return None
+        since = since_by_type[action_type].applied_at
+        rise = sum(
+            _bucketed(delta.actions).get(action_type, 0)
+            for delta in increases
+            if delta.observed_at > since
+        )
         if rise > 0:
             rises[action_type] = rise
-            baselines[action_type] = before
     if not rises:
         return None
-    # The credits rise is measured from the baseline of the earliest restriction
-    # whose action type rose (evidence only; priced below for Fusion alone).
+    # The credits rise is counted from the earliest restriction whose action
+    # type rose (evidence only; priced below for Fusion alone).
     earliest_type = min(rises, key=lambda t: (since_by_type[t].applied_at, since_by_type[t].id))
-    before = baselines[earliest_type]
-    now_rows, then_rows = reader.pairs(view, now_records, before)
-    credits_rise = _credits(list(now_rows)) - _credits(then_rows)
+    since = since_by_type[earliest_type].applied_at
+    counted = [delta for delta in increases if delta.observed_at > since]
+    credits_rise = sum((Decimal(delta.credits or 0) for delta in counted), Decimal("0"))
     credits: Decimal | None = None
     if set(rises) == {"fusion"}:
+        models: dict[str, int] = {}
+        for delta in counted:
+            for key, count in ledger.fusion_models(delta.actions).items():
+                models[key] = models.get(key, 0) + count
         priced = usage_mix._price_fusion(
             session,
-            latest=usage_mix._fusion_models(session, latest, [target_id]),
-            baseline=usage_mix._fusion_models(session, before, [target_id]),
+            latest=models,
+            baseline={},
             fusion_rise=rises["fusion"],
             own=max(credits_rise, Decimal("0")),
         )
         if priced:
             credits = sum((part.credits for part in priced), Decimal("0"))
+    latest_at = max(delta.observed_at for delta in increases)
     label = first.target_label or target_id
     listed = ", ".join(
         f"{usage_mix.ACTION_LABELS.get(action_type, action_type)} {count} transaction"
@@ -1493,11 +1270,8 @@ def _usage_for_target(
             action_type: since_by_type[action_type].applied_at.isoformat()  # type: ignore[union-attr]
             for action_type in rises
         },
-        "baseline_reading_at": before.collected_at.isoformat(),
-        "baseline_reading_at_by_action": {
-            action_type: baselines[action_type].collected_at.isoformat() for action_type in rises
-        },
-        "latest_reading_at": latest.collected_at.isoformat(),
+        "counted_since": since.isoformat(),
+        "latest_reading_at": latest_at.isoformat(),
         "restrictions": sorted({str(action.kind) for action in actions}),
     }
     key = f"{KIND_USAGE_AFTER}:{target_type}:{target_id}:{first.id}"

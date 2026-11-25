@@ -126,20 +126,13 @@ class Trend:
 
 
 def latest_snapshot_records(session: Session, view: UsageView) -> list[UsageRecord]:
-    """The newest reading's rows as the feed reported them. A carried row (a
-    name the feed did not report this time, still counted towards its entity
-    for a while, see ingestion._Anchors.carry) is left out of every list and
-    sum shown by name; budgets still count it."""
     snapshot = ingestion.latest_snapshot(session, view)
     if snapshot is None:
         return []
     return list(
         session.scalars(
             select(UsageRecord)
-            .where(
-                UsageRecord.snapshot_id == snapshot.id,
-                UsageRecord.held_reason.is_distinct_from(ingestion.HELD_CARRIED),
-            )
+            .where(UsageRecord.snapshot_id == snapshot.id)
             .order_by(UsageRecord.credits_used.desc())
         )
     )

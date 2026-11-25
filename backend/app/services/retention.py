@@ -96,6 +96,7 @@ class RetentionResult:
     enforcement_actions: int = 0
     auto_triage_charges: int = 0
     policy_violations: int = 0
+    ledger_rows: int = 0
     # Thinning and raw rows (see the module docstring).
     thinning: bool = True
     thinned_snapshots: int = 0
@@ -120,12 +121,14 @@ class RetentionResult:
             + self.auto_triage_charges
             + self.policy_violations
             + self.thinned_snapshots
+            + self.ledger_rows
         )
 
     def as_stats(self) -> dict[str, object]:
         return {
             "usage_snapshots": self.usage_snapshots,
             "usage_records": self.usage_records,
+            "ledger_rows": self.ledger_rows,
             "notifications": self.notifications,
             "audit_entries": self.audit_entries,
             "scheduler_runs": self.scheduler_runs,
@@ -182,6 +185,7 @@ def prune(
     _prune_period_states(session, cutoff)
     result.auto_triage_charges = _prune_auto_triage_charges(session, cutoff)
     result.policy_violations = _prune_policy_violations(session, cutoff)
+    result.ledger_rows = _prune_ledger(session, cutoff)
 
     # Audited last, and only if something was removed, so the entry can state the
     # counts. This is the single place that deletes audit rows.
@@ -676,6 +680,23 @@ def _prune_audit(session: Session, cutoff) -> int:
     if boundary_id is None:
         return 0
     return _delete_where(session, AuditLogEntry, AuditLogEntry.id <= boundary_id)
+
+
+def _prune_ledger(session: Session, cutoff) -> int:  # type: ignore[no-untyped-def]
+    """Ledger increases older than the retention window. Budget counters do
+    not depend on them; an increase of an entity under a restriction still in
+    force is kept, since usage after the restriction is measured from them."""
+    from app.models.usage import UsageDelta
+
+    restricted = select(EnforcementAction.target_id).where(
+        EnforcementAction.status == EnforcementStatus.APPLIED
+    )
+    return _delete_where(
+        session,
+        UsageDelta,
+        (UsageDelta.observed_at < cutoff)
+        & (UsageDelta.entity_id.is_(None) | UsageDelta.entity_id.not_in(restricted)),
+    )
 
 
 def _delete_where(session: Session, model, condition) -> int:  # type: ignore[no-untyped-def]

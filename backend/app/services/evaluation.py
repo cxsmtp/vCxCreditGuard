@@ -79,6 +79,7 @@ from app.services import (
     enforcement,
     error_text,
     ingestion,
+    ledger,
     notifications,
     pacing,
     settings_store,
@@ -160,29 +161,10 @@ class UsageIndex:
 
     def __init__(self, session: Session) -> None:
         self._session = session
-        # Each view's names and their anchors, in one statement per view: the
-        # totals and what a budget's period discounts (``effective_baseline``)
-        # come from the same reading.
-        self.names = {
-            str(view): ingestion.latest_names(session, view)
-            for view in (
-                UsageView.USER,
-                UsageView.APPLICATION,
-                UsageView.PROJECT,
-                UsageView.GROUP,
-            )
-        }
-        self.users = ingestion.totals_of(self.names[str(UsageView.USER)])
-        self.applications = ingestion.totals_of(self.names[str(UsageView.APPLICATION)])
-        self.projects = ingestion.totals_of(self.names[str(UsageView.PROJECT)])
-        self.groups = ingestion.totals_of(self.names[str(UsageView.GROUP)])
-        self._ids: dict[tuple[str, str], list[str]] = {}
-        # (view, entity id) -> the names counting towards it.
-        self._by_entity: dict[tuple[str, str], list[ingestion.NameRow]] = {}
-        for view, rows in self.names.items():
-            for row in rows.values():
-                if row.entity_id is not None:
-                    self._by_entity.setdefault((view, row.entity_id), []).append(row)
+        self.users = ingestion.latest_totals(session, UsageView.USER)
+        self.applications = ingestion.latest_totals(session, UsageView.APPLICATION)
+        self.projects = ingestion.latest_totals(session, UsageView.PROJECT)
+        self.groups = ingestion.latest_totals(session, UsageView.GROUP)
         self.project_dimension = ingestion.dimension_supported(session, UsageView.PROJECT)
         self.group_dimension = ingestion.dimension_supported(session, UsageView.GROUP)
         self.application_dimension = ingestion.dimension_supported(session, UsageView.APPLICATION)
@@ -298,7 +280,13 @@ class UsageIndex:
         if self.application_dimension and application_id in self.applications:
             return self.applications[application_id], True
         # Fall back to the sum of the application's projects.
-        project_ids = self._linked("application_projects", application_id)
+        project_ids = list(
+            self._session.scalars(
+                select(CxApplicationProject.project_id).where(
+                    CxApplicationProject.application_id == application_id
+                )
+            )
+        )
         if not project_ids or not self.project_dimension:
             if self.application_dimension:
                 # The dimension works, this application simply spent nothing.
@@ -317,7 +305,11 @@ class UsageIndex:
         if not include_members and self.group_dimension and group_id in self.groups:
             return self.groups[group_id], True
 
-        project_ids = self._linked("group_projects", group_id)
+        project_ids = list(
+            self._session.scalars(
+                select(CxProjectGroup.project_id).where(CxProjectGroup.group_id == group_id)
+            )
+        )
         total = Decimal("0")
         available = False
         if project_ids and self.project_dimension:
@@ -326,145 +318,17 @@ class UsageIndex:
             )
             available = True
         if include_members:
-            member_ids = self._linked("group_members", group_id)
+            member_ids = list(
+                self._session.scalars(
+                    select(CxGroupMembership.user_id).where(CxGroupMembership.group_id == group_id)
+                )
+            )
             if member_ids and self.user_dimension:
                 total += sum(
                     (self.users.get(uid, Decimal("0")) for uid in member_ids), Decimal("0")
                 )
                 available = True
         return total, available
-
-    def _linked(self, kind: str, entity_id: str) -> list[str]:
-        """Projects of an application or group, or a group's members (cached)."""
-        cache_key = (kind, entity_id)
-        if cache_key not in self._ids:
-            if kind == "application_projects":
-                query = select(CxApplicationProject.project_id).where(
-                    CxApplicationProject.application_id == entity_id
-                )
-            elif kind == "group_projects":
-                query = select(CxProjectGroup.project_id).where(
-                    CxProjectGroup.group_id == entity_id
-                )
-            else:
-                query = select(CxGroupMembership.user_id).where(
-                    CxGroupMembership.group_id == entity_id
-                )
-            self._ids[cache_key] = list(self._session.scalars(query))
-        return self._ids[cache_key]
-
-    def feeding(self, limit: CreditLimit) -> set[tuple[str, str]]:
-        """The (view, entity id) pairs whose names make up ``reported_total``."""
-        user, project = str(UsageView.USER), str(UsageView.PROJECT)
-        if limit.entity_type == EntityType.USER:
-            return {(user, limit.entity_id)} if self.user_dimension else set()
-        if limit.entity_type == EntityType.PROJECT:
-            return {(project, limit.entity_id)} if self.project_dimension else set()
-        if limit.entity_type == EntityType.APPLICATION:
-            if self.application_dimension and limit.entity_id in self.applications:
-                return {(str(UsageView.APPLICATION), limit.entity_id)}
-            if not self.project_dimension:
-                return set()
-            return {(project, pid) for pid in self._linked("application_projects", limit.entity_id)}
-        if limit.entity_type == EntityType.GROUP:
-            members = limit.include_member_usage
-            if not members and self.group_dimension and limit.entity_id in self.groups:
-                return {(str(UsageView.GROUP), limit.entity_id)}
-            found: set[tuple[str, str]] = set()
-            if self.project_dimension:
-                found |= {(project, pid) for pid in self._linked("group_projects", limit.entity_id)}
-            if members and self.user_dimension:
-                found |= {(user, uid) for uid in self._linked("group_members", limit.entity_id)}
-            return found
-        return set()
-
-    def name_figures(self, limit: CreditLimit) -> dict[str, object] | None:
-        """What the names that can later move counted towards this budget now,
-        for a new baseline: ``{"names": {"<view>|<name>": [credits,
-        anchored_at, removed_at, offset]}}``.
-
-        Only names that can move are kept: anchored (mapped or moved), held
-        (kept or carried), and every user subject (a match can be corrected or
-        disputed). A project or application name that matches its entity by
-        name never moves (a real match always wins), so a budget over thousands
-        of projects stores next to nothing.
-        """
-        user = str(UsageView.USER)
-        names: dict[str, list] = {}
-        for view, entity_id in self.feeding(limit):
-            for row in self._by_entity.get((view, entity_id), ()):
-                if view != user and row.anchor_entity is None and row.held_reason is None:
-                    continue
-                names[f"{view}|{row.key}"] = [
-                    str(row.counted),
-                    row.anchored_at.isoformat() if row.anchored_at else None,
-                    row.removed_at.isoformat() if row.removed_at else None,
-                    str(row.offset) if row.offset is not None and row.anchor_live else "0",
-                ]
-        return {"names": names} if names else None
-
-    def effective_baseline(self, limit: CreditLimit, state: LimitPeriodState) -> Decimal:
-        """The period's baseline, adjusted for names that moved since it was taken.
-
-        * A name that stops counting towards the budget by an explicit move
-          (unmapped, mapped elsewhere, a corrected match, a move by itself), or
-          whose anchor is taken afresh while it still counts here (mapped again
-          after an unmap, the window rolled past its offset), no longer brings
-          into the total what it brought into the baseline: that is discounted,
-          so the move takes away only the name's usage within the period.
-        * A name moved between two entities that both count towards the budget
-          (two projects of one group or application, two members of a group)
-          kept counting here throughout: its old position is carried over, so
-          the budget neither loses nor gains anything by the move.
-
-        Names that simply stop being reported are left to the usual
-        re-baselining. May be negative (a carried-over position).
-        """
-        baseline = Decimal(state.baseline_credits or 0)
-        captured = (state.baseline_names or {}).get("names") if state.baseline_names else None
-        if not captured:
-            return baseline
-        # Only a budget that discounts usage already reported has the names'
-        # figures in its baseline; one that counts it all has a baseline of 0.
-        in_baseline = baseline > 0
-        feeding = self.feeding(limit)
-        adjust = Decimal("0")
-        for name, figures in captured.items():
-            view, _, key = name.partition("|")
-            row = self.names.get(view, {}).get(key)
-            if row is None:
-                continue
-            credits, anchored_at, removed_at, offset = (list(figures) + [None] * 4)[:4]
-            now_anchored = row.anchored_at.isoformat() if row.anchored_at else None
-            now_removed = row.removed_at.isoformat() if row.removed_at else None
-            feeds = row.entity_id is not None and (view, row.entity_id) in feeding
-            if feeds:
-                if not (
-                    row.anchor_live
-                    and row.anchor_entity == row.entity_id
-                    and now_anchored != anchored_at
-                ):
-                    continue
-                within = (
-                    now_removed is not None
-                    and now_removed != removed_at
-                    and now_removed == now_anchored
-                    and (view, row.removed_from) in feeding
-                )
-                if within:
-                    # One move between two entities of this budget: the name's
-                    # count carries on from its old offset.
-                    adjust += Decimal(str(row.offset or 0)) - Decimal(str(offset or 0))
-                elif in_baseline:
-                    adjust += Decimal(str(credits))
-            elif (
-                in_baseline
-                and now_removed is not None
-                and now_removed != removed_at
-                and (view, row.removed_from) in feeding
-            ):
-                adjust += Decimal(str(credits))
-        return baseline - adjust
 
     def reported_total(self, limit: CreditLimit) -> tuple[Decimal, bool]:
         if limit.entity_type == EntityType.USER:
@@ -506,6 +370,9 @@ def evaluate_all(
     moment = now or utcnow()
     actor = actor or AuditActor.system("evaluator")
     result = EvaluationResult()
+    # The increases observed since the last evaluation join the period each
+    # budget is in now (app/services/ledger.py).
+    ledger.consume_pending(session, moment)
     index = UsageIndex(session)
     resolver = enforcement.RoleResolver(client) if client is not None else None
     budget: enforcement.EnforcementBudget | None = None
@@ -1650,25 +1517,33 @@ def _evaluate_one(
         reported_total=reported_total,
         available=available,
         moment=moment,
-        index=index,
     )
 
-    baseline = index.effective_baseline(limit, state)
-    # A sliding lookback window can drop old consumption, which would otherwise
-    # produce negative usage. Re-baseline instead (and take the names afresh).
-    if reported_total < baseline:
-        logger.info(
-            "Reported total for %s %s fell below the period baseline, re-baselining",
-            limit.entity_type,
-            limit.entity_id,
-        )
-        state.baseline_credits = reported_total
-        state.baseline_names = index.name_figures(limit)
-        baseline = reported_total
+    if counts_from_totals(session, limit, window):
+        # A budget that counts usage already reported: the current totals of
+        # the names that count towards it. A sliding lookback window can drop
+        # old consumption, which would otherwise produce negative usage.
+        # Re-baseline instead.
+        if reported_total < state.baseline_credits:
+            logger.info(
+                "Reported total for %s %s fell below the period baseline, re-baselining",
+                limit.entity_type,
+                limit.entity_id,
+            )
+            state.baseline_credits = reported_total
+        used = max(Decimal("0"), reported_total - state.baseline_credits)
+    else:
+        # A period budget: what the ledger counted for it in this period.
+        used, _counts = ledger.period_usage(session, limit.id, window.key)
+        # Informational only: what of the reported total was there before.
+        state.baseline_credits = max(Decimal("0"), reported_total - used)
+        # What the period counted stays counted when nothing reports towards
+        # the budget any more (a group whose projects were all deleted).
+        available = available or used > 0
 
     state.reported_total = reported_total
     state.usage_available = available
-    state.credits_used = max(Decimal("0"), reported_total - baseline) if available else Decimal("0")
+    state.credits_used = used if available else Decimal("0")
     attributed = (
         index.attributed_usage(limit, window=window, state=state, moment=moment)
         if available
@@ -1882,6 +1757,20 @@ def baseline_for(
     return reported_total
 
 
+def counts_from_totals(session: Session, limit: CreditLimit, window: PeriodWindow) -> bool:
+    """True for a budget whose usage is read from the current totals rather
+    than from the ledger: one that counts usage already reported (lifetime,
+    custom, count existing usage), and, in demo mode, a demo budget (demo
+    readings never reach the ledger)."""
+    if counts_existing_usage(limit, window=window):
+        return True
+    from app.services import demo_service
+
+    return settings_store.demo_mode(session) and str(limit.entity_id).startswith(
+        demo_service.DEMO_PREFIX
+    )
+
+
 def counts_existing_usage(limit: CreditLimit, *, window: PeriodWindow) -> bool:
     """True when the period counts usage already reported when it opened.
 
@@ -1910,13 +1799,24 @@ def period_usage(
     """
     reported_total, available = index.reported_total(limit)
     state = index.period_state(limit.id, window.key)
+    if not counts_from_totals(session, limit, window):
+        # The period's counter, and what the next evaluation will add to it;
+        # kept when nothing reports towards the budget any more.
+        used, _counts = ledger.period_usage(session, limit.id, window.key, pending=True)
+        if not available and used <= 0:
+            return Decimal("0"), False, None
+        if available:
+            attributed = index.attributed_usage(limit, window=window, state=state, moment=moment)
+            if attributed is not None:
+                return used + attributed.counted, True, attributed
+        return used, True, None
+    if not available:
+        return Decimal("0"), False, None
     baseline = (
-        index.effective_baseline(limit, state)
+        state.baseline_credits
         if state is not None
         else baseline_for(limit, window=window, reported_total=reported_total, available=available)
     )
-    if not available:
-        return Decimal("0"), False, None
     used = max(Decimal("0"), reported_total - baseline)
     attributed = index.attributed_usage(limit, window=window, state=state, moment=moment)
     if attributed is not None:
@@ -1932,7 +1832,6 @@ def _get_or_create_state(
     reported_total: Decimal,
     available: bool,
     moment: datetime | None = None,
-    index: UsageIndex | None = None,
 ) -> LimitPeriodState:
     state = session.scalar(
         select(LimitPeriodState).where(
@@ -1942,17 +1841,14 @@ def _get_or_create_state(
     )
     if state is not None:
         return state
-    baseline = baseline_for(
-        limit, window=window, reported_total=reported_total, available=available
-    )
     state = LimitPeriodState(
         limit_id=limit.id,
         period_key=window.key,
         period_start=window.start,
         period_end=window.end,
-        baseline_credits=baseline,
-        # What each name brought into the baseline (see effective_baseline).
-        baseline_names=index.name_figures(limit) if index is not None else None,
+        baseline_credits=baseline_for(
+            limit, window=window, reported_total=reported_total, available=available
+        ),
         baseline_at=moment or utcnow(),
         reported_total=reported_total,
         credits_used=Decimal("0"),

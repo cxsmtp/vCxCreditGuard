@@ -94,7 +94,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
-from types import SimpleNamespace
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
@@ -115,7 +114,7 @@ from app.models.usage import (
     AutoTriageCharge,
     AutoTriageProjectState,
     UnresolvedSubject,
-    UsageAnchor,
+    UsageEntityOffset,
     UsageRecord,
     UsageSnapshot,
 )
@@ -364,7 +363,6 @@ def project_readings(
     collector only takes while the cursor already stands at 0.
     """
     readings: dict[str, ProjectReading | None] = {}
-    anchors = _anchors(session)
     for record in session.scalars(
         select(UsageRecord).where(
             UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.is_not(None)
@@ -381,51 +379,34 @@ def project_readings(
                 readings[record.entity_id] = None
                 continue
             count, certain = 0, False
-        share = auto_triage_share(record, price)
-        count, share = _forward(record, anchors, count, share, price)
         known = readings.get(record.entity_id) or ProjectReading(0, ZERO)
         readings[record.entity_id] = ProjectReading(
             transactions=known.transactions + count,
-            credits=known.credits + share,
+            credits=known.credits + auto_triage_share(record, price),
             certain=known.certain and certain,
         )
-    return readings
-
-
-def _anchors(session: Session) -> dict[str, UsageAnchor]:
-    return {
-        anchor.subject_key: anchor
-        for anchor in session.scalars(
-            select(UsageAnchor).where(
-                UsageAnchor.view_by == UsageView.PROJECT.value, UsageAnchor.released_at.is_(None)
-            )
+    # A name that joined or left a project (a mapping, a rename, a move, a
+    # name missing from a reading and back) shifts the project's figure by
+    # its whole Auto Triage history. The usage ledger keeps that shift per
+    # project (``UsageEntityOffset``), so the reading moves only by Auto Triage
+    # observed while a name counted towards the project: no history is ever
+    # charged to whoever scanned (app/services/ledger.py).
+    offsets = {
+        row.entity_id: row
+        for row in session.scalars(
+            select(UsageEntityOffset).where(UsageEntityOffset.view_by == UsageView.PROJECT.value)
         )
     }
-
-
-def _forward(
-    record: UsageRecord,
-    anchors: dict[str, UsageAnchor],
-    count: int,
-    share: Decimal,
-    price: Decimal | None,
-) -> tuple[int, Decimal]:
-    """The part of a row's Auto Triage that counts towards its project.
-
-    A name mapped to the project (or moved to it) counts only what it reported
-    beyond its anchor: its earlier Auto Triage is no increase for anyone who
-    scans the project now.
-    """
-    anchor = anchors.get(record.subject_key)
-    if record.attributed_credits is None or anchor is None or anchor.entity_id != record.entity_id:
-        return count, share
-    reference = anchor.reference_actions or {}
-    before = reference.get(ActionType.AUTO_TRIAGE.value)
-    before_count = before if _valid_count(before) else 0
-    before_share = auto_triage_share(
-        SimpleNamespace(actions=reference, credits_used=anchor.offset_credits), price
-    )
-    return max(0, count - before_count), max(ZERO, share - before_share)
+    for project_id, reading in list(readings.items()):
+        offset = offsets.get(project_id)
+        if reading is None or offset is None:
+            continue
+        readings[project_id] = ProjectReading(
+            transactions=max(0, reading.transactions - int(offset.auto_triage_transactions or 0)),
+            credits=max(ZERO, reading.credits - Decimal(offset.auto_triage_credits or 0)),
+            certain=reading.certain,
+        )
+    return readings
 
 
 def project_auto_triage_credits(
@@ -433,7 +414,6 @@ def project_auto_triage_credits(
 ) -> dict[str, tuple[Decimal, int]]:
     """``A_p`` and its Auto Triage transactions, per synced project that has any."""
     result: dict[str, tuple[Decimal, int]] = {}
-    anchors = _anchors(session)
     for record in session.scalars(
         select(UsageRecord).where(
             UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.is_not(None)
@@ -442,13 +422,13 @@ def project_auto_triage_credits(
         if not record.entity_id:
             continue
         share = auto_triage_share(record, price)
-        raw_count = (record.actions or {}).get(ActionType.AUTO_TRIAGE.value)
-        count, share = _forward(
-            record, anchors, raw_count if _valid_count(raw_count) else 0, share, price
-        )
         if share > 0:
+            count = (record.actions or {}).get(ActionType.AUTO_TRIAGE.value)
             credits, transactions = result.get(record.entity_id, (ZERO, 0))
-            result[record.entity_id] = (credits + share, transactions + count)
+            result[record.entity_id] = (
+                credits + share,
+                transactions + (count if _valid_count(count) else 0),
+            )
     return result
 
 
