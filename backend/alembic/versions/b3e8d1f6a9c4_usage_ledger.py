@@ -1,14 +1,16 @@
 """The usage ledger: period budgets count increases
 
-Revision ID: f9c1e4b7a2d3
-Revises: d8b3f6a2c5e1
+Revision ID: b3e8d1f6a9c4
+Revises: f9c1e4b7a2d3
 Create Date: 2026-11-25
 
 * ``usage_delta`` - every live reading's increase per reported name, attributed
-  to the entity the name counted towards when it was observed.
-* ``usage_missing_name`` - the last total of a name the last reading lacked.
-* ``budget_usage`` - each budget's counter per period ("" is pending: increases
-  the next evaluation moves into the period it evaluates).
+  to the entity the name counted towards when it was observed, with the time
+  of the reading it is measured from (``since``).
+* ``usage_missing_name`` - the last total of a name the last reading lacked
+  (or whose fall a doubted reading reported), with when it was read and the
+  entity it counted towards.
+* ``budget_usage`` - each budget's counter per period of observation.
 * ``usage_entity_offset`` - how far names joining or leaving a project shifted
   its Auto Triage figure (Auto Triage attribution subtracts it).
 * ``unresolved_subject.automation_noticed_at`` - the "new automation identity"
@@ -25,6 +27,10 @@ its increases are counted from, and every name an earlier live reading had
 and the latest lacks is remembered with its last total (``usage_missing_name``),
 so its return adds only what it reported since.
 
+A database already at the unreleased usage-anchor schema (revision
+f9c1e4b7a2d3 as it once was) loses what that added here: its tables and
+columns are dropped if present.
+
 Downgrading drops the tables and the column: period budgets then go back to
 a baseline taken when their period opened (counters are lost; an open period
 keeps the baseline it had).
@@ -33,21 +39,35 @@ keeps the baseline it had).
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import sqlalchemy as sa
 
 from alembic import op
 
-revision = "f9c1e4b7a2d3"
-down_revision = "d8b3f6a2c5e1"
+revision = "b3e8d1f6a9c4"
+down_revision = "f9c1e4b7a2d3"
 branch_labels = None
 depends_on = None
 
 COUNTS_EXISTING_PERIODS = ("lifetime", "custom")
 DEMO_PERIOD_PARAM = "__demo__"
 FUSION_MODEL = "fusion_model:"
+# How far back each lookback window reaches (app.checkmarx.usage.PERIOD_DAYS).
+PERIOD_DAYS = {
+    "last_month": 31,
+    "last_30_days": 30,
+    "last_90_days": 90,
+    "last_180_days": 180,
+    "last_year": 365,
+}
+# What the unreleased usage-anchor schema added.
+ANCHOR_TABLES = ("usage_anchor", "usage_name_state")
+ANCHOR_COLUMNS = {
+    "usage_record": ("attributed_credits", "held_reason", "held_readings", "held_since"),
+    "limit_period_state": ("baseline_names",),
+}
 
 
 def _json(value: object) -> object:
@@ -119,34 +139,43 @@ def _seed_missing_names(bind, now: datetime) -> None:  # type: ignore[no-untyped
         seen: set[str] = set()
         rows = bind.execute(
             sa.text(
-                "SELECT r.subject_key, r.credits_used, r.actions, r.raw, s.collected_at "
+                "SELECT r.subject_key, r.credits_used, r.actions, r.raw, s.collected_at, "
+                "r.entity_id "
                 "FROM usage_record r JOIN usage_snapshot s ON s.id = r.snapshot_id "
                 "WHERE s.view_by = :view AND s.held_reason IS NULL AND s.period_param = :period "
                 "AND s.id <> :latest ORDER BY s.collected_at DESC, s.id DESC"
             ),
             {"view": view, "period": period, "latest": latest_id},
         )
-        for key, credits, actions, raw, collected_at in rows:
+        horizon = now - timedelta(days=PERIOD_DAYS.get(period, 365))
+        for key, credits, actions, raw, collected_at, entity_id in rows:
             if key in present or key in seen:
                 continue
             seen.add(key)
+            seen_at = _when(collected_at) or now
+            if seen_at < horizon:
+                continue  # nothing of that total is left in the window
             bind.execute(
                 sa.text(
                     "INSERT INTO usage_missing_name (view_by, subject_key, last_total, "
-                    "last_actions, missing_since, period_param) "
-                    "VALUES (:view, :key, :total, :actions, :since, :period)"
+                    "last_actions, missing_since, last_seen_at, period_param, entity_id, kind) "
+                    "VALUES (:view, :key, :total, :actions, :now, :since, :period, :entity, "
+                    "'missing')"
                 ).bindparams(
                     sa.bindparam("total", type_=sa.Numeric(18, 4)),
                     sa.bindparam("actions", type_=sa.JSON()),
                     sa.bindparam("since", type_=sa.DateTime(timezone=True)),
+                    sa.bindparam("now", type_=sa.DateTime(timezone=True)),
                 ),
                 {
                     "view": view,
                     "key": key,
                     "total": Decimal(str(credits or 0)),
                     "actions": _counts(actions, raw),
-                    "since": _when(collected_at) or now,
+                    "since": seen_at,
+                    "now": now,
                     "period": period,
+                    "entity": entity_id,
                 },
             )
 
@@ -186,6 +215,7 @@ def upgrade() -> None:
         sa.Column("credits", sa.Numeric(18, 4), nullable=False),
         sa.Column("actions", sa.JSON(), nullable=True),
         sa.Column("observed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("since", sa.DateTime(timezone=True), nullable=False),
         sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
         sa.UniqueConstraint("snapshot_id", "view_by", "subject_key", name="usage_delta_reading"),
     )
@@ -199,7 +229,10 @@ def upgrade() -> None:
         sa.Column("last_total", sa.Numeric(18, 4), nullable=False),
         sa.Column("last_actions", sa.JSON(), nullable=True),
         sa.Column("missing_since", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("period_param", sa.String(32), nullable=False),
+        sa.Column("entity_id", sa.String(64), nullable=True),
+        sa.Column("kind", sa.String(16), nullable=False, server_default="missing"),
         sa.UniqueConstraint("view_by", "subject_key", name="usage_missing_name_subject"),
     )
     op.create_table(
@@ -279,6 +312,17 @@ def upgrade() -> None:
             ),
             {"limit_id": limit_id, "key": period_key, "credits": credits, "now": now},
         )
+
+    # What the unreleased usage-anchor schema added, if this database has it.
+    for table in ANCHOR_TABLES:
+        if table in tables:
+            op.drop_table(table)
+    for table, columns in ANCHOR_COLUMNS.items():
+        present = [column for column in columns if column in _columns(bind, table)]
+        if present:
+            with op.batch_alter_table(table) as batch:
+                for column in present:
+                    batch.drop_column(column)
 
 
 def downgrade() -> None:

@@ -376,6 +376,9 @@ def ingest_usage(
         session, CxApplication, mappings.get(str(UsageView.APPLICATION))
     )
     groups_by_id, groups_by_name = _named_index(session, CxGroup)
+    # Whether a group or application budget is fed by its own row or by its
+    # projects is decided once, before any view is read.
+    own = ledger.own_figures(session)
 
     # Fetched at most once per run, and only if a dimension's support is still
     # unknown. See _confirm_not_a_fallback for why this is necessary.
@@ -449,6 +452,7 @@ def ingest_usage(
                 apps_by_name=apps_by_name,
                 groups_by_id=groups_by_id,
                 groups_by_name=groups_by_name,
+                own=own,
             )
             if dimension.held:
                 result.warnings.append(dimension.error or f"The {view} read was held back.")
@@ -556,6 +560,21 @@ class _Fetched:
     # Rows read across every page, before rows for the same subject (the same
     # email or name, reported more than once) were merged.
     rows: int = 0
+    # Rows served more than once (the same row on two pages, as when the
+    # ranking shifts between page requests): read once, never added up.
+    repeated: int = 0
+    # Distinct rows: different rows of one subject (a person under their email
+    # and under their name) are added up.
+    distinct: int = 0
+
+    @property
+    def suspect(self) -> bool:
+        """The completeness checks doubt this listing: a row was served twice,
+        or fewer distinct rows came back than the feed says it has. A fall in
+        such a reading is not believed (see ledger.record_reading)."""
+        return self.repeated > 0 or (
+            self.total_items is not None and self.distinct < self.total_items
+        )
 
     @property
     def total_credits(self) -> Decimal:
@@ -577,7 +596,9 @@ def _fetch_dimension(
     would become the "latest" one and be evaluated as though it were the truth.
     """
     raw_pages: list[dict] = []
-    merged: dict[str, usage_api.ParsedUsageItem] = {}
+    # subject -> row identity -> the row.
+    parts: dict[str, dict[tuple, usage_api.ParsedUsageItem]] = {}
+    repeated = 0
     total_items: int | None = None
     total_pages: int | None = None
     pages = 0
@@ -598,13 +619,28 @@ def _fetch_dimension(
         if page.total_pages is not None:
             total_pages = page.total_pages
         for item in page.items:
-            existing = merged.get(item.subject_key)
-            if existing is None:
-                merged[item.subject_key] = item
+            rows_of = parts.setdefault(item.subject_key, {})
+            identity = _row_identity(item)
+            seen = rows_of.get(identity)
+            if seen is None:
+                rows_of[identity] = item
             else:
-                # The same subject appearing on two pages would otherwise be
-                # overwritten rather than combined.
-                merged[item.subject_key] = _combine(existing, item)
+                # The same row served again (on the next page, after the
+                # ranking shifted): one row, never two. The higher reading of
+                # it is the later one (totals only grow within a read).
+                repeated += 1
+                if item.credits_used > seen.credits_used:
+                    rows_of[identity] = item
+
+    # Different rows of one subject (a person under their email and their
+    # name) are added up.
+    merged: dict[str, usage_api.ParsedUsageItem] = {}
+    for subject_key, rows_of in parts.items():
+        combined: usage_api.ParsedUsageItem | None = None
+        for item in rows_of.values():
+            combined = item if combined is None else _combine(combined, item)
+        if combined is not None:
+            merged[subject_key] = combined
 
     # The endpoint says how many pages there are. Stopping short of that (an empty
     # page in the middle, or the safety cap on page count) means consumption is
@@ -630,7 +666,29 @@ def _fetch_dimension(
         )
 
     return _Fetched(
-        raw_pages=raw_pages, merged=merged, total_items=total_items, pages=pages, rows=rows
+        raw_pages=raw_pages,
+        merged=merged,
+        total_items=total_items,
+        pages=pages,
+        rows=rows,
+        repeated=repeated,
+        distinct=sum(len(rows_of) for rows_of in parts.values()),
+    )
+
+
+def _row_identity(item: usage_api.ParsedUsageItem) -> tuple:
+    """What tells one consumption row from another: its id when it has one,
+    else its own name and email fields (two rows of one person differ in
+    them; the same row served twice does not)."""
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    if item.reported_id:
+        return ("id", item.reported_id)
+    return (
+        "row",
+        *(
+            str(raw.get(field) or "").strip().lower()
+            for field in ("name", "displayName", "userName", "username", "userEmail", "email")
+        ),
     )
 
 
@@ -719,6 +777,7 @@ def _store_dimension(
     apps_by_name: dict[str, str],
     groups_by_id: dict[str, str] | None = None,
     groups_by_name: dict[str, str] | None = None,
+    own: dict[str, set[str]] | None = None,
 ) -> DimensionResult:
     """Write one fully fetched dimension. Makes no network calls."""
     now = utcnow()
@@ -853,7 +912,7 @@ def _store_dimension(
     session.flush()
     # The increases since the last live reading, attributed to where each name
     # counts now, and added to the budgets fed now (see app/services/ledger.py).
-    ledger.record_reading(session, view, snapshot, stored)
+    ledger.record_reading(session, view, snapshot, stored, suspect=fetched.suspect, own=own)
 
     snapshot.total_credits = total
     result.total_credits = total
@@ -1102,6 +1161,9 @@ def move_subject(
     row follows the mapping (a real name match wins).
     """
     view = str(view)
+    # What the name used while it counted towards nothing is never claimed
+    # once an admin has decided where it counts: it counts from now on.
+    ledger.settle_waiting(session, view, subject_key)
     snapshot = latest_live_snapshot(session, view)
     record = (
         session.scalar(

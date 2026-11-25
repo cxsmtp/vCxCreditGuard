@@ -200,9 +200,13 @@ class UsageDelta(Base):
     counted is never taken back. See app/services/ledger.py for the rules.
 
     ``actions`` holds the increase per action type (``"fusion_model:<key>"``
-    entries per Fusion model). A row for a name that counted towards nothing
-    may be claimed later (``claimed_at``) by an entity first synced after it,
-    so a project created and used before the sync brought it keeps its usage.
+    entries per Fusion model). ``since`` is when the name's previous total was
+    read, so the increase happened between ``since`` and ``observed_at``; it
+    counts towards the budget period both fall in, and towards none when the
+    interval spans the period's start. A row for a name that counted towards
+    nothing may be claimed later (``claimed_at``) by an entity synced shortly
+    after it was observed, so a project created and used before the sync
+    brought it keeps its usage.
     """
 
     __tablename__ = "usage_delta"
@@ -217,6 +221,7 @@ class UsageDelta(Base):
     credits: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
     actions: Mapped[dict | None] = mapped_column(JSONColumn)
     observed_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    since: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     claimed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     __table_args__ = (
@@ -227,9 +232,18 @@ class UsageDelta(Base):
 
 
 class UsageMissingName(Base):
-    """A name the last live reading lacked: its last total, so that its return
-    adds only what it reported since, and so that a new name appearing as it
-    left (a rename the feed reported first) starts from it."""
+    """A name whose last total the ledger keeps, because the latest live
+    reading does not give it.
+
+    ``kind`` "missing": the reading lacked the name. Its return adds only what
+    it reported since, and a new name of the same entity (a rename), or one
+    appearing as it left, starts from it. Dropped once older than the lookback
+    window: nothing of that total can be left in the window then.
+
+    ``kind`` "dip": the name fell in a reading the completeness checks doubted
+    (a short or repeated page). The fall is not believed: the name continues
+    from this total until it recovers, or a believed reading confirms the fall.
+    """
 
     __tablename__ = "usage_missing_name"
 
@@ -239,7 +253,12 @@ class UsageMissingName(Base):
     last_total: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
     last_actions: Mapped[dict | None] = mapped_column(JSONColumn)
     missing_since: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    # When the reading that last gave ``last_total`` was taken.
+    last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     period_param: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The entity the name counted towards in that reading.
+    entity_id: Mapped[str | None] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
 
     __table_args__ = (
         UniqueConstraint("view_by", "subject_key", name="usage_missing_name_subject"),
@@ -247,12 +266,11 @@ class UsageMissingName(Base):
 
 
 class BudgetUsage(Base):
-    """A budget's usage counter for one period, from the ledger.
-
-    ``period_key`` "" is the pending counter: increases observed since the last
-    evaluation, which the evaluation moves into the period it is evaluating
-    (``ledger.consume_pending``). A budget's usage in a period is its counter,
-    and nothing else; old ledger rows can be thinned without touching it.
+    """A budget's usage counter for one period, from the ledger: the
+    increases observed in that period (whose interval lies within it) while a
+    name counted towards an entity that fed the budget. Every active budget is
+    fed, whatever its period type; one that counts usage already reported does
+    not read its counter. Pruned with the period states.
     """
 
     __tablename__ = "budget_usage"

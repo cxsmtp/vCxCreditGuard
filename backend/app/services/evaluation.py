@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
@@ -74,6 +74,7 @@ from app.models.org import (
     CxProjectGroup,
     CxUser,
 )
+from app.models.usage import BudgetUsage
 from app.services import (
     auto_triage_attribution,
     enforcement,
@@ -173,7 +174,21 @@ class UsageIndex:
         # Read on first use, once for every limit (reports and previews ask
         # about hundreds of limits in one request).
         self._states: dict[str, dict[int, LimitPeriodState]] = {}
+        self._counters: dict[str, dict[int, BudgetUsage]] = {}
         self._exempt: set[tuple[str, str]] | None = None
+
+    def counter(self, limit_id: int, period_key: str) -> tuple[Decimal, dict[str, int]] | None:
+        """A limit's ledger counter for a period, read for every limit at once
+        (None: there is none yet)."""
+        if period_key not in self._counters:
+            self._counters[period_key] = {
+                row.limit_id: row
+                for row in self._session.scalars(
+                    select(BudgetUsage).where(BudgetUsage.period_key == period_key)
+                )
+            }
+        row = self._counters[period_key].get(limit_id)
+        return (Decimal(row.credits or 0), dict(row.actions or {})) if row is not None else None
 
     def period_state(self, limit_id: int, period_key: str) -> LimitPeriodState | None:
         """The stored state of a limit's period, read for every limit at once."""
@@ -370,9 +385,9 @@ def evaluate_all(
     moment = now or utcnow()
     actor = actor or AuditActor.system("evaluator")
     result = EvaluationResult()
-    # The increases observed since the last evaluation join the period each
-    # budget is in now (app/services/ledger.py).
-    ledger.consume_pending(session, moment)
+    # Periods already over whose counters grew since they were last evaluated
+    # (an increase observed before the rollover, evaluated after it).
+    _settle_closed_periods(session, moment)
     index = UsageIndex(session)
     resolver = enforcement.RoleResolver(client) if client is not None else None
     budget: enforcement.EnforcementBudget | None = None
@@ -1519,6 +1534,13 @@ def _evaluate_one(
         moment=moment,
     )
 
+    # The period's ledger counter exists from its first evaluation on, so
+    # that a closed period is reconciled with it (``_settle_closed_periods``)
+    # once the budget counts its counter, whatever it counted meanwhile.
+    known = index.counter(limit.id, window.key)
+    counter = (
+        known[0] if known is not None else ledger.ensure_counter(session, limit.id, window.key)[0]
+    )
     if counts_from_totals(session, limit, window):
         # A budget that counts usage already reported: the current totals of
         # the names that count towards it. A sliding lookback window can drop
@@ -1534,7 +1556,7 @@ def _evaluate_one(
         used = max(Decimal("0"), reported_total - state.baseline_credits)
     else:
         # A period budget: what the ledger counted for it in this period.
-        used, _counts = ledger.period_usage(session, limit.id, window.key)
+        used = counter
         # Informational only: what of the reported total was there before.
         state.baseline_credits = max(Decimal("0"), reported_total - used)
         # What the period counted stays counted when nothing reports towards
@@ -1802,7 +1824,8 @@ def period_usage(
     if not counts_from_totals(session, limit, window):
         # The period's counter, and what the next evaluation will add to it;
         # kept when nothing reports towards the budget any more.
-        used, _counts = ledger.period_usage(session, limit.id, window.key, pending=True)
+        known = index.counter(limit.id, window.key)
+        used = known[0] if known is not None else Decimal("0")
         if not available and used <= 0:
             return Decimal("0"), False, None
         if available:
@@ -1822,6 +1845,42 @@ def period_usage(
     if attributed is not None:
         used += attributed.counted
     return used, True, attributed
+
+
+def _settle_closed_periods(session: Session, moment: datetime) -> int:
+    """Bring a closed period's usage up to its counter.
+
+    Counters are kept by the period an increase was observed in, so a reading
+    taken just before a rollover and evaluated after it still counts towards
+    the period it belongs to. Only periods that ended, of budgets that count
+    their counter, whose usage differs from it."""
+    rows = session.execute(
+        select(LimitPeriodState, BudgetUsage, CreditLimit)
+        .join(
+            BudgetUsage,
+            (BudgetUsage.limit_id == LimitPeriodState.limit_id)
+            & (BudgetUsage.period_key == LimitPeriodState.period_key),
+        )
+        .join(CreditLimit, CreditLimit.id == LimitPeriodState.limit_id)
+        .where(
+            LimitPeriodState.period_end.is_not(None),
+            LimitPeriodState.period_end <= moment,
+            LimitPeriodState.credits_used
+            != BudgetUsage.credits + func.coalesce(LimitPeriodState.attributed_credits, 0),
+        )
+    ).all()
+    settled = 0
+    for state, counter, limit in rows:
+        if ledger.counts_existing(limit):
+            continue
+        used = Decimal(counter.credits or 0) + Decimal(state.attributed_credits or 0)
+        if used != state.credits_used:
+            state.credits_used = used
+            settled += 1
+        state.last_evaluated_at = moment
+    if rows:
+        session.flush()
+    return settled
 
 
 def _get_or_create_state(

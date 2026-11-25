@@ -629,13 +629,21 @@ def _prune_policy_violations(session: Session, cutoff) -> int:
 
 
 def _prune_period_states(session: Session, cutoff) -> int:
-    """Closed period states older than the window. The current period is kept by
-    virtue of its period_start being recent."""
-    return _delete_where(
+    """Closed period states older than the window, and their ledger counters.
+    The current period is kept by virtue of its period_start being recent."""
+    from sqlalchemy import tuple_
+
+    from app.models.usage import BudgetUsage
+
+    old = (LimitPeriodState.period_end.is_not(None)) & (LimitPeriodState.period_end < cutoff)
+    _delete_where(
         session,
-        LimitPeriodState,
-        (LimitPeriodState.period_end.is_not(None)) & (LimitPeriodState.period_end < cutoff),
+        BudgetUsage,
+        tuple_(BudgetUsage.limit_id, BudgetUsage.period_key).in_(
+            select(LimitPeriodState.limit_id, LimitPeriodState.period_key).where(old)
+        ),
     )
+    return _delete_where(session, LimitPeriodState, old)
 
 
 def _prune_auto_triage_charges(session: Session, cutoff) -> int:
