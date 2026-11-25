@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, Integer, String, Text
+from sqlalchemy import Boolean, Index, Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -51,3 +51,16 @@ class EnforcementSelfTest(Base):
     summary: Mapped[str | None] = mapped_column(Text)
     # Every step of every target, with its diff and timings.
     result: Mapped[dict | None] = mapped_column(JSONColumn)
+
+    __table_args__ = (
+        # At most one run in progress, enforced by the database itself (a
+        # partial unique index, on SQLite and PostgreSQL alike): a second
+        # process, or a second worker, cannot start a run while one is going.
+        Index(
+            "uq_enforcement_selftest_running",
+            "status",
+            unique=True,
+            sqlite_where=text("status = 'running'"),
+            postgresql_where=text("status = 'running'"),
+        ),
+    )

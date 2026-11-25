@@ -1388,10 +1388,14 @@ def _lift_unjustified_restrictions(
             EnforcementAction.target_id,
             EnforcementAction.kind,
             EnforcementAction.reversal_reason,
+            EnforcementAction.period_key,
         )
         .where(EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES))
         .order_by(EnforcementAction.id)
     ).all()
+    # A demo self-test's restriction lives in the demo tenant, never this one:
+    # the demo retry lifts it (enforcement_selftest.retry_demo_holds).
+    rows = [row for row in rows if not _demo_selftest_row(row)]
     unsettled = [row.id for row in rows if row.status != EnforcementStatus.APPLIED]
     in_force_unsettled = {
         action.id
@@ -1441,7 +1445,12 @@ def _lift_unjustified_restrictions(
             # or the process stopped): complete it.
             reason = enforcement.ADMIN_REASON
         elif limit is None:
-            reason = "limit_removed"
+            # A self-test's restriction its restore left behind, or a deleted limit's.
+            reason = (
+                "selftest_cleanup"
+                if str(row.period_key or "").startswith(enforcement.SELFTEST_PERIOD_PREFIX)
+                else "limit_removed"
+            )
         elif (row.entity_type, row.entity_id) in exempt:
             reason = enforcement.EXEMPTED_REASON
         elif enforcement.deselected_kind(row.kind, row.target_type, limit):
@@ -1491,6 +1500,16 @@ def _lift_unjustified_restrictions(
             session.rollback()
             logger.warning("Could not lift the restrictions of limit %s", limit_id, exc_info=True)
             result.errors.append(f"limit {limit_id}: {error_text.public_error(exc)}")
+
+
+def _demo_selftest_row(row) -> bool:  # type: ignore[no-untyped-def]
+    from app.services import demo_service
+
+    return (
+        row.limit_id is None
+        and str(row.period_key or "").startswith(enforcement.SELFTEST_PERIOD_PREFIX)
+        and str(row.target_id).startswith(demo_service.DEMO_PREFIX)
+    )
 
 
 def _evaluate_one(

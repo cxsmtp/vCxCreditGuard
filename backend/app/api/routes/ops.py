@@ -24,7 +24,14 @@ from app.schemas.limits import (
     UpdateStatusResponse,
     WatchdogResponse,
 )
-from app.services import audit_chain, demo_service, ingestion, ops_hardening, settings_store
+from app.services import (
+    audit_chain,
+    demo_service,
+    enforcement_selftest,
+    ingestion,
+    ops_hardening,
+    settings_store,
+)
 from app.services import delivery as delivery_service
 from app.services import diagnostics as diagnostics_service
 from app.services import notifications as notification_service
@@ -103,13 +110,16 @@ def scheduler_status(ctx: CurrentUser, db: DbSession) -> SchedulerStatusResponse
         )
         or 0
     )
-    restricted = int(
-        db.scalar(
-            select(func.count(func.distinct(EnforcementAction.entity_id))).where(
-                EnforcementAction.status == EnforcementStatus.APPLIED
+    restricted = len(
+        set(
+            db.scalars(
+                select(func.distinct(EnforcementAction.entity_id)).where(
+                    EnforcementAction.status == EnforcementStatus.APPLIED
+                )
             )
         )
-        or 0
+        # In doubt (a write or a self-test restore not confirmed): may be in force.
+        | {action.entity_id for action in enforcement_selftest.unsettled_in_force(db)}
     )
     # The same number the dashboard and Diagnostics show (unmatched people).
     unresolved = int(

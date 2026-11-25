@@ -298,19 +298,77 @@ class TestProject:
         assert report["kinds"][0]["outcome"] == "not_restricted"
         assert "cannot turn it off" in " ".join(report["warnings"])
 
-    def test_an_inherited_fusion_value_pinned_by_the_restore_is_a_warning(
-        self, db: Session
-    ) -> None:
+    def test_an_inherited_fusion_value_is_not_tested(self, db: Session) -> None:
+        """Restore can only write Fusion at the project level, which would pin an
+        inherited value there: the self-test leaves it alone and says so."""
         tenant, client = setup_tenant(db)
         tenant.set_fusion_setting("proj-web", value="true", origin="Tenant")
+        before = dict(tenant.fusion_setting("proj-web"))
+
+        check = selftest.check(db, client, request_for(project="proj-web"), demo=False)
+        assert "inherited from the tenant" in " ".join(check.targets[0]["changes"])
+        assert "inherited from the tenant" in " ".join(check.warnings)
+
         row = run(db, client, project="proj-web", actions=["fusion"])
         report = target_report(row, "project")
         assert row.status == "warning", row.summary
-        assert setting(report, "Fusion: value")["restored_equal"]
-        origin = setting(report, "Fusion: origin level")
-        assert origin["informational"] and not origin["restored_equal"]
-        assert "set on the project itself" in " ".join(report["warnings"])
-        assert report["restore"]["held"] == []
+        assert [item["outcome"] for item in report["kinds"]] == ["not_applicable"]
+        assert "pin it on the project" in " ".join(report["warnings"])
+        assert not tenant.config_patches
+        assert tenant.fusion_setting("proj-web") == before
+        assert not run_actions(db, row)
+
+        # With other settings chosen, those are tested and Fusion still is not.
+        row = run(db, client, project="proj-api", actions=["auto_triage", "fusion"])
+        assert row.status == "passed"
+        tenant.set_fusion_setting("proj-api", value="false", origin="Tenant")
+        row = run(db, client, project="proj-api", actions=["auto_triage", "fusion"])
+        report = target_report(row, "project")
+        outcomes = {item["kind"]: item["outcome"] for item in report["kinds"]}
+        assert outcomes["disable_auto_triage"] == "applied"
+        assert outcomes["disable_fusion"] == "not_applicable"
+        assert tenant.fusion_setting("proj-api")["originLevel"] == "Tenant"
+        assert row.status == "warning"
+
+    def test_a_change_in_where_fusion_is_set_is_a_failure(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        original = tenant._project_config_response
+        patches = {"count": 0}
+
+        def drift_on_restore(request: httpx.Request, params):  # type: ignore[no-untyped-def]
+            response = original(request, params)
+            if request.method == "PATCH":
+                patches["count"] += 1
+                if patches["count"] == 2:  # the restore
+                    tenant.fusion_setting("proj-web")["originLevel"] = "Tenant"
+            return response
+
+        tenant._project_config_response = drift_on_restore  # type: ignore[method-assign]
+        row = run(db, client, project="proj-web", actions=["fusion"])
+        report = target_report(row, "project")
+        assert row.status == "failed", row.summary
+        assert not setting(report, "Fusion: origin level")["restored_equal"]
+        assert "Fusion: origin level" in step(report, "verify_restored")["detail"]
+
+    def test_a_pinned_ai_configuration_shows_as_a_failure(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        original = tenant._auto_triage_response
+        puts = {"count": 0}
+
+        def pin_on_restore(request: httpx.Request, path: str):  # type: ignore[no-untyped-def]
+            response = original(request, path)
+            if request.method == "PUT":
+                puts["count"] += 1
+                if puts["count"] == 2:  # the restore
+                    tenant.allow_ai_usage["proj-web"] = False
+            return response
+
+        tenant._auto_triage_response = pin_on_restore  # type: ignore[method-assign]
+        row = run(db, client, project="proj-web", actions=["auto_triage"])
+        report = target_report(row, "project")
+        assert setting(report, "AI agent configuration: scope")["before"] == "project"
+        assert not setting(report, "AI agent configuration: allowAiUsage")["restored_equal"]
+        assert row.status == "failed"
 
     def test_both_targets_in_one_run(self, db: Session) -> None:
         _tenant, client = setup_tenant(db)
@@ -960,3 +1018,223 @@ class TestDemo:
         with pytest.raises(selftest.SelfTestRefused) as caught:
             run(db, demo_tenant.client(), user="user-alice", demo=True)
         assert caught.value.refusals[0].code == "demo"
+
+
+# ------------------------------------------------------ review follow-ups
+
+
+def held_restriction(db: Session, client, tenant: FakeTenant):
+    """A self-test whose restore failed: Alice stays restricted, held in doubt."""
+    tenant.fail_requests[("POST", "/role-mappings/clients/")] = 400
+    row = run(db, client, user="user-alice")
+    assert row.status == "restore_failed"
+    [held] = run_actions(db, row)
+    tenant.fail_requests.clear()
+    return row, held
+
+
+class TestCleanup:
+    def test_restore_on_the_alert_keeps_a_real_budgets_restriction(
+        self, admin_client: TestClient, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant, client = setup_tenant(db)
+        monkeypatch.setattr(connection_service, "get_client", lambda _session: client)
+        _row, held = held_restriction(db, client, tenant)
+        limit = make_limit(db, entity_type=EntityType.USER, entity_id="user-alice")
+        enforcement.apply_enforcement(db, client, limit=limit, period_key="2026-11", actor=ACTOR)
+        db.commit()
+
+        response = admin_client.post(f"/api/notifications/enforcements/{held.id}/restore")
+        assert response.status_code == 200, response.text
+        db.expire_all()
+        held = db.get(EnforcementAction, held.id)
+        real = db.scalar(select(EnforcementAction).where(EnforcementAction.limit_id == limit.id))
+        assert held.status == EnforcementStatus.REVERSED
+        assert held.reversal_reason == selftest.SELFTEST_CLEANUP_REASON
+        assert real.status == EnforcementStatus.APPLIED
+        assert not AI & set(tenant.role_mappings["user-alice"])
+        # The real restriction now carries what must eventually be given back.
+        assert {e["name"] for e in real.undo_snapshot["removed_roles"]} == AI
+
+    def test_restore_on_the_alert_alone_gives_the_access_back(
+        self, admin_client: TestClient, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant, client = setup_tenant(db)
+        monkeypatch.setattr(connection_service, "get_client", lambda _session: client)
+        _row, held = held_restriction(db, client, tenant)
+        response = admin_client.post(f"/api/notifications/enforcements/{held.id}/restore")
+        assert response.status_code == 200, response.text
+        assert set(tenant.role_mappings["user-alice"]) >= AI
+
+    def test_the_sweep_lifts_a_hold_as_selftest_cleanup(self, db: Session) -> None:
+        tenant, client = setup_tenant(db)
+        _row, held = held_restriction(db, client, tenant)
+        evaluation.evaluate_all(db, client=client)
+        db.commit()
+        db.expire_all()
+        assert db.get(EnforcementAction, held.id).reversal_reason == "selftest_cleanup"
+        entry = db.scalar(
+            select(AuditLogEntry)
+            .where(AuditLogEntry.action == "enforcement.reversed")
+            .order_by(AuditLogEntry.id.desc())
+        )
+        assert "selftest_cleanup" in entry.detail
+        notice = db.scalar(select(Notification).where(Notification.title.like("%restored%")))
+        assert notice is not None and "self-test" in notice.body
+
+    def test_in_doubt_holds_count_as_restrictions_in_force(
+        self, admin_client: TestClient, db: Session
+    ) -> None:
+        tenant = populated_tenant()
+        tenant.add_user(user_id="u-held", username="held@example.com", roles=list(AI_ROLE_NAMES))
+        tenant, client = setup_tenant(db, tenant)
+        original = tenant._role_mapping_response
+
+        def drop_posts(request: httpx.Request, path: str) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(204)
+            return original(request, path)
+
+        tenant._role_mapping_response = drop_posts  # type: ignore[method-assign]
+        row = run(db, client, user="u-held")
+        [held] = run_actions(db, row)
+        assert held.status == EnforcementStatus.FAILED and enforcement.may_be_in_force(held)
+        assert [a.id for a in selftest.unsettled_in_force(db)] == [held.id]
+        status = admin_client.get("/api/ops/status").json()
+        assert any(value == 1 for key, value in status.items() if "restrict" in key), status
+
+
+class TestDemoHolds:
+    @pytest.fixture(autouse=True)
+    def fresh_demo_tenant(self):
+        demo_tenant.tenant().reset()
+        yield
+        demo_tenant.tenant().reset()
+
+    def held_demo(self, db: Session, monkeypatch: pytest.MonkeyPatch):
+        demo_service.seed(db)
+        settings_store.set_value(db, settings_store.KEY_DEMO_MODE, True)
+        db.commit()
+        real_iam = demo_tenant.DemoTenant._iam
+
+        def failing_posts(self, method, path, body):  # type: ignore[no-untyped-def]
+            if method == "POST" and "role-mappings" in path:
+                return httpx.Response(500, json={"message": "down"})
+            return real_iam(self, method, path, body)
+
+        monkeypatch.setattr(demo_tenant.DemoTenant, "_iam", failing_posts)
+        row = run(db, demo_tenant.client(), user="demo-user-ada", demo=True)
+        assert row.status == "restore_failed"
+        monkeypatch.setattr(demo_tenant.DemoTenant, "_iam", real_iam)
+        [held] = run_actions(db, row)
+        return held
+
+    def test_the_demo_cycle_restores_a_demo_hold(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.services import cycle
+
+        held = self.held_demo(db, monkeypatch)
+        assert not AI & set(demo_tenant.tenant().state["users"]["demo-user-ada"])
+        check = next(
+            c for c in diagnostics.run_diagnostics(db).checks if c.key == "enforcement_selftest"
+        )
+        assert check.status == diagnostics.FAIL
+
+        cycle.run_cycle(trigger="manual")
+
+        db.expire_all()
+        assert db.get(EnforcementAction, held.id).status == EnforcementStatus.REVERSED
+        assert set(demo_tenant.tenant().state["users"]["demo-user-ada"]) >= AI
+        check = next(
+            c for c in diagnostics.run_diagnostics(db).checks if c.key == "enforcement_selftest"
+        )
+        assert check.status != diagnostics.FAIL
+
+    def test_the_live_sweep_never_sends_a_demo_hold_to_the_tenant(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        live, client = setup_tenant(db)
+        held = self.held_demo(db, monkeypatch)
+        since = len(live.requests)
+        evaluation.evaluate_all(db, client=client)
+        db.commit()
+        assert not [p for _m, p in live.requests[since:] if "demo-" in p]
+        db.expire_all()
+        assert enforcement.may_be_in_force(db.get(EnforcementAction, held.id))
+
+
+class TestOneAtATime:
+    def test_the_database_refuses_a_second_running_row(self, db: Session) -> None:
+        from sqlalchemy.exc import IntegrityError
+
+        db.add(EnforcementSelfTest(started_at=utcnow(), status="running"))
+        db.commit()
+        db.add(EnforcementSelfTest(started_at=utcnow(), status="running"))
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+        db.add(EnforcementSelfTest(started_at=utcnow(), status="passed"))
+        db.add(EnforcementSelfTest(started_at=utcnow(), status="passed"))
+        db.commit()
+
+    def test_a_row_inserted_meanwhile_is_busy_not_an_error(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Another process inserts its running row after this one's check."""
+        _tenant, client = setup_tenant(db)
+        real = selftest._check_confirmation
+
+        def other_process_starts(targets, confirm):  # type: ignore[no-untyped-def]
+            real(targets, confirm)
+            other = get_session_factory()()
+            other.add(EnforcementSelfTest(started_at=utcnow(), status="running"))
+            other.commit()
+            other.close()
+
+        monkeypatch.setattr(selftest, "_check_confirmation", other_process_starts)
+        with pytest.raises(selftest.SelfTestBusy):
+            run(db, client, user="user-alice")
+
+    def test_a_stale_running_row_is_rewritten_as_interrupted(self, db: Session) -> None:
+        _tenant, client = setup_tenant(db)
+        stale = EnforcementSelfTest(
+            started_at=utcnow() - selftest.STALE_AFTER * 2, status="running"
+        )
+        db.add(stale)
+        db.commit()
+        assert run(db, client, user="user-alice").status == "passed"
+        db.expire_all()
+        stale = db.get(EnforcementSelfTest, stale.id)
+        assert stale.status == "interrupted"
+        assert stale.finished_at is not None and "Interrupted" in stale.summary
+
+    def test_a_scan_started_after_the_first_check_is_caught_under_the_lock(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant, client = setup_tenant(db)
+        # The first listing (before the lock) finds nothing; one starts before
+        # the second (under the lock).
+        calls = {"n": 0}
+        real_running = selftest._running_scans
+
+        def running_second_time(client_, project_id):  # type: ignore[no-untyped-def]
+            calls["n"] += 1
+            if calls["n"] == 2:
+                tenant.add_scan(
+                    project_id=project_id,
+                    scan_id="late-scan",
+                    initiator=None,
+                    completed_at=utcnow(),
+                    status="Queued",
+                )
+            return real_running(client_, project_id)
+
+        monkeypatch.setattr(selftest, "_running_scans", running_second_time)
+        since = len(tenant.requests)
+        row = run(db, client, project="proj-api", actions=["auto_triage"])
+        report = target_report(row, "project")
+        assert row.status == "failed"
+        assert not step(report, "checks")["ok"]
+        assert "scan is running or queued" in step(report, "checks")["detail"]
+        assert not writes(tenant, since)

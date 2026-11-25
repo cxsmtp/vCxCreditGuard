@@ -41,6 +41,7 @@ from app.models.usage import CreditBalanceSnapshot, SchedulerLock, SchedulerRun
 from app.services import (
     auto_triage_attribution,
     delivery,
+    enforcement_selftest,
     error_text,
     evaluation,
     ingestion,
@@ -377,6 +378,16 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
                 ),
                 actor=actor,
             ).as_stats()
+
+    def selftest_demo() -> None:
+        # A demo self-test's restriction its restore left behind lives in the
+        # in-process demo tenant: retried here, in demo mode or not, never
+        # against the live tenant.
+        retried = enforcement_selftest.retry_demo_holds(session, actor=actor)
+        if retried:
+            result.steps["selftest_demo"] = {"restored": retried}
+
+    _run_step(session, result, "selftest_demo", selftest_demo, degrades_run=False)
 
     # Demo mode: touch no live tenant - no sync, ingestion or enforcement. Still
     # evaluate the seeded data with no client (so demo limits get period state and

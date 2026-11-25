@@ -31,9 +31,17 @@ Safety, which is the point:
   incomplete after a restore that answered OK, it is put back the same way.
   A prominent notification, the audit log and the result all carry the
   exact snapshot. Nothing is left restricted silently.
+* **Never pins, never releases.** Fusion the project inherits is not tested:
+  Restore can only write it back at the project level, which would stop the
+  project following the tenant (README, Remaining unknowns #6). Lifting a
+  self-test restriction later uses ``SELFTEST_CLEANUP_REASON``, never the
+  admin's, so a real budget's restriction on the same target stays in force.
+  A demo self-test's restriction is only ever restored in the demo tenant.
 * **No transaction across a Checkmarx call.** Everything written before a
   tenant call is committed first (the restriction code does the same).
-* **One at a time.** A process lock admits one self-test; the target's own
+* **One at a time.** A process lock admits one self-test, and a partial
+  unique index on ``status = 'running'`` makes the database refuse a second
+  one from another process; the target's own
   lock (``enforcement._target_lock``, the one a cycle takes for each target)
   is held from the checks to the last read, so a cycle working on the same
   target waits for the self-test, and the self-test waits (briefly) for it.
@@ -50,12 +58,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.checkmarx import iam, platform, scans
@@ -95,8 +104,13 @@ logger = logging.getLogger(__name__)
 
 # Reversal reason on a self-test's restrictions.
 SELFTEST_REASON = "selftest"
+# Reversal reason when a self-test restriction left behind (its restore failed)
+# is lifted later: by the cycle's sweep, the demo retry or Restore on its alert.
+# Not the admin reason, so a real budget's restriction on the same target is
+# never released with it (see enforcement._restore_action_locked).
+SELFTEST_CLEANUP_REASON = "selftest_cleanup"
 # Period key of a self-test's restrictions: one per run, so each run's rows are its own.
-PERIOD_PREFIX = "selftest-"
+PERIOD_PREFIX = enforcement.SELFTEST_PERIOD_PREFIX
 # How many results are kept.
 KEEP_RESULTS = 20
 # How long the self-test waits for a cycle that is working on the same target.
@@ -231,7 +245,44 @@ def period_key_for(run_id: int) -> str:
 
 
 def is_selftest_action(action: EnforcementAction) -> bool:
-    return action.limit_id is None and str(action.period_key or "").startswith(PERIOD_PREFIX)
+    return enforcement.is_selftest(action)
+
+
+def is_demo_action(action: EnforcementAction) -> bool:
+    """A self-test restriction on a demo entity: it lives in the demo tenant."""
+    from app.services import demo_service
+
+    return is_selftest_action(action) and str(action.target_id).startswith(demo_service.DEMO_PREFIX)
+
+
+def client_for(
+    action: EnforcementAction, live: Callable[[], CheckmarxClient | None]
+) -> CheckmarxClient | None:
+    """The client a restore of this action must use: the built-in demo tenant
+    for a demo self-test's restriction (never the live tenant), else ``live()``."""
+    if is_demo_action(action):
+        from app.services import demo_tenant
+
+        return demo_tenant.client()
+    return live()
+
+
+def restore_reason_for(action: EnforcementAction, requested: str) -> str:
+    """The reason to restore with: a self-test's restriction is always cleaned
+    up as such, so an admin's Restore on it releases no real budget's hold."""
+    return SELFTEST_CLEANUP_REASON if is_selftest_action(action) else requested
+
+
+# Said wherever Fusion is skipped because the project inherits it.
+FUSION_INHERITED = (
+    "Fusion is inherited from the tenant; the self-test does not change it, because "
+    "restoring would pin it on the project (Restore can only write a value at the project "
+    "level). The repository's Fusion setting goes with it and is not tested either."
+)
+
+
+def _fusion_inherited(reading: Reading | None) -> bool:
+    return reading is not None and reading.settings.get("Fusion: set on the project") is False
 
 
 # ---------------------------------------------------------------- refusals
@@ -537,19 +588,6 @@ _OWNED: dict[str, tuple[str, ...]] = {
     EnforcementKind.DISABLE_FUSION.value: ("Fusion: value", "Fusion: allowOverride"),
     EnforcementKind.DISABLE_REPO_FUSION.value: ("Repository Fusion (fusionScanConfig)",),
 }
-# Compared and shown, but a difference is a known effect of restoring, not a
-# failure: putting Fusion back writes it at the project level (no per-key
-# delete is known), so an inherited value becomes the project's own.
-_INFORMATIONAL: dict[str, str] = {
-    "Fusion: origin level": (
-        "Restore writes Fusion back at the project level, so a value the project "
-        "inherited is now set on the project itself (same value)."
-    ),
-    "Fusion: set on the project": (
-        "Restore writes Fusion back at the project level, so a value the project "
-        "inherited is now set on the project itself (same value)."
-    ),
-}
 
 
 def _owner_of(setting: str) -> str | None:
@@ -615,7 +653,12 @@ def _read_project(
         settings["Auto Triage: on"] = state.enabled
         settings["Auto Triage: configuration"] = state.config
         settings["Auto Triage: allowOverride"] = state.allow_override
-        entries = (state.raw or {}).get("configurations")
+        # Where the configuration comes from, and the inherited AI switch: a
+        # write that pinned either on the project shows as a difference.
+        settings["AI agent configuration: scope"] = state.scope if state.scope else ABSENT
+        raw = state.raw or {}
+        settings["AI agent configuration: allowAiUsage"] = raw.get("allowAiUsage", ABSENT)
+        entries = raw.get("configurations")
         settings["AI agent configuration: other features"] = {
             str(entry.get("feature")): entry
             for entry in (entries if isinstance(entries, list) else [])
@@ -749,33 +792,51 @@ def _plan_lines(
         if kind == EnforcementKind.DISABLE_AUTO_TRIAGE:
             now = settings.get("Auto Triage: on")
             lines.append(
-                f"{words}: on → off, then back on."
+                f"{words}: on → off, then turned back on with the configuration read "
+                "before; the test checks it then reads exactly as before."
                 if now is True
                 else f"{words}: already off, so nothing is written (checked only)."
                 if now is not None
-                else f"{words}: turned off if it is on, then put back."
+                else f"{words}: turned off if it is on, then turned back on as read before; "
+                "the test checks it then reads exactly as before."
             )
         elif kind == EnforcementKind.DISABLE_PR_REMEDIATION:
             now = settings.get("PR triage and remediation: severities")
             lines.append(
-                f"{words}: severities {_show(now)} → none, then back to {_show(now)}."
+                f"{words}: severities {_show(now)} → none, then written back as "
+                f"{_show(now)}; the test checks they then read exactly as before."
                 if isinstance(now, list)
-                else f"{words}: severities cleared, then put back."
+                else f"{words}: severities cleared, then written back as read before; the "
+                "test checks they then read exactly as before."
             )
         elif kind == EnforcementKind.DISABLE_FUSION:
+            if _fusion_inherited(reading):
+                lines.append(f"{words}: not tested. {FUSION_INHERITED}")
+                continue
             now = settings.get("Fusion: value")
             lock = settings_store.fusion_lock_enabled(session)
             lines.append(
                 f"{words}: {_show(now) if now is not None else 'its value'} → false"
                 + (" and locked against per-scan override" if lock else "")
-                + ", then put back as it was."
+                + ", then written back with the value and lock read before; the test checks "
+                "it then reads exactly as before, the level it is set at included."
+                + (
+                    ""
+                    if reading is not None
+                    else " If it turns out to be inherited from the tenant, it is not tested."
+                )
             )
         elif kind == EnforcementKind.DISABLE_REPO_FUSION:
+            if _fusion_inherited(reading):
+                continue
             now = settings.get("Repository Fusion (fusionScanConfig)")
             if now == ABSENT:
                 lines.append(f"{words}: not present on this repository; nothing to change.")
             else:
-                lines.append(f"{words}: enabled → false, then put back as it was.")
+                lines.append(
+                    f"{words}: enabled → false, then written back as read before; the test "
+                    "checks it then reads exactly as before."
+                )
     if not kinds:
         lines.append("Nothing: none of the chosen settings applies to this project.")
     return lines
@@ -849,6 +910,12 @@ def check(
                 live = _live_protection(session, target, reading)
                 if live is not None:
                     refusals.append(live)
+            if (
+                not target.is_user
+                and EnforcementKind.DISABLE_FUSION in kinds
+                and _fusion_inherited(reading)
+            ):
+                warnings.append(f"{target.label}: {FUSION_INHERITED}")
             if not target.is_user:
                 session.commit()  # nothing open while the scans are listed
                 refusal, warning = _scan_check(client, target)
@@ -915,6 +982,36 @@ def _running_row(session: Session) -> EnforcementSelfTest | None:
     )
 
 
+def _mark_interrupted(session: Session) -> None:
+    """A run still "running" long after it started belongs to a process that
+    stopped: it is recorded as interrupted (and frees the one-run slot). What
+    it left restricted is an ordinary restriction the cycle lifts."""
+    stale = list(
+        session.scalars(
+            select(EnforcementSelfTest).where(
+                EnforcementSelfTest.status == STATUS_RUNNING,
+                EnforcementSelfTest.started_at <= utcnow() - STALE_AFTER,
+            )
+        )
+    )
+    for row in stale:
+        row.status = STATUS_INTERRUPTED
+        row.finished_at = row.finished_at or utcnow()
+        row.summary = row.summary or (
+            "Interrupted: the process stopped while the self-test ran. Anything it left "
+            "restricted is lifted by the next cycle."
+        )
+    if stale:
+        session.commit()
+
+
+def _audit_label(labels: Iterable[str]) -> str | None:
+    """Labels for an audit entry, cut to the column's width here: the entry's
+    hash is taken over the value as given, so it must not be trimmed later."""
+    joined = ", ".join(labels)
+    return joined[:512] or None
+
+
 def _settle(session: Session) -> None:
     """End the open transaction: commit it, or roll it back if it cannot be."""
     try:
@@ -960,6 +1057,7 @@ def _run_locked(
     confirm: dict[str, str | None],
     demo: bool,
 ) -> EnforcementSelfTest:
+    _mark_interrupted(session)
     if _running_row(session) is not None:
         raise SelfTestBusy("Another self-test is running. Wait for it to finish.")
     targets, refusals = resolve_targets(session, request)
@@ -984,7 +1082,7 @@ def _run_locked(
             action="selftest.refused",
             actor=actor,
             target_type=AUDIT_TARGET,
-            target_label=", ".join(target.label for target in targets) or None,
+            target_label=_audit_label(target.label for target in targets),
             after={"refusals": [refusal.as_dict() for refusal in refusals]},
             detail=" ".join(refusal.sentence() for refusal in refusals),
         )
@@ -1006,14 +1104,19 @@ def _run_locked(
         result={"notes": notes, "warnings": warnings, "targets": []},
     )
     session.add(row)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        # The partial unique index: another process started a run meanwhile.
+        session.rollback()
+        raise SelfTestBusy("Another self-test is running. Wait for it to finish.") from exc
     record_audit(
         session,
         action="selftest.started",
         actor=actor,
         target_type=AUDIT_TARGET,
         target_id=str(row.id),
-        target_label=", ".join(target.label for target in targets),
+        target_label=_audit_label(target.label for target in targets),
         after={
             "targets": [target.as_dict() for target in targets],
             "project_actions": list(request.project_actions) if project else [],
@@ -1088,7 +1191,7 @@ def _finish(
             actor=actor,
             target_type=AUDIT_TARGET,
             target_id=str(row.id),
-            target_label=", ".join(report["label"] for report in reports) or None,
+            target_label=_audit_label(report["label"] for report in reports),
             after={"status": status, "summary": row.summary},
             detail=f"Enforcement self-test {status.replace('_', ' ')}: {row.summary}",
         )
@@ -1246,10 +1349,16 @@ def _test_target_locked(
     demo = bool(run.demo)
 
     def recheck() -> tuple[None, bool, str]:
-        # The cycle may have restricted it while this run waited for the lock.
+        # The cycle may have restricted it while this run waited for the lock,
+        # and a scan may have started since the first check.
         again = _db_refusals(session, target, demo=demo)
         if again:
             return None, False, " ".join(refusal.reason for refusal in again)
+        if not target.is_user:
+            session.commit()  # nothing open while the scans are listed
+            refusal, _warning = _scan_check(client, target)
+            if refusal is not None:
+                return None, False, refusal.reason
         return None, True, "Not restricted, not near a budget, not protected or exempt."
 
     steps.run("checks", "Safety checks (under the target's lock)", recheck)
@@ -1279,13 +1388,46 @@ def _test_target_locked(
         # Nothing was changed: no restriction was attempted.
         return
 
+    # What is applied: every kind read, except Fusion when the project
+    # inherits it (restoring it would pin it on the project). It is still read
+    # before and after, which shows it was left alone.
+    apply_actions = [] if target.is_user else list(request.project_actions)
+    apply_kinds = list(kinds)
+    skipped: list[dict[str, Any]] = []
+    if not target.is_user and _fusion_inherited(before):
+        fusion_kinds = [
+            kind
+            for kind in kinds
+            if kind in (EnforcementKind.DISABLE_FUSION, EnforcementKind.DISABLE_REPO_FUSION)
+        ]
+        if fusion_kinds:
+            apply_actions = [a for a in apply_actions if a != ProjectAction.FUSION]
+            apply_kinds = [kind for kind in kinds if kind not in fusion_kinds]
+            skipped = [
+                {
+                    "kind": kind,
+                    "action_id": None,
+                    "outcome": "not_applicable",
+                    "detail": FUSION_INHERITED,
+                }
+                for kind in fusion_kinds
+            ]
+            report["warnings"].append(FUSION_INHERITED)
+    report["kinds"] = [
+        {"kind": kind, "outcome": "planned", "detail": ""} for kind in apply_kinds
+    ] + skipped
+    if not apply_kinds:
+        # Nothing left to change (an empty action list would mean the legacy
+        # pair to the restriction code, so it is never passed on).
+        return
+
     restricted: Reading | None = None
     try:
         limit = _TestLimit(
             entity_type=EntityType.USER if target.is_user else EntityType.PROJECT,
             entity_id=target.target_id,
             entity_label=f"{target.label} (self-test #{run.id})",
-            project_actions=None if target.is_user else list(request.project_actions),
+            project_actions=None if target.is_user else apply_actions,
         )
 
         def apply() -> tuple[enforcement.EnforcementOutcome, bool, str]:
@@ -1300,7 +1442,10 @@ def _test_target_locked(
                     resolver=resolver,
                 )
             session.commit()
-            ok, detail = _classify(session, target, period_key, kinds, outcome, before, report)
+            ok, detail = _classify(
+                session, target, period_key, apply_kinds, outcome, before, report
+            )
+            report["kinds"] = report["kinds"] + skipped
             return outcome, ok, detail
 
         steps.run("apply", "Apply the restriction (the budget-breach code path)", apply)
@@ -1708,11 +1853,6 @@ def _compare_restored(before: Reading, after: Reading, report: dict[str, Any]) -
         if was == UNREADABLE or now == UNREADABLE:
             report["warnings"].append(f"{name} could not be compared (not readable).")
             continue
-        if name in _INFORMATIONAL:
-            report["warnings"].append(
-                f"{name}: {_show(was)} → {_show(now)}. {_INFORMATIONAL[name]}"
-            )
-            continue
         differences.append(f"{name}: {_describe_change(was, now)}")
     if differences:
         return False, "Not as before: " + "; ".join(differences)
@@ -1748,7 +1888,6 @@ def _diff_rows(
                 "changed": mid != was and mid != UNREADABLE,
                 "restored_equal": end == was,
                 "owned_by": _owner_of(name),
-                "informational": name in _INFORMATIONAL,
             }
         )
     return rows
@@ -1881,6 +2020,60 @@ def _target_summary(report: dict[str, Any]) -> str:
     elif report["failures"]:
         extra = f" ({report['failures'][0][:200]})"
     return f"{report['label']}: {words} in {seconds:.1f} s{extra}"
+
+
+# ---------------------------------------------------------------- demo holds
+
+
+def retry_demo_holds(session: Session, *, actor: AuditActor) -> int:
+    """Restore every demo self-test restriction still in force, in the demo
+    tenant (the cycle's sweep, which talks to the live tenant, leaves them
+    alone). Returns how many were restored."""
+    from app.services import demo_service, demo_tenant
+
+    held = [
+        action
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.limit_id.is_(None),
+                EnforcementAction.period_key.like(f"{PERIOD_PREFIX}%"),
+                EnforcementAction.target_id.like(f"{demo_service.DEMO_PREFIX}%"),
+                EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES),
+            )
+        )
+        if enforcement.may_be_in_force(action)
+    ]
+    if not held:
+        return 0
+    client = demo_tenant.client()
+    restored = 0
+    for action in held:
+        try:
+            if enforcement.restore_action(
+                session, client, action=action, actor=actor, reason=SELFTEST_CLEANUP_REASON
+            ):
+                restored += 1
+            session.commit()
+        except CheckmarxError:
+            # Recorded on the action by restore_action; tried again next cycle.
+            session.commit()
+            logger.warning("Could not restore demo self-test restriction %s", action.id)
+    return restored
+
+
+def unsettled_in_force(session: Session) -> list[EnforcementAction]:
+    """Restrictions that are not "applied" but may be in force: a write (or a
+    self-test's restore) whose outcome is in doubt. Counted with the applied
+    ones wherever restrictions in force are counted."""
+    return [
+        action
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.status.in_((EnforcementStatus.PENDING, EnforcementStatus.FAILED))
+            )
+        )
+        if enforcement.may_be_in_force(action)
+    ]
 
 
 # -------------------------------------------------------------------- reading

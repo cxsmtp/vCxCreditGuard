@@ -2186,9 +2186,17 @@ run it. For each target it:
 4. restores it from the undo snapshot **through the Restore path**;
 5. reads it back again and compares with step 1, setting by setting. Lists are
    compared regardless of order (Checkmarx may list roles in another order),
-   but exactly otherwise: a role someone granted meanwhile is a difference.
-   Writing Fusion back pins an inherited value on the project (no per-key
-   delete is known), which is shown as a warning, not a failure.
+   but exactly otherwise: a role someone granted meanwhile is a difference,
+   and so is a setting that changed where it is set (the level a Fusion value
+   comes from, the AI configuration's `scope` and `allowAiUsage`).
+
+**Fusion inherited from the tenant is not tested.** Restore can only write a
+Fusion value back at the project level, which would pin an inherited value
+there for good (see [Remaining unknowns](#remaining-unknowns) #6). So when the
+read in step 1 shows the project inherits Fusion, the self-test leaves Fusion
+(and the repository's Fusion setting, which goes with it) alone, marks it *not
+applicable* and says so on the check and in the result; the other settings are
+tested as usual.
 
 The result has a before / restricted / restored diff per setting, pass or fail
 per step and the time each took. The last 20 results are kept, and Diagnose
@@ -2208,15 +2216,25 @@ Safety:
   `selftest-<run>`). If its restore fails, or answers OK but does not read back,
   it is marked as in doubt (`outcome_unknown`) and stays a tracked
   restriction: a critical notification with *Restore* on it and the exact
-  snapshot is raised, the result shows the snapshot, and the next cycle lifts
-  it like any restriction whose budget is gone. A target is never left
-  restricted silently.
+  snapshot is raised, the result shows the snapshot, and the next cycle's
+  sweep lifts it (reason `selftest_cleanup`). It is counted with the
+  restrictions in force meanwhile. A target is never left restricted silently.
+- **A self-test never releases a real budget's restriction.** Lifting one of
+  its restrictions (the sweep, or *Restore* on its alert) uses the
+  `selftest_cleanup` reason, never the admin's: if a real budget restricts the
+  same target by then, what the self-test recorded is handed over to that
+  restriction, which stays in force.
 - **No database transaction is held across a Checkmarx call**: what is about to
   be done is committed first, as for every restriction.
-- **One at a time.** A second self-test is refused while one runs, and the
-  self-test holds the target's own lock (the one the cycle takes for each
-  target) from its checks to its last read, so a cycle working on the same
-  target waits for it (and it waits up to 30 seconds for the cycle).
+- **One at a time.** A second self-test is refused while one runs: in the
+  process, and in the database by a partial unique index on the result
+  table's `running` status (so a second process cannot start one either). A
+  run left "running" by a process that stopped is recorded as interrupted
+  after 15 minutes. The self-test holds the target's own lock (the one the
+  cycle takes for each target) from its checks to its last read, so a cycle
+  working on the same target waits for it (and it waits up to 30 seconds for
+  the cycle); the refusal checks and the running-scan check are repeated under
+  that lock.
 - **Audited**: start, every step, the restore and the outcome, in the
   hash-chained audit log, next to the restriction's own entries. The
   "restricted" and "restored" notifications the restriction code would raise
@@ -2226,7 +2244,10 @@ Safety:
   enforcement is on. In demo mode it runs against a small built-in demo tenant
   (made-up data, nothing leaves the process), only on the demo users and
   projects, and says so; one demo user keeps a Fusion role through a group, to
-  show a restriction that cannot bite.
+  show a restriction that cannot bite. A demo restriction whose restore
+  failed is retried against the demo tenant by every cycle (demo mode or
+  not), and its Restore button uses the demo tenant too: it is never sent to
+  Checkmarx One.
 
 ### Accounts
 
@@ -2544,6 +2565,17 @@ They are listed because each has a cost worth knowing about.
    (`inherited_before`, `is_persisted_before`) and said in the restriction and
    restore messages; Restore still writes the previous value back on the
    project.
+
+   **The effect, plainly:** after a real budget has turned Fusion off on a
+   project that inherited it (with the Fusion lock on, the default, this
+   includes a project that inherited Fusion *off*: the lock alone is written),
+   Restore leaves the project with its own Fusion value. The value is the
+   same, but the project no longer follows the tenant: a later change to
+   Fusion at the tenant level does not reach it until someone resets it to
+   inherited in Checkmarx One. The enforcement self-test does not touch an
+   inherited Fusion value for this reason. Fixing Restore waits for the
+   tenant's "reset to inherited" request to be captured (see above); no
+   guessed `DELETE` is sent.
 
 7. **Where a user's roles come from.** The effective-roles, user-groups,
    group-role-mapping and composite-role reads follow Keycloak's admin REST API

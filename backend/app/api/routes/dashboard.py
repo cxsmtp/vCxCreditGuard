@@ -52,6 +52,7 @@ from app.schemas.dashboard import (
 )
 from app.services import (
     auto_triage_attribution,
+    enforcement_selftest,
     ingestion,
     key_permissions,
     settings_store,
@@ -188,7 +189,7 @@ def get_dashboard(
             .where(EnforcementAction.status == EnforcementStatus.APPLIED)
         )
         or 0
-    )
+    ) + len(enforcement_selftest.unsettled_in_force(db))  # in doubt: may be in force
     limits_configured = int(db.scalar(select(func.count()).select_from(CreditLimit)) or 0)
     limits_enforcing = int(
         db.scalar(

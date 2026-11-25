@@ -561,7 +561,7 @@ def add_exemption(
 
     # An exemption that leaves an existing restriction in place would be a trap.
     if client is not None:
-        from app.services import enforcement
+        from app.services import enforcement, enforcement_selftest
 
         for action in enforcement.active_actions_for(
             session, entity_type=entity_type, entity_id=entity_id
@@ -569,7 +569,8 @@ def add_exemption(
             try:
                 enforcement.restore_action(
                     session,
-                    client,
+                    # A demo self-test's restriction lives in the demo tenant.
+                    enforcement_selftest.client_for(action, lambda: client),
                     action=action,
                     actor=actor,
                     reason=enforcement.EXEMPTED_REASON,

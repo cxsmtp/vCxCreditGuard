@@ -20,7 +20,7 @@ from app.schemas.limits import (
     NotificationResponse,
 )
 from app.services import connection as connection_service
-from app.services import enforcement
+from app.services import enforcement, enforcement_selftest
 from app.services import notifications as notification_service
 
 logger = logging.getLogger(__name__)
@@ -262,7 +262,8 @@ def restore_access(action_id: int, ctx: AdminUser, db: DbSession) -> dict[str, o
         }
 
     try:
-        client = connection_service.get_client(db)
+        # A demo self-test's restriction lives in the built-in demo tenant.
+        client = enforcement_selftest.client_for(action, lambda: connection_service.get_client(db))
     except CheckmarxError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -274,7 +275,13 @@ def restore_access(action_id: int, ctx: AdminUser, db: DbSession) -> dict[str, o
 
     try:
         restored = enforcement.restore_action(
-            db, client, action=action, actor=ctx.actor, reason=enforcement.ADMIN_REASON
+            db,
+            client,
+            action=action,
+            actor=ctx.actor,
+            # A self-test's restriction is cleaned up as such: a real budget's
+            # restriction on the same target stays in force.
+            reason=enforcement_selftest.restore_reason_for(action, enforcement.ADMIN_REASON),
         )
     except CheckmarxError as exc:
         db.commit()  # keep the failure notification and audit entry

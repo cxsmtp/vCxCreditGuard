@@ -1112,7 +1112,6 @@ export interface SelfTestSettingRow {
   changed: boolean;
   restored_equal: boolean;
   owned_by: string | null;
-  informational: boolean;
 }
 
 export interface SelfTestTargetReport {

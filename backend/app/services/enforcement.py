@@ -86,6 +86,17 @@ EXEMPTED_REASON = "exempted"
 ADMIN_REASON = "admin"
 # The limit no longer turns this off (an admin changed what it turns off).
 DESELECTED_REASON = "action_deselected"
+# Period key prefix of the enforcement self-test's restrictions (they have no
+# limit). See app/services/enforcement_selftest.py.
+SELFTEST_PERIOD_PREFIX = "selftest-"
+
+
+def is_selftest(action: EnforcementAction) -> bool:
+    """A restriction the enforcement self-test made (no limit, its own period)."""
+    return action.limit_id is None and str(action.period_key or "").startswith(
+        SELFTEST_PERIOD_PREFIX
+    )
+
 
 # Which project action each project kind belongs to.
 PROJECT_ACTION_OF_KIND: dict[str, str] = {
@@ -3084,7 +3095,11 @@ def _restore_action_locked(
     # An admin's Restore, or the target itself becoming exempt or protected,
     # means nobody may restrict it: every limit holding it lets go together.
     # Anything else is about this one limit, and the others keep their hold.
-    release_target = reason == ADMIN_REASON or target_released(session, action) is not None
+    # A self-test's own restriction is never a reason to let go of a real
+    # budget's: Restore on it hands its snapshot over like any other lift.
+    release_target = (reason == ADMIN_REASON and not is_selftest(action)) or target_released(
+        session, action
+    ) is not None
     if siblings and not release_target:
         # Another limit still restricts this target, so nothing is given back in
         # Checkmarx yet. What this action knows about the original state is
@@ -3910,6 +3925,10 @@ def _restoration_body(action: EnforcementAction, snapshot: dict[str, Any], reaso
             "so the restriction was lifted."
         ),
         EXEMPTED_REASON: "An exemption was granted for this entity, so the restriction was lifted.",
+        "selftest_cleanup": (
+            "An enforcement self-test's restriction, which its own restore had not given back, "
+            "was lifted."
+        ),
         DESELECTED_REASON: (
             "The limit no longer turns this off (its choice of what to turn off was changed), "
             "so it was put back."

@@ -589,9 +589,7 @@ function TargetDetail({ target }: { target: SelfTestTargetReport }) {
                   <Value value={row.restored} />
                 </Td>
                 <Td>
-                  <Badge
-                    tone={row.restored_equal ? "good" : row.informational ? "warning" : "critical"}
-                  >
+                  <Badge tone={row.restored_equal ? "good" : "critical"}>
                     {row.restored_equal ? "Yes" : "No"}
                   </Badge>
                 </Td>

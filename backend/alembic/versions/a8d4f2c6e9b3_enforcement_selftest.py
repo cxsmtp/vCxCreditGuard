@@ -10,6 +10,10 @@ restored and read back again, with a per-setting diff (before / restricted /
 restored), pass or fail and timings for every step. New and empty; the
 restrictions a self-test makes are ordinary ``enforcement_action`` rows.
 
+A partial unique index on ``status = 'running'`` lets the database itself
+refuse a second run in progress (SQLite and PostgreSQL both support partial
+indexes), whichever process or worker starts it.
+
 Merge note: the ``activity-feed`` branch adds its own migration
 ``c9f2b6d4e8a1`` on top of the same parent (``c9f2a6e1d4b7``). Whichever of the
 two branches is merged second must re-chain its migration onto the other's
@@ -46,8 +50,18 @@ def upgrade() -> None:
         sa.Column("result", sa.JSON(), nullable=True),
     )
     op.create_index("ix_enforcement_selftest_started_at", "enforcement_selftest", ["started_at"])
+    # One run in progress at a time, held by the database (partial unique index).
+    op.create_index(
+        "uq_enforcement_selftest_running",
+        "enforcement_selftest",
+        ["status"],
+        unique=True,
+        sqlite_where=sa.text("status = 'running'"),
+        postgresql_where=sa.text("status = 'running'"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("uq_enforcement_selftest_running", table_name="enforcement_selftest")
     op.drop_index("ix_enforcement_selftest_started_at", table_name="enforcement_selftest")
     op.drop_table("enforcement_selftest")
