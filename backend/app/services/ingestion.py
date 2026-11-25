@@ -587,6 +587,8 @@ class _Fetched:
     # Distinct rows: different rows of one subject (a person under their email
     # and under their name) are added up.
     distinct: int = 0
+    # User view: per subject, how many display-name-only rows it was read as.
+    display_rows: dict[str, int] = field(default_factory=dict)
 
     @property
     def suspect(self) -> bool:
@@ -709,6 +711,12 @@ def _fetch_dimension(
         rows=rows,
         repeated=repeated,
         distinct=sum(len(rows_of) for rows_of in parts.values()),
+        display_rows={
+            subject_key: sum(1 for identity in rows_of if identity[0] == "display")
+            for subject_key, rows_of in parts.items()
+        }
+        if view == UsageView.USER
+        else {},
     )
 
 
@@ -959,6 +967,9 @@ def _store_dimension(
             transactions=item.transactions,
             actions=item.actions or None,
             raw=item.raw,
+            display_rows=fetched.display_rows.get(item.subject_key)
+            if view == UsageView.USER
+            else None,
         )
         session.add(record)
         stored.append(record)

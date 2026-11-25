@@ -110,6 +110,11 @@ class UsageRecord(Base):
     # reading to reading by the ledger. Once that is older than the lookback
     # window, nothing the name reported can still be in it.
     last_rise_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # User view: how many display-name-only rows (no id, no email) the
+    # subject was read as. When it changes between readings, two people who
+    # share a display name were split or joined by the page layout, and the
+    # ledger counts nothing for that reading.
+    display_rows: Mapped[int | None] = mapped_column(Integer)
 
     snapshot: Mapped[UsageSnapshot] = relationship(back_populates="records")
 
