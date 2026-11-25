@@ -466,6 +466,11 @@ def record_reading(
         earlier = previous_rows[key]
         shifts.leave(earlier.entity_id, earlier)
         row = kept.get(key)
+        if row is not None and row.kind == REBASE:
+            # Not yet rebased by a believed reading: its last totals may be a
+            # glitch, so it stays to start from what it reports on return.
+            row.missing_since = now
+            continue
         if row is None:
             row = UsageMissingName(view_by=view, subject_key=key)
             session.add(row)

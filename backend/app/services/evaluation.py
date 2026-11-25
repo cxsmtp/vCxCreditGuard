@@ -1808,9 +1808,10 @@ def restriction_started(session: Session, limit_id: int, period_key: str) -> boo
     pending (being rolled out, or written with an unknown outcome). Carrying
     it on is not a new restriction (``summary_hold``); a failed one is not in
     force, and trying it again would be."""
-    return (
-        session.scalar(
-            select(EnforcementAction.id).where(
+    return any(
+        enforcement.may_be_in_force(action)
+        for action in session.scalars(
+            select(EnforcementAction).where(
                 EnforcementAction.limit_id == limit_id,
                 EnforcementAction.period_key == period_key,
                 EnforcementAction.status.in_(
@@ -1818,7 +1819,6 @@ def restriction_started(session: Session, limit_id: int, period_key: str) -> boo
                 ),
             )
         )
-        is not None
     )
 
 
