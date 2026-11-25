@@ -17,6 +17,7 @@ budget.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -244,7 +245,13 @@ def _sync_groups(
     result.duplicate_group_names = sorted(duplicates)
 
     result.soft_deleted += _soft_delete_after(
-        session, result, existing, seen, now, kind="group", complete=True
+        session,
+        result,
+        existing,
+        seen,
+        now,
+        kind="group",
+        complete=_groups_settled(session, result, existing, seen),
     )
     session.flush()
     return GroupIndex(by_name=by_name, by_path=by_path, ambiguous_names=frozenset(duplicates))
@@ -265,8 +272,18 @@ def _sync_users(
     users, reported_total, warning = iam.fetch_users(client)
     if warning:
         result.warnings.append(warning)
-    # A user the listing did not return is gone only if the listing was whole.
-    complete = warning is None
+    # A user the listing did not return is gone only if the listing was whole
+    # (or the same short listing has come back unchanged several times).
+    complete = _settle_listing(
+        session,
+        result,
+        kind="user",
+        complete=warning is None,
+        reason="shortfall",
+        ids={user.id for user in users},
+        total=reported_total,
+        note=warning,
+    )
     if reported_total is not None:
         logger.info("IAM reported %d users, read %d", reported_total, len(users))
 
@@ -335,7 +352,7 @@ def _sync_users(
         )
 
     result.soft_deleted += _soft_delete_after(
-        session, result, existing, seen, now, kind="user", complete=complete, note=warning
+        session, result, existing, seen, now, kind="user", complete=complete
     )
     session.flush()
 
@@ -348,6 +365,7 @@ def _sync_projects(
 ) -> set[str]:
     listing = Listing()
     projects = platform.fetch_projects(client, listing=listing)
+    complete = _settle_listing(session, result, kind="project", listing=listing)
     existing = {row.id: row for row in session.scalars(select(CxProject))}
     seen: set[str] = set()
 
@@ -357,7 +375,7 @@ def _sync_projects(
         CxProjectGroup.project_id,
         {project.id for project in projects},
         existing,
-        complete=listing.complete,
+        complete=complete,
     )
 
     for project in projects:
@@ -383,7 +401,7 @@ def _sync_projects(
             result.project_groups += 1
 
     result.soft_deleted += _soft_delete_after(
-        session, result, existing, seen, now, kind="project", listing=listing
+        session, result, existing, seen, now, kind="project", complete=complete
     )
     session.flush()
     return seen
@@ -401,6 +419,7 @@ def _sync_applications(
 ) -> None:
     listing = Listing()
     applications = platform.fetch_applications(client, listing=listing)
+    complete = _settle_listing(session, result, kind="application", listing=listing)
     existing = {row.id: row for row in session.scalars(select(CxApplication))}
     seen: set[str] = set()
 
@@ -410,7 +429,7 @@ def _sync_applications(
         CxApplicationProject.application_id,
         {application.id for application in applications},
         existing,
-        complete=listing.complete,
+        complete=complete,
     )
 
     unknown_links = 0
@@ -447,7 +466,7 @@ def _sync_applications(
         )
 
     result.soft_deleted += _soft_delete_after(
-        session, result, existing, seen, now, kind="application", listing=listing
+        session, result, existing, seen, now, kind="application", complete=complete
     )
     session.flush()
 
@@ -481,27 +500,13 @@ def _soft_delete_after(
     now,
     *,
     kind: str,
-    listing: Listing | None = None,
-    complete: bool | None = None,
-    note: str | None = None,
+    complete: bool,
 ) -> int:
-    """Soft-delete what a listing no longer returns, only if it was complete.
-
-    A listing that came back short (fewer rows than its reported total, a
-    page cap, a repeated page) says nothing about the rows it did not return:
-    deleting them would make their usage count towards nothing until the next
-    sync. Each complete listing is also remembered, which is how a deletion is
-    confirmed (``deletion_confirmed``).
-    """
-    if listing is not None:
-        complete = listing.complete
-        note = listing.note
+    """Soft-delete what a listing no longer returns, only if it was complete
+    (``_settle_listing``). Each complete listing is remembered: that is how a
+    deletion is confirmed, and how a name held on an entity knows a sync has
+    looked since it went missing (``listed_since``)."""
     if not complete:
-        result.warnings.append(
-            f"The {kind} listing was incomplete ({note or 'fewer rows than reported'}), so "
-            f"no {kind} it did not return was treated as deleted. The next complete "
-            "sync settles it."
-        )
         return 0
     stamps = settings_store.get_value(session, COMPLETE_LISTINGS_KEY) or {}
     if not isinstance(stamps, dict):
@@ -509,6 +514,121 @@ def _soft_delete_after(
     stamps[kind] = ([*(stamps.get(kind) or [])][-1:] + [now.isoformat()])[-2:]
     settings_store.set_value(session, COMPLETE_LISTINGS_KEY, stamps)
     return _soft_delete_missing(session, existing, seen, now)
+
+
+SHORT_LISTINGS_KEY = "org_sync.short_listings"
+# A short listing that comes back identical this many times in a row is taken
+# as the whole of what the key can see (see _settle_listing).
+SHORT_LISTING_REPEATS = 3
+
+
+def _settle_listing(
+    session: Session,
+    result: OrgSyncResult,
+    *,
+    kind: str,
+    listing: Listing | None = None,
+    complete: bool | None = None,
+    reason: str | None = None,
+    ids: set[str] | None = None,
+    total: int | None = None,
+    note: str | None = None,
+) -> bool:
+    """Whether a listing may be treated as complete.
+
+    A listing short of its reported total says nothing about the rows it did
+    not return, so nothing is deleted after one. One exception: some servers
+    report a total that counts rows the key cannot see, so every listing is
+    short by the same rows for ever. When the same short listing (the same ids,
+    the same total) comes back ``SHORT_LISTING_REPEATS`` times in a row, it is
+    taken as complete, with one warning saying so. A repeated page or the page
+    limit is never accepted that way.
+    """
+    if listing is not None:
+        complete, reason, ids, total, note = (
+            listing.complete,
+            listing.reason,
+            listing.ids,
+            listing.total,
+            listing.note,
+        )
+    memory = settings_store.get_value(session, SHORT_LISTINGS_KEY) or {}
+    if not isinstance(memory, dict):
+        memory = {}
+    if complete:
+        if kind in memory:
+            memory.pop(kind)
+            settings_store.set_value(session, SHORT_LISTINGS_KEY, memory)
+        return True
+    fingerprint = None
+    if reason == "shortfall" and ids:
+        fingerprint = hashlib.sha256(
+            (f"{total}|" + "\n".join(sorted(ids))).encode("utf-8")
+        ).hexdigest()
+    entry = memory.get(kind) if isinstance(memory.get(kind), dict) else {}
+    repeats = entry.get("repeats", 0) + 1 if fingerprint and entry.get("id") == fingerprint else 1
+    warned = bool(entry.get("warned")) and entry.get("id") == fingerprint
+    memory[kind] = {"id": fingerprint, "repeats": repeats, "warned": warned}
+    accepted = fingerprint is not None and repeats >= SHORT_LISTING_REPEATS
+    if accepted and not warned:
+        memory[kind]["warned"] = True
+        result.warnings.append(
+            f"The {kind} listing has reported more rows than it returns ({note}) "
+            f"{repeats} times in a row with the same rows each time, so it is taken as "
+            "everything this API key can see. This is said once."
+        )
+    elif not accepted:
+        result.warnings.append(
+            f"The {kind} listing was incomplete ({note or 'fewer rows than reported'}), so "
+            f"no {kind} it did not return was treated as deleted. The next complete "
+            "sync settles it."
+        )
+    settings_store.set_value(session, SHORT_LISTINGS_KEY, memory)
+    return accepted
+
+
+GROUP_DROP_KEY = "org_sync.pending_group_deletions"
+# More than this share of the known groups missing at once is suspicious.
+GROUP_DROP_SHARE = 0.2
+
+
+def _groups_settled(
+    session: Session, result: OrgSyncResult, existing: dict, seen: set[str]
+) -> bool:
+    """Groups come in one IAM call with no count to check it against. A drop
+    of more than one group and more than a fifth of the known groups at once
+    is only acted on when the next sync misses exactly the same groups."""
+    known = {row_id for row_id, row in existing.items() if not row.is_deleted}
+    missing = sorted(known - seen)
+    pending = settings_store.get_value(session, GROUP_DROP_KEY)
+    if len(missing) <= 1 or len(missing) <= GROUP_DROP_SHARE * len(known):
+        if pending:
+            settings_store.set_value(session, GROUP_DROP_KEY, None)
+        return True
+    if pending == missing:
+        settings_store.set_value(session, GROUP_DROP_KEY, None)
+        return True
+    settings_store.set_value(session, GROUP_DROP_KEY, missing)
+    result.warnings.append(
+        f"{len(missing)} of {len(known)} groups were missing from the IAM listing at once, "
+        "so none was treated as deleted. If the next sync misses the same groups, they are."
+    )
+    return False
+
+
+def listed_since(session: Session, kind: str, since) -> bool:  # type: ignore[no-untyped-def]
+    """True once a complete listing of ``kind`` was taken after ``since``."""
+    if since is None:
+        return False
+    stamps = (settings_store.get_value(session, COMPLETE_LISTINGS_KEY) or {}).get(kind) or []
+    for stamp in stamps:
+        try:
+            when = datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            continue
+        if when > since:
+            return True
+    return False
 
 
 def deletion_confirmed(session: Session, kind: str, deleted_at) -> bool:  # type: ignore[no-untyped-def]

@@ -23,7 +23,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import quote
@@ -492,35 +492,45 @@ class CheckmarxClient:
                 total = reported
             listing.total = total
             if not items:
-                if total is not None and seen < total:
-                    listing.incomplete(f"{seen} of {total} rows could be read")
+                distinct = len(listing.ids) if listing.ids else seen
+                if total is not None and distinct < total:
+                    listing.incomplete(f"{distinct} of {total} rows could be read", "shortfall")
                 return
             first = items[0].get("id", items[0]) if isinstance(items[0], dict) else items[0]
             if page and first == previous_first:
                 # The same page again: the server ignores the offset.
-                listing.incomplete(f"the listing repeated itself after {seen} rows")
+                listing.incomplete(f"the listing repeated itself after {seen} rows", "repeated")
                 return
             previous_first = first
 
             yield from items
+            for item in items:
+                if isinstance(item, dict) and item.get("id") is not None:
+                    listing.ids.add(str(item["id"]))
             seen += len(items)
-            listing.read = seen
+            # Rows told apart by id: a listing whose order shifts while it is
+            # read can repeat one row and skip another, and must not then look
+            # complete by its count alone.
+            distinct = len(listing.ids) if listing.ids else seen
+            listing.read = distinct
             page += 1
             offset += len(items)
 
             if total is not None:
-                if seen >= total:
+                if distinct >= total:
                     return
                 if offset_is_page_number and len(items) < page_size:
                     # A short page by index cannot be continued without
                     # skipping rows.
-                    listing.incomplete(f"{seen} of {total} rows could be read")
+                    listing.incomplete(f"{distinct} of {total} rows could be read", "shortfall")
                     return
                 continue
             if len(items) < page_size and offset_is_page_number:
                 return
 
-        listing.incomplete(f"stopped at the {MAX_PAGES} page safety limit after {seen} rows")
+        listing.incomplete(
+            f"stopped at the {MAX_PAGES} page safety limit after {seen} rows", "page_limit"
+        )
         logger.warning(
             "Pagination of %s stopped at the %d page safety limit", redact(path), MAX_PAGES
         )
@@ -534,10 +544,15 @@ class Listing:
     total: int | None = None
     read: int = 0
     note: str | None = None
+    # "shortfall" (fewer distinct rows than the reported total), "repeated"
+    # (the server ignored the offset) or "page_limit".
+    reason: str | None = None
+    ids: set[str] = field(default_factory=set)
 
-    def incomplete(self, note: str) -> None:
+    def incomplete(self, note: str, reason: str) -> None:
         self.complete = False
         self.note = note
+        self.reason = reason
 
 
 def _extract_items(payload: Any, items_key: str | None) -> list[dict[str, Any]]:
