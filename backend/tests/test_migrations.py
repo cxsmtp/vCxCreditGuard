@@ -31,6 +31,8 @@ EXPECTED_TABLES = {
     "dimension_state",
     "entity_mapping",
     "usage_delta",
+    "usage_activity_key",
+    "usage_activity_state",
     "usage_missing_name",
     "budget_usage",
     "usage_entity_offset",
