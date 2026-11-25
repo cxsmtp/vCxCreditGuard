@@ -83,6 +83,9 @@ class ActivitySourceState(Base):
     summary_paused: Mapped[dict | None] = mapped_column(JSONColumn)
     # [[start, end or null], ...]: when the log was the source (ISO times).
     eras: Mapped[list | None] = mapped_column(JSONColumn)
+    # When the one-off notice that the activity log is the usage source (and
+    # what that means for restrictions) was raised.
+    noticed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     # The last full comparison of the log's sum with the summary's total.
     reconciliation: Mapped[dict | None] = mapped_column(JSONColumn)
     # What the last fetch did, for Diagnose and the cycle record.
@@ -132,6 +135,9 @@ class ProjectBudgetInterval(Base):
     # Not a foreign key: the history outlives a deleted budget.
     limit_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     project_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # The budget's own creation time: with the project, what tells this
+    # budget's rows from those of a deleted budget whose id was reused.
+    budget_created_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     start_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     end_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     # The last observation that agreed with this row.

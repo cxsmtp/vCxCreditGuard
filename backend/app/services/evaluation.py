@@ -1675,8 +1675,8 @@ def _evaluate_one(
         credits_used=state.credits_used,
         attributed=attributed.counted if attributed is not None else None,
     )
-    if on_summary is not None and _has_active_enforcement(session, limit.id, window.key):
-        # A restriction already in force stays in force.
+    if on_summary is not None and restriction_started(session, limit.id, window.key):
+        # A restriction already in force (or started) stays in force.
         on_summary = None
 
     if state.credits_used >= Decimal(limit.credit_limit):
@@ -1716,6 +1716,11 @@ def _evaluate_one(
         elif to_enforce is not None:
             # Applied after every lift of the cycle (evaluate_all).
             to_enforce.append(limit.id)
+            if not evaluation.newly_breached:
+                # Breached earlier without a restriction (held on summary
+                # totals, say): the restriction now starting is announced.
+                # Raised once per period (the notice is deduplicated).
+                _notify_breach(session, limit, state, window, exempt=False)
         # RESTRICTED means "a restriction from this limit is in force for this
         # period", not "a restriction was newly applied this cycle". Deriving it
         # from the action rows keeps it true on every later cycle of the period,
@@ -1798,6 +1803,25 @@ def _in_force_count(session: Session, limit_id: int, period_key: str) -> int:
     )
 
 
+def restriction_started(session: Session, limit_id: int, period_key: str) -> bool:
+    """A restriction of this period is in force, or may be: applied, or
+    pending (being rolled out, or written with an unknown outcome). Carrying
+    it on is not a new restriction (``summary_hold``); a failed one is not in
+    force, and trying it again would be."""
+    return (
+        session.scalar(
+            select(EnforcementAction.id).where(
+                EnforcementAction.limit_id == limit_id,
+                EnforcementAction.period_key == period_key,
+                EnforcementAction.status.in_(
+                    (EnforcementStatus.APPLIED, EnforcementStatus.PENDING)
+                ),
+            )
+        )
+        is not None
+    )
+
+
 def _has_active_enforcement(session: Session, limit_id: int, period_key: str) -> bool:
     return (
         session.scalar(
@@ -1869,9 +1893,10 @@ def summary_hold(
     A period budget's counter holds what the activity log counted and what
     the summary ledger counted (after a fallback to the summary, or from a
     group's own summary row). From running totals the summary cannot always
-    tell a glitch from a real fall, so only the log's part (with the
-    auto-triage charged to the person, which never comes from the counter)
-    may start a new restriction; summary-counted usage warns. Not for a
+    tell a glitch from a real fall, so only the log's part may start a new
+    restriction; summary-counted usage warns. So do the auto-triage credits
+    charged to the person who started the scan: they always derive from the
+    summary's project readings (they still count towards the figure). Not for a
     budget that counts current totals (lifetime, custom, count existing
     usage, a demo budget), and not when the admin chose the summary only and
     allowed restrictions from it (``usage.summary_restricts``). A restriction
@@ -1882,8 +1907,7 @@ def summary_hold(
         return None
     if settings_store.summary_restricts(session):
         return None
-    restricting = index.log_counter(limit.id, window.key) + (attributed or Decimal("0"))
-    if restricting >= Decimal(limit.credit_limit):
+    if index.log_counter(limit.id, window.key) >= Decimal(limit.credit_limit):
         return None
     hold = index.restriction_hold
     if hold is None:

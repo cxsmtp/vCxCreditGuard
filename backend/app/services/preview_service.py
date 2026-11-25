@@ -695,7 +695,7 @@ def _project_one(
         if projected == LimitStatus.BREACHED and limit.enforce and not exempt
         else None
     )
-    if on_summary is not None and evaluation._has_active_enforcement(session, limit.id, window.key):
+    if on_summary is not None and evaluation.restriction_started(session, limit.id, window.key):
         on_summary = None  # a restriction in force stays (and is shown as such)
     if projected == LimitStatus.BREACHED:
         if exempt:

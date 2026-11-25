@@ -529,8 +529,12 @@ def record_reading(
             continue
         if row is not None and row.kind == REBASE:
             # Missing when the lookback window changed: its old total is in
-            # another window, so it starts from what it reports now.
-            _drop(session, row)
+            # another window, so it starts from what it reports now. Not from
+            # a reading the completeness checks doubt (its total may be a
+            # glitch, and the recovery would count): it stays to be rebased by
+            # the next believed reading, counting nothing meanwhile.
+            if not suspect:
+                _drop(session, row)
             record.last_rise_at = now
             continue
         if row is not None and row.kind == DIP:

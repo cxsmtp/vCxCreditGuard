@@ -81,9 +81,11 @@ The same usage is never counted from both sources:
   a malformed answer, or an outage - or a failure of this step itself - longer
   than ``OUTAGE_GRACE``), the summary feed's first ``SUMMARY_PAUSE_READINGS``
   (2) readings of each covered view count nothing (``summary_paused``), and
-  they rebase the ledger's memory of names of those views: a name it
-  remembers (missing, or holding a fall or a ceiling) continues from what it
-  reports then, never from a total from before or during the log's era. Lost:
+  they rebase the ledger's memory of names of those views: every name it
+  remembers (missing, or holding a fall or a ceiling, present or not) becomes
+  kind "rebase", and starts from what it reports in the next reading the
+  completeness checks believe, never from a total from before or during the
+  log's era. Lost:
   what happened between the log's last fetch and the third reading (two to
   three cycles), and the usage of a name missing across the handover until it
   returns. This assumes the summary reports an event no later than about two
@@ -357,10 +359,27 @@ def _plain_group_entries(
             CreditLimit.include_member_usage.is_(False),
         )
     ):
-        entry = feeds.get(str(limit.id))
-        if isinstance(entry, dict) and str(limit.entity_id) in own:
+        entry = _entry_of(feeds, limit)
+        if entry is not None and str(limit.entity_id) in own:
             found.append((str(limit.id), entry))
     return found
+
+
+def _group_identity(limit: CreditLimit) -> dict[str, object]:
+    return {"entity": str(limit.entity_id), "created": _iso(limit.created_at)}
+
+
+def _entry_of(feeds: dict, limit: CreditLimit) -> dict | None:  # type: ignore[type-arg]
+    """The log's group-feed entry of this budget: keyed by id, and only if it
+    names the budget's group and creation time (a deleted budget's id can be
+    handed to a new one, which must not inherit its floor or its "fed")."""
+    entry = feeds.get(str(limit.id))
+    if not isinstance(entry, dict):
+        return None
+    identity = _group_identity(limit)
+    if "entity" in entry and any(entry.get(key) != value for key, value in identity.items()):
+        return None
+    return entry
 
 
 def _groups_taken_back(session: Session, state: ActivitySourceState, snapshot) -> bool:  # type: ignore[no-untyped-def]
@@ -432,15 +451,15 @@ def _rebase_names(session: Session, view: str, snapshot: UsageSnapshot, records:
     from app.models.usage import UsageMissingName
     from app.services import ledger
 
-    present = {record.subject_key for record in records}
     for row in list(
         session.scalars(select(UsageMissingName).where(UsageMissingName.view_by == view))
     ):
-        if row.subject_key in present:
-            session.delete(row)
-        else:
-            row.kind = ledger.REBASE
-            row.period_param = snapshot.period_param
+        # Every kind, the name present or not: a held fall (or ceiling) of a
+        # name present now may be a glitch of this very reading, and dropping
+        # it would count the recovery. As "rebase", the name counts nothing
+        # until it is read again in a reading the checks believe.
+        row.kind = ledger.REBASE
+        row.period_param = snapshot.period_param
     session.flush()
 
 
@@ -542,21 +561,46 @@ class BudgetHistory:
         from app.models.activity import ProjectBudgetInterval
 
         self.intervals: dict[str, list[tuple[datetime, datetime | None]]] = defaultdict(list)
-        latest: dict[int, ProjectBudgetInterval] = {}
-        rows = list(
-            session.scalars(select(ProjectBudgetInterval).order_by(ProjectBudgetInterval.id))
-        )
-        for row in rows:
-            latest[row.limit_id] = row
-        made: list[ProjectBudgetInterval] = []
         limits = {
             limit.id: limit
             for limit in session.scalars(
                 select(CreditLimit).where(CreditLimit.entity_type == EntityType.PROJECT.value)
             )
         }
+        rows = list(
+            session.scalars(select(ProjectBudgetInterval).order_by(ProjectBudgetInterval.id))
+        )
+
+        def close(index: int, row: ProjectBudgetInterval) -> None:
+            if persist:
+                row.end_at = now
+                row.checked_at = now
+            else:
+                rows[index] = ProjectBudgetInterval(
+                    limit_id=row.limit_id,
+                    project_id=row.project_id,
+                    budget_created_at=row.budget_created_at,
+                    start_at=row.start_at,
+                    end_at=now,
+                    checked_at=now,
+                )
+
+        # The latest row of each budget. A row is a budget's only if it names
+        # the budget's project and creation time too: a deleted budget's id
+        # can be handed to a new one (SQLite reuses the highest id), and the
+        # new one must not take over the old one's history.
+        latest: dict[int, int] = {}
+        for index, row in enumerate(rows):
+            limit = limits.get(row.limit_id)
+            if limit is None or _same_budget(row, limit):
+                latest[row.limit_id] = index
+            elif row.end_at is None:
+                # Another budget's (now gone) open interval: it ends now.
+                close(index, row)
+        made: list[ProjectBudgetInterval] = []
         for limit_id, limit in limits.items():
-            row = latest.get(limit_id)
+            index = latest.get(limit_id)
+            row = rows[index] if index is not None else None
             created = limit.created_at or now
             if limit.is_active:
                 if row is None:
@@ -567,27 +611,12 @@ class BudgetHistory:
             elif row is None:
                 made.append(_interval(limit, created, created, now))
             elif row.end_at is None:
-                if persist:
-                    row.end_at = now
-                    row.checked_at = now
-                else:
-                    rows[rows.index(row)] = _interval(limit, row.start_at, now, now)
+                close(index, row)  # type: ignore[arg-type]
             elif persist:
                 row.checked_at = now
-        for limit_id, row in latest.items():
-            if limit_id not in limits and row.end_at is None:
-                # Deleted: it ends now.
-                if persist:
-                    row.end_at = now
-                    row.checked_at = now
-                else:
-                    rows[rows.index(row)] = ProjectBudgetInterval(
-                        limit_id=row.limit_id,
-                        project_id=row.project_id,
-                        start_at=row.start_at,
-                        end_at=now,
-                        checked_at=now,
-                    )
+        for limit_id, index in latest.items():
+            if limit_id not in limits and rows[index].end_at is None:
+                close(index, rows[index])  # deleted: it ends now
         if persist:
             for row in made:
                 session.add(row)
@@ -605,12 +634,21 @@ class BudgetHistory:
         )
 
 
+def _same_budget(row, limit: CreditLimit) -> bool:  # type: ignore[no-untyped-def]
+    return row.project_id == str(limit.entity_id)[:64] and (
+        row.budget_created_at is None
+        or limit.created_at is None
+        or row.budget_created_at == limit.created_at
+    )
+
+
 def _interval(limit: CreditLimit, start: datetime, end: datetime | None, now: datetime):  # type: ignore[no-untyped-def]
     from app.models.activity import ProjectBudgetInterval
 
     return ProjectBudgetInterval(
         limit_id=limit.id,
         project_id=str(limit.entity_id)[:64],
+        budget_created_at=limit.created_at,
         start_at=start,
         end_at=end,
         checked_at=now,
@@ -1093,14 +1131,18 @@ def _observe_groups(
         select(CreditLimit).where(CreditLimit.entity_type == EntityType.GROUP.value)
     ):
         key = str(limit.id)
-        entry = previous.get(key)
+        entry = _entry_of(previous, limit)
         if not limit.is_active:
             if entry is not None:
                 current[key] = entry
             continue
         if limit.include_member_usage or str(limit.entity_id) not in own:
-            current[key] = entry if isinstance(entry, dict) else {"since": _iso(now), "fed": False}
-        elif isinstance(entry, dict) and entry.get("fed"):
+            current[key] = (
+                entry
+                if entry is not None
+                else {"since": _iso(now), "fed": False, **_group_identity(limit)}
+            )
+        elif entry is not None and entry.get("fed"):
             handed_back = True
     if handed_back:
         snapshot = ingestion.latest_live_snapshot(session, UsageView.GROUP.value)
@@ -1144,7 +1186,7 @@ def ingest_activity(session: Session, client: CheckmarxClient) -> ActivityResult
     """One cycle of the activity source: read (no transaction open), then
     count and record under the attribution lock, in one transaction."""
     try:
-        return _ingest(session, client)
+        result = _ingest(session, client)
     except Exception as exc:  # noqa: BLE001 - never stops the summary feed
         session.rollback()
         logger.exception("The credit activity step failed")
@@ -1170,6 +1212,70 @@ def ingest_activity(session: Session, client: CheckmarxClient) -> ActivityResult
             result.read_failed = active
             result.error = f"The credit activity step failed: {exc}"
             return result
+    try:
+        _notice_once(session, result)
+    except Exception:  # noqa: BLE001 - a notice never fails the step
+        session.rollback()
+        logger.exception("The usage source notice could not be raised")
+    return result
+
+
+NOTICE_KEY = "usage.source.activity_log"
+
+
+def _notice_once(session: Session, result: ActivityResult) -> None:
+    """Once per install, at the first cycle with the activity log as the
+    chosen source (an upgrade moves there without being asked): say so, and
+    what it means for restrictions; when the log is not available, how to
+    restrict from summary totals as before."""
+    from app.models.enums import Severity
+    from app.services import notifications
+
+    if not result.enabled:
+        return
+    state = _state(session)
+    if state is None or state.noticed_at is not None:
+        return
+    rule = (
+        "Monthly and quarterly budgets of projects, users and applications now restrict only "
+        "on usage the activity log counted: usage the consumption summary counts (while the "
+        "log is unavailable, or from a group's own summary row) and auto-triage charged to "
+        "the person who started a scan still count and warn, but do not start a "
+        "restriction. Lifetime, custom and count-existing budgets, and restrictions already "
+        "in force, are unchanged."
+    )
+    opt_back = (
+        "To go back to the consumption summary as before: Settings → Schedule & data → "
+        "Usage source: Summary only, and turn on Allow restrictions from summary totals "
+        "(less accurate)."
+    )
+    if result.source_active:
+        title = "Usage now comes from the credit activity log"
+        body = (
+            "CreditGuard now counts each billed action from Checkmarx One's credit activity "
+            "log, by project and application id, in the period it happened in. "
+            f"{rule} {opt_back}"
+        )
+        severity = Severity.INFO
+    else:
+        title = "Restrictions paused for period budgets: the activity log is not available"
+        body = (
+            "CreditGuard now uses Checkmarx One's credit activity log as the usage source, "
+            "but it could not be read"
+            + (f" ({result.error})" if result.error else "")
+            + f". Usage comes from the consumption summary meanwhile. {rule} {opt_back}"
+        )
+        severity = Severity.WARNING
+    notifications.notify(
+        session,
+        category=notifications.CATEGORY_WARNING,
+        severity=severity,
+        title=title,
+        body=body,
+        dedupe_key=NOTICE_KEY,
+    )
+    state.noticed_at = utcnow()
+    session.commit()
 
 
 def _ingest(session: Session, client: CheckmarxClient) -> ActivityResult:
@@ -1294,7 +1400,11 @@ def _write(
         state.status = ACTIVE
         state.floor_at = now
         state.active_since = now
-        state.summary_paused = None
+        state.summary_paused = {
+            view: value
+            for view, value in (state.summary_paused or {}).items()
+            if view == UsageView.GROUP.value
+        } or None
         _start_era(state, now)
         result.seeded = True
         result.warnings.append(
