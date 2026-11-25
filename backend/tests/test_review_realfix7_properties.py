@@ -528,7 +528,8 @@ def test_random_sequences_keep_both_invariants(
     increases: dict[str, int] = defaultdict(int)
     rolled: set[str] = set()
     history: list[str] = []
-    totals_periods: set[str | None] = set()
+    # Month -> whether its latest evaluation counted reported totals.
+    totals_periods: dict[str | None, bool] = {}
     for _ in range(STEPS):
         with pytest.MonkeyPatch.context() as mp:
             change = _step(world, db, admin_client, mp, budgets)
@@ -545,10 +546,10 @@ def test_random_sequences_keep_both_invariants(
                     rolled.add(new)
             group_grew, app_grew = world.group_grew, world.app_grew
             read = _cycle(db, world, admin_client)
-            if world.existing and not world.skip_evaluation:
-                # Evaluated from reported totals: that period is not the
-                # ledger's, and a closed period is never rewritten later.
-                totals_periods.add(_month(world.clock))
+            if not world.skip_evaluation:
+                # Counted from reported totals or from the ledger, as its
+                # latest evaluation did: a closed month is never rewritten.
+                totals_periods[_month(world.clock)] = world.existing
         if not read:
             continue
         world.group_grew = world.app_grew = 0
@@ -607,7 +608,7 @@ def test_random_sequences_keep_both_invariants(
             for state in db.scalars(
                 select(LimitPeriodState).where(LimitPeriodState.limit_id == limit.id)
             ):
-                if budget == "proj-web" and state.period_key in totals_periods:
+                if budget == "proj-web" and totals_periods.get(state.period_key):
                     continue
                 key = (state.period_key, budget)
                 used = state.credits_used

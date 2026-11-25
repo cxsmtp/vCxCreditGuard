@@ -573,6 +573,8 @@ class TestCeilingCountsOnlyWhatWouldReallyChange:
         settings_store.set_value(db, settings_store.KEY_MAX_NEW_TARGETS, 1)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)  # baseline
+        # The application's own row feeds its budget from its third reading (ninth review).
+        ingestion.ingest_usage(db, client)
         tenant.set_entity_credits(
             view="application", name="Payments", credits=500, entity_id="app-payments"
         )
