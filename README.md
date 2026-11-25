@@ -144,7 +144,7 @@ telemetry, no analytics, and nothing else is contacted.
 | **Account-wide Auto Triage may override a project.** | If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project. |
 | **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
 | **The general Risk Management roles are used for now.** | AI Triage and AI Remediation are reached through them today, so a restricted person also loses the Risk Management pages and dashboard. When Checkmarx One's dedicated AI permissions reach your tenant, swap them in under Settings → Enforcement, *Roles a user restriction removes*. |
-| **A cycle or two of usage is not counted when the usage source switches.** | When the activity log becomes the source (the setting turned on, or the log back after failing), its first read only records what it holds: what happened since the summary's last reading is not counted. When the summary takes over (the setting turned off, the log refused or malformed, or failing for more than an hour), its first reading counts nothing: about one to two cycles are not counted. While the log fails for less than an hour nothing new is counted; it is counted when the log answers again. A row reaching the log more than about two hours late is counted only by the daily full read, and only if dated after the switch; rows of the same second that meet at a page boundary wait for a later cycle ([Switching source](#switching-source-and-what-is-not-counted)). |
+| **A few cycles of usage are not counted when the usage source switches.** | When the activity log becomes the source (the setting turned on, or the log back after failing), its first read only records what it holds: what happened since the summary's last reading is not counted. When the summary takes over (the setting turned off, the log refused or malformed, or failing for more than an hour), its first two readings count nothing: about two to three cycles are not counted, and a name missing from the summary across the switch counts nothing when it returns. While the log fails for less than an hour nothing new is counted; it is counted when the log answers again. A row reaching the log more than about two hours late is counted only by the daily full read, and only if dated after the switch; rows of the same second that meet at a page boundary wait for a later cycle. A group budget taken over by the log from its own summary row counts no event dated before the takeover, and two group readings count nothing when the row takes it back ([Switching source](#switching-source-and-what-is-not-counted)). |
 | **Figures only cover Checkmarx's lookback window.** | The consumption summary reports totals over a window (at most the last year), and the activity log covers the last 30 days. "Lifetime", custom and count-existing budgets read the summary's totals, so they mean everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened (or before the budget was created), unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
 | **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution); a mapping counts from then on. Automation counts towards a person only by the [integration-account rule](#integration-accounts) (Auto-remediation towards nobody: no scan initiator is traced for it). With the summary as the source, project usage reported under a repository name that is no project (87% of project credits on a live tenant) counts towards no project, group or application budget until mapped; the activity log names projects by id. All of it is shown on the Overview. |
 | **Credits per action are measured, not quoted.** | Checkmarx's listed rate is not what a Fusion or DAST correlation action costs (on a live tenant about 109 credits per Opus 5.5 Fusion scan against a rate of 2). Where they disagree, messages price an action at the feed's average over the lookback window and say so; it is an average, not the cost of one scan. |
@@ -379,14 +379,21 @@ before it happened:
 
 **No row id, so a multiset.** Identical rows are distinct events (59 of the
 1,939 rows were exact duplicates of another, to the second): nothing is ever
-deduplicated. A row's identity is every identifying field (date, action,
-credits, user, email, project ids, application ids, scan ids, scanner), hashed,
-and `usage_activity_key` keeps how many rows of each identity have been seen. A
+deduplicated. A row's identity is the fields that describe the action itself
+and are assumed never to change for a past action (date, action, credits,
+project ids, scan ids, scanner), hashed, and `usage_activity_key` keeps how many
+rows of each identity have been seen. Who (user, email) and the application are
+left out because Checkmarx may fill them in or change them later for the same
+action: the new events of an identity count towards a person or an application
+only when every row of it in the read names the same one (which of differing
+rows is new cannot be told), and otherwise only towards its project and what
+the project belongs to (**not counted** towards the person or application then). A
 fetch holding `n` rows of an identity counts `max(0, n − seen)` new events and
 raises `seen` to `n`, in the transaction that feeds the counters, under the
 attribution lock. Nothing is written while Checkmarx is called: every page is
 read first. Keys are pruned 31 days after their date, and an event older than
-that is never counted.
+that - or than the highest cutoff ever used, should the clock go back - is never
+counted.
 
 **Fetching so that no row is read twice.** Pages are read in ascending order of
 `sort_order=asc`: new rows append at the end, and rows ageing out leave from the
@@ -431,12 +438,26 @@ The same usage is never counted from both sources:
   summary's last reading and that first fetch (about one cycle).
 * **The summary takes over** (the setting turned off; a 403, a 404 or a
   malformed answer, tried again after 6 hours; or a 5xx, timeout or rate limit
-  lasting more than an hour): the summary's first reading of each covered view
-  counts nothing, and the following ones count increases as before. **Not
-  counted:** what happened between the log's last fetch and the summary's second
-  reading (one to two cycles). This assumes the summary reports an event no
-  later than a cycle after the log does (they are the same data: their totals
-  matched exactly).
+  lasting more than an hour, or a failure of the activity step itself lasting
+  as long): the summary's first two readings of each covered view count
+  nothing, and the following ones count increases as before. Those two
+  readings also rebase the ledger's memory of names of the covered views: a
+  name missing, or holding a fall or a ceiling, continues from what it reports
+  then, never from a total from before or during the log's era. **Not
+  counted:** what happened between the log's last fetch and the summary's third
+  reading (two to three cycles), and what a name missing across the switch
+  used until it returns. This assumes the summary reports an event no later
+  than about two cycles after the log does (they are the same data: their
+  totals matched exactly).
+* **Group budgets.** The group view is not covered by the log: a plain group
+  budget whose group has a row of its own there is fed by that row; otherwise
+  (and always with member usage) the log feeds it through its projects and
+  members. When the log takes a budget over (the row left, or member usage was
+  switched on), it counts towards it only events dated from that moment on;
+  when the row takes it back, the group view's next two readings count nothing
+  (for every group). **Not counted:** events dated before a takeover that the
+  log counts after it (a backlog after an outage, a late row), and those two
+  group readings.
 * **A shorter outage** keeps the log as the source: nothing new is counted
   meanwhile (the cycle is not fresh, so no new restriction is applied on it),
   and what happened is counted when the log answers again.
@@ -456,7 +477,12 @@ of its project, and the project's groups and application, like any usage.
 Towards a person:
 
 * **if the event's project had an active project budget at the event's date**,
-  towards no user budget: the project budget governs it;
+  towards no user budget: the project budget governs it. When each project
+  budget may have been active is recorded at every activity write and every
+  evaluation (`usage_budget_interval`), so the answer for a past event never
+  changes, also for the auto-triage charges evaluation recomputes. A budget
+  switched off and on again between two of those observations counts as
+  active throughout (**not counted** towards the person then);
 * otherwise `Auto-triage` goes to the person who started the scan through
   [auto-triage charging](#charging-auto-triage-to-the-person-who-started-the-scan)
   (when it is on and resolves one; nobody otherwise), and `Auto-remediation` to

@@ -181,7 +181,7 @@ const LIMITATIONS: Limitation[] = [
     ),
   },
   {
-    title: "A cycle or two of usage is not counted when the usage source switches.",
+    title: "A few cycles of usage are not counted when the usage source switches.",
     group: "data",
     meaning: (
       <>
@@ -189,8 +189,12 @@ const LIMITATIONS: Limitation[] = [
         the log back after failing), its first read only records what it holds,
         so what happened since the summary&apos;s last reading is not counted.
         When the summary takes over (the setting turned off, the log refused or
-        malformed, or failing for more than an hour), its first reading counts
-        nothing, so about one to two cycles are not counted. While the log
+        malformed, or failing for more than an hour), its first two readings
+        count nothing, so about two to three cycles are not counted, and a name
+        missing from the summary across the switch counts nothing when it
+        returns. A group budget the log takes over from the group&apos;s own
+        summary row counts no event dated before the takeover, and two group
+        readings count nothing when the row takes it back. While the log
         fails for less than an hour nothing new is counted; it is counted when
         the log answers again. A row that reaches the log more than about two
         hours late is counted only by the daily full read, and only if it is
