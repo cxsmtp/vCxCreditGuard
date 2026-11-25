@@ -38,12 +38,10 @@ from app.models.usage import (
     DimensionState,
     EntityMapping,
     UnresolvedSubject,
-    UsageAnchor,
-    UsageNameState,
     UsageRecord,
     UsageSnapshot,
 )
-from app.services import subject_matching
+from app.services import ledger, subject_matching
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome, UserProfile
 
@@ -795,8 +793,7 @@ def _store_dimension(
             projects_by_id, projects_by_name = by_id, by_name
         else:
             apps_by_id, apps_by_name = by_id, by_name
-    anchors = _Anchors(session, view, snapshot, {key[:320] for key in merged})
-
+    stored: list[UsageRecord] = []
     for item in merged.values():
         outcome: MatchOutcome | None = None
         key = item.subject_key[:320]
@@ -819,37 +816,27 @@ def _store_dimension(
                 groups_by_id=groups_by_id or {},
                 groups_by_name=groups_by_name or {},
             )
-        # A subject that becomes disputed keeps counting towards the user it
-        # counted towards (flagged, as held) until an admin resolves it.
-        placed = anchors.attribute(key, entity_id, item.credits_used, item.actions or None)
-        if placed.entity_id is not None and entity_id is None:
-            entity_type = _VIEW_ENTITY.get(str(view), entity_type)
-        entity_id = placed.entity_id
-        if view != UsageView.USER and entity_type is not None and entity_id is None:
-            # Reported under a name (or id) that is no synced entity: it
-            # counts towards no limit. Counted, so it is never silent.
-            result.unmatched_entities += 1
-            result.unmatched_credits += item.credits_used
-        session.add(
-            UsageRecord(
-                snapshot_id=snapshot.id,
-                view_by=str(view),
-                subject_key=key,
-                subject_name=item.subject_name,
-                subject_email=item.subject_email,
-                entity_type=entity_type,
-                entity_id=entity_id,
-                credits_used=item.credits_used,
-                attributed_credits=placed.attributed,
-                held_reason=placed.held_reason,
-                held_readings=placed.held_readings,
-                held_since=placed.held_since,
-                percent_of_total=item.percent_of_total,
-                transactions=item.transactions,
-                actions=item.actions or None,
-                raw=item.raw,
-            )
+            if entity_type is not None and entity_id is None:
+                # Reported under a name (or id) that is no synced entity: it
+                # counts towards no limit. Counted, so it is never silent.
+                result.unmatched_entities += 1
+                result.unmatched_credits += item.credits_used
+        record = UsageRecord(
+            snapshot_id=snapshot.id,
+            view_by=str(view),
+            subject_key=key,
+            subject_name=item.subject_name,
+            subject_email=item.subject_email,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            credits_used=item.credits_used,
+            percent_of_total=item.percent_of_total,
+            transactions=item.transactions,
+            actions=item.actions or None,
+            raw=item.raw,
         )
+        session.add(record)
+        stored.append(record)
         total += item.credits_used
         result.records += 1
 
@@ -863,10 +850,10 @@ def _store_dimension(
             else:
                 _apply_user_outcome(session, item, outcome, now, result)
 
-    # Names the last reading counted towards an entity but this one does not
-    # report at all: carried for a few readings (see _Anchors.carry).
-    for carried in anchors.carry():
-        session.add(carried)
+    session.flush()
+    # The increases since the last live reading, attributed to where each name
+    # counts now, and added to the budgets fed now (see app/services/ledger.py).
+    ledger.record_reading(session, view, snapshot, stored)
 
     snapshot.total_credits = total
     result.total_credits = total
@@ -1034,19 +1021,13 @@ def _apply_user_outcome(
         )
 
 
-# ------------------------------------------------------- forward-only attribution
+# --------------------------------------------------------------- attribution
 #
-# The consumption feed reports cumulative totals over its lookback window. A
-# name that starts to count towards an entity part way (an admin maps it, a
-# project is renamed to it, or a sync brings the entity it names) would
-# otherwise bring everything it ever reported into the entity's current budget
-# period at once. Instead, the name is anchored at its reported total when it
-# starts to count (``UsageAnchor.offset_credits``), and only what it reports
-# beyond that counts (``UsageRecord.attributed_credits``). Period baselines are
-# never shifted, so a mapping cannot race an evaluation.
+# Mapping writes and the ingest's write of a new reading (with its ledger
+# increases, see app/services/ledger.py) run under one lock, and neither holds
+# it across a call to Checkmarx One: a mapping is seen by a reading either
+# entirely or not at all.
 
-# Mapping writes and the ingest's record writes both run under this lock, and
-# neither holds it across a network call.
 _ATTRIBUTION_LOCK_KEY = 0x43584147  # "CXAG"
 ATTRIBUTION_LOCK_SETTING = "attribution.lock"
 
@@ -1089,503 +1070,6 @@ def latest_live_snapshot(
     )
 
 
-_VIEW_ENTITY = {
-    str(UsageView.USER): EntityType.USER,
-    str(UsageView.PROJECT): EntityType.PROJECT,
-    str(UsageView.APPLICATION): EntityType.APPLICATION,
-    str(UsageView.GROUP): EntityType.GROUP,
-}
-_VIEW_MODEL = {
-    str(UsageView.USER): CxUser,
-    str(UsageView.PROJECT): CxProject,
-    str(UsageView.APPLICATION): CxApplication,
-    str(UsageView.GROUP): CxGroup,
-}
-_VIEW_KIND = {
-    str(UsageView.USER): "user",
-    str(UsageView.PROJECT): "project",
-    str(UsageView.APPLICATION): "application",
-    str(UsageView.GROUP): "group",
-}
-HOLD_READINGS_KEY = "attribution.hold_readings"
-DEFAULT_HOLD_READINGS = 8
-
-HELD_KEPT = "kept"
-HELD_CARRIED = "carried"
-
-
-def hold_readings(session: Session) -> int:
-    """How many readings a name is kept on an entity that has just been
-    deleted (unconfirmed), or carried while the feed does not report it."""
-    from app.services import settings_store
-
-    value = settings_store.get_value(session, HOLD_READINGS_KEY, DEFAULT_HOLD_READINGS)
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return DEFAULT_HOLD_READINGS
-
-
-@dataclass(frozen=True, slots=True)
-class Placement:
-    """Where one name's row counts, and how much of it."""
-
-    entity_id: str | None
-    attributed: Decimal | None = None
-    held_reason: str | None = None
-    held_readings: int | None = None
-    held_since: datetime | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _Before:
-    entity_id: str | None
-    credits: Decimal
-    attributed: Decimal | None
-    held_reason: str | None
-    held_readings: int
-    held_since: datetime | None
-    actions: dict | None
-    record: UsageRecord | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _Entity:
-    deleted: bool
-    deleted_at: datetime | None
-    created_at: datetime | None
-
-
-class _Anchors:
-    """Where each name's usage counts, for one dimension's new reading.
-
-    The rules, name by name (``attribute``):
-
-    * A name counting through a live anchor (an admin's mapping, a move)
-      counts what it reported beyond the anchor's offset.
-    * A name that counted towards an entity keeps counting there: towards the
-      same entity as before (in full or from its offset); kept on it while it
-      matches nothing (``held_reason = "kept"``: a rename the sync learnt
-      first, a disputed match, an entity just deleted); carried while the feed
-      does not report it (``carry``).
-    * A name that moves from one entity to another is anchored at its previous
-      total: only what it reports from now on counts at the new one.
-    * A name that counted nowhere and starts to count:
-      - towards (or anywhere after) the entity it last counted towards before
-        it was released: anchored at its total then (``UsageNameState``), so
-        its history never comes back as new usage;
-      - taking over from a name of the same entity that just left the feed (a
-        rename the feed reported first): in full, and the old name stops;
-      - a name the feed never reported before: in full (all of it is new);
-      - an unmatched name whose entity was first synced after the name's first
-        unmatched reading, within one org refresh (a project or user created
-        and used before the sync brought it): in full, less any history it
-        had when first seen;
-      - any other unmatched name: from its last total.
-
-    A hold (kept or carried) ends only once ``hold_readings`` readings have
-    passed AND a complete org sync has listed the entity's kind since the hold
-    began, and, for a deleted entity, its deletion is confirmed. A name kept on
-    an entity that still exists is kept for as long as it is reported.
-    """
-
-    def __init__(
-        self,
-        session: Session,
-        view: UsageView,
-        snapshot: UsageSnapshot,
-        reported: set[str],
-    ) -> None:
-        from app.services import settings_store
-
-        self.session = session
-        self.view = str(view)
-        self.kind = _VIEW_KIND.get(self.view, self.view)
-        self.snapshot = snapshot
-        self.now = utcnow()
-        self.limit = hold_readings(session)
-        refresh = settings_store.get_value(session, settings_store.KEY_ORG_REFRESH_MINUTES)
-        try:
-            refresh_minutes = max(1, int(refresh))
-        except (TypeError, ValueError):
-            refresh_minutes = 30
-        # How long after a name's first unmatched reading a newly synced
-        # entity may still be "the entity it was waiting for".
-        self.new_entity_window = timedelta(minutes=refresh_minutes) + timedelta(hours=1)
-        self.anchors = {
-            anchor.subject_key: anchor
-            for anchor in session.scalars(
-                select(UsageAnchor).where(UsageAnchor.view_by == self.view)
-            )
-        }
-        self.names = {
-            row.subject_key: row
-            for row in session.scalars(
-                select(UsageNameState).where(UsageNameState.view_by == self.view)
-            )
-        }
-        self.previous = latest_live_snapshot(session, view, excluding=snapshot.id)
-        self.before: dict[str, _Before] = {}
-        if self.previous is not None:
-            for record in session.scalars(
-                select(UsageRecord).where(UsageRecord.snapshot_id == self.previous.id)
-            ):
-                self.before[record.subject_key] = _Before(
-                    entity_id=record.entity_id,
-                    credits=Decimal(record.credits_used or 0),
-                    attributed=record.attributed_credits,
-                    held_reason=record.held_reason,
-                    held_readings=record.held_readings or 0,
-                    held_since=record.held_since,
-                    actions=record.actions,
-                    record=record,
-                )
-        self.reported = reported
-        # Entities losing a name from the feed in this reading (carried, or
-        # about to be): a name that starts to count towards one of them from
-        # nowhere is taken as the renamed name taking over.
-        self.vanishing: dict[str, datetime] = {}
-        for key, before in self.before.items():
-            if before.entity_id is None or key in reported:
-                continue
-            since = (
-                before.held_since
-                if before.held_reason == HELD_CARRIED and before.held_since
-                else self.now
-            )
-            known = self.vanishing.get(before.entity_id)
-            self.vanishing[before.entity_id] = since if known is None else min(known, since)
-        self._entities: dict[str, _Entity | None] = {}
-        # Entities a name started to count towards from nowhere, in full.
-        self.fresh: set[str] = set()
-
-    # ---------------------------------------------------------------- helpers
-
-    def _entity(self, entity_id: str) -> _Entity | None:
-        if entity_id not in self._entities:
-            model = _VIEW_MODEL.get(self.view)
-            row = (
-                self.session.execute(
-                    select(model.is_deleted, model.last_synced_at, model.created_at).where(
-                        model.id == entity_id
-                    )
-                ).first()
-                if model is not None
-                else None
-            )
-            self._entities[entity_id] = (
-                _Entity(deleted=bool(row[0]), deleted_at=row[1], created_at=row[2])
-                if row is not None
-                else None
-            )
-        return self._entities[entity_id]
-
-    def _hold_over(self, entity_id: str, held: int, since: datetime | None) -> bool:
-        """True once a hold on ``entity_id`` (``held`` readings so far, since
-        ``since``) may end. Never on readings alone: a complete org sync must
-        have looked since the hold began, and a deletion must be confirmed."""
-        from app.services import org_sync
-
-        entity = self._entity(entity_id)
-        if entity is None:
-            return True
-        if held < self.limit:
-            return False
-        if not org_sync.listed_since(self.session, self.kind, since):
-            return False
-        if entity.deleted:
-            return org_sync.deletion_confirmed(self.session, self.kind, entity.deleted_at)
-        return True
-
-    def _through(self, anchor: UsageAnchor, credits: Decimal, actions: dict | None) -> Decimal:
-        if credits < Decimal(anchor.offset_credits):
-            # The lookback window rolled past usage from before the anchor:
-            # re-anchor, so the name never counts less than nothing. What it
-            # reported between the last reading and this one, if any, is not
-            # counted (inherent: the feed gives no dates).
-            anchor.offset_credits = credits
-            anchor.reference_actions = actions
-            anchor.snapshot_id = self.snapshot.id
-            anchor.anchored_at = self.now
-        return credits - Decimal(anchor.offset_credits)
-
-    def _anchor(
-        self,
-        key: str,
-        entity_id: str,
-        offset: Decimal,
-        actions: dict | None,
-        *,
-        reason: str,
-        removed_from: str | None,
-    ) -> UsageAnchor:
-        anchor = self.anchors.get(key)
-        if anchor is None:
-            anchor = UsageAnchor(view_by=self.view, subject_key=key)
-            self.session.add(anchor)
-            self.anchors[key] = anchor
-        anchor.entity_id = entity_id
-        anchor.offset_credits = offset
-        anchor.reference_actions = actions
-        anchor.snapshot_id = self.previous.id if self.previous is not None else None
-        anchor.anchored_at = self.now
-        anchor.reason = reason
-        anchor.released_at = None
-        anchor.released_credits = None
-        anchor.release_reason = None
-        if removed_from is not None:
-            anchor.removed_from = removed_from
-            anchor.removed_at = self.now
-        return anchor
-
-    def _state(self, key: str) -> UsageNameState:
-        state = self.names.get(key)
-        if state is None:
-            state = UsageNameState(view_by=self.view, subject_key=key, first_seen_new=False)
-            self.session.add(state)
-            self.names[key] = state
-        return state
-
-    def _unmatched(self, key: str, credits: Decimal, before: _Before | None) -> None:
-        """The name counts nowhere in this reading: note since when."""
-        state = self.names.get(key)
-        if state is not None and state.first_unmatched_at is not None:
-            return
-        state = self._state(key)
-        if before is not None:
-            # Already unmatched last reading, with nothing noted (data from
-            # before this was kept): unmatched since then at least.
-            state.first_unmatched_at = (
-                self.previous.collected_at if self.previous is not None else self.now
-            )
-            state.first_unmatched_credits = before.credits
-            state.first_seen_new = False
-        else:
-            state.first_unmatched_at = self.now
-            state.first_unmatched_credits = credits
-            # Absent from a reading before this one: all of it is new usage.
-            state.first_seen_new = self.previous is not None and key not in self.before
-            if state.last_entity_id is not None:
-                state.first_seen_new = False
-
-    def _left(self, key: str, entity_id: str, credits: Decimal) -> None:
-        """The name stopped counting towards ``entity_id`` at ``credits``."""
-        state = self._state(key)
-        state.last_entity_id = entity_id
-        state.last_credits = credits
-        state.left_at = self.now
-
-    def _counts(self, key: str) -> None:
-        """The name counts somewhere: what was noted about it is spent."""
-        state = self.names.pop(key, None)
-        if state is not None and state.id is not None:
-            self.session.delete(state)
-        elif state is not None:
-            self.session.expunge(state)
-
-    # ------------------------------------------------------------------ rules
-
-    def attribute(
-        self, key: str, entity_id: str | None, credits: Decimal, actions: dict | None
-    ) -> Placement:
-        credits = Decimal(credits or 0)
-        anchor = self.anchors.get(key)
-        before = self.before.get(key)
-
-        if entity_id is None:
-            previous = before.entity_id if before is not None else None
-            if previous is not None:
-                kept_before = before.held_reason == HELD_KEPT
-                held = before.held_readings if kept_before else 0
-                since = before.held_since if kept_before and before.held_since else self.now
-                entity = self._entity(previous)
-                release = entity is None or (
-                    entity.deleted and self._hold_over(previous, held, since)
-                )
-                if not release:
-                    attributed = None
-                    if (
-                        anchor is not None
-                        and anchor.released_at is None
-                        and anchor.entity_id == previous
-                    ):
-                        attributed = self._through(anchor, credits, actions)
-                    return Placement(previous, attributed, HELD_KEPT, held + 1, since)
-                if anchor is not None and anchor.released_at is None:
-                    anchor.released_at = self.now
-                    anchor.released_credits = credits
-                    anchor.release_reason = RELEASE_DELETED
-                self._left(key, previous, credits)
-            self._unmatched(key, credits, before)
-            return Placement(None)
-
-        placement = self._place(key, entity_id, credits, actions, anchor, before)
-        self._counts(key)
-        return placement
-
-    def _place(
-        self,
-        key: str,
-        entity_id: str,
-        credits: Decimal,
-        actions: dict | None,
-        anchor: UsageAnchor | None,
-        before: _Before | None,
-    ) -> Placement:
-        if anchor is not None and anchor.entity_id == entity_id:
-            if anchor.released_at is None:
-                return Placement(entity_id, self._through(anchor, credits, actions))
-            if anchor.release_reason == RELEASE_DELETED:
-                # Its entity came back: the same anchor counts again.
-                anchor.released_at = None
-                anchor.released_credits = None
-                anchor.release_reason = None
-                return Placement(entity_id, self._through(anchor, credits, actions))
-
-        if before is not None and before.entity_id == entity_id:
-            if before.attributed is None:
-                return Placement(entity_id)
-            # Counted from an offset whose anchor is gone: keep that offset.
-            offset = max(Decimal("0"), min(before.credits - before.attributed, credits))
-            self._anchor(
-                key, entity_id, offset, before.actions, reason=ANCHOR_MOVED, removed_from=None
-            )
-            return Placement(entity_id, credits - offset)
-        if before is not None and before.entity_id is not None:
-            # Moved from one entity to another.
-            offset = max(Decimal("0"), min(before.credits, credits))
-            self._anchor(
-                key,
-                entity_id,
-                offset,
-                before.actions,
-                reason=ANCHOR_MOVED,
-                removed_from=before.entity_id,
-            )
-            return Placement(entity_id, credits - offset)
-
-        # Counted nowhere in the last reading.
-        state = self.names.get(key)
-        if state is not None and state.last_entity_id is not None:
-            # It counted somewhere before it left: never its history again.
-            offset = max(Decimal("0"), min(Decimal(state.last_credits or 0), credits))
-            return self._from(key, entity_id, credits, offset, before, reason=ANCHOR_RETURNED)
-        never_reported = before is None and (state is None or state.first_unmatched_at is None)
-        left_at = self.vanishing.get(entity_id)
-        if left_at is not None and (
-            never_reported
-            or (
-                state is not None
-                and state.first_unmatched_at is not None
-                and state.first_unmatched_at >= left_at - self.new_entity_window
-            )
-        ):
-            # The entity's old name left the feed as this one appeared: the
-            # renamed name took over (never a name unmatched since before).
-            self.fresh.add(entity_id)
-            return Placement(entity_id)
-        if never_reported:
-            # A name the feed never reported before: all of it is new usage.
-            self.fresh.add(entity_id)
-            return Placement(entity_id)
-        first_at = (
-            state.first_unmatched_at
-            if state is not None and state.first_unmatched_at is not None
-            else (self.previous.collected_at if self.previous is not None else self.now)
-        )
-        first_credits = (
-            Decimal(state.first_unmatched_credits or 0)
-            if state is not None and state.first_unmatched_credits is not None
-            else (before.credits if before is not None else Decimal("0"))
-        )
-        entity = self._entity(entity_id)
-        created = entity.created_at if entity is not None else None
-        if created is not None and first_at <= created <= first_at + self.new_entity_window:
-            # A new entity the name was waiting for: its usage since the name
-            # was first seen is the entity's own.
-            first_new = state is not None and state.first_seen_new
-            offset = Decimal("0") if first_new else min(first_credits, credits)
-        else:
-            # An entity that existed all along: forward only, from the last total.
-            last = before.credits if before is not None else first_credits
-            offset = max(Decimal("0"), min(last, credits))
-        if offset <= 0:
-            self.fresh.add(entity_id)
-            return Placement(entity_id)
-        return self._from(key, entity_id, credits, offset, before, reason=ANCHOR_MATCHED)
-
-    def _from(
-        self,
-        key: str,
-        entity_id: str,
-        credits: Decimal,
-        offset: Decimal,
-        before: _Before | None,
-        *,
-        reason: str,
-    ) -> Placement:
-        self._anchor(
-            key,
-            entity_id,
-            offset,
-            before.actions if before is not None else None,
-            reason=reason,
-            removed_from=None,
-        )
-        return Placement(entity_id, credits - offset)
-
-    def carry(self) -> list[UsageRecord]:
-        """Rows for names the last reading counted and this one lacks.
-
-        A one-off gap in the feed, or a rename the feed reported before the
-        sync: the old name's row keeps counting until the hold may end
-        (``_hold_over``), so the entity's figure does not fall (and its period
-        lose its usage) meanwhile. Not when a name started to count towards the
-        same entity from nowhere in this reading (the renamed name took over).
-        When a carry ends, where the name counted is remembered.
-        """
-        rows: list[UsageRecord] = []
-        for key, before in self.before.items():
-            if key in self.reported or before.entity_id is None or before.record is None:
-                continue
-            if before.entity_id in self.fresh:
-                continue
-            carried_before = before.held_reason == HELD_CARRIED
-            held = before.held_readings if carried_before else 0
-            since = before.held_since if carried_before and before.held_since else self.now
-            if self._hold_over(before.entity_id, held, since):
-                self._left(key, before.entity_id, before.credits)
-                continue
-            record = before.record
-            rows.append(
-                UsageRecord(
-                    snapshot_id=self.snapshot.id,
-                    view_by=record.view_by,
-                    subject_key=record.subject_key,
-                    subject_name=record.subject_name,
-                    subject_email=record.subject_email,
-                    entity_type=record.entity_type,
-                    entity_id=record.entity_id,
-                    credits_used=record.credits_used,
-                    attributed_credits=record.attributed_credits,
-                    held_reason=HELD_CARRIED,
-                    held_readings=held + 1,
-                    held_since=since,
-                    transactions=record.transactions,
-                    actions=record.actions,
-                )
-            )
-        return rows
-
-
-ANCHOR_MAPPING = "mapping"
-ANCHOR_MOVED = "moved"
-ANCHOR_RETURNED = "returned"
-ANCHOR_MATCHED = "matched"
-RELEASE_UNMAP = "unmap"
-RELEASE_DELETED = "deleted"
-
-
 @dataclass
 class SubjectMove:
     """What re-pointing one reported name did to the latest reading."""
@@ -1593,9 +1077,8 @@ class SubjectMove:
     name: str
     # What the name has reported in the latest reading.
     reported: Decimal = Decimal("0")
-    # Where it counted before, and what of it counted there: no longer.
+    # Where it counted before.
     previous_entity: str | None = None
-    removed: Decimal = Decimal("0")
     # False: a real name match wins over the mapping, so nothing moved.
     followed: bool = True
     changed: bool = False
@@ -1610,13 +1093,13 @@ def move_subject(
     entity_id: str | None,
     follows,  # type: ignore[no-untyped-def]
 ) -> SubjectMove:
-    """Point a reported name at ``entity_id`` (None: at nothing), forward only.
+    """Point a reported name at ``entity_id`` (None: at nothing).
 
     Call under ``attribution_lock``. The latest live reading's row is re-pointed
-    at once, and the name is anchored at what it has reported so far: only what
-    it reports from now on counts towards the new entity. Unmapping takes away
-    exactly what the name added since it was mapped. ``follows(record)`` says
-    whether the row follows the mapping (a real name match wins).
+    at once, so pages show the mapping straight away. Nothing is counted by
+    it: usage counts where it is observed (the ledger), so a mapping moves only
+    what the name reports from now on. ``follows(record)`` says whether the
+    row follows the mapping (a real name match wins).
     """
     view = str(view)
     snapshot = latest_live_snapshot(session, view)
@@ -1632,66 +1115,19 @@ def move_subject(
         else None
     )
     move = SubjectMove(name=(record.subject_name or record.subject_key) if record else subject_key)
-    credits = Decimal(record.credits_used or 0) if record is not None else Decimal("0")
-    move.reported = credits
-    if record is not None:
-        move.previous_entity = record.entity_id
-        if not follows(record):
-            move.followed = False
-            return move
-        if record.entity_id is not None and record.entity_id == entity_id:
-            return move
-        if record.entity_id is not None:
-            move.removed = Decimal(
-                record.attributed_credits
-                if record.attributed_credits is not None
-                else record.credits_used or 0
-            )
-    anchor = session.scalar(
-        select(UsageAnchor).where(
-            UsageAnchor.view_by == view, UsageAnchor.subject_key == subject_key
-        )
-    )
-    now = utcnow()
-    previous = record.entity_id if record is not None else None
-    actions = record.actions if record is not None else None
-    if anchor is None and (entity_id is not None or previous is not None):
-        anchor = UsageAnchor(
-            view_by=view,
-            subject_key=subject_key,
-            entity_id=entity_id or previous,
-            offset_credits=credits,
-            anchored_at=now,
-            reason=ANCHOR_MAPPING,
-        )
-        session.add(anchor)
-    if anchor is not None:
-        if previous is not None:
-            # Budgets that counted the name there keep what it counted before
-            # their period began (evaluation, baseline_names).
-            anchor.removed_from = previous
-            anchor.removed_at = now
-        if entity_id is None:
-            if anchor.released_at is None:
-                anchor.released_at = now
-                anchor.released_credits = credits
-            anchor.release_reason = RELEASE_UNMAP
-        else:
-            anchor.entity_id = entity_id
-            anchor.offset_credits = credits
-            anchor.reference_actions = actions
-            anchor.snapshot_id = snapshot.id if snapshot is not None else None
-            anchor.anchored_at = now
-            anchor.reason = ANCHOR_MAPPING
-            anchor.released_at = None
-            anchor.released_credits = None
-            anchor.release_reason = None
-    if record is not None:
-        record.entity_type = entity_type
-        record.entity_id = entity_id
-        record.attributed_credits = Decimal("0") if entity_id is not None else None
-        record.held_reason = None
-        record.held_readings = None
+    if record is None:
+        move.changed = True
+        return move
+    move.reported = Decimal(record.credits_used or 0)
+    move.previous_entity = record.entity_id
+    if not follows(record):
+        move.followed = False
+        return move
+    if record.entity_id is not None and record.entity_id == entity_id:
+        return move
+    ledger.shift_for_move(session, view, record, record.entity_id, entity_id)
+    record.entity_type = entity_type
+    record.entity_id = entity_id
     move.changed = True
     session.flush()
     return move
@@ -1720,20 +1156,12 @@ def latest_snapshot(session: Session, view: UsageView | str) -> UsageSnapshot | 
 
 
 def latest_totals(session: Session, view: UsageView | str) -> dict[str, Decimal]:
-    """Credit totals keyed by resolved entity id, from the newest snapshot.
-
-    A name that started to count towards an entity after it had already
-    reported usage (an admin's mapping, or a rename that made it match) adds
-    only what it reported since: ``attributed_credits``.
-    """
+    """Reported credit totals keyed by resolved entity id, from the newest snapshot."""
     snapshot = latest_snapshot(session, view)
     if snapshot is None:
         return {}
     rows = session.execute(
-        select(
-            UsageRecord.entity_id,
-            func.sum(func.coalesce(UsageRecord.attributed_credits, UsageRecord.credits_used)),
-        )
+        select(UsageRecord.entity_id, func.sum(UsageRecord.credits_used))
         .where(
             UsageRecord.snapshot_id == snapshot.id,
             UsageRecord.entity_id.is_not(None),
@@ -1741,122 +1169,6 @@ def latest_totals(session: Session, view: UsageView | str) -> dict[str, Decimal]
         .group_by(UsageRecord.entity_id)
     ).all()
     return {entity_id: Decimal(str(total or 0)) for entity_id, total in rows if entity_id}
-
-
-@dataclass(frozen=True, slots=True)
-class NameRow:
-    """One name of the newest reading, with what it counts and its anchor."""
-
-    key: str
-    entity_id: str | None
-    counted: Decimal
-    anchor_entity: str | None = None
-    anchor_live: bool = False
-    anchored_at: datetime | None = None
-    removed_from: str | None = None
-    removed_at: datetime | None = None
-    offset: Decimal | None = None
-    held_reason: str | None = None
-
-
-def latest_names(session: Session, view: UsageView | str) -> dict[str, NameRow]:
-    """Every name of the newest reading, read in one statement with its anchor,
-    so the figures and the anchors always describe the same moment (a mapping
-    committed meanwhile is seen either entirely or not at all)."""
-    snapshot = latest_snapshot(session, view)
-    if snapshot is None:
-        return {}
-    rows = session.execute(
-        select(
-            UsageRecord.subject_key,
-            UsageRecord.entity_id,
-            func.coalesce(UsageRecord.attributed_credits, UsageRecord.credits_used),
-            UsageAnchor.entity_id,
-            UsageAnchor.released_at,
-            UsageAnchor.anchored_at,
-            UsageAnchor.removed_from,
-            UsageAnchor.removed_at,
-            UsageAnchor.offset_credits,
-            UsageRecord.held_reason,
-        )
-        .select_from(UsageRecord)
-        .outerjoin(
-            UsageAnchor,
-            (UsageAnchor.view_by == UsageRecord.view_by)
-            & (UsageAnchor.subject_key == UsageRecord.subject_key),
-        )
-        .where(UsageRecord.snapshot_id == snapshot.id)
-    ).all()
-    return {
-        key: NameRow(
-            key=key,
-            entity_id=entity_id,
-            counted=Decimal(str(counted or 0)),
-            anchor_entity=anchor_entity,
-            anchor_live=anchor_entity is not None and released_at is None,
-            anchored_at=anchored_at,
-            removed_from=removed_from,
-            removed_at=removed_at,
-            offset=Decimal(str(offset)) if offset is not None else None,
-            held_reason=held_reason,
-        )
-        for (
-            key,
-            entity_id,
-            counted,
-            anchor_entity,
-            released_at,
-            anchored_at,
-            removed_from,
-            removed_at,
-            offset,
-            held_reason,
-        ) in rows
-    }
-
-
-def anchors_for(session: Session, view: str, keys: list[str]) -> dict[str, UsageAnchor]:
-    """The live anchors of these names (for ``forward_actions``)."""
-    found: dict[str, UsageAnchor] = {}
-    unique = sorted(set(keys))
-    for start in range(0, len(unique), 500):
-        for anchor in session.scalars(
-            select(UsageAnchor).where(
-                UsageAnchor.view_by == view,
-                UsageAnchor.subject_key.in_(unique[start : start + 500]),
-                UsageAnchor.released_at.is_(None),
-            )
-        ):
-            found[anchor.subject_key] = anchor
-    return found
-
-
-def forward_actions(record: UsageRecord, anchors: dict[str, UsageAnchor]) -> dict:
-    """A row's per action transactions that count towards its entity: for a
-    name counting through an anchor, only those beyond the anchor's reference
-    (the same rule as ``attributed_credits``)."""
-    actions = record.actions or {}
-    anchor = anchors.get(record.subject_key)
-    if record.attributed_credits is None or anchor is None or anchor.entity_id != record.entity_id:
-        return actions
-    reference = anchor.reference_actions or {}
-    forward: dict = {}
-    for action, count in actions.items():
-        before = reference.get(action, 0)
-        if isinstance(count, int | float) and isinstance(before, int | float):
-            forward[action] = max(0, count - before)
-        else:
-            forward[action] = count
-    return forward
-
-
-def totals_of(names: dict[str, NameRow]) -> dict[str, Decimal]:
-    """``latest_totals`` from ``latest_names``."""
-    totals: dict[str, Decimal] = {}
-    for row in names.values():
-        if row.entity_id:
-            totals[row.entity_id] = totals.get(row.entity_id, Decimal("0")) + row.counted
-    return totals
 
 
 def dimension_supported(session: Session, view: UsageView | str) -> bool:
