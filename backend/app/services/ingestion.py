@@ -41,7 +41,7 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
-from app.services import ledger, subject_matching
+from app.services import activity_source, ledger, subject_matching
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome, UserProfile
 
@@ -151,14 +151,20 @@ class IngestResult:
     # to pass (outage, rate limit, truncated answer). Evaluation then runs on the
     # previous snapshot, and the cycle is reported as partial.
     errors: list[str] = field(default_factory=list)
+    # The credit activity log's step (app/services/activity_source.py).
+    activity: activity_source.ActivityResult | None = None
 
     @property
     def fresh(self) -> bool:
         """True when every dimension that feeds limits was read and believed.
 
         The action dimension only feeds the dashboard breakdown, so a problem
-        there does not make the figures limits are judged on stale.
+        there does not make the figures limits are judged on stale. While the
+        activity log is the source, a cycle it could not be read in is not
+        fresh either.
         """
+        if self.activity is not None and self.activity.read_failed:
+            return False
         return not any(
             dimension.held or dimension.read_failed
             for view, dimension in self.dimensions.items()
@@ -170,7 +176,7 @@ class IngestResult:
         return sum(dimension.records for dimension in self.dimensions.values())
 
     def as_stats(self) -> dict[str, object]:
-        return {
+        stats: dict[str, object] = {
             view: {
                 "supported": dimension.supported,
                 "records": dimension.records,
@@ -187,6 +193,9 @@ class IngestResult:
             }
             for view, dimension in self.dimensions.items()
         }
+        if self.activity is not None and self.activity.enabled:
+            stats["activity"] = self.activity.as_stats()
+        return stats
 
 
 # ------------------------------------------------------------------- resolution
@@ -377,6 +386,14 @@ def ingest_usage(
 
         period_param = settings_store.usage_period(session)
     result = IngestResult()
+    # The activity log first: whether it is the source of the project, user
+    # and application views this cycle decides whether the summary readings
+    # below feed their budgets (app/services/activity_source.py).
+    result.activity = activity_source.ingest_activity(session, client)
+    result.warnings.extend(result.activity.warnings)
+    if result.activity.read_failed and result.activity.error:
+        result.errors.append(f"credit activity log could not be read: {result.activity.error}")
+    integrations = activity_source.listed_extras(session)
     user_index = build_user_index(session)
     mappings = entity_mappings(session)
     projects_by_id, projects_by_name = _named_index(
@@ -463,6 +480,7 @@ def ingest_usage(
                 groups_by_id=groups_by_id,
                 groups_by_name=groups_by_name,
                 own=own,
+                integrations=integrations,
             )
             if dimension.held:
                 result.warnings.append(dimension.error or f"The {view} read was held back.")
@@ -806,8 +824,13 @@ def _store_dimension(
     groups_by_id: dict[str, str] | None = None,
     groups_by_name: dict[str, str] | None = None,
     own: dict[str, set[str]] | None = None,
+    integrations: frozenset[str] = frozenset(),
 ) -> DimensionResult:
-    """Write one fully fetched dimension. Makes no network calls."""
+    """Write one fully fetched dimension. Makes no network calls.
+
+    ``integrations``: account names an admin listed as integration accounts
+    (``attribution.integration_accounts``), shown as automation when they
+    match nobody."""
     now = utcnow()
     merged = fetched.merged
     held_reason = _hold_reason(
@@ -891,6 +914,15 @@ def _store_dimension(
                 email=item.subject_email,
                 integrations=True,
             )
+            if (
+                integrations
+                and outcome.counted_user_id is None
+                and not outcome.is_bot
+                and activity_source.is_integration_account(
+                    item.subject_name, item.subject_email, integrations
+                )
+            ):
+                outcome = replace(outcome, is_bot=True)
             entity_type, entity_id = EntityType.USER, outcome.counted_user_id
         else:
             entity_type, entity_id = _attribute(
@@ -940,9 +972,13 @@ def _store_dimension(
     session.flush()
     # The increases since the last live reading, attributed to where each name
     # counts now, and added to the budgets fed now (see app/services/ledger.py).
+    # While the activity log is the source of this view, the reading is kept
+    # (totals, names, Attribution) but feeds no budget counter.
+    feeds = activity_source.summary_feeds(session, str(view), snapshot)
     counted = ledger.record_reading(
-        session, view, snapshot, stored, suspect=fetched.suspect, own=own
+        session, view, snapshot, stored, suspect=fetched.suspect, own=own, feed=feeds
     )
+    activity_source.note_summary_reading(session, str(view), snapshot)
     result.doubted_falls = counted.dips
 
     snapshot.total_credits = total

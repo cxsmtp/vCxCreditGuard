@@ -301,6 +301,17 @@ class SettingsResponse(BaseModel):
     # Charge each project's auto-triage credits also to the person whose scan
     # triggered it. Off by default.
     charge_auto_triage_to_scan_initiator: bool = False
+    # Where period budgets of projects, users and applications get their
+    # usage: "activity" (the credit activity log, with the summary as its
+    # fallback) or "summary" (the consumption summary only).
+    usage_source: str = "activity"
+    allowed_usage_sources: list[str] = Field(default_factory=list)
+    activity_max_pages_per_cycle: int = 40
+    # Extra integration account names (besides "[bot]" accounts, Auto-triage
+    # and Auto-remediation).
+    integration_accounts: list[str] = Field(default_factory=list)
+    # The activity source's state, for the Settings page.
+    usage_source_status: dict[str, Any] | None = None
     current_schedule_description: str
     # Pacing for large tenants (per cycle; 0 = no budget). See pacing.py.
     verify_interval_minutes: int = 60
@@ -352,6 +363,9 @@ class SettingsUpdateRequest(StrictModel):
     # that look like administration roles (settings_store.ADMIN_ROLE_PATTERNS).
     confirm_admin_roles: bool | None = None
     charge_auto_triage_to_scan_initiator: bool | None = None
+    usage_source: str | None = Field(default=None, max_length=16)
+    activity_max_pages_per_cycle: int | None = Field(default=None, ge=0, le=100_000)
+    integration_accounts: list[str] | None = Field(default=None, max_length=200)
     verify_interval_minutes: int | None = Field(default=None, ge=0, le=10080)
     max_verifications_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
     max_writes_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)

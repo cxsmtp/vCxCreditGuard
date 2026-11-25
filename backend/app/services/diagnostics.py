@@ -83,6 +83,12 @@ _REMEDIATION: dict[tuple[str, str], str] = {
         "acts for, so their share of auto-triage credits counts. If scans could not be read, "
         "check the connection; those credits stay estimated until a later cycle reads them."
     ),
+    ("activity_source", WARN): (
+        "Check that the API key may read the credit activity log and that the tenant is "
+        "reachable. A mismatch with the consumption summary that persists is worth raising "
+        "with Checkmarx; meanwhile Settings → Schedule & data can switch the usage source to "
+        "the summary only."
+    ),
     ("enforcement", WARN): (
         "Restore the Checkmarx connection; the next healthy cycle retries the pending "
         "actions. You can also run a cycle now from Operations."
@@ -146,6 +152,9 @@ def run_diagnostics(
     coverage_check = _coverage_check(session)
     if coverage_check is not None:
         checks.append(coverage_check)
+    activity = _activity_check(session, moment)
+    if activity is not None:
+        checks.append(activity)
     if settings_store.auto_triage_to_initiator(session):
         # Only while charging auto triage to scan initiators is on, so the
         # report is unchanged for everyone who has not turned it on.
@@ -383,6 +392,62 @@ def _doubted_falls_check(session: Session) -> Check | None:
         f"reading confirms it, for at most {ledger.DIP_MAX_DOUBTS} readings or "
         f"{int(ledger.DIP_MAX_AGE.total_seconds() // 3600)} hours.",
     )
+
+
+def _activity_check(session: Session, moment: datetime) -> Check | None:
+    """The credit activity log as the usage source: whether it is the source,
+    and whether its sum matched the consumption summary's total over the same
+    window the last time both were read in full."""
+    from app.services import activity_source
+
+    if settings_store.usage_source(session) != settings_store.USAGE_SOURCE_ACTIVITY:
+        return None
+    info = activity_source.describe(session)
+    label = "Usage source"
+    status = info.get("status")
+    if status == activity_source.ACTIVE:
+        detail = "The credit activity log is the source of project, user and application usage."
+        failing = info.get("failing_since")
+        if failing:
+            return Check(
+                "activity_source",
+                label,
+                WARN,
+                f"{detail} It could not be read since {failing} ({info.get('last_error')}); "
+                "nothing new is counted until it answers, and the consumption summary takes "
+                f"over after {int(activity_source.OUTAGE_GRACE.total_seconds() // 60)} minutes.",
+            )
+        reconciliation = info.get("reconciliation") or {}
+        if isinstance(reconciliation, dict) and reconciliation.get("status") == "mismatch":
+            return Check(
+                "activity_source",
+                label,
+                WARN,
+                f"{detail} But over {reconciliation.get('period')} the log adds up to "
+                f"{reconciliation.get('activity_credits')} credits and the consumption summary "
+                f"reports {reconciliation.get('summary_credits')} (checked "
+                f"{reconciliation.get('at')}): some usage may be missing from one of them.",
+            )
+        if isinstance(reconciliation, dict) and reconciliation.get("status") == "match":
+            detail += (
+                f" Over {reconciliation.get('period')} it adds up to the consumption summary's "
+                f"total ({reconciliation.get('summary_credits')} credits)."
+            )
+        return Check("activity_source", label, OK, detail)
+    if status == activity_source.FALLBACK:
+        return Check(
+            "activity_source",
+            label,
+            WARN,
+            "The credit activity log could not be read "
+            f"({info.get('last_error')}), so usage comes from the consumption summary, "
+            "matched by name. The log is tried again "
+            + (f"after {info.get('retry_after')}." if info.get("retry_after") else "every cycle."),
+        )
+    detail = "Usage comes from the consumption summary, matched by name."
+    if info.get("last_error"):
+        detail += f" The credit activity log is not available: {info.get('last_error')}"
+    return Check("activity_source", label, OK, detail)
 
 
 def _group_names_check(session: Session) -> Check | None:

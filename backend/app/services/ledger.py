@@ -389,6 +389,7 @@ def record_reading(
     *,
     suspect: bool = False,
     own: dict[str, set[str]] | None = None,
+    feed: bool = True,
 ) -> LedgerResult:
     """Turn one stored live reading into ledger increases and budget counters.
 
@@ -398,7 +399,9 @@ def record_reading(
     was stored). ``suspect``: the completeness checks doubt the listing (a
     short or repeated page), so a fall in it is not believed yet. ``own``: the
     groups and applications with a row of their own (``own_figures``), taken
-    once per ingest.
+    once per ingest. ``feed`` False: the increases are recorded but no budget
+    counter is fed (the activity log is the source of this view's usage, see
+    app/services/activity_source.py).
     """
     from app.services import ingestion
 
@@ -650,8 +653,9 @@ def record_reading(
     claimed = _claims(session, view, records, window, now)
     result.claimed = len(claimed)
     attributed = [d for d in deltas if d.entity_id is not None]
-    _feed(session, view, attributed, result, own)
-    _feed(session, view, claimed, result, own, claimed=True)
+    if feed:
+        _feed(session, view, attributed, result, own)
+        _feed(session, view, claimed, result, own, claimed=True)
     shifts.save(now)
     session.flush()
     return result

@@ -171,6 +171,9 @@ class UsageIndex:
         self.application_dimension = ingestion.dimension_supported(session, UsageView.APPLICATION)
         self.user_dimension = ingestion.dimension_supported(session, UsageView.USER)
         self._attribution: auto_triage_attribution.AttributionModel | None = None
+        # The activity source's integration-account rule for auto-triage
+        # charges (None: nothing to skip), read on first use.
+        self._initiator_skip: object = False
         # Read on first use, once for every limit (reports and previews ask
         # about hundreds of limits in one request).
         self._states: dict[str, dict[int, LimitPeriodState]] = {}
@@ -273,12 +276,17 @@ class UsageIndex:
         else:
             # No period yet: the first evaluation takes its baseline now.
             since = moment
+        if self._initiator_skip is False:
+            from app.services import activity_source
+
+            self._initiator_skip = activity_source.initiator_skip(self._session)
         return auto_triage_attribution.attributed_usage(
             self.attribution,
             user_ids=user_ids,
             exclude_projects=exclude,
             counts_existing=counts_all,
             since=since,
+            skip=self._initiator_skip,  # type: ignore[arg-type]
         )
 
     def project_total(self, project_id: str) -> tuple[Decimal, bool]:
