@@ -638,7 +638,7 @@ class TestAuditAndNotifications:
         notification = db.scalar(select(Notification).where(Notification.category == "enforcement"))
         assert notification is not None
         assert "Alice Archer" in notification.title
-        assert "view-risk-management" in (notification.body or "")
+        assert "create-fusion-scan" in (notification.body or "")
         assert "Restore access" in (notification.body or "")
 
     def test_restoration_is_audited_and_notified(self, db: Session) -> None:

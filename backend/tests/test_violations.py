@@ -341,7 +341,7 @@ class TestUsageAfter:
         """Usage by a person who still holds an AI role through a group is not
         acting against the restriction: the restriction cannot take that role,
         and said so once when it was applied."""
-        tenant.add_group(group_id="grp-ai", name="AI Users", roles=["view-risk-management"])
+        tenant.add_group(group_id="grp-ai", name="AI Users", roles=["create-fusion-scan"])
         tenant.join_group("user-alice", "grp-ai")
         assert cycle.run_cycle(trigger="manual", force_org_sync=True).steps["violations"]
         limits_service.create_limit(

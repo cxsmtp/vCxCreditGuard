@@ -119,12 +119,15 @@ const LIMITATIONS: Limitation[] = [
     group: "enforcement",
     meaning: (
       <>
-        On a live tenant ast-admin, held by 274 of 296 users, is a composite
-        role containing all three default AI roles, and it is protected: a user
-        restriction would have reached almost nobody. Check Enforcement coverage
-        (Simulation or Settings → Enforcement) before relying on user budgets;
-        project, group and application budgets still turn AI features off on
-        projects.
+        A user budget cannot stop someone who gets Fusion through a composite
+        role: ast-admin (held by 274 of 296 users on a live tenant, and
+        protected) and scan-fusion both contain create-fusion-scan, so
+        removing the direct mapping takes nothing away. The fix is on the
+        tenant: give people ast-scanner or ast-risk-manager, which contain no
+        AI role, plus create-fusion-scan directly where they should run Fusion.
+        Check Enforcement coverage (Simulation or Settings → Enforcement)
+        before relying on user budgets. Project, group and application budgets
+        do not depend on roles: they turn AI features off on the projects.
       </>
     ),
   },
@@ -164,15 +167,17 @@ const LIMITATIONS: Limitation[] = [
     ),
   },
   {
-    title: "The general Risk Management roles are used for now.",
+    title: "A user restriction removes the Fusion and LLM roles.",
     group: "enforcement",
     meaning: (
       <>
-        AI Triage and AI Remediation are reached through them today, so a
-        restricted person also loses the Risk Management pages and dashboard.
-        When Checkmarx One's dedicated AI permissions reach your tenant, swap
-        them in under Settings → Enforcement,{" "}
-        <i>Roles a user restriction removes</i>.
+        By default create-fusion-scan (the role that spends credits),
+        manage-fusion, update-llm-scan-mode and manage-llm-configuration. The
+        composites scan-fusion and fusion-manager are left alone, because
+        removing them would also take ordinary scanning or tenant settings
+        rights, and ai-triage-assist can never be chosen: removing it breaks
+        Auto Triage. An install that had chosen other roles keeps them
+        (Settings → Enforcement, <i>Roles a user restriction removes</i>).
       </>
     ),
   },

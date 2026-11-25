@@ -252,7 +252,9 @@ export function SettingsPage({
     try {
       // An administration-like AI role is saved only with an explicit
       // confirmation: one given in the picker's dialog, or one already saved.
-      const adminLike = (changes.ai_roles ?? []).filter(isAdminLikeRole);
+      const adminLike = (changes.ai_roles ?? []).filter(
+        (name) => isAdminLikeRole(name) && !(current?.default_ai_roles ?? []).includes(name),
+      );
       const confirmed =
         adminLike.length > 0 &&
         adminLike.every(
@@ -2223,6 +2225,9 @@ function isAdminLikeRole(name: string): boolean {
   );
 }
 
+/** Roles the server refuses as AI roles: removing ai-triage-assist breaks Auto Triage. */
+const NEVER_AI_ROLES = ["ai-triage-assist"];
+
 /** The client roles a user restriction removes, picked from the tenant's own roles. */
 function AiRolesPicker({
   isAdmin,
@@ -2249,10 +2254,13 @@ function AiRolesPicker({
   const [confirming, setConfirming] = useState<string | null>(null);
   const listing = roles.data;
   const isProtected = (name: string) => protectedRoles.includes(name.toLowerCase());
-  const adminLike = (name: string) => byName.get(name)?.admin_like ?? isAdminLikeRole(name);
+  // The defaults are never treated as admin roles (manage-fusion matches manage-*).
+  const adminLike = (name: string) =>
+    byName.get(name)?.admin_like ?? (isAdminLikeRole(name) && !defaults.includes(name));
+  const isNever = (name: string) => NEVER_AI_ROLES.includes(name.toLowerCase());
 
   function add(name: string) {
-    if (isProtected(name)) return;
+    if (isProtected(name) || isNever(name)) return;
     if (adminLike(name)) {
       setConfirming(name);
       return;
@@ -2274,13 +2282,18 @@ function AiRolesPicker({
       <p className="text-sm font-medium">Roles a user restriction removes</p>
       <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
         The client roles (on <code>ast-app</code>) taken from a person who goes over a user
-        budget. The default is the three general Risk Management roles AI Triage and AI
-        Remediation are reached through, so a restricted person also loses the Risk Management
-        pages. When Checkmarx One ships dedicated AI Triage and Remediation roles (announced for
-        10 January), add them here and remove the general ones. A change applies only to
-        restrictions made from then on: a restriction in force keeps, and gives back, exactly
-        the roles it recorded. A role a person holds through a group or a composite role is not
-        taken away by removing their direct mapping; CreditGuard says so when it happens.
+        budget. The default is the Fusion and LLM roles: <code>create-fusion-scan</code> (the role
+        that spends credits), <code>manage-fusion</code>, <code>update-llm-scan-mode</code> and{" "}
+        <code>manage-llm-configuration</code>. Composites such as <code>scan-fusion</code> or{" "}
+        <code>fusion-manager</code> also carry ordinary scanning or tenant-settings rights, so
+        removing them over-restricts; <code>ai-triage-assist</code> is refused, because removing it
+        breaks Auto Triage. A change applies only to restrictions made from then on: a restriction
+        in force keeps, and gives back, exactly the roles it recorded. A role a person holds
+        through a group or a composite role is not taken away by removing their direct mapping:
+        a user budget cannot stop someone who gets Fusion through <code>ast-admin</code> or{" "}
+        <code>scan-fusion</code>. The fix is on the tenant: give people <code>ast-scanner</code> or{" "}
+        <code>ast-risk-manager</code> plus <code>create-fusion-scan</code> directly where wanted.
+        Project budgets do not depend on roles.
       </p>
       <div className="mt-2 flex flex-wrap gap-1.5">
         {value.map((name) => {
@@ -2331,11 +2344,13 @@ function AiRolesPicker({
                   <option
                     key={role.name}
                     value={role.name}
-                    disabled={isProtected(role.name)}
+                    disabled={isProtected(role.name) || isNever(role.name)}
                   >
                     {role.name}
                     {role.composite ? " (composite)" : ""}
-                    {isProtected(role.name)
+                    {isNever(role.name)
+                      ? " (AI Triage system role: cannot be an AI role)"
+                      : isProtected(role.name)
                       ? " (protected: cannot be an AI role)"
                       : adminLike(role.name)
                         ? " ⚠ admin role"

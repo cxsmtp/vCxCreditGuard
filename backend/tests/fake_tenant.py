@@ -35,6 +35,11 @@ ALL_ROLES: dict[str, str] = {
     "view-risk-management-tab": "82660f23-52cb-4361-9d49-7abae5e520fa",
     "view-projects": "92660f23-52cb-4361-9d49-7abae5e520fb",
     "view-scans": "a2660f23-52cb-4361-9d49-7abae5e520fc",
+    # The default AI roles (iam.DEFAULT_AI_ROLE_NAMES).
+    "create-fusion-scan": "b2660f23-52cb-4361-9d49-7abae5e520fd",
+    "manage-fusion": "c2660f23-52cb-4361-9d49-7abae5e520fe",
+    "update-llm-scan-mode": "d2660f23-52cb-4361-9d49-7abae5e520ff",
+    "manage-llm-configuration": "e2660f23-52cb-4361-9d49-7abae5e52100",
 }
 
 

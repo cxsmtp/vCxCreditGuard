@@ -119,9 +119,10 @@ def seed(admin_username: str, admin_password: str | None) -> None:
                     role_names=[
                         "view-projects",
                         "view-scans",
-                        "view-risk-management",
-                        "view-risk-management-dashboard",
-                        "view-risk-management-tab",
+                        "create-fusion-scan",
+                        "manage-fusion",
+                        "update-llm-scan-mode",
+                        "manage-llm-configuration",
                     ],
                     group_names=groups,
                     last_synced_at=now,

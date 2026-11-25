@@ -358,7 +358,8 @@ def _validated_ai_roles(  # type: ignore[no-untyped-def]
 ) -> list[str]:
     """The AI role list, checked against the roles the tenant actually has.
 
-    A protected role is refused: its holders are never restricted, so a list
+    ``ai-triage-assist`` (iam.NEVER_AI_ROLE_NAMES) is always refused: removing
+    it breaks Auto Triage. A protected role is refused: its holders are never restricted, so a list
     that names it would silently restrict nobody who holds it. A role that looks
     like an administration role (settings_store.ADMIN_ROLE_PATTERNS) is refused
     unless the request confirms it (``confirm_admin_roles``). When the tenant's
@@ -373,6 +374,20 @@ def _validated_ai_roles(  # type: ignore[no-untyped-def]
                 "code": "invalid_ai_roles",
                 "message": "Name at least one role: with none, a user restriction would "
                 "remove nothing.",
+            },
+        )
+    never = [name for name in names if iam.never_removed(name)]
+    if never:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "forbidden_ai_roles",
+                "message": (
+                    f"{', '.join(never)} cannot be an AI role: it is the built-in role of the "
+                    "AI Triage system user, and removing it breaks Auto Triage. Remove it from "
+                    "the list."
+                ),
+                "roles": never,
             },
         )
     _refuse_protected_ai_roles(names, protected)

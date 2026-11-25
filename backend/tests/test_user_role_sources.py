@@ -19,7 +19,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.checkmarx import iam
-from app.checkmarx.iam import DEFAULT_AI_ROLE_NAMES
+from app.checkmarx.iam import DEFAULT_AI_ROLE_NAMES, LEGACY_AI_ROLE_NAMES
 from app.models import AuditLogEntry, EnforcementAction, Notification, PolicyViolation
 from app.models.enums import EnforcementKind, EnforcementStatus, EntityType, PeriodType
 from app.models.limits import CreditLimit
@@ -39,7 +39,9 @@ from tests.fake_tenant import FakeTenant, populated_tenant
 
 ACTOR = AuditActor.system("test")
 PERIOD = "2026-08"
-RM, RM_DASH, RM_TAB = DEFAULT_AI_ROLE_NAMES
+# Three of the default AI roles (the names are from when the default was the
+# Risk Management roles).
+RM, RM_DASH, RM_TAB = DEFAULT_AI_ROLE_NAMES[:3]
 
 
 def setup_tenant(db: Session, tenant: FakeTenant | None = None):
@@ -115,7 +117,7 @@ def requests(tenant: FakeTenant, method: str, fragment: str) -> int:
 
 
 class TestConfigurableRoleList:
-    def test_default_list_is_the_legacy_three(self, db: Session) -> None:
+    def test_default_list_is_the_fusion_roles(self, db: Session) -> None:
         assert settings_store.ai_role_names(db) == DEFAULT_AI_ROLE_NAMES
         tenant, client = setup_tenant(db)
         apply(db, client, user_limit(db))
@@ -178,7 +180,8 @@ class TestConfigurableRoleList:
 
     def test_view_scans_from_an_old_restriction_is_still_returned_once(self, db: Session) -> None:
         """A restriction made before the list was a setting has no recorded list:
-        the default three count as its AI roles, so view-scans goes back."""
+        the default of the time (the Risk Management three) counts as its AI roles,
+        so view-scans goes back."""
         tenant, client = setup_tenant(db)
         set_ai_roles(db, [RM_TAB])
         limit = user_limit(db)
@@ -192,7 +195,7 @@ class TestConfigurableRoleList:
         legacy["removed_roles"] = [
             {"id": iam_id, "name": name}
             for name, iam_id in tenant.client_roles.items()
-            if name in (*DEFAULT_AI_ROLE_NAMES, "view-scans")
+            if name in (*LEGACY_AI_ROLE_NAMES, "view-scans")
         ]
         action.undo_snapshot = legacy
         db.commit()
@@ -206,7 +209,7 @@ class TestConfigurableRoleList:
         assert set(tenant.role_mappings["user-alice"]) == {
             "view-projects",
             "view-scans",
-            *DEFAULT_AI_ROLE_NAMES,
+            *LEGACY_AI_ROLE_NAMES,
         }
 
     def test_merged_snapshots_keep_every_list(self) -> None:
@@ -219,7 +222,7 @@ class TestConfigurableRoleList:
             {"kind": "remove_user_roles", "removed_roles": []},
             {"kind": "remove_user_roles", "removed_roles": [], "ai_roles": ["y"]},
         )
-        assert set(legacy["ai_roles"]) == {*DEFAULT_AI_ROLE_NAMES, "y"}
+        assert set(legacy["ai_roles"]) == {*LEGACY_AI_ROLE_NAMES, "y"}
 
 
 # -------------------------------------------------- where roles come from
@@ -447,10 +450,10 @@ class TestSimulation:
         assert user.read is True
         removed = {role.name: role for role in user.removed}
         assert set(removed) == {*DEFAULT_AI_ROLE_NAMES, "ai-bundle"}
-        assert removed["ai-bundle"].grants == ["view-projects", RM_DASH]
+        assert removed["ai-bundle"].grants == sorted(["view-projects", RM_DASH])
         assert removed["ai-bundle"].description == "AI power users"
         assert removed[RM].grants == []
-        assert "AI Triage/Remediation are reached from here" in (removed[RM].description or "")
+        assert removed[RM].description == iam.ROLE_DESCRIPTIONS[RM]
         kept = {role.name: role.sources for role in user.kept}
         # The group still grants RM. RM_DASH comes with ai-bundle, which this
         # restriction removes as well, so it is not kept (Keycloak would drop it).
@@ -789,7 +792,7 @@ class TestSettingsApi:
         assert body["available"] is True
         names = {role["name"]: role for role in body["roles"]}
         assert names["ai-triage"]["description"] == "AI Triage (dedicated)"
-        assert "reached from here" in names[RM]["known_description"]
+        assert names[RM]["known_description"] == iam.ROLE_DESCRIPTIONS[RM]
         # Cached briefly: a second ask does not read the tenant again.
         before = requests(connected, "GET", "/roles")
         admin_client.get("/api/settings/client-roles")
