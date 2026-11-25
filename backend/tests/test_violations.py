@@ -648,6 +648,7 @@ class TestUsageBaseline:
         from decimal import Decimal
 
         from app.models.usage import UsageRecord, UsageSnapshot
+        from app.services import ledger
 
         now = utcnow()
         t0, t1, t2, t3 = (now - timedelta(hours=h) for h in (10, 8, 4, 1))
@@ -674,6 +675,14 @@ class TestUsageBaseline:
                 )
             )
             db.flush()
+            # A live reading: its increases go to the usage ledger, which usage
+            # after a restriction is measured from.
+            ledger.record_reading(
+                db,
+                "project",
+                snapshot,
+                list(db.scalars(select(UsageRecord).where(UsageRecord.snapshot_id == snapshot.id))),
+            )
 
         snap(t0 - timedelta(minutes=5), 0)  # before the Auto Triage restriction
         snap(t1, 3)  # 3 Fusion scans while Fusion was still allowed

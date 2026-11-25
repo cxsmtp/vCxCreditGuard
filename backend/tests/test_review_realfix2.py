@@ -1,10 +1,9 @@
 """Second review of realfix: mappings and automatic matches count forward only.
 
-Ported from the reviewer's tests. A mapping no longer shifts any budget
-period's baseline (which raced the evaluation, and two mappings raced each
-other); the mapped name is anchored at what it had reported, and only what it
-reports beyond that counts. Expectations that described baseline shifts are
-restated for that design; the race tests are kept as they were.
+Ported from the reviewer's tests, and restated for the usage ledger (fifth
+review): a period budget counts the increases observed while a name counted
+towards it, so a mapping moves only what the name reports from then on, and
+nothing it already counted is taken back. The race tests are kept as they were.
 
 Synthetic data only (tests/fake_tenant.py).
 """
@@ -24,7 +23,6 @@ from app.models import (
     EntityMapping,
     LimitPeriodState,
     Notification,
-    UsageAnchor,
     UsageRecord,
     UsageSnapshot,
 )
@@ -44,45 +42,42 @@ def _breach(db: Session):
     )
 
 
-def _anchor(db: Session, key: str, view: str = "project") -> UsageAnchor | None:
-    db.expire_all()
-    return db.scalar(
-        select(UsageAnchor).where(UsageAnchor.view_by == view, UsageAnchor.subject_key == key)
-    )
-
-
 def test_map_unmap_remap_counts_each_credit_once(
     db: Session,
     connected,  # noqa: F811
     admin_client: TestClient,
 ) -> None:
-    """Usage spent while mapped counts; unmapping takes exactly that away;
-    mapping again starts afresh. Nothing is counted twice or brought back."""
+    """Usage spent while mapped counts and stays counted; unmapping and mapping
+    again move only what is reported from then on. Nothing is counted twice,
+    brought back, or taken back."""
     tenant = live_tenant()
     tenant.set_entity_credits(view="project", name=NAME, credits=0)
     connected(tenant)
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     _map(admin_client, "proj-api")  # mapped before the budget exists
     project = _limit(db, EntityType.PROJECT, "proj-api")
-    cycle.run_cycle(trigger="manual")  # baseline = 8, the project's own
+    cycle.run_cycle(trigger="manual")
     tenant.set_entity_credits(view="project", name=NAME, credits=600)  # spent this period
     cycle.run_cycle(trigger="manual")
     assert _state(db, project).credits_used == 600
 
     body = _map(admin_client, None)
-    assert "of the 600 credits it had added there" in body["confirmation"], body["confirmation"]
+    assert body["confirmation"] == (
+        f"Usage reported under {NAME} from now on counts towards nothing. "
+        "What it already counted towards payments/api stays there."
+    ), body["confirmation"]
+    tenant.set_entity_credits(view="project", name=NAME, credits=620)  # counts nowhere
     cycle.run_cycle(trigger="manual")
-    assert _state(db, project).credits_used == 0
+    assert _state(db, project).credits_used == 600
 
     body = _map(admin_client, "proj-api")
-    assert "from now on count towards payments/api" in body["confirmation"]
-    assert "600 credits it has already reported do not" in body["confirmation"]
+    assert "from now on counts towards payments/api" in body["confirmation"]
     cycle.run_cycle(trigger="manual")
-    assert _state(db, project).credits_used == 0
-    tenant.set_entity_credits(view="project", name=NAME, credits=650)
+    assert _state(db, project).credits_used == 600
+    tenant.set_entity_credits(view="project", name=NAME, credits=670)
     cycle.run_cycle(trigger="manual")
     state = _state(db, project)
-    assert state.credits_used == 50, (state.credits_used, state.baseline_credits)
+    assert state.credits_used == 650, (state.credits_used, state.baseline_credits)
 
 
 def test_mapping_while_a_cycle_evaluates_does_not_lose_the_shift(
@@ -213,9 +208,9 @@ def test_two_names_mapped_to_one_project_at_once_both_count_forward(
     start = _state(db, project).baseline_credits
 
     assert _map_in_threads([NAME, NAME2], "proj-api", gate=True) == ["ok", "ok"]
-    assert _anchor(db, NAME).offset_credits == 870
-    assert _anchor(db, NAME2).offset_credits == 500
-    assert _state(db, project).baseline_credits == start
+    db.expire_all()
+    assert len(list(db.scalars(select(EntityMapping)))) == 2
+    assert start is not None
     cycle.run_cycle(trigger="manual")
     assert _state(db, project).credits_used == 0
     tenant.set_entity_credits(view="project", name=NAME, credits=880)
@@ -257,9 +252,10 @@ def test_budgets_of_every_period_type_and_the_simulation_count_forward_only(
     connected,  # noqa: F811
     admin_client: TestClient,
 ) -> None:
-    """A lifetime budget counts usage already reported by its own names, but a
-    name mapped to it counts only from the mapping: the same for every budget,
-    so a mapping never brings history into any of them."""
+    """A period budget counts what is observed while a name counts towards it.
+    A lifetime budget counts everything reported by the names that count
+    towards it now (restated in the fifth review: it is no ledger budget), so
+    a mapped name's history is part of it."""
     from app.models.enums import PeriodType
     from app.services import limits_service
 
@@ -289,12 +285,12 @@ def test_budgets_of_every_period_type_and_the_simulation_count_forward_only(
     assert _state(db, monthly).credits_used == 0
     db.expire_all()
     lt = db.scalar(select(LimitPeriodState).where(LimitPeriodState.limit_id == lifetime.id))
-    assert lt.credits_used == 8
+    assert lt.credits_used == 878
     tenant.set_entity_credits(view="project", name=NAME, credits=970)
     cycle.run_cycle(trigger="manual")
     db.expire_all()
     lt = db.scalar(select(LimitPeriodState).where(LimitPeriodState.limit_id == lifetime.id))
-    assert lt.credits_used == 108
+    assert lt.credits_used == 978
     assert _state(db, monthly).credits_used == 100
 
 
@@ -370,13 +366,12 @@ def test_same_name_mapped_twice_at_once_is_applied_once(
     assert _map_in_threads([NAME, NAME], "proj-api", gate=True) == ["ok", "ok"]
     db.expire_all()
     assert len(list(db.scalars(select(EntityMapping)))) == 1
-    assert _anchor(db, NAME).offset_credits == 870
-    assert _state(db, project).baseline_credits == start
+    assert start is not None
     cycle.run_cycle(trigger="manual")
     assert _state(db, project).credits_used == 0
 
 
-def test_user_mapping_after_demo_mode_anchors_on_the_live_reading(
+def test_user_mapping_after_demo_mode_repoints_the_live_reading(
     db: Session,
     connected,  # noqa: F811
     admin_client: TestClient,
@@ -393,7 +388,6 @@ def test_user_mapping_after_demo_mode_anchors_on_the_live_reading(
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     limit = _limit(db, EntityType.USER, "user-alice")
     cycle.run_cycle(trigger="manual")
-    start = _state(db, limit).baseline_credits
     live = ingestion.latest_live_snapshot(db, "user")
     # A demo reading left behind (demo mode now off), newer than the live one.
     snap = UsageSnapshot(
@@ -420,8 +414,7 @@ def test_user_mapping_after_demo_mode_anchors_on_the_live_reading(
     )
     r = admin_client.post(f"/api/usage/unresolved/{subject.id}/map", json={"user_id": "user-alice"})
     assert r.status_code == 200, r.text
-    anchor = _anchor(db, "former contractor", view="user")
-    assert anchor.offset_credits == 500 and anchor.snapshot_id == live.id
+    db.expire_all()
     demo_row = db.scalar(select(UsageRecord).where(UsageRecord.snapshot_id == snap.id))
     assert demo_row.entity_id is None
     live_row = db.scalar(
@@ -429,10 +422,12 @@ def test_user_mapping_after_demo_mode_anchors_on_the_live_reading(
             UsageRecord.snapshot_id == live.id, UsageRecord.subject_key == "former contractor"
         )
     )
-    assert live_row.entity_id == "user-alice" and live_row.attributed_credits == 0
-    assert _state(db, limit).baseline_credits == start
+    assert live_row.entity_id == "user-alice"
     cycle.run_cycle(trigger="manual")
     assert _state(db, limit).credits_used == 0
+    tenant.set_user_credits(name="Former Contractor", credits=512)
+    cycle.run_cycle(trigger="manual")
+    assert _state(db, limit).credits_used == 12
 
 
 def test_a_name_that_starts_to_match_by_itself_is_not_this_periods_usage(
@@ -440,10 +435,8 @@ def test_a_name_that_starts_to_match_by_itself_is_not_this_periods_usage(
     connected,  # noqa: F811
 ) -> None:
     """A project renamed in Checkmarx One to a name the feed already reported
-    separately, while unmatched. Since the fourth review, an unmatched name
-    counts in full only when its entity was first synced after the name's
-    first unmatched reading (a project created and used before the sync); a
-    project that existed all along counts it from its last total."""
+    separately, while unmatched: only what the name reports from then on
+    counts there (the usage ledger)."""
     tenant = live_tenant()
     tenant.set_entity_credits(view="project", name=NAME, credits=870)
     connected(tenant)
@@ -457,14 +450,12 @@ def test_a_name_that_starts_to_match_by_itself_is_not_this_periods_usage(
     cycle.run_cycle(trigger="manual")
     state = _state(db, project)
     assert state.credits_used == 0, (state.credits_used, state.baseline_credits)
-    anchor = _anchor(db, NAME)
-    assert anchor.reason == ingestion.ANCHOR_MATCHED and anchor.offset_credits == 870
     tenant.set_entity_credits(view="project", name=NAME, credits=880)
     cycle.run_cycle(trigger="manual")
     assert _state(db, project).credits_used == 10
 
 
-def test_a_new_name_counts_in_full_and_a_rolled_window_re_anchors(
+def test_a_new_name_counts_in_full_and_a_rolled_window_counts_nothing(
     db: Session,
     connected,  # noqa: F811
     admin_client: TestClient,
@@ -479,13 +470,14 @@ def test_a_new_name_counts_in_full_and_a_rolled_window_re_anchors(
     # The lookback window rolls past most of the name's old usage.
     tenant.set_entity_credits(view="project", name=NAME, credits=600)
     cycle.run_cycle(trigger="manual")
-    anchor = _anchor(db, NAME)
-    assert anchor.offset_credits == 600
     assert _state(db, project).credits_used == 0
     tenant.set_entity_credits(view="project", name=NAME, credits=630)
     cycle.run_cycle(trigger="manual")
     assert _state(db, project).credits_used == 30
     # A name that never reported before and matches at once counts in full.
-    tenant.set_entity_credits(view="project", name="payments/web", credits=5)
+    tenant.set_entity_credits(view="project", name="payments/api-tests", credits=5)
+    for p in tenant.projects:
+        if p["id"] == "proj-api":
+            p["name"] = "payments/api"
     cycle.run_cycle(trigger="manual")
-    assert _anchor(db, "payments/web") is None
+    assert _state(db, project).credits_used == 30

@@ -1,4 +1,4 @@
-"""Third review of realfix: a mapped name's anchor reading is not pinned by retention, so
+"""Third review of realfix (restated for the usage ledger): thinning old readings must not hide
 once thinning removes it the name's real rise after a restriction is skipped.
 
 Synthetic data only (tests/fake_tenant.py).
@@ -13,10 +13,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
-from app.models import EnforcementAction, PolicyViolation, UnresolvedSubject, UsageAnchor
+from app.models import EnforcementAction, PolicyViolation, UnresolvedSubject
 from app.models.enums import EntityType, PeriodType
 from app.models.usage import UsageSnapshot
-from app.services import cycle, limits_service, retention
+from app.services import cycle, ingestion, limits_service, retention
 from tests.test_real_tenant_usage import ACTOR, connected, live_tenant  # noqa: F401
 
 
@@ -60,14 +60,12 @@ def test_rise_of_a_mapped_name_after_thinning_is_still_reported(
     assert r.status_code == 200, r.text
     cycle.run_cycle(trigger="manual")
     db.expire_all()
-    anchor = db.scalar(select(UsageAnchor).where(UsageAnchor.subject_key == "former contractor"))
-    assert anchor.snapshot_id is not None
+    mapped_reading = ingestion.latest_live_snapshot(db, "user")
 
     # Five days pass (everything so far is older than the 3 days kept whole).
     back = timedelta(days=5)
     for model, columns in (
         (UsageSnapshot, ("collected_at",)),
-        (UsageAnchor, ("anchored_at",)),
         (EnforcementAction, ("applied_at", "created_at")),
     ):
         for row in db.scalars(select(model)):
@@ -76,11 +74,11 @@ def test_rise_of_a_mapped_name_after_thinning_is_still_reported(
                     setattr(row, column, getattr(row, column) - back)
     db.commit()
     keep, _ = retention.pinned_snapshots(db, utcnow())
-    pinned = anchor.snapshot_id in keep
+    pinned = mapped_reading.id in keep
     retention.prune(db, retention_days=365, actor=ACTOR)
     db.commit()
     db.expire_all()
-    gone = db.get(UsageSnapshot, anchor.snapshot_id) is None
+    gone = db.get(UsageSnapshot, mapped_reading.id) is None
 
     # Remediation the mapped name runs now is usage after the restriction.
     _contractor(tenant, 520, 43)

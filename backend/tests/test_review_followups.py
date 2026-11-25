@@ -1,4 +1,5 @@
-"""Follow-ups to the review of realfix: baselines on mapping, automation
+"""Follow-ups to the review of realfix: mappings (restated for the usage
+ledger in the fifth review), automation
 notices, coverage that could not read, pricing without a feed figure.
 
 Synthetic data only (tests/fake_tenant.py).
@@ -57,8 +58,9 @@ def _map(admin_client: TestClient, entity_id: str | None, *, name: str = NAME) -
 
 
 class TestMappingsCountForwardOnly:
-    """A mapping anchors the name at what it has reported: only what it reports
-    from then on counts. No budget's baseline moves, for any period type."""
+    """Usage counts where it is observed (the usage ledger, fifth review): a
+    mapping moves only what the name reports from then on, and what a budget
+    counted stays counted. No baseline is involved for a period budget."""
 
     def _setup(self, db: Session, connected):  # noqa: F811
         tenant = live_tenant()
@@ -69,28 +71,23 @@ class TestMappingsCountForwardOnly:
         group = _limit(db, EntityType.GROUP, "grp-payments")  # the sum of its projects
         application = _limit(db, EntityType.APPLICATION, "app-payments")
         counted = _limit(db, EntityType.PROJECT, "proj-web", existing=True)
-        cycle.run_cycle(trigger="manual")  # every period's baseline
+        cycle.run_cycle(trigger="manual")
         return tenant, project, group, application, counted
 
-    def test_map_unmap_and_map_again_move_no_baseline(
+    def test_map_unmap_and_map_again(
         self,
         db: Session,
         connected,  # noqa: F811
         admin_client: TestClient,
     ) -> None:
         tenant, project, group, _application, _counted = self._setup(db, connected)
-        start = _state(db, project).baseline_credits
-        group_start = _state(db, group).baseline_credits
 
         body = _map(admin_client, "proj-api")
         assert body["confirmation"] == (
-            "Credits reported under example-org/payments-api from now on count towards "
-            "payments/api. The 870 credits it has already reported do not."
+            "Usage reported under example-org/payments-api from now on counts towards payments/api."
         )
         assert "baseline_shifts" not in body
         cycle.run_cycle(trigger="manual")
-        assert _state(db, project).baseline_credits == start
-        assert _state(db, group).baseline_credits == group_start
         assert _state(db, project).credits_used == 0
         assert _state(db, group).credits_used == 0
 
@@ -100,18 +97,15 @@ class TestMappingsCountForwardOnly:
         assert _state(db, group).credits_used == 20
 
         body = _map(admin_client, None)
-        assert body["confirmation"].startswith(
-            "Credits reported under example-org/payments-api no longer count towards "
-            "anything. It no longer adds to payments/api: of the 20 credits it had added "
-            "there, each of payments/api's budgets takes off only what it added within the "
-            "budget's current period."
+        assert body["confirmation"] == (
+            "Usage reported under example-org/payments-api from now on counts towards "
+            "nothing. What it already counted towards payments/api stays there."
         ), body["confirmation"]
         cycle.run_cycle(trigger="manual")
-        assert _state(db, project).credits_used == 0
+        assert _state(db, project).credits_used == 20
         _map(admin_client, "proj-api")
         cycle.run_cycle(trigger="manual")
-        assert _state(db, project).baseline_credits == start
-        assert _state(db, project).credits_used == 0
+        assert _state(db, project).credits_used == 20
         assert (
             db.scalar(
                 select(Notification).where(Notification.title.like("%reached its credit limit"))
@@ -137,34 +131,37 @@ class TestMappingsCountForwardOnly:
         cycle.run_cycle(trigger="manual")
         assert _state(db, project).credits_used == 30
 
-    def test_a_budget_that_counts_existing_usage_does_not_count_the_names_history(
+    def test_a_budget_that_counts_existing_usage_counts_the_names_total(
         self,
         db: Session,
         connected,  # noqa: F811
         admin_client: TestClient,
     ) -> None:
+        """Restated in the fifth review: such a budget counts everything
+        reported by the names that count towards it now, history included."""
         _tenant, _project, _group, _application, counted = self._setup(db, connected)
         before = _state(db, counted).credits_used
         _map(admin_client, "proj-web")
         cycle.run_cycle(trigger="manual")
-        assert _state(db, counted).credits_used == before
+        assert _state(db, counted).credits_used == before + 870
 
-    def test_remapping_to_another_project_takes_away_only_what_it_added(
+    def test_remapping_to_another_project_moves_only_what_comes_after(
         self,
         db: Session,
         connected,  # noqa: F811
         admin_client: TestClient,
     ) -> None:
-        tenant, project, _group, _application, counted = self._setup(db, connected)
+        tenant, project, _group, _application, _counted = self._setup(db, connected)
+        tools = _limit(db, EntityType.PROJECT, "proj-tools")
         _map(admin_client, "proj-api")
         tenant.set_entity_credits(view="project", name=NAME, credits=880)
         cycle.run_cycle(trigger="manual")
-        web_before = _state(db, counted).credits_used
-        body = _map(admin_client, "proj-web")
-        assert "of the 10 credits it had added there" in body["confirmation"]
+        body = _map(admin_client, "proj-tools")
+        assert "What it already counted towards payments/api stays there." in (body["confirmation"])
+        tenant.set_entity_credits(view="project", name=NAME, credits=885)
         cycle.run_cycle(trigger="manual")
-        assert _state(db, project).credits_used == 0
-        assert _state(db, counted).credits_used == web_before
+        assert _state(db, project).credits_used == 10
+        assert _state(db, tools).credits_used == 5
 
     def test_a_user_mapping_counts_forward_only(
         self,
@@ -178,7 +175,6 @@ class TestMappingsCountForwardOnly:
         cycle.run_cycle(trigger="manual", force_org_sync=True)
         limit = _limit(db, EntityType.USER, "user-alice")
         cycle.run_cycle(trigger="manual")
-        start = _state(db, limit).baseline_credits
         subject = db.scalar(
             select(UnresolvedSubject).where(UnresolvedSubject.subject_key == "former contractor")
         )
@@ -186,21 +182,24 @@ class TestMappingsCountForwardOnly:
             f"/api/usage/unresolved/{subject.id}/map", json={"user_id": "user-alice"}
         )
         assert response.status_code == httpx.codes.OK, response.text
-        assert (
-            "The 500 credits it has already reported do not." in (response.json()["confirmation"])
+        assert response.json()["confirmation"] == (
+            "Usage reported under Former Contractor from now on counts towards Alice Archer."
         )
         cycle.run_cycle(trigger="manual")
-        assert _state(db, limit).baseline_credits == start
         assert _state(db, limit).credits_used == 0
         tenant.set_user_credits(name="Former Contractor", credits=512)
         cycle.run_cycle(trigger="manual")
         assert _state(db, limit).credits_used == 12
-        # Unmapping says what it takes away.
         response = admin_client.post(
             f"/api/usage/unresolved/{subject.id}/map", json={"user_id": None}
         )
         assert response.status_code == httpx.codes.OK, response.text
-        assert "of the 12 credits it had added there" in response.json()["confirmation"]
+        assert (
+            "What it already counted towards Alice Archer stays there."
+            in (response.json()["confirmation"])
+        )
+        cycle.run_cycle(trigger="manual")
+        assert _state(db, limit).credits_used == 12
 
 
 class TestMappingEndpoint:

@@ -1,7 +1,6 @@
-"""Review 4: a project mapping made before the upgrade but after a
-restriction on that project. The migration anchors it at offset 0, dated at
-mapped_at, with no reference_actions; violations then read the name's whole
-history as usage after the restriction.
+"""Fourth review of realfix (restated for the usage ledger): a project mapping
+made before the upgrade but after a restriction on that project must not read
+the name's whole history as usage after the restriction.
 
 Synthetic data only (tests/fake_tenant.py).
 """
@@ -12,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
-from app.models import EnforcementAction, EntityMapping, PolicyViolation, UsageAnchor, UsageRecord
+from app.models import EnforcementAction, EntityMapping, PolicyViolation, UsageRecord
 from app.models.enums import EntityType, PeriodType
 from app.services import cycle, ingestion, limits_service
 from tests.test_real_tenant_usage import ACTOR, connected, live_tenant  # noqa: F401
@@ -46,7 +45,8 @@ def test_pre_upgrade_mapping_after_a_restriction_is_no_violation(
     assert ("disable_auto_triage", "applied") in kinds, kinds
 
     # Before the upgrade, an admin mapped the name (the old code re-pointed the
-    # latest reading's row); the upgrade then anchors it at 0, at mapped_at.
+    # latest reading's row). Under the usage ledger only increases observed
+    # after the restriction count, and there are none.
     mapped_at = utcnow()
     latest = ingestion.latest_live_snapshot(db, "project")
     db.add(
@@ -60,17 +60,6 @@ def test_pre_upgrade_mapping_after_a_restriction_is_no_violation(
         )
     )
     row.entity_id, row.entity_type = "proj-api", EntityType.PROJECT
-    db.add(
-        UsageAnchor(
-            view_by="project",
-            subject_key=NAME,
-            entity_id="proj-api",
-            offset_credits=0,
-            snapshot_id=latest.id,
-            anchored_at=mapped_at,
-            reason="mapping",
-        )
-    )
     db.commit()
     cycle.run_cycle(trigger="manual")  # nothing new reported
     db.expire_all()

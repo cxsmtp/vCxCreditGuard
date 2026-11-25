@@ -2,15 +2,13 @@
 
 Listings that come back short never soft-delete; a name whose entity was
 really deleted is kept on it until the deletion is confirmed and re-uses its
-anchor when the entity comes back; a corrected automatic match keeps the
+history when the entity comes back; a corrected automatic match keeps the
 budget's own usage; the automation rule knows common build identities.
 
 Synthetic data only (tests/fake_tenant.py).
 """
 
 from __future__ import annotations
-
-from decimal import Decimal
 
 import httpx
 import pytest
@@ -19,10 +17,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import Listing
-from app.models import UnresolvedSubject, UsageAnchor, UsageRecord
+from app.models import UnresolvedSubject, UsageRecord
 from app.models.enums import EntityType
 from app.models.org import CxApplication, CxProject
-from app.services import cycle, ingestion, org_sync, settings_store
+from app.services import cycle, ingestion, org_sync
 from app.services.subject_matching import is_integration_identity
 from tests.fake_tenant import FakeTenant
 from tests.test_real_tenant_usage import connected, live_tenant  # noqa: F401
@@ -155,7 +153,8 @@ def test_a_project_deleted_for_one_sync_keeps_its_usage(
         .where(UsageRecord.subject_key == "payments/web")
         .order_by(UsageRecord.id.desc())
     )
-    assert row.entity_id == "proj-web" and row.held_reason == ingestion.HELD_KEPT
+    # Its name counts nowhere meanwhile, and what was counted stays counted.
+    assert row.entity_id is None
     assert _state(db, group).credits_used == 100
 
     # Back at the next sync: nothing was lost, nothing counted twice.
@@ -166,7 +165,7 @@ def test_a_project_deleted_for_one_sync_keeps_its_usage(
     assert _state(db, group).credits_used == 100
 
 
-def test_a_confirmed_deletion_releases_the_name_and_a_return_reuses_its_anchor(
+def test_a_confirmed_deletion_and_a_return_bring_no_history(
     db: Session,
     connected,  # noqa: F811
     admin_client: TestClient,
@@ -174,40 +173,29 @@ def test_a_confirmed_deletion_releases_the_name_and_a_return_reuses_its_anchor(
     tenant = live_tenant()
     tenant.set_entity_credits(view="project", name=NAME, credits=870)
     connected(tenant)
-    # The hold ends once a complete sync confirmed the deletion and at least
-    # this many readings passed (here: as soon as it is confirmed).
-    settings_store.set_value(db, ingestion.HOLD_READINGS_KEY, 1)
-    db.commit()
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     _map(admin_client, "proj-tools")
+    tools = _limit(db, EntityType.PROJECT, "proj-tools")
     cycle.run_cycle(trigger="manual")
-    anchor = db.scalar(select(UsageAnchor).where(UsageAnchor.subject_key == NAME))
-    offset, anchored_at = anchor.offset_credits, anchor.anchored_at
 
     dropped = _drop(tenant, "proj-tools")
     cycle.run_cycle(trigger="manual", force_org_sync=True)  # deleted
     cycle.run_cycle(trigger="manual", force_org_sync=True)  # confirmed
     db.expire_all()
-    anchor = db.scalar(select(UsageAnchor).where(UsageAnchor.subject_key == NAME))
-    assert anchor.released_at is not None and anchor.release_reason == "deleted"
     assert "proj-tools" not in ingestion.latest_totals(db, "project")
 
     tenant.projects.extend(dropped)
     tenant.set_entity_credits(view="project", name=NAME, credits=900)
     cycle.run_cycle(trigger="manual", force_org_sync=True)
-    db.expire_all()
-    anchor = db.scalar(select(UsageAnchor).where(UsageAnchor.subject_key == NAME))
-    assert anchor.released_at is None
-    assert (anchor.offset_credits, anchor.anchored_at) == (offset, anchored_at)
-    # Only the 30 reported since: the project's own name was released with it
-    # and, like the mapped name, never brings its history back.
-    assert ingestion.latest_totals(db, "project")["proj-tools"] == Decimal("30")
+    # Only the 30 reported since it came back (usage ledger): nothing of its
+    # history, or of the mapped name's, comes back as usage.
+    assert _state(db, tools).credits_used == 30
 
 
 # ------------------------------------------- correcting an automatic match
 
 
-def test_correcting_an_automatic_match_keeps_the_budgets_own_usage(
+def test_correcting_an_automatic_match_moves_only_what_comes_after(
     db: Session,
     connected,  # noqa: F811
     admin_client: TestClient,
@@ -252,8 +240,19 @@ def test_correcting_an_automatic_match_keeps_the_budgets_own_usage(
     assert r.status_code == 200, r.text
     evaluation.evaluate_all(db, now=next_month + timedelta(hours=2))
     db.commit()
-    # Only the handle's 3 this period are taken off; Dave's own 5 stay.
-    assert _latest(db, dave).credits_used == 5
+    # Restated for the usage ledger (fifth review): what a period counted stays
+    # counted; the correction moves the handle's usage from now on.
+    assert _latest(db, dave).credits_used == 8
+    bob = _limit(db, EntityType.USER, "user-bob")
+    evaluation.evaluate_all(db, now=next_month + timedelta(hours=3))
+    db.commit()
+    tenant.set_user_credits(name="cx-dave-dawson", credits=50)
+    ingestion.ingest_usage(db, connection_client(db))
+    db.commit()
+    evaluation.evaluate_all(db, now=next_month + timedelta(hours=4))
+    db.commit()
+    assert _latest(db, dave).credits_used == 8
+    assert _latest(db, bob).credits_used == 7
 
 
 def connection_client(db):  # type: ignore[no-untyped-def]

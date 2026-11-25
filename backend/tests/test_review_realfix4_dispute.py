@@ -1,8 +1,8 @@
 """Fourth review of realfix: a user's consumption subject that becomes
-disputed (a second person with the same name is synced) used to stop counting
-at once, and the admin's resolution (mapping it back to the same user)
-anchored it afresh, so the period's usage of that subject was lost. It now
-keeps counting, flagged, until resolved, and mapping it back changes nothing.
+disputed (a second person with the same name is synced) used to lose the
+period's usage. With the usage ledger (fifth review) what was counted stays
+counted; the disputed subject counts nowhere until an admin resolves it, and
+mapping it back counts it from then on.
 
 Synthetic data only (tests/fake_tenant.py).
 """
@@ -53,10 +53,10 @@ def test_a_dispute_resolved_back_to_the_same_user_keeps_the_period(
     subject = db.scalar(
         select(UnresolvedSubject).where(UnresolvedSubject.subject_key == "bob baker")
     )
-    # Disputed, and raised for the admin, but it keeps counting towards the
-    # user it counted towards (flagged as kept) until the admin resolves it.
+    # Disputed: raised for the admin and counted nowhere meanwhile, while
+    # what it already counted for Bob stays counted (the usage ledger).
     assert subject is not None and subject.status == "disputed", subject and subject.status
-    assert row.entity_id == "user-bob" and row.held_reason == ingestion.HELD_KEPT
+    assert row.entity_id is None
     assert _state(db, bob).credits_used == 100
 
     # The admin settles it: this subject is the original Bob.

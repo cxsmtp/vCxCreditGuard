@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.models.enums import EntityType
 from app.models.org import CxProject
-from app.services import cycle, ingestion, settings_store
+from app.services import cycle
 from tests.test_real_tenant_usage import connected, live_tenant  # noqa: F401
 from tests.test_review_followups import _limit, _state
 
@@ -30,8 +30,6 @@ def test_a_project_that_comes_back_brings_no_history(
     # A long-lived project: 1,000 credits of history inside the lookback window.
     tenant.set_entity_credits(view="project", name="payments/web", credits=1000, entity_id=None)
     connected(tenant)
-    settings_store.set_value(db, ingestion.HOLD_READINGS_KEY, 2)
-    db.commit()
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     project = _limit(db, EntityType.PROJECT, "proj-web")
     group = _limit(db, EntityType.GROUP, "grp-payments")

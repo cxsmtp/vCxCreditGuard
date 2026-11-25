@@ -16,7 +16,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx import iam
-from app.models import UsageAnchor
 from app.models.enums import EntityType
 from app.models.org import CxProject, CxUser
 from app.services import cycle, org_sync
@@ -72,12 +71,10 @@ def test_project_paging_shortfall_for_one_sync_zeroes_the_period(
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     cycle.run_cycle(trigger="manual")
     db.expire_all()
-    anchor = db.scalar(select(UsageAnchor).where(UsageAnchor.subject_key == "payments/web"))
     # The 100 credits spent this period no longer count anywhere.
     assert _state(db, project).credits_used == 100, (
         _state(db, project).credits_used,
         _state(db, project).baseline_credits,
-        anchor and (anchor.offset_credits, anchor.reason),
     )
     assert _state(db, group).credits_used == 100
 

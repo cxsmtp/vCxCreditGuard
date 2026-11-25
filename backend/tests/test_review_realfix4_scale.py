@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import time
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import LimitPeriodState
+from app.models import BudgetUsage
 from app.models.enums import EntityType, PeriodType
 from app.models.limits import CreditLimit
 from app.services import cycle, evaluation
@@ -58,9 +57,8 @@ def test_scale(db: Session, connected) -> None:  # noqa: F811
     evaluation.evaluate_all(db)
     db.commit()
     second = time.perf_counter() - start
-    sizes = [len(json.dumps(s.baseline_names or {})) for s in db.scalars(select(LimitPeriodState))]
-    # Real name matches never move, so a budget over thousands of projects
-    # stores next to nothing; and the cost stays the evaluation's own.
-    assert len(sizes) == N + len(groups)
-    assert max(sizes) < 200 and sum(sizes) < 50 * len(sizes), (max(sizes), sum(sizes))
+    counters = list(db.scalars(select(BudgetUsage)))
+    # No increase was observed: every budget counted nothing, and nothing per
+    # name is stored per period (the usage ledger keeps counters only).
+    assert all(row.credits == 0 for row in counters), [r.credits for r in counters][:5]
     assert first < 120 and second < 120, (first, second)

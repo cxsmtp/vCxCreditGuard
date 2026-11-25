@@ -110,9 +110,14 @@ class TestSafetyCeiling:
         set_ceiling(db, 1)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
 
-        # Even with a single limit now over the line, nothing is applied.
-        tenant.set_user_credits(name="Bob Baker", credits=5)
-        ingestion.ingest_usage(db, client)
+        # Even with a single limit now over the line, nothing is applied. (Bob's
+        # limit is switched off: a lower reading no longer takes back usage a
+        # period has counted, see app/services/ledger.py.)
+        from app.models.limits import CreditLimit
+
+        for limit in db.scalars(select(CreditLimit).where(CreditLimit.entity_id == "user-bob")):
+            limit.is_active = False
+        db.commit()
         again = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         assert again.enforced == 0 and has_ai_roles(tenant, "user-alice")
         # One alert, not one per cycle.

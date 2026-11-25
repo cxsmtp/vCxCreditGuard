@@ -5,16 +5,12 @@ Synthetic data only (tests/fake_tenant.py).
 
 from __future__ import annotations
 
-from decimal import Decimal
-
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient, Listing
-from app.models import UsageAnchor
 from app.models.enums import EntityType
 from app.models.org import CxGroup, CxProject
 from app.services import cycle, ingestion, org_sync, settings_store
@@ -109,7 +105,8 @@ def test_an_old_unmatched_name_does_not_take_over_a_vanishing_one(
     connected,  # noqa: F811
 ) -> None:
     """The entity's old name leaves the feed while a name that has been
-    unmatched all along starts to match it: not a rename taking over."""
+    unmatched all along starts to match it: its history is no usage (the
+    usage ledger counts increases only)."""
     tenant = live_tenant()
     tenant.set_entity_credits(view="project", name=NAME, credits=870)
     connected(tenant)
@@ -118,14 +115,6 @@ def test_an_old_unmatched_name_does_not_take_over_a_vanishing_one(
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     project = _limit(db, EntityType.PROJECT, "proj-api")
     cycle.run_cycle(trigger="manual")
-    # Push the name's first unmatched reading far into the past.
-    from datetime import timedelta
-
-    from app.models import UsageNameState
-
-    state = db.scalar(select(UsageNameState).where(UsageNameState.subject_key == NAME))
-    state.first_unmatched_at = state.first_unmatched_at - timedelta(days=3)
-    db.commit()
     for p in tenant.projects:
         if p["id"] == "proj-api":
             p["name"] = NAME
@@ -138,15 +127,13 @@ def test_an_old_unmatched_name_does_not_take_over_a_vanishing_one(
     assert state.credits_used < 100, (state.credits_used, state.baseline_credits)
 
 
-def test_a_returning_name_whose_total_rolled_down_re_anchors_lower(
+def test_a_returning_name_whose_total_rolled_down_counts_only_new_usage(
     db: Session,
     connected,  # noqa: F811
 ) -> None:
     tenant = live_tenant()
     tenant.set_entity_credits(view="project", name="payments/web", credits=1000)
     connected(tenant)
-    settings_store.set_value(db, ingestion.HOLD_READINGS_KEY, 1)
-    db.commit()
     cycle.run_cycle(trigger="manual", force_org_sync=True)
     project = _limit(db, EntityType.PROJECT, "proj-web")
     cycle.run_cycle(trigger="manual")
@@ -159,19 +146,19 @@ def test_a_returning_name_whose_total_rolled_down_re_anchors_lower(
     tenant.set_entity_credits(view="project", name="payments/web", credits=600)
     tenant.projects.append(web)
     cycle.run_cycle(trigger="manual", force_org_sync=True)
-    db.expire_all()
-    anchor = db.scalar(select(UsageAnchor).where(UsageAnchor.subject_key == "payments/web"))
-    assert anchor.reason == ingestion.ANCHOR_RETURNED and anchor.offset_credits == 600
     assert _state(db, project).credits_used == 0
     tenant.set_entity_credits(view="project", name="payments/web", credits=625)
     cycle.run_cycle(trigger="manual")
     assert _state(db, project).credits_used == 25
 
 
-def test_a_carried_name_is_left_out_of_the_lists_by_name(
+def test_a_name_missing_from_a_reading_keeps_what_it_counted(
     db: Session,
     connected,  # noqa: F811
 ) -> None:
+    """Restated for the usage ledger (no carried rows): the name leaves the
+    lists and the totals, while what it counted stays counted, and its return
+    adds only what it reported since."""
     from app.models.enums import UsageView
     from app.services import dashboard
 
@@ -181,14 +168,22 @@ def test_a_carried_name_is_left_out_of_the_lists_by_name(
     tenant.set_entity_credits(view="project", name="payments/api", credits=1000)
     connected(tenant)
     cycle.run_cycle(trigger="manual", force_org_sync=True)
-    tenant.consumption["project"] = [
-        r for r in tenant.consumption["project"] if r["name"] != "payments/web"
-    ]
+    project = _limit(db, EntityType.PROJECT, "proj-web")
+    cycle.run_cycle(trigger="manual")
+    tenant.set_entity_credits(view="project", name="payments/web", credits=110)
+    cycle.run_cycle(trigger="manual")
+    rows = tenant.consumption["project"]
+    saved = [r for r in rows if r["name"] == "payments/web"]
+    tenant.consumption["project"] = [r for r in rows if r["name"] != "payments/web"]
     cycle.run_cycle(trigger="manual")
     names = {r.subject_key for r in dashboard.latest_snapshot_records(db, UsageView.PROJECT)}
     assert "payments/web" not in names
-    # ...while budgets still count it until the hold ends.
-    assert ingestion.latest_totals(db, UsageView.PROJECT)["proj-web"] == Decimal("104")
+    assert "proj-web" not in ingestion.latest_totals(db, UsageView.PROJECT)
+    assert _state(db, project).credits_used == 6
+    tenant.consumption["project"].extend(saved)
+    tenant.set_entity_credits(view="project", name="payments/web", credits=113)
+    cycle.run_cycle(trigger="manual")
+    assert _state(db, project).credits_used == 9
 
 
 # ------------------------------------------------------------------ paging
