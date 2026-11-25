@@ -318,6 +318,9 @@ class TestEnforcement:
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.commit()
+        # The application's own row feeds its budget from its third reading (ninth review).
+        ingestion.ingest_usage(db, client)
+        db.commit()
         tenant.set_entity_credits(
             view="application", name="Payments", credits=500, entity_id="app-payments"
         )
@@ -414,6 +417,9 @@ class TestPrecedence:
             enforce=True,
         )
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
+        db.commit()
+        # The application's own row feeds its budget from its third reading (ninth review).
+        ingestion.ingest_usage(db, client)
         db.commit()
         tenant.set_entity_credits(
             view="project", name="payments/api", credits=999, entity_id="proj-api"

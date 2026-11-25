@@ -14,9 +14,11 @@ Create Date: 2026-11-25
 * ``ix_usage_delta_observed`` - for the retention prune.
 * The open period of an active budget that counts usage already reported
   gets a counter, if it has none, seeded with what the rows of its own entity
-  grew by between the first and the latest live reading of the period, name by
-  name (names present in both readings only, so no history comes in), and only
-  over the readings since the lookback window last changed (totals read over
+  grew by up to the latest live reading of the period, name by name, from
+  the highest total any earlier reading of the run gave it (the last one
+  before the period and every one in it; names in no earlier reading bring
+  nothing, so no history comes in), and only over the readings since the
+  lookback window last changed (totals read over
   different windows are not comparable). Turning "count existing usage" off
   then keeps the period's usage from before the upgrade. A budget fed by a
   roll-up (a group's projects or members, an application's projects), or with
@@ -139,6 +141,7 @@ def _reported_since(bind, entity_type: str, entity_id: str, start: datetime) -> 
             run = []
         run.append(row)
     in_period = [row[0] for row in run if (_when(row[1]) or start) >= start]
+    before_period = [row[0] for row in run if (_when(row[1]) or start) < start]
     if len(in_period) < 2:
         return Decimal(0)
 
@@ -154,11 +157,18 @@ def _reported_since(bind, entity_type: str, entity_id: str, start: datetime) -> 
             )
         }
 
-    # Name by name, and only names in both readings: a name that came to
-    # count towards the entity meanwhile brings no history with it.
-    first, latest = totals(in_period[0]), totals(in_period[-1])
+    # Name by name, from the highest total any earlier reading of the run
+    # gave it (the last one before the period, and every one in it): a reading
+    # that reported it low (a short listing) is never taken for the start, and
+    # a name that came to count towards the entity meanwhile, present in no
+    # earlier reading, brings no history with it.
+    start_totals: dict[str, Decimal] = {}
+    for snapshot_id in before_period[-1:] + in_period[:-1]:
+        for key, value in totals(snapshot_id).items():
+            start_totals[key] = max(start_totals.get(key, value), value)
+    latest = totals(in_period[-1])
     return sum(
-        (max(Decimal(0), latest[key] - first[key]) for key in latest if key in first),
+        (max(Decimal(0), latest[key] - start_totals[key]) for key in latest if key in start_totals),
         Decimal(0),
     )
 

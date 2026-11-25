@@ -190,6 +190,9 @@ def test_application_credit_increase_restores_child_projects(db: Session) -> Non
     )
     evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
     db.commit()
+    # The application's own row feeds its budget from its third reading (ninth review).
+    ingestion.ingest_usage(db, client)
+    db.commit()
 
     tenant.set_entity_credits(
         view="application", name="Payments", credits=500, entity_id="app-payments"

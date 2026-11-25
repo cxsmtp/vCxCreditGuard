@@ -7,7 +7,8 @@ already spending (claims), mapped to later; group and application rows of
 their own appearing and leaving; demo mode on and off; plain, late-read and
 skipped-evaluation rollovers; the lookback window rolling past old usage; a
 change of lookback window; short org listings; names missing from a reading;
-page drift serving a row twice; a dip in a doubted reading and its recovery;
+a group's own row leaving while a member project is missing; page drift
+serving a row twice; a dip in a doubted reading and its recovery;
 budgets switched to counting existing usage and back; a project renamed back
 to a name it had; and all usage ageing out of the lookback window (the clock
 jumps past it, every name leaves the feed, and names come back with new
@@ -95,6 +96,7 @@ OPS = [
     "lookback",
     "short",
     "gap",
+    *["group_gap"] * 3,
     "drift",
     "dip",
     "new_project",
@@ -103,6 +105,7 @@ OPS = [
     "existing",
     *["rename_back"] * 2,
     "age_out",
+    "collapse",
 ]
 
 
@@ -132,6 +135,10 @@ class _World:
         self.owner[NEW_NAME] = NEW_PROJECT
         # A name left out of one reading, with its total, back (and grown) after.
         self.gap: tuple[str, int] | None = None
+        # The group's own row leaves when the name back from the gap returns,
+        # or a reading before (the gap then lasts one reading more).
+        self.group_leaves = False
+        self.gap_wait = 0
         # Names reported lower than they are, in a doubted reading, this step.
         self.dipped: set[str] = set()
         # The group's and the application's own rows (None: not reported).
@@ -143,6 +150,13 @@ class _World:
         self.after_late = False
         # Names that left the feed when all their usage aged out.
         self.aged: set[str] = set()
+        # A glitch lasting several readings: ("dip", name, low, left) or
+        # ("collapse", None, 0, left).
+        self.glitch: tuple[str, str | None, int, int] | None = None
+        # Two people who share the display name "Bob Baker" (no id, no
+        # email) in the user view, and what they spent since the budget.
+        self.bobs = [300, 120]
+        self.bob_spent = 0
         # Names the feed moved this step (old, new): their pending usage moves.
         self.moves: list[tuple[str, str]] = []
         self.skip_evaluation = False
@@ -151,6 +165,9 @@ class _World:
         self.gap_back: set[str] = set()
         # Names whose total ever fell (a roll-down, or ageing out).
         self.ever_fell: set[str] = set()
+        # Ceilings a glitch may have left (a name's total before it): what a
+        # name adds below its ceiling is a documented under-count.
+        self.ceilings: dict[str, int] = {}
 
     def set(self, name: str, total: int) -> None:
         self.totals[name] = total
@@ -239,19 +256,78 @@ def _step(world: _World, db: Session, client: TestClient, mp: pytest.MonkeyPatch
         world.after_late = False
         world.clock = _month_end(world.clock) + timedelta(minutes=10)
     world.gap_back = set()
+    row_left = False
     if world.gap is not None:
         name, total = world.gap
-        world.gap = None
-        if name not in world.totals:
+        if world.group_leaves:
+            # The group's own row, which counted what the missing name spent,
+            # leaves as the name comes back or a reading before (ninth review,
+            # seed 93).
+            world.group_leaves = False
+            row_left = True
+            world.group_row = None
+            world.group_grew = 0
+            world._set_row("group", "Payments", "grp-payments", None)
+        if world.gap_wait:
+            world.gap_wait -= 1
+        elif name not in world.totals:
             world.set(name, total)
             amount = rng.randint(0, 40)
             world.spend(name, amount)
             increase[name] += amount
             world.gap_back.add(name)
+        if not world.gap_wait:
+            world.gap = None
+    _user_layout(world, rng)
     op = world.op = rng.choice(OPS)
     names = sorted(world.totals)
     if len(names) < 2:
         op = world.op = "spend"  # everything aged out: names come back first
+    if world.glitch is None and op == "dip" and names:
+        # A dip lasting one to four readings (three or more: a ceiling).
+        name = rng.choice(names)
+        world.glitch = ("dip", name, world.totals[name] // 3, rng.randint(1, 4))
+        world.ceilings[name] = max(world.ceilings.get(name, 0), world.totals[name])
+    elif world.glitch is None and op == "collapse":
+        # The whole project feed reports a tenth, for long enough to be
+        # accepted (3 readings over 2 hours) or not.
+        world.glitch = ("collapse", None, 0, rng.randint(2, 5))
+        for name in names:
+            world.ceilings[name] = max(world.ceilings.get(name, 0), world.totals[name])
+    if world.glitch is not None:
+        kind, name, low, left = world.glitch
+        world.glitch = (kind, name, low, left - 1) if left > 1 else None
+        if kind == "collapse":
+            world.op = op = "collapse"
+            world.clock += timedelta(minutes=55)
+            world.dipped = set(world.totals)
+            _serve(
+                mp,
+                lambda rows: (
+                    [dict(r, creditsUsed=str(int(float(r["creditsUsed"])) // 10)) for r in rows],
+                    len(rows),
+                ),
+            )
+            return {"increase": dict(increase), "rolled": rolled}
+        if name in world.totals:
+            world.op = op = "dip"
+            world.dipped = {name}
+            _serve(
+                mp,
+                lambda rows: (
+                    [dict(r, creditsUsed=str(low)) if r["name"] == name else r for r in rows],
+                    len(rows) + 1,
+                ),
+            )
+            # Spending goes on meanwhile (on other names: what the dipped one
+            # adds is measured from before the dip, which the oracle does not
+            # follow).
+            others = [n for n in names if n != name]
+            for other in rng.sample(others, k=min(len(others), rng.randint(0, 2))):
+                amount = rng.randint(1, 40)
+                world.spend(other, amount)
+                increase[other] += amount
+            return {"increase": dict(increase), "rolled": rolled}
     if op == "spend":
         # Names that left the feed when their usage aged out come back with
         # new usage only.
@@ -392,10 +468,33 @@ def _step(world: _World, db: Session, client: TestClient, mp: pytest.MonkeyPatch
         world.period = "last_90_days" if world.period == "last_year" else "last_year"
     elif op == "short":
         _truncate_project_listings(mp)
-    elif op == "gap":
+    elif op == "gap" and world.gap is None:
         name = rng.choice(names)
         world.gap = (name, world.totals[name])
         world.drop(name)
+    elif op == "group_gap":
+        # A member project of the group goes missing for a reading or two and
+        # spends meanwhile, which the group's own row counts; the row leaves
+        # as the project comes back (or a reading before). With no row yet,
+        # the row appears first.
+        members = [
+            n
+            for n in names
+            if (p := world.any_project(world.owner.get(n, ""))) and "grp-payments" in p["groups"]
+        ]
+        if world.group_row is None and not row_left:
+            world.group_row = rng.randint(100, 3000)
+            world.group_grew = 0
+            world._set_row("group", "Payments", "grp-payments", world.group_row)
+        elif world.group_row is not None and members and world.gap is None:
+            name = rng.choice(members)
+            amount = rng.randint(1, 40)
+            world.spend(name, amount)
+            increase[name] += amount
+            world.gap = (name, world.totals[name])
+            world.group_leaves = True
+            world.gap_wait = rng.randint(0, 1)
+            world.drop(name)
     elif op == "drift" and len(names) >= 2:
         # The ranking shifts between page requests: one row is served twice,
         # another not at all.
@@ -407,21 +506,11 @@ def _step(world: _World, db: Session, client: TestClient, mp: pytest.MonkeyPatch
                 len(rows),
             ),
         )
-    elif op == "dip":
-        name = rng.choice(names)
-        low = str(world.totals[name] // 3)
-        world.dipped = {name}
-        _serve(
-            mp,
-            lambda rows: (
-                [dict(r, creditsUsed=low) if r["name"] == name else r for r in rows],
-                len(rows) + 1,
-            ),
-        )
     elif op == "new_project":
         if world.any_project(NEW_PROJECT) is None:
             world.tenant.add_project(project_id=NEW_PROJECT, name=NEW_NAME, group_ids=[])
-    elif op == "group_row":
+    elif op == "group_row" and not row_left:
+        # (A row that left this step is not back before a reading misses it.)
         if world.group_row is None:
             # First reported with history in it.
             world.group_row = rng.randint(100, 3000)
@@ -453,6 +542,27 @@ def _step(world: _World, db: Session, client: TestClient, mp: pytest.MonkeyPatch
                 world.drop(old)
                 world.set(new, total)
     return {"increase": dict(increase), "rolled": rolled}
+
+
+def _user_layout(world: _World, rng: random.Random) -> None:
+    """The two Bob Bakers may spend; the user view's rows move and its page
+    size changes, so they land on one page or across a boundary."""
+    if rng.random() < 0.3:
+        who = rng.randrange(2)
+        amount = rng.randint(1, 30)
+        world.bobs[who] += amount
+        world.bob_spent += amount
+    rows = [r for r in world.tenant.consumption["user"] if r.get("name") != "Bob Baker"]
+    bobs = [{"name": "Bob Baker", "creditsUsed": str(credits)} for credits in world.bobs]
+    if rng.random() < 0.3:
+        rows = bobs + rows
+        world.tenant.page_size_override = None
+    else:
+        rng.shuffle(rows)
+        for bob in bobs:
+            rows.insert(rng.randint(0, len(rows)), bob)
+        world.tenant.page_size_override = rng.choice([1, 2, 3])
+    world.tenant.consumption["user"] = rows
 
 
 def _month_end(moment: datetime) -> datetime:
@@ -554,6 +664,11 @@ def test_random_sequences_keep_both_invariants(
     # A name in constant use, whose usage never ages out: the feed never
     # collapses when everything else does.
     tenant.set_entity_credits(view="project", name="example-org/filler", credits=200000)
+    # The two Bob Bakers, on one page from the start.
+    tenant.consumption["user"] = [
+        *({"name": "Bob Baker", "creditsUsed": str(credits)} for credits in world.bobs),
+        *(r for r in tenant.consumption["user"] if r.get("name") != "Bob Baker"),
+    ]
     connected(tenant)
     _cycle(db, world, admin_client)
     budgets = {
@@ -564,6 +679,8 @@ def test_random_sequences_keep_both_invariants(
         "grp-payments": _limit(db, EntityType.GROUP, "grp-payments"),
         "app-payments": _limit(db, EntityType.APPLICATION, "app-payments"),
     }
+    bob = _limit(db, EntityType.USER, "user-bob")
+    world.bob_spent = 0
     _cycle(db, world, admin_client)
     # (period, budget) -> bound
     lower: dict[tuple[str, str], int] = defaultdict(int)
@@ -579,9 +696,14 @@ def test_random_sequences_keep_both_invariants(
     last2_app: _Reading | None = None
     last_feeds = _feeds(db)
     increases: dict[str, int] = defaultdict(int)
+    # Budget -> what names not read yet had added while the budget was fed by
+    # its own row (which may have counted it): never counted again through
+    # its projects once the row has left (ninth review, seed 93).
+    hidden_own: dict[str, dict[str, int]] = defaultdict(dict)
     rolled: set[str] = set()
     history: list[str] = []
-    totals_periods: set[str | None] = set()
+    # Month -> whether its latest evaluation counted reported totals.
+    totals_periods: dict[str | None, bool] = {}
     for _ in range(STEPS):
         with pytest.MonkeyPatch.context() as mp:
             change = _step(world, db, admin_client, mp, budgets)
@@ -590,34 +712,71 @@ def test_random_sequences_keep_both_invariants(
                 increases[name] += amount
             rolled |= change["rolled"]
             for old, new in world.moves:
+                # A rename keeps the ceiling it was under.
+                if old in world.ceilings:
+                    world.ceilings[new] = max(world.ceilings.get(new, 0), world.ceilings[old])
                 # The feed reports the name's usage under its new name now.
                 if old in increases:
                     increases[new] += increases.pop(old)
+                for hidden in hidden_own.values():
+                    if old in hidden:
+                        hidden[new] = hidden.get(new, 0) + hidden.pop(old)
                 if old in rolled:
                     rolled.discard(old)
                     rolled.add(new)
             group_grew, app_grew = world.group_grew, world.app_grew
             read = _cycle(db, world, admin_client)
-            if world.existing and not world.skip_evaluation:
-                # Evaluated from reported totals: that period is not the
-                # ledger's (and a closed period is never rewritten later).
-                totals_periods.add(_month(world.clock))
+            if not world.skip_evaluation:
+                # Counted from reported totals or from the ledger, as its
+                # latest evaluation did: a closed month is never rewritten.
+                totals_periods[_month(world.clock)] = world.existing
         if not read:
             continue
         world.group_grew = world.app_grew = 0
         now = _Reading(db, "project")
         group, app = _Reading(db, "group"), _Reading(db, "application")
-        assert now.id != last.id, "\n".join(history)
+        if now.id == last.id:
+            # The project reading was held back (a collapse not accepted yet);
+            # the group and application views were read all the same.
+            history.append("  held")
+            for budget, (entity, before_view, now_view, grew, before2_view) in {
+                "grp-payments": ("grp-payments", last_group, group, group_grew, last2_group),
+                "app-payments": ("app-payments", last_app, app, app_grew, last2_app),
+            }.items():
+                if before_view.has(entity):
+                    hidden_own[budget] = dict(increases)
+                if (
+                    before_view.has(entity)
+                    and now_view.has(entity)
+                    and before_view.period == now_view.period
+                    and _month(before_view.at) == _month(now_view.at)
+                ):
+                    key = (_month(now_view.at), budget)
+                    upper[key] += grew
+                    if before2_view is not None and before2_view.has(entity):
+                        lower[key] += grew
+            last2_group, last2_app = last_group, last_app
+            last_group, last_app = group, app
+            continue
         history.append(f"  reading {now.rows}")
         feeds = _feeds(db)
         period = _month(now.at)
         counts = _month(last.at) == period and last.period == now.period
         seen = {name for name in now.rows if name not in world.dipped}
+        # A name new or back while names under a ceiling are missing may be
+        # their rename: it starts under the highest of those ceilings.
+        live = [c for n, c in world.ceilings.items() if n not in now.rows]
+        for name in now.rows:
+            if name not in last.rows and live:
+                world.ceilings[name] = max(world.ceilings.get(name, 0), *live)
+        under = {name for name in now.rows if name in world.ceilings and name not in world.dipped}
         own = {
             "grp-payments": ("grp-payments", last_group, group, group_grew, last2_group),
             "app-payments": ("app-payments", last_app, app, app_grew, last2_app),
         }
         for budget, projects in feeds.items():
+            if budget in own and own[budget][1].has(own[budget][0]):
+                hidden_own[budget] = dict(increases)
             if not counts:
                 continue
             key = (period, budget)
@@ -632,9 +791,10 @@ def test_random_sequences_keep_both_invariants(
                         lower[key] += grew
                 continue
             members = projects | last_feeds[budget]
-            for name, amount in increases.items():
+            for name, pending in increases.items():
                 if name not in seen:
                     continue
+                amount = max(0, pending - hidden_own[budget].get(name, 0))
                 before, after = last.rows.get(name), now.rows.get(name)
                 if {before, after, world.owner.get(name)} & members:
                     upper[key] += amount
@@ -643,6 +803,7 @@ def test_random_sequences_keep_both_invariants(
                     and before == after
                     and after in projects
                     and name not in rolled
+                    and name not in under
                 ):
                     lower[key] += amount
                 elif (
@@ -655,6 +816,7 @@ def test_random_sequences_keep_both_invariants(
                     and last2.rows[name] == after
                     and after in projects
                     and name not in world.ever_fell
+                    and name not in under
                     and set(last2.rows) - {name} <= set(last.rows)
                     and set(last.rows) <= set(now.rows)
                     and not any(
@@ -669,9 +831,16 @@ def test_random_sequences_keep_both_invariants(
                     # Back from one missing reading, nothing else it could be
                     # a rename of: it counts what it added while away.
                     lower[key] += amount
+        # A ceiling is cleared once a reading reports the name at or above it.
+        for name in under:
+            if world.totals.get(name, 0) >= world.ceilings[name]:
+                del world.ceilings[name]
         # What a name absent from this reading (or reported lower than it is)
         # added is still to be observed.
         increases = defaultdict(int, {n: a for n, a in increases.items() if n not in seen})
+        for hidden in hidden_own.values():
+            for name in seen:
+                hidden.pop(name, None)
         rolled = {n for n in rolled if n not in seen}
         for name in last.rows:
             if name not in now.rows:
@@ -685,13 +854,23 @@ def test_random_sequences_keep_both_invariants(
         if world.skip_evaluation:
             continue
         db.expire_all()
+        db.expire_all()
+        bob_used = sum(
+            state.credits_used
+            for state in db.scalars(
+                select(LimitPeriodState).where(LimitPeriodState.limit_id == bob.id)
+            )
+        )
+        assert bob_used <= world.bob_spent, (
+            f"seed {seed}, user-bob: {bob_used} <= {world.bob_spent}\n" + "\n".join(history)
+        )
         for budget, limit in budgets.items():
             if budget == "proj-web" and world.existing:
                 continue  # it counts reported totals while switched
             for state in db.scalars(
                 select(LimitPeriodState).where(LimitPeriodState.limit_id == limit.id)
             ):
-                if budget == "proj-web" and state.period_key in totals_periods:
+                if budget == "proj-web" and totals_periods.get(state.period_key):
                     continue
                 key = (state.period_key, budget)
                 used = state.credits_used

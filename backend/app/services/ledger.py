@@ -70,7 +70,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
@@ -228,29 +228,47 @@ def counts_existing(limit: CreditLimit) -> bool:
     )
 
 
-def own_figures(session: Session) -> dict[str, set[str]]:
+def own_figures(session: Session, excluding: int | None = None) -> dict[str, set[str]]:
     """Groups and applications with a row of their own in their view's latest
-    live reading. Taken once per ingest, before any view is read, so a group
-    or application budget is fed either by its own row or by its projects in
-    a given cycle, whichever order the views are read in."""
-    from app.services import ingestion
+    live reading (``view``), and in the one before it too (``view:steady``).
+    Taken once per ingest, before any view is read, so a group or application
+    budget is fed either by its own row or by its projects in a given cycle,
+    whichever order the views are read in. An own row feeds its budget only
+    once it is steady: in the ingest its entity first has one, its projects
+    have fed the budget up to their own read, after the application's."""
+    from app.services.settings_store import DEMO_PERIOD_PARAM
 
     found: dict[str, set[str]] = {}
     for view in AGGREGATE_VIEWS:
-        snapshot = ingestion.latest_live_snapshot(session, view)
-        found[view] = (
+        query = (
+            select(UsageSnapshot.id)
+            .where(
+                UsageSnapshot.view_by == view,
+                UsageSnapshot.held_reason.is_(None),
+                UsageSnapshot.period_param.is_distinct_from(DEMO_PERIOD_PARAM),
+            )
+            .order_by(UsageSnapshot.collected_at.desc(), UsageSnapshot.id.desc())
+            .limit(2)
+        )
+        if excluding is not None:
+            query = query.where(UsageSnapshot.id != excluding)
+        ids = list(session.scalars(query))
+        sets = [
             {
                 str(entity_id)
                 for entity_id in session.scalars(
                     select(UsageRecord.entity_id).where(
-                        UsageRecord.snapshot_id == snapshot.id,
+                        UsageRecord.snapshot_id == snapshot_id,
                         UsageRecord.entity_id.is_not(None),
                     )
                 )
             }
-            if snapshot is not None
-            else set()
-        )
+            for snapshot_id in ids
+        ]
+        found[view] = sets[0] if sets else set()
+        found[f"{view}:steady"] = sets[0] & sets[1] if len(sets) == 2 else set()
+        # The latest reading of the view before this ingest (its id).
+        found[f"{view}:upto"] = {str(ids[0])} if ids else set()
     return found
 
 
@@ -264,11 +282,57 @@ class _Feeds:
         for limit in session.scalars(select(CreditLimit).where(CreditLimit.is_active.is_(True))):
             self.by_target[(str(limit.entity_type), limit.entity_id)].append(limit)
         self._own = own if own is not None else None
+        self._last_own: dict[str, dict[str, datetime]] = {}
 
     def _with_own_figure(self, view: str) -> set[str]:
         if self._own is None:
             self._own = own_figures(self.session)
         return self._own.get(view, set())
+
+    def own_row_until(self, limit: CreditLimit) -> datetime | None:
+        """For a group or application budget fed by its projects: when a
+        reading of its view last had its own row (which fed it then). A
+        project's increase whose interval began before that may hold usage the
+        own row already counted, so it does not feed the budget. None for any
+        other budget."""
+        kind = str(limit.entity_type)
+        if self.view != UsageView.PROJECT.value or kind not in (
+            EntityType.GROUP.value,
+            EntityType.APPLICATION.value,
+        ):
+            return None
+        if kind == EntityType.GROUP.value and limit.include_member_usage:
+            return None  # fed by its members' rows whatever its own row does
+        view = (
+            UsageView.GROUP.value if kind == EntityType.GROUP.value else UsageView.APPLICATION.value
+        )
+        if view not in self._last_own:
+            from app.services.settings_store import DEMO_PERIOD_PARAM
+
+            # Readings up to the latest before this ingest: this ingest's own
+            # application reading (read before the projects) is no own-row
+            # feeding yet.
+            upto = self._with_own_figure(f"{view}:upto")
+            if not upto:
+                self._last_own[view] = {}
+                return None
+
+            self._last_own[view] = {
+                str(entity_id): when
+                for entity_id, when in self.session.execute(
+                    select(UsageRecord.entity_id, func.max(UsageSnapshot.collected_at))
+                    .join(UsageSnapshot, UsageSnapshot.id == UsageRecord.snapshot_id)
+                    .where(
+                        UsageSnapshot.view_by == view,
+                        UsageSnapshot.held_reason.is_(None),
+                        UsageSnapshot.period_param.is_distinct_from(DEMO_PERIOD_PARAM),
+                        UsageRecord.entity_id.is_not(None),
+                        UsageSnapshot.id <= int(next(iter(upto))),
+                    )
+                    .group_by(UsageRecord.entity_id)
+                )
+            }
+        return self._last_own[view].get(str(limit.entity_id))
 
     def budgets(self, entity_ids: set[str]) -> dict[str, list[CreditLimit]]:
         """entity id -> the budgets it feeds."""
@@ -310,10 +374,17 @@ class _Feeds:
                         self.by_target.get((EntityType.APPLICATION.value, app_id), [])
                     )
         elif self.view == UsageView.APPLICATION.value:
+            steady = self._with_own_figure(f"{UsageView.APPLICATION.value}:steady")
             for app_id in ids:
-                found[app_id].extend(self.by_target.get((EntityType.APPLICATION.value, app_id), []))
+                if app_id in steady:
+                    found[app_id].extend(
+                        self.by_target.get((EntityType.APPLICATION.value, app_id), [])
+                    )
         elif self.view == UsageView.GROUP.value:
+            steady = self._with_own_figure(f"{UsageView.GROUP.value}:steady")
             for group_id in ids:
+                if group_id not in steady:
+                    continue
                 found[group_id].extend(
                     limit
                     for limit in self.by_target.get((EntityType.GROUP.value, group_id), [])
@@ -369,10 +440,20 @@ def _window(session: Session) -> timedelta:
     return timedelta(minutes=minutes) + timedelta(hours=1)
 
 
+# How long usage can stay in a window after it was spent, where that is longer
+# than the window's nominal length: "last_month" is the previous calendar
+# month, so usage on the 1st of a month is in it until the end of the next.
+_FORGET_DAYS = {"last_month": 62}
+
+
 def _lookback(period_param: str) -> timedelta:
+    """How long after its last rise a name's total may still be in the
+    window (rolling windows by their length; calendar ones by the longest
+    stretch they can cover)."""
     from app.checkmarx import usage as usage_api
 
-    return timedelta(days=usage_api.PERIOD_DAYS.get(period_param, 365))
+    days = _FORGET_DAYS.get(period_param, usage_api.PERIOD_DAYS.get(period_param, 365))
+    return timedelta(days=days)
 
 
 def _highest(rows: list[UsageMissingName]) -> tuple[Decimal, dict[str, int], datetime]:
@@ -430,6 +511,8 @@ def record_reading(
     view = str(view)
     result = LedgerResult()
     now = snapshot.collected_at
+    if own is None:
+        own = own_figures(session, excluding=snapshot.id)
     previous = ingestion.latest_live_snapshot(session, view, excluding=snapshot.id)
     kept = {
         row.subject_key: row
@@ -497,19 +580,31 @@ def record_reading(
             row = UsageMissingName(view_by=view, subject_key=key)
             session.add(row)
             kept[key] = row
-        if row.kind not in HELD_KINDS:
-            # A held fall keeps the higher total it was held at.
+        ceiling = row.kind in HELD_KINDS or (row.kind == FRESH and row.doubts == 1)
+        if not ceiling:
             row.last_total = credits
             row.last_actions = counts
             row.last_seen_at = then
             row.last_rise_at = earlier.last_rise_at or then
-        row.kind = MISSING
+        if ceiling or collapse:
+            # A held fall keeps the higher total it was held at, and keeps
+            # it while the name is missing; a name missing from a collapse
+            # accepted because it persisted fell in it too.
+            row.kind = COLLAPSE if (collapse or row.kind in (COLLAPSE, FRESH)) else CEILING
+        else:
+            row.kind = MISSING
         row.doubts = 0
         row.missing_since = now
         row.period_param = snapshot.period_param
         row.entity_id = earlier.entity_id
 
-    missing = {key: row for key, row in kept.items() if row.kind == MISSING}
+    # Rename partners: remembered names, and names held under a ceiling that
+    # the feed does not report.
+    missing = {
+        key: row
+        for key, row in kept.items()
+        if row.kind == MISSING or (row.kind in HELD_KINDS and key not in reported)
+    }
 
     def partners(entity_id: str | None, exclude: str | None = None) -> list[UsageMissingName]:
         """What a name new to the feed, or back in it, may be a rename of: any
@@ -539,6 +634,8 @@ def record_reading(
         # is a fall of this name (a start raised to a possible rename's total
         # is not).
         own_start: Decimal | None = None
+        # Whether a possible rename's start is held under a ceiling.
+        under_ceiling = False
         # When the name last rose, carried forward; set to now if it rises.
         if key in before:
             record.last_rise_at = previous_rows[key].last_rise_at or then
@@ -554,10 +651,17 @@ def record_reading(
             fresh = row or UsageMissingName(view_by=view, subject_key=key)
             if row is None:
                 session.add(fresh)
+            held = (
+                row is not None
+                and row.kind in HELD_KINDS
+                and Decimal(row.last_total or 0) > credits_now
+            )
             fresh.kind = FRESH
-            fresh.doubts = 0
-            fresh.last_total = credits_now
-            fresh.last_actions = counts_now
+            # 1: back under a ceiling it keeps (``last_total``) after this.
+            fresh.doubts = 1 if held else 0
+            if not held:
+                fresh.last_total = credits_now
+                fresh.last_actions = counts_now
             fresh.last_seen_at = now
             fresh.last_rise_at = now
             fresh.missing_since = now
@@ -567,7 +671,14 @@ def record_reading(
             result.held += 1
             continue
         if row is not None and row.kind == FRESH:
-            _drop(session, row)
+            if row.doubts == 1 and credits_now < Decimal(row.last_total or 0):
+                # Its second reading counts nothing either; it is still under
+                # the ceiling it came back with, which it keeps.
+                row.kind = COLLAPSE
+                row.doubts = 0
+                row.last_seen_at = now
+            else:
+                _drop(session, row)
             record.last_rise_at = now
             result.held += 1
             continue
@@ -588,6 +699,12 @@ def record_reading(
                 # Back at (or above) the total before the fall: what is above
                 # it is new.
                 _drop(session, row)
+            elif collapse:
+                # The whole feed's collapse, accepted because it persisted, is
+                # no confirmation of a held fall: the ceiling stays.
+                row.kind = COLLAPSE
+                result.held += 1
+                continue
             elif row.kind == DIP and suspect:
                 if (row.doubts or 0) + 1 < DIP_MAX_DOUBTS and now - row.missing_since < DIP_MAX_AGE:
                     row.doubts = (row.doubts or 0) + 1
@@ -614,6 +731,15 @@ def record_reading(
         elif key in before:
             start_credits, start_counts = before[key]
             own_start = start_credits
+            was = previous_rows[key].display_rows
+            if was is not None and record.display_rows is not None and was != record.display_rows:
+                # Two people who share a display name were split across pages
+                # (read as one repeated row) or joined on one page (added up):
+                # the totals are not comparable. The name starts from what it
+                # reports now; what was spent in this interval is not counted.
+                record.last_rise_at = now
+                result.held += 1
+                continue
         elif row is not None:
             # A name back after missing readings. It may have been renamed and
             # renamed back: what its other names counted from its total is
@@ -622,6 +748,7 @@ def record_reading(
             own_start = start_credits
             since = row.last_seen_at
             others = partners(record.entity_id, exclude=key)
+            under_ceiling = any(other.kind in HELD_KINDS for other in others)
             if others:
                 high, high_counts, seen = _highest(others)
                 start_credits, start_counts = _raise_to(
@@ -631,6 +758,7 @@ def record_reading(
             returning = row
         else:
             found = partners(record.entity_id)
+            under_ceiling = any(other.kind in HELD_KINDS for other in found)
             start_credits, start_counts = ZERO, {}
             if found:
                 start_credits, start_counts, partner_seen = _highest(found)
@@ -648,9 +776,10 @@ def record_reading(
                     shifts.join(record.entity_id, earlier)
         credits = credits_now - start_credits
         falls = own_start is not None and credits_now < own_start
-        if credits < 0 and collapse and not suspect and falls:
+        if credits < 0 and (collapse and falls or under_ceiling):
             # The whole feed collapsed and the collapse was accepted only
             # because it persisted: the total before it stays the ceiling.
+            # So does the ceiling of a name this one may be a rename of.
             hold = returning or UsageMissingName(view_by=view, subject_key=key)
             if returning is None:
                 session.add(hold)
@@ -877,6 +1006,12 @@ def _feed(
                     and limit.created_at > delta.observed_at
                 ):
                     continue
+                own_until = feeds.own_row_until(limit)
+                if own_until is not None and delta.since < own_until:
+                    # The budget was fed by its own row during this interval:
+                    # what the project added may be counted there already.
+                    result.dropped += Decimal(delta.credits or 0)
+                    continue
                 for granularity in _GRANULARITIES:
                     period = current_window(
                         SimpleNamespace(period_type=granularity, created_at=limit.created_at),
@@ -917,6 +1052,9 @@ def _feed(
         # reconciled only with what arrived after it was last evaluated.
         row.updated_at = max(row.updated_at, latest) if row.updated_at else latest
         result.counted[(limit_id, key)] = credits
+    # Sessions do not autoflush: the next feed of this reading (claims) must
+    # find these counters.
+    session.flush()
 
 
 def _as_row(credits: Decimal, counts: dict[str, int]) -> SimpleNamespace:

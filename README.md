@@ -766,10 +766,21 @@ measured from the last reading that was stored.
   email and under their name) are added up. User rows with a display name only
   are added up when they come on one page (two people may share a name); one
   on a later page whose name an earlier page of the same reading already had is
-  a repeat (the higher is kept, and the reading is doubted).
+  a repeat (the higher is kept, and the reading is doubted). How many such rows
+  a subject was read as is kept on its row (`display_rows`); when it changes
+  between readings (two people who share a display name split across a page
+  boundary, or joined on one page), the totals are not comparable and that
+  reading counts nothing for the subject. So two real people who share a display
+  name lose what they spend in every interval where the page layout splits or
+  joins them, and while they are split only the higher of the two is followed
+  (the other's usage is not counted): an under-count, limited to subjects read
+  as several display-name-only rows.
 * **A fall** adds nothing. In a reading the completeness checks believe, it is
-  the lookback window rolling past older usage, and the name continues from its
-  new total. In a reading they doubt (a row served twice, or fewer rows than the
+  taken as the lookback window rolling past older usage, and the name continues
+  from its new total. This rests on a premise: a complete listing reports each
+  name correctly. A per-name glitch in a reading the checks believe (one name
+  reported low while the listing is complete and no collapse is under way)
+  cannot be told from a roll-down, and its recovery is counted as usage. In a reading they doubt (a row served twice, or fewer rows than the
   feed says it has, counting rows the parser skips), the fall is not believed at
   once: the name continues from its previous total (`usage_missing_name`, kind
   `dip`) until it recovers or a believed reading confirms the fall. Each
@@ -780,8 +791,12 @@ measured from the last reading that was stored.
   counts, until a believed reading confirms the lower total or the lookback
   horizon passes. A collapse of the whole feed that is accepted only because it
   persisted (3 readings over 2 hours) leaves the same ceiling on every name that
-  fell (kind `collapse`), cleared only by rising above it or at the horizon. So
-  an outlasting glitch is never counted when it ends; a real roll-down first
+  fell, or is missing from it (kind `collapse`), also when that reading is
+  doubted, and on a fall already held as doubted. The ceiling stays while the
+  name is missing from later readings, is a rename partner meanwhile (a name
+  that may be its rename, new or back, starts under the same ceiling), and is
+  cleared only by rising above it or at the horizon. So an outlasting glitch is
+  never counted when it ends; a real roll-down first
   reported in doubted readings, or in such a collapse, costs what the name adds
   below its old total (an under-count). A believed fall to a non-zero total
   counts as a rise for forgetting: the usage spent meanwhile may be in it.
@@ -789,8 +804,10 @@ measured from the last reading that was stored.
   (`usage_missing_name`), so when it returns only what it reported since counts.
   It is forgotten once its total last rose, fell to a non-zero total or first
   appeared longer ago than the lookback window plus two days (`last_rise_at`,
-  carried on every reading's rows; the margin covers calendar-year and
-  day-granular windows):
+  carried on every reading's rows). The rolling windows count by their length
+  (`last_year` is taken as the last 365 days); `last_month`, the previous
+  calendar month, can hold usage for up to 62 days; the two days cover windows
+  counted in whole days:
   nothing it reported can be left in the window then, so its return counts in
   full. A name back after missing readings may have been renamed and renamed
   back: it starts from the highest of its own last total and those of the names
@@ -821,7 +838,17 @@ measured from the last reading that was stored.
   otherwise by its projects, decided once per ingest before any view is read; a
   group's or application's own row that is new, or back after missing readings,
   counts nothing in that reading nor in the next (its projects fed the budget
-  meanwhile, up to their own read, which comes after the application's).
+  meanwhile, up to their own read, which comes after the application's); a
+  ceiling it was under stays. More generally, an own row feeds its budget only
+  once its entity had one in both of the two readings before (a row mapped by an
+  admin, or renamed in the feed before the sync, starts feeding a reading
+  later); the reading in between counts towards neither (an under-count).
+  Back on its projects, a budget whose own row left counts only project
+  increases observed wholly after the row's last reading: an increase whose
+  interval spans it (a project missing while the row counted what it spent, then
+  back once the row has left) counts towards neither, since the row may have
+  counted part of it already (an under-count of what that project spent after
+  the row's last reading, in that interval only).
   Every active budget has a counter per month and per quarter, fed whatever its
   period type or setting: one that counts usage already reported (lifetime,
   custom, *count existing usage*) reads its totals instead, and switching it
@@ -869,8 +896,11 @@ interval; what a name adds while a doubted fall of it waits for confirmation
 when the fall is real, and usage below a ceiling kept after an outlasting doubt
 or a persisting collapse; usage in the reading after a change of lookback
 window; an interval that spans a budget's period start; the reading in which a
-group's or application's own row leaves its view, and its second reading when it
-appears; and usage observed while a name
+group's or application's own row leaves its view, its second reading when it
+appears, and the reading before an own row that starts matching its entity
+feeds it; a project increase whose interval spans the last reading of an own
+row that has since left; what two people who share a display name spend while the page layout
+splits or joins them, and the lower one's usage while they are split; and usage observed while a name
 counted towards nothing that no new entity claims.
 
 The same increases drive the rest: usage after a restriction is the restricted
@@ -893,10 +923,13 @@ jumps or loses anything, remembers the names earlier readings had and the latest
 lacks, and starts the ledger from the latest live reading. Migration
 `e2a7c4f9b1d8` adds when each name last rose and the doubt count, and gives the
 open period of every active budget that counts existing usage a counter: what
-the rows of its own entity grew by between the period's first and latest live
-readings, name by name (names present in both only), over the readings since
-the lookback window last changed; zero for a budget fed by a roll-up, or with
-fewer than two such readings. A database at the
+the rows of its own entity grew by up to the period's latest live reading, name
+by name, from the highest total any earlier reading of the run gave it (the last
+one before the period and every one in it, so a reading that reported a name
+low is never the start; names in no earlier reading bring nothing), over the
+readings since the lookback window last changed; zero for a budget fed by a
+roll-up, or with fewer than two such readings. Migration `d5b1e8a3c7f2` adds
+`usage_record.display_rows`. A database at the
 unreleased usage-anchor revision `f9c1e4b7a2d3` (now an empty placeholder) loses
 that schema's tables and columns on the way. **Downgrading** drops the ledger
 tables; period budgets then count from the baseline their period opened with.

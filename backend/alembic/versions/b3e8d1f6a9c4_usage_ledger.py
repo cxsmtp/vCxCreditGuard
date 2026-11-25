@@ -147,7 +147,10 @@ def _seed_missing_names(bind, now: datetime) -> None:  # type: ignore[no-untyped
             ),
             {"view": view, "period": period, "latest": latest_id},
         )
-        horizon = now - timedelta(days=PERIOD_DAYS.get(period, 365))
+        # As the ledger forgets (ledger._lookback, HORIZON_MARGIN): "last_month"
+        # is a calendar month, so up to 62 days; two days' margin.
+        days = 62 if period == "last_month" else PERIOD_DAYS.get(period, 365)
+        horizon = now - timedelta(days=days + 2)
         for key, credits, actions, raw, collected_at, entity_id in rows:
             if key in present or key in seen:
                 continue
