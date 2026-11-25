@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session
 
@@ -180,7 +181,8 @@ def test_a_database_at_the_replaced_anchor_revision_reaches_the_ledger(tmp_path:
     }
     with engine.begin() as connection:
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert version == "c9f2a6e1d4b7"
+    # The single head, whatever it is now: later migrations chain after this one.
+    assert version == ScriptDirectory.from_config(config).get_current_head()
     # And back down the whole chain, and up again.
     command.downgrade(config, BEFORE)
     command.upgrade(config, "head")
