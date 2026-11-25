@@ -14,7 +14,7 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: backend
@@ -56,7 +56,7 @@ jobs:
     # PostgreSQL disagree on locking, column widths and constraint names, and
     # every defect of that kind was invisible while only SQLite was tested.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: backend
