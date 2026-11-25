@@ -25,6 +25,7 @@ from app.models.org import (
     CxProjectGroup,
     CxUser,
 )
+from app.models.selftest import EnforcementSelfTest
 from app.models.usage import (
     AutoTriageCharge,
     AutoTriageProjectState,
@@ -65,6 +66,7 @@ __all__ = [
     "CxUser",
     "DimensionState",
     "EnforcementAction",
+    "EnforcementSelfTest",
     "EntityMapping",
     "Exemption",
     "LimitPeriodState",

@@ -27,6 +27,7 @@ from app.api.routes import (
     preview,
     reports,
     requests,
+    selftest,
     updates,
     violations,
 )
@@ -149,6 +150,7 @@ def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) 
     api.include_router(requests.router)
     api.include_router(notifications.router)
     api.include_router(ops.router)
+    api.include_router(selftest.router)
     api.include_router(settings_routes.router)
     api.include_router(dashboard.router)
     api.include_router(violations.router)

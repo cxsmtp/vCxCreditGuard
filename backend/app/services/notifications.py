@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -33,6 +36,23 @@ CATEGORY_POLICY = "policy"
 # In-app updates: available, installed, rolled back, needs a new image, token refused.
 CATEGORY_UPDATES = "updates"
 
+# Per thread: the enforcement self-test runs the real restriction and restore
+# code, whose "restricted" and "restored" notices would be false alarms. It
+# reports in its own result instead (and raises its own alert when a restore
+# fails). Other threads (the scheduler's cycle) are never affected.
+_suppressed = threading.local()
+
+
+@contextmanager
+def suppressed() -> Iterator[None]:
+    """Within this block, ``notify`` on this thread records nothing."""
+    previous = getattr(_suppressed, "active", False)
+    _suppressed.active = True
+    try:
+        yield
+    finally:
+        _suppressed.active = previous
+
 
 def notify(
     session: Session,
@@ -53,6 +73,8 @@ def notify(
     checked here, because two scheduler processes racing on the same condition
     must not produce two rows.
     """
+    if getattr(_suppressed, "active", False):
+        return None
     dedupe_key = _bounded_key(dedupe_key)
     if dedupe_key is not None:
         existing = session.scalar(select(Notification).where(Notification.dedupe_key == dedupe_key))

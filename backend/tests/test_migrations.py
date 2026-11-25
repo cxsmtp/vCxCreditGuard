@@ -35,6 +35,7 @@ EXPECTED_TABLES = {
     "budget_usage",
     "usage_entity_offset",
     "enforcement_action",
+    "enforcement_selftest",
     "exemption",
     "limit_period_state",
     "login_attempt",

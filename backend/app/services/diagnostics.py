@@ -87,6 +87,17 @@ _REMEDIATION: dict[tuple[str, str], str] = {
         "Restore the Checkmarx connection; the next healthy cycle retries the pending "
         "actions. You can also run a cycle now from Operations."
     ),
+    ("enforcement_selftest", WARN): (
+        "Open Settings → Enforcement and read the last self-test's steps and diff: it shows "
+        "which step failed and what was found. Fix that (permissions, a setting the tenant "
+        "does not keep) and run it again on the same target."
+    ),
+    ("enforcement_selftest", FAIL): (
+        "A self-test could not give its target back. The restriction is tracked: the next "
+        "cycle retries the restore, and Restore in the Notification Center does it now. "
+        "If it keeps failing, put it back in Checkmarx One by hand from the snapshot shown "
+        "on Settings → Enforcement."
+    ),
     ("dimensions", FAIL): (
         "This tenant does not report per-user consumption. Govern with project, application, "
         "or group limits instead, or ask Checkmarx to enable per-user reporting."
@@ -146,6 +157,9 @@ def run_diagnostics(
     coverage_check = _coverage_check(session)
     if coverage_check is not None:
         checks.append(coverage_check)
+    selftest_check = _selftest_check(session, moment)
+    if selftest_check is not None:
+        checks.append(selftest_check)
     if settings_store.auto_triage_to_initiator(session):
         # Only while charging auto triage to scan initiators is on, so the
         # report is unchanged for everyone who has not turned it on.
@@ -440,6 +454,53 @@ def _auto_triage_check(session: Session) -> Check:
     if problems:
         return Check("auto_triage_attribution", label, WARN, f"{detail} {' '.join(problems)}")
     return Check("auto_triage_attribution", label, OK, detail)
+
+
+def _selftest_check(session: Session, moment: datetime) -> Check | None:
+    """The last enforcement self-test: passed or failed, and when. Shown once
+    one has run. A target a self-test could not give back is a failure while
+    its restriction is still in force."""
+    from app.services import enforcement, enforcement_selftest
+
+    row = enforcement_selftest.latest(session)
+    if row is None:
+        return None
+    label = "Enforcement self-test"
+    when = _ago(moment, row.finished_at or row.started_at)
+    what = ", ".join(name for name in (row.user_label, row.project_label) if name)
+    where = f" on {what}" if what else ""
+    demo = " (demo tenant)" if row.demo else ""
+    held = [
+        action
+        for action in session.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.limit_id.is_(None),
+                EnforcementAction.period_key.like(f"{enforcement_selftest.PERIOD_PREFIX}%"),
+                EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES),
+            )
+        )
+        if enforcement.may_be_in_force(action)
+    ]
+    if held:
+        targets = ", ".join(sorted({action.target_label or action.target_id for action in held}))
+        return Check(
+            "enforcement_selftest",
+            label,
+            FAIL,
+            f"A self-test left {targets} restricted: its restore failed and is retried by the "
+            f"next cycle. Last self-test {row.status.replace('_', ' ')}{where}, {when}.",
+        )
+    if row.status in ("passed", "warning"):
+        words = "passed" if row.status == "passed" else "passed with warnings"
+        return Check(
+            "enforcement_selftest", label, OK, f"Last self-test {words}{where}{demo}, {when}."
+        )
+    return Check(
+        "enforcement_selftest",
+        label,
+        WARN,
+        f"Last self-test {row.status.replace('_', ' ')}{where}{demo}, {when}.",
+    )
 
 
 def _pending_enforcement_check(session: Session) -> Check:
