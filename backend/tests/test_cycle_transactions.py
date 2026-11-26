@@ -68,7 +68,7 @@ def _enforced_user_limit(db: Session, *, credit_limit: int) -> None:
         db,
         data=limits_service.LimitInput(
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             credit_limit=credit_limit,
             period_type=PeriodType.MONTHLY,
             enforce=True,
@@ -111,11 +111,11 @@ class TestNoWriteLockAcrossNetworkCalls:
         assert cycle.run_cycle(trigger="manual", force_org_sync=True).status == RunStatus.SUCCESS
         _enforced_user_limit(db, credit_limit=1)
         cycle.run_cycle(trigger="manual")
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
 
         held = _watch_for_write_locks(tenant)
         cycle.run_cycle(trigger="manual")
-        assert not any(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         assert held == []
 
         # Raising the limit restores access, also without a lock across the call.
@@ -134,5 +134,5 @@ class TestNoWriteLockAcrossNetworkCalls:
                 actor=ACTOR,
                 client=tenant.client(),
             )
-        assert all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         assert held == []

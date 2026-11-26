@@ -43,7 +43,6 @@ Checkmarx call, and one project's failure never stops the others.
 
 from __future__ import annotations
 
-import bisect
 import logging
 import math
 import re
@@ -63,7 +62,6 @@ from app.checkmarx.errors import CheckmarxAuthError, CheckmarxError, CheckmarxNo
 from app.db.base import utcnow
 from app.models.enums import ActionType, EnforcementKind, EnforcementStatus, Severity, UsageView
 from app.models.limits import CreditLimit, EnforcementAction
-from app.models.usage import UsageRecord, UsageSnapshot
 from app.models.violations import (
     INFO_KINDS,
     KIND_AI_SCAN,
@@ -76,7 +74,7 @@ from app.models.violations import (
     STATUS_RESOLVED,
     PolicyViolation,
 )
-from app.services import error_text, ingestion, notifications, pacing, settings_store, usage_mix
+from app.services import error_text, ledger, notifications, pacing, settings_store, usage_mix
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -552,20 +550,22 @@ def _model_key(name: str | None) -> str | None:
 
 
 def _fusion_price(
-    model: str | None, rates: dict[str, tuple[Decimal, str | None]]
-) -> Decimal | None:
-    """Credits per Fusion scan with this model (``opus-5.5``), when the rates say.
+    model: str | None, prices: dict[str, usage_mix.ActionPrice]
+) -> usage_mix.ActionPrice | None:
+    """Credits per Fusion scan with this model (``opus-5.5``), when known.
 
-    The model must match a Fusion rate's model exactly (by its action type or
+    The model must match a Fusion price's model exactly (by its action type or
     its display name): ``opus-5.5`` never takes the price of ``x-opus-5.5``.
+    The price is the listed rate or, where the feed disagrees with it, the
+    feed's observed average (see ``usage_mix.price_table``).
     """
     wanted = _model_key(model)
     if wanted is None:
         return None
-    for key, (price, display) in rates.items():
+    for key, price in prices.items():
         if usage_api.normalise_action_type(key) != ActionType.FUSION:
             continue
-        for name in (key, display):
+        for name in (key, price.display):
             if _model_key(usage_api.fusion_model(name)) == wanted:
                 return price
     return None
@@ -661,7 +661,7 @@ def _detect_scans(session: Session, client: CheckmarxClient, result: DetectionRe
     if len(watches) > per_cycle:
         result.skipped_projects += len(watches) - per_cycle
         watches = watches[:per_cycle]
-    rates = usage_mix.rate_table(session)
+    rates = usage_mix.price_table(session)
 
     # 1. List each project's scans and sort them out, without single-scan reads.
     # The listings are independent reads, made a few at a time; nothing is
@@ -825,7 +825,7 @@ def _record_project_scans(
     project: _ProjectScans,
     *,
     cursors: dict[str, Any],
-    rates: dict[str, tuple[Decimal, str | None]],
+    rates: dict[str, usage_mix.ActionPrice],
     result: DetectionResult,
 ) -> None:
     """Record one project's findings and move its cursor (no commit)."""
@@ -964,7 +964,7 @@ def _record_scan(
     watch: _FusionWatch,
     scan: scans_api.ScanSummary,
     limit: CreditLimit | None,
-    rates: dict[str, tuple[Decimal, str | None]],
+    rates: dict[str, usage_mix.ActionPrice],
 ) -> bool:
     if not scan.fusion:
         return _count_ai_scan(session, watch=watch, scan=scan, limit=limit)
@@ -985,16 +985,30 @@ def _record_scan(
         "llm_model": model,
         "source_origin": scan.source_origin,
         "source_type": scan.source_type,
-        "credits_per_scan": str(price) if price is not None else None,
+        "credits_per_scan": str(price.per_transaction) if price is not None else None,
+        # "rate" (the listed rate) or "observed" (the consumption feed's average).
+        "price_source": price.source if price is not None else None,
         "restricted_since": watch.since.isoformat(),
     }
     who = scan.initiator or "someone Checkmarx One does not name"
-    cost = (
-        f" At the current rate a Fusion scan with {model} costs "
-        f"{usage_mix.format_credits(price)} credits."
-        if price is not None and model
-        else ""
-    )
+    cost = ""
+    if price is None and model and finished:
+        cost = (
+            f" What a Fusion scan with {model} costs is not known from this tenant's data: the "
+            "listed rate is not its price, and the consumption feed has no figure for it yet."
+        )
+    if price is not None and model:
+        if price.source == usage_mix.PRICE_OBSERVED:
+            cost = (
+                f" A Fusion scan with {model} costs about "
+                f"{usage_mix.format_credits(price.per_transaction.quantize(Decimal('0.01')))} "
+                f"credits ({price.source_words()})."
+            )
+        else:
+            cost = (
+                f" At the listed rate a Fusion scan with {model} costs "
+                f"{usage_mix.format_credits(price.per_transaction)} credits."
+            )
     unfinished = "" if finished else f" It had not finished when it was checked ({scan.status})."
     what = (
         f"Scan {scan.id} on {label} ran Fusion{f' ({model})' if model else ''} although "
@@ -1026,7 +1040,7 @@ def _record_scan(
             actor=scan.initiator,
             source=source,
             evidence=evidence,
-            credits=price,
+            credits=price.per_transaction if price is not None else None,
         )
         is not None
     )
@@ -1125,111 +1139,13 @@ _STOPS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _record_for(session: Session, snapshot: UsageSnapshot, entity_id: str) -> UsageRecord | None:
-    return session.scalar(
-        select(UsageRecord)
-        .where(UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id == entity_id)
-        .limit(1)
-    )
-
-
-def _bucketed(record: UsageRecord | None) -> dict[str, int]:
+def _bucketed(counts: dict | None) -> dict[str, int]:
     totals: dict[str, int] = {}
-    for action, count in ((record.actions if record else None) or {}).items():
+    for action, count in ledger.plain_actions(counts).items():
         if isinstance(count, int) and not isinstance(count, bool):
             key = usage_mix.bucket(action)
             totals[key] = totals.get(key, 0) + count
     return totals
-
-
-class _UsageReader:
-    """The consumption readings ``_detect_usage`` compares, read in bulk.
-
-    The same answers as ``ingestion.latest_snapshot``, ``usage_mix._snapshot_at``
-    and ``_record_for``, but one query per view and per snapshot rather than
-    several per restricted target: a large tenant has thousands of them.
-    """
-
-    def __init__(self, session: Session) -> None:
-        self.session = session
-        self._latest: dict[str, UsageSnapshot | None] = {}
-        # view -> believed snapshots (collected_at, id), oldest first.
-        self._timeline: dict[str, list[tuple[datetime, int]]] = {}
-        self._records: dict[tuple[int, str], UsageRecord | None] = {}
-
-    def latest(self, view: str) -> UsageSnapshot | None:
-        if view not in self._latest:
-            self._latest[view] = ingestion.latest_snapshot(self.session, view)
-        return self._latest[view]
-
-    def prepare(self, view: str, moments: list[datetime]) -> None:
-        """Load the snapshots that can be the reading at any of these moments."""
-        if not moments:
-            return
-        first = usage_mix._snapshot_at(self.session, view, min(moments))
-        query = select(UsageSnapshot.collected_at, UsageSnapshot.id).where(
-            UsageSnapshot.view_by == view,
-            UsageSnapshot.held_reason.is_(None),
-            UsageSnapshot.collected_at > min(moments),
-            UsageSnapshot.collected_at <= max(moments),
-        )
-        if not settings_store.demo_mode(self.session):
-            query = query.where(
-                UsageSnapshot.period_param.is_distinct_from(settings_store.DEMO_PERIOD_PARAM)
-            )
-        timeline = [(row.collected_at, row.id) for row in self.session.execute(query)]
-        if first is not None:
-            timeline.append((first.collected_at, first.id))
-        timeline.sort()
-        self._timeline[view] = timeline
-
-    def baseline(self, view: str, action: EnforcementAction) -> UsageSnapshot | None:
-        """The reading a rise since this restriction is measured from.
-
-        The snapshot pinned when it was applied (``baseline_snapshot_id``), or,
-        for a restriction from before that existed (or whose snapshot is gone),
-        the newest believed snapshot at or before ``applied_at``, as before.
-        """
-        if action.baseline_snapshot_id is not None:
-            pinned = self.session.get(UsageSnapshot, action.baseline_snapshot_id)
-            if pinned is not None and pinned.view_by == view and pinned.held_reason is None:
-                return pinned
-        if action.applied_at is None:
-            return None
-        return self.at(view, action.applied_at)
-
-    def at(self, view: str, moment: datetime) -> UsageSnapshot | None:
-        """The newest believed snapshot taken at or before ``moment``."""
-        timeline = self._timeline.get(view)
-        if timeline is None:
-            return usage_mix._snapshot_at(self.session, view, moment)
-        position = bisect.bisect_right(timeline, (moment, math.inf))
-        if position == 0:
-            return None
-        return self.session.get(UsageSnapshot, timeline[position - 1][1])
-
-    def preload(self, snapshot: UsageSnapshot | None, entity_ids: set[str]) -> None:
-        if snapshot is None:
-            return
-        wanted = sorted(eid for eid in entity_ids if (snapshot.id, eid) not in self._records)
-        for start in range(0, len(wanted), 1000):
-            chunk = wanted[start : start + 1000]
-            for eid in chunk:
-                self._records[(snapshot.id, eid)] = None
-            for record in self.session.scalars(
-                select(UsageRecord)
-                .where(UsageRecord.snapshot_id == snapshot.id, UsageRecord.entity_id.in_(chunk))
-                .order_by(UsageRecord.id)
-            ):
-                # The first row, as ``_record_for`` returns it.
-                if self._records.get((snapshot.id, record.entity_id)) is None:
-                    self._records[(snapshot.id, record.entity_id)] = record
-
-    def record(self, snapshot: UsageSnapshot, entity_id: str) -> UsageRecord | None:
-        key = (snapshot.id, entity_id)
-        if key not in self._records:
-            self._records[key] = _record_for(self.session, snapshot, entity_id)
-        return self._records[key]
 
 
 def _detect_usage(session: Session, result: DetectionResult) -> None:
@@ -1244,25 +1160,6 @@ def _detect_usage(session: Session, result: DetectionResult) -> None:
     ):
         if str(action.kind) in _STOPS:
             groups.setdefault((action.target_type, action.target_id), []).append(action)
-    reader = _UsageReader(session)
-    for view, target_type in ((UsageView.USER.value, "cx_user"), (UsageView.PROJECT.value, None)):
-        mine = {
-            key: actions
-            for key, actions in groups.items()
-            if (key[0] == "cx_user") == (target_type == "cx_user")
-        }
-        if not mine:
-            continue
-        reader.prepare(
-            view, [a.applied_at for actions in mine.values() for a in actions if a.applied_at]
-        )
-        ids = {key[1] for key in mine}
-        reader.preload(reader.latest(view), ids)
-        baselines = {
-            reader.baseline(view, a) for actions in mine.values() for a in actions if a.applied_at
-        }
-        for snapshot in baselines:
-            reader.preload(snapshot, ids)
     session.commit()
     for (target_type, target_id), actions in groups.items():
         if any(
@@ -1276,7 +1173,7 @@ def _detect_usage(session: Session, result: DetectionResult) -> None:
             # usage is not acting against the restriction.
             continue
         try:
-            outcome = _usage_for_target(session, target_type, target_id, actions, reader=reader)
+            outcome = _usage_for_target(session, target_type, target_id, actions)
             if outcome == "detected":
                 result.detected += 1
             elif outcome == "updated":
@@ -1293,25 +1190,24 @@ def _usage_for_target(
     target_type: str,
     target_id: str,
     actions: list[EnforcementAction],
-    *,
-    reader: _UsageReader | None = None,
 ) -> str | None:
     """ "detected", "updated", or None when there is nothing (new) to say.
 
-    Each action type is measured from its own restriction: Fusion restricted
-    after Auto Triage is compared with the reading before *Fusion* was
-    restricted, so Fusion used legitimately in between is not reported.
+    What the restriction is meant to stop, observed after it: the usage
+    ledger's increases attributed to the target since the restriction was
+    applied (app/services/ledger.py). Each action type is measured from its own
+    restriction: Fusion restricted after Auto Triage counts only Fusion
+    observed after *Fusion* was restricted. A name that only started to count
+    towards the target later (mapped, renamed) brings no history: only its
+    increases from then on are in the ledger.
     """
     first = actions[0]
     view = UsageView.USER.value if target_type == "cx_user" else UsageView.PROJECT.value
-    reader = reader or _UsageReader(session)
-    latest = reader.latest(view)
-    if latest is None:
+    earliest = min(action.applied_at for action in actions if action.applied_at)
+    increases = ledger.entity_increases(session, view, target_id, earliest)
+    if not increases:
         return None
-    now_record = reader.record(latest, target_id)
-    if now_record is None:
-        return None
-    now_counts = _bucketed(now_record)
+
     # The earliest applied restriction that stops each action type (actions
     # are in applied order).
     since_by_type: dict[str, EnforcementAction] = {}
@@ -1319,42 +1215,39 @@ def _usage_for_target(
         for stop in _STOPS[str(action.kind)]:
             since_by_type.setdefault(stop, action)
     rises: dict[str, int] = {}
-    baselines: dict[str, UsageSnapshot] = {}
     for action_type in sorted(since_by_type):
-        restricted = since_by_type[action_type]
-        before = reader.baseline(view, restricted)
-        if before is None or before.id == latest.id:
-            continue
-        then_counts = _bucketed(reader.record(before, target_id))
-        rise = now_counts.get(action_type, 0) - then_counts.get(action_type, 0)
-        if rise < 0:
-            # Older transactions left the lookback window: new ones cannot be
-            # told apart from them, so nothing is claimed.
-            return None
+        since = since_by_type[action_type].applied_at
+        rise = sum(
+            _bucketed(delta.actions).get(action_type, 0)
+            for delta in increases
+            if delta.observed_at > since
+        )
         if rise > 0:
             rises[action_type] = rise
-            baselines[action_type] = before
     if not rises:
         return None
-    # The credits rise is measured from the baseline of the earliest restriction
-    # whose action type rose (evidence only; priced below for Fusion alone).
+    # The credits rise is counted from the earliest restriction whose action
+    # type rose (evidence only; priced below for Fusion alone).
     earliest_type = min(rises, key=lambda t: (since_by_type[t].applied_at, since_by_type[t].id))
-    before = baselines[earliest_type]
-    then_record = reader.record(before, target_id)
-    credits_rise = Decimal(now_record.credits_used or 0) - Decimal(
-        (then_record.credits_used if then_record else 0) or 0
-    )
+    since = since_by_type[earliest_type].applied_at
+    counted = [delta for delta in increases if delta.observed_at > since]
+    credits_rise = sum((Decimal(delta.credits or 0) for delta in counted), Decimal("0"))
     credits: Decimal | None = None
     if set(rises) == {"fusion"}:
+        models: dict[str, int] = {}
+        for delta in counted:
+            for key, count in ledger.fusion_models(delta.actions).items():
+                models[key] = models.get(key, 0) + count
         priced = usage_mix._price_fusion(
             session,
-            latest=usage_mix._fusion_models(session, latest, [target_id]),
-            baseline=usage_mix._fusion_models(session, before, [target_id]),
+            latest=models,
+            baseline={},
             fusion_rise=rises["fusion"],
             own=max(credits_rise, Decimal("0")),
         )
         if priced:
-            credits = sum((part[3] for part in priced), Decimal("0"))
+            credits = sum((part.credits for part in priced), Decimal("0"))
+    latest_at = max(delta.observed_at for delta in increases)
     label = first.target_label or target_id
     listed = ", ".join(
         f"{usage_mix.ACTION_LABELS.get(action_type, action_type)} {count} transaction"
@@ -1377,11 +1270,8 @@ def _usage_for_target(
             action_type: since_by_type[action_type].applied_at.isoformat()  # type: ignore[union-attr]
             for action_type in rises
         },
-        "baseline_reading_at": before.collected_at.isoformat(),
-        "baseline_reading_at_by_action": {
-            action_type: baselines[action_type].collected_at.isoformat() for action_type in rises
-        },
-        "latest_reading_at": latest.collected_at.isoformat(),
+        "counted_since": since.isoformat(),
+        "latest_reading_at": latest_at.isoformat(),
         "restrictions": sorted({str(action.kind) for action in actions}),
     }
     key = f"{KIND_USAGE_AFTER}:{target_type}:{target_id}:{first.id}"

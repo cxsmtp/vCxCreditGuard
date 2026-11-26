@@ -96,6 +96,7 @@ class RetentionResult:
     enforcement_actions: int = 0
     auto_triage_charges: int = 0
     policy_violations: int = 0
+    ledger_rows: int = 0
     # Thinning and raw rows (see the module docstring).
     thinning: bool = True
     thinned_snapshots: int = 0
@@ -120,12 +121,14 @@ class RetentionResult:
             + self.auto_triage_charges
             + self.policy_violations
             + self.thinned_snapshots
+            + self.ledger_rows
         )
 
     def as_stats(self) -> dict[str, object]:
         return {
             "usage_snapshots": self.usage_snapshots,
             "usage_records": self.usage_records,
+            "ledger_rows": self.ledger_rows,
             "notifications": self.notifications,
             "audit_entries": self.audit_entries,
             "scheduler_runs": self.scheduler_runs,
@@ -182,6 +185,7 @@ def prune(
     _prune_period_states(session, cutoff)
     result.auto_triage_charges = _prune_auto_triage_charges(session, cutoff)
     result.policy_violations = _prune_policy_violations(session, cutoff)
+    result.ledger_rows = _prune_ledger(session, cutoff)
 
     # Audited last, and only if something was removed, so the entry can state the
     # counts. This is the single place that deletes audit rows.
@@ -625,13 +629,53 @@ def _prune_policy_violations(session: Session, cutoff) -> int:
 
 
 def _prune_period_states(session: Session, cutoff) -> int:
-    """Closed period states older than the window. The current period is kept by
-    virtue of its period_start being recent."""
-    return _delete_where(
+    """Closed period states older than the window, and their ledger counters.
+    The current period is kept by virtue of its period_start being recent."""
+    from sqlalchemy import tuple_
+
+    from app.models.usage import BudgetUsage
+
+    old = (LimitPeriodState.period_end.is_not(None)) & (LimitPeriodState.period_end < cutoff)
+    _delete_where(
         session,
-        LimitPeriodState,
-        (LimitPeriodState.period_end.is_not(None)) & (LimitPeriodState.period_end < cutoff),
+        BudgetUsage,
+        tuple_(BudgetUsage.limit_id, BudgetUsage.period_key).in_(
+            select(LimitPeriodState.limit_id, LimitPeriodState.period_key).where(old)
+        ),
     )
+    deleted = _delete_where(session, LimitPeriodState, old)
+    _prune_counters(session, cutoff)
+    return deleted
+
+
+def _prune_counters(session: Session, cutoff) -> int:  # type: ignore[no-untyped-def]
+    """Month and quarter counters whose period ended before the window, also
+    those of periods that never had a state (every budget is fed per month and
+    per quarter, whatever its type)."""
+    from app.models.usage import BudgetUsage
+
+    stale: list[int] = []
+    for row_id, key in session.execute(select(BudgetUsage.id, BudgetUsage.period_key)):
+        end = _period_end(key)
+        if end is not None and end < cutoff:
+            stale.append(row_id)
+    for start in range(0, len(stale), 1000):
+        _delete_where(session, BudgetUsage, BudgetUsage.id.in_(stale[start : start + 1000]))
+    return len(stale)
+
+
+def _period_end(key: str):  # type: ignore[no-untyped-def]
+    """When a "YYYY-MM" or "YYYY-Qn" period ends; None for any other key."""
+    from datetime import UTC, datetime
+
+    try:
+        year, rest = key.split("-", 1)
+        # The month after the period's last month.
+        month = int(rest[1:]) * 3 + 1 if rest.startswith("Q") else int(rest) + 1
+        year_number = int(year) + (month - 1) // 12
+        return datetime(year_number, (month - 1) % 12 + 1, 1, tzinfo=UTC)
+    except (ValueError, IndexError):
+        return None
 
 
 def _prune_auto_triage_charges(session: Session, cutoff) -> int:
@@ -676,6 +720,23 @@ def _prune_audit(session: Session, cutoff) -> int:
     if boundary_id is None:
         return 0
     return _delete_where(session, AuditLogEntry, AuditLogEntry.id <= boundary_id)
+
+
+def _prune_ledger(session: Session, cutoff) -> int:  # type: ignore[no-untyped-def]
+    """Ledger increases older than the retention window. Budget counters do
+    not depend on them; an increase of an entity under a restriction still in
+    force is kept, since usage after the restriction is measured from them."""
+    from app.models.usage import UsageDelta
+
+    restricted = select(EnforcementAction.target_id).where(
+        EnforcementAction.status == EnforcementStatus.APPLIED
+    )
+    return _delete_where(
+        session,
+        UsageDelta,
+        (UsageDelta.observed_at < cutoff)
+        & (UsageDelta.entity_id.is_(None) | UsageDelta.entity_id.not_in(restricted)),
+    )
 
 
 def _delete_where(session: Session, model, condition) -> int:  # type: ignore[no-untyped-def]

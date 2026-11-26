@@ -4,7 +4,7 @@ Answers one question: is a zero on screen an attribution failure (Checkmarx
 reported credits and we could not match them to this entity) or a baseline effect
 (we matched them, but the budget period opened after they were spent)?
 
-    python -m scripts.diagnose_usage --project "singakash/CxHybrid"
+    python -m scripts.diagnose_usage --project "carolorg/CxHybrid"
     python -m scripts.diagnose_usage --user "someone@example.com"
 
 Read only. It touches nothing and calls no API.

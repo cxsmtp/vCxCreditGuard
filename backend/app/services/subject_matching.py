@@ -4,13 +4,13 @@ The consumption feed identifies a user by whatever string the action was
 reported under. Most rows carry a clean email or display name that the exact
 ladder in :mod:`app.services.ingestion` resolves. What is left over is the messy
 tail the exact ladder cannot touch: service-style handles such as
-``cx-ryan-wakeham`` for *Ryan Wakeham*, a bare email local part, a first name on
+``cx-dave-dawson`` for *Dave Dawson*, a bare email local part, a first name on
 its own, or a small typo. Left unmatched these credits count towards nobody's
 limit, which is exactly the usage a limit is meant to catch.
 
 This module turns both sides into a normalised *token set* and scores them, so
-``cx-ryan-wakeham`` and ``ryan.wakeham@checkmarx.com`` land on the same
-``{ryan, wakeham}`` and match at full confidence. The score drives a three-way
+``cx-dave-dawson`` and ``dave.dawson@example.com`` land on the same
+``{dave, dawson}`` and match at full confidence. The score drives a three-way
 decision, deliberately conservative because a wrong auto-match silently bills the
 wrong person:
 
@@ -27,6 +27,7 @@ policy is unit-testable in isolation.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -43,7 +44,7 @@ AMBIGUITY_MARGIN = 0.05
 MAX_SUGGESTIONS = 5
 
 # Leading connector prefixes stripped from a handle before comparison, so
-# ``cx-ryan-wakeham`` compares as ``ryan wakeham``.
+# ``cx-dave-dawson`` compares as ``dave dawson``.
 _PREFIX_TOKENS = frozenset({"cx", "svc", "srv"})
 
 # Handles that are automation rather than people. Matched exactly (or on the
@@ -63,6 +64,16 @@ _BOT_NAMES = frozenset(
         "mergify",
         "mergify[bot]",
         "greenkeeper",
+        "snyk",
+        "snyk[bot]",
+        "imgbot",
+        "allcontributors",
+        "pre-commit-ci",
+        "pre-commit-ci[bot]",
+        "sonarcloud",
+        "sonarcloud[bot]",
+        "github-advanced-security",
+        "copilot",
     }
 )
 
@@ -137,8 +148,8 @@ def tokenize(*values: str | None) -> frozenset[str]:
     """Turn one or more identity strings into a comparable token set.
 
     Drops a leading connector prefix (``cx``) and single-character noise, so
-    ``cx-ryan-wakeham``, ``Ryan Wakeham`` and ``ryan.wakeham@checkmarx.com`` all
-    reduce to ``{ryan, wakeham}``.
+    ``cx-dave-dawson``, ``Dave Dawson`` and ``dave.dawson@example.com`` all
+    reduce to ``{dave, dawson}``.
     """
     collected: set[str] = set()
     for value in values:
@@ -170,11 +181,141 @@ def is_bot_subject(*values: str | None) -> bool:
     return False
 
 
+# Tokens that mark a handle as an integration or service account rather than a
+# person. Matched only as a whole token between separators ("-", "_", "."), so
+# "example-ci-bot" and "svc-scanner" are automation while "tokenaga",
+# "jenkinson" or "mary_ann" are not.
+_AUTOMATION_TOKENS = frozenset(
+    {
+        "bot",
+        "bots",
+        "ci",
+        "cd",
+        "cicd",
+        "svc",
+        "srv",
+        "service",
+        "integration",
+        "automation",
+        "pipeline",
+        "pipelines",
+        "connector",
+        "scm",
+    }
+)
+# CI/SCM products, which name their integration identities after themselves.
+# Matched as a whole token of an all-lowercase handle: "jenkins" or
+# "jenkins-scan" is the server, "Jenkins" is someone's display name.
+_PRODUCT_TOKENS = frozenset(
+    {
+        "github",
+        "gitlab",
+        "bitbucket",
+        "jenkins",
+        "azure",
+        "azuredevops",
+        "circleci",
+        "teamcity",
+        "buildkite",
+        "travis",
+        "argocd",
+    }
+)
+
+
+# Build and CI words. In a handle of several parts these mark automation
+# whatever the case ("GitHub-Actions", "sonar-scanner", "Build-Agent"); a
+# handle of one part only when it is written in lowercase, digits allowed
+# ("buildserver01").
+_BUILD_TOKENS = frozenset(
+    {
+        "actions",
+        "sonar",
+        "sonarqube",
+        "scanner",
+        "build",
+        "buildserver",
+        "buildagent",
+        "pipeline",
+        "deploy",
+    }
+)
+# Words that are also surnames ("Runner", "Builder"): automation only in a
+# handle written in lowercase ("gitlab-runner", "builder").
+_LOWERCASE_BUILD_TOKENS = frozenset({"runner", "builder", "deployer"})
+_PHRASES = frozenset({"github-actions", "gitlab-ci", "azure-pipelines", "bitbucket-pipelines"})
+
+
+def _person_like(text: str) -> bool:
+    """A handle written like a person's name: dotted parts ("lee.sonar",
+    "paul.scanner") or a Capitalised part ("Paul-Scanner", "Mary-Build")."""
+    if "." in text:
+        return True
+    return any(
+        part[:1].isupper() and any(char.islower() for char in part[1:])
+        for part in re.split(r"[-_]+", text)
+        if part
+    )
+
+
+def is_integration_identity(name: str | None, email: str | None) -> bool:
+    """True for a consumption subject that looks like an integration, not a person.
+
+    On a live tenant the largest consumer (62% of credits) was reported under a
+    single handle with no email anywhere: an SCM or CI integration's identity.
+    A bare name with no email is not enough ("Priya", "José", "jsmith2",
+    "Jean-Luc", "mary_ann" or a departed person's login are people). With no
+    email, the handle must also:
+
+    * carry "[bot]", or be a known bot handle ("dependabot", "renovate", ...);
+    * contain a CI phrase in any case ("github-actions", "GitHub-Actions",
+      "gitlab-ci", "azure-pipelines");
+    * have an automation token as a whole, lowercase part ("-bot", "_bot",
+      "-ci", "svc-", "-svc", "-integration", ...);
+    * or, unless it is written like a person's name (dotted parts, or a
+      Capitalised part: "lee.sonar", "Paul.Scanner", "Mary-Build"), have a
+      build word as a whole part ("sonar-scanner", "build-agent",
+      "buildserver01"), or be a CI/SCM product's or build word's own lowercase
+      name ("jenkins", "gitlab-runner").
+
+    Digits, hyphens and underscores alone say nothing, and a token is never
+    matched inside a word. It is applied only once nothing matched (see
+    ``classify``), and stays mappable to a person under Settings → Attribution.
+    """
+    if email and email.strip():
+        return False
+    text = (name or "").strip()
+    if not text or "@" in text or any(char.isspace() for char in text):
+        return False
+    low = text.lower()
+    if "[bot]" in low or low in _BOT_NAMES:
+        return True
+    if not text.isascii():
+        return False
+    tokens = [token for token in re.split(r"[-_.]+", low) if token]
+    if any(phrase in low for phrase in _PHRASES):
+        return True
+    parts = [part for part in re.split(r"[-_.]+", text) if part]
+    if len(parts) > 1 and any(part in _AUTOMATION_TOKENS for part in parts):
+        return True
+    if _person_like(text):
+        return False
+    # "buildserver01" is "buildserver": trailing digits number instances.
+    stems = [token.rstrip("0123456789") for token in tokens]
+    if len(tokens) > 1 and any(stem in _BUILD_TOKENS for stem in stems):
+        return True
+    lowercase_words = _PRODUCT_TOKENS | _BUILD_TOKENS | _LOWERCASE_BUILD_TOKENS
+    return text == low and any(
+        token in lowercase_words or stem in lowercase_words
+        for token, stem in zip(tokens, stems, strict=True)
+    )
+
+
 def similarity(a: frozenset[str], b: frozenset[str]) -> float:
     """Similarity of two token sets in ``[0, 1]``.
 
-    Blends token overlap (order-independent, so "Wakeham Ryan" matches "Ryan
-    Wakeham") with a character-level ratio that rescues typos and nicknames
+    Blends token overlap (order-independent, so "Dawson Dave" matches "Dave
+    Dawson") with a character-level ratio that rescues typos and nicknames
     ("mathew" vs "matthew"). The larger of the two wins, so either signal alone
     is enough.
     """
@@ -215,18 +356,28 @@ def classify(
     name: str | None,
     email: str | None,
     profiles: tuple[UserProfile, ...],
+    integrations: bool = False,
 ) -> MatchOutcome:
-    """Decide how a still-unresolved subject should be attributed."""
+    """Decide how a still-unresolved subject should be attributed.
+
+    ``integrations``: an unmatched handle with no email is automation (see
+    :func:`is_integration_identity`). Used for consumption rows, which name a
+    person by email or display name; not for scan initiators, which are often a
+    bare login.
+    """
     if is_bot_subject(subject_key, name, email):
         return MatchOutcome(MatchMethod.UNMATCHED, None, (), is_bot=True)
 
+    integration = integrations and is_integration_identity(name or subject_key, email)
     subject_tokens = tokenize(subject_key, name, email)
     if not subject_tokens:
-        return MatchOutcome(MatchMethod.UNMATCHED, None, ())
+        return MatchOutcome(MatchMethod.UNMATCHED, None, (), is_bot=integration)
 
     candidates = tuple(rank_candidates(subject_tokens, profiles))
     if not candidates:
-        return MatchOutcome(MatchMethod.UNMATCHED, None, ())
+        # Nobody comes close: a handle with no email is automation (an
+        # integration identity), not a person to chase.
+        return MatchOutcome(MatchMethod.UNMATCHED, None, (), is_bot=integration)
 
     top = candidates[0]
     if top.score < AUTO_MATCH_THRESHOLD:

@@ -218,7 +218,7 @@ export function App() {
         <Route path="/" element={<DashboardPage isAdmin={isAdmin} />} />
         <Route path="/setup" element={<SetupPage isAdmin={isAdmin} onConnected={loadMe} />} />
         <Route path="/limits" element={<LimitsPage isAdmin={isAdmin} />} />
-        <Route path="/preview" element={<PreviewPage />} />
+        <Route path="/preview" element={<PreviewPage isAdmin={isAdmin} />} />
         <Route path="/reports" element={<ReportsPage isAdmin={isAdmin} />} />
         {me.can_request_credits && (
           <Route path="/requests" element={<RequestsPage isAdmin={isAdmin} />} />

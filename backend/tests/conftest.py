@@ -87,6 +87,70 @@ def isolated_environment(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Iter
     reset_settings_cache()
 
 
+# Test modules written for the credit activity log as the usage source (the
+# default of a fresh install). Every other test was written for the
+# consumption summary and its old enforcement, which a fresh install no
+# longer has by default: they run with the usage source at "summary" and
+# restrictions from summary totals allowed, which is exactly that behaviour
+# (app/services/evaluation.py ``summary_hold``).
+ACTIVITY_DEFAULT_MODULES = (
+    "test_activity_source",
+    "test_activity_properties",
+    "test_review_activity_attacks",
+    "test_summary_hold",
+    "test_review2_activity_attacks",
+    "test_log_fed_enforcement",
+    "test_recount_gate",
+)
+
+
+@pytest.fixture(autouse=True)
+def legacy_usage_source(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import settings_store
+
+    if os.environ.get("REVIEW_REAL_DEFAULTS") == "1":
+        # The whole suite under the real defaults (review switch).
+        return
+    if request.module.__name__.rsplit(".", 1)[-1] in ACTIVITY_DEFAULT_MODULES:
+        return
+    monkeypatch.setitem(
+        settings_store.DEFAULTS,
+        settings_store.KEY_USAGE_SOURCE,
+        settings_store.USAGE_SOURCE_SUMMARY,
+    )
+    monkeypatch.setitem(settings_store.DEFAULTS, settings_store.KEY_SUMMARY_RESTRICTS, True)
+
+
+# Test modules that run the independent recount before a new restriction
+# (app/services/recount.py) for real, against the fake tenant's activity log.
+REAL_RECOUNT_MODULES = ACTIVITY_DEFAULT_MODULES
+
+
+@pytest.fixture(autouse=True)
+def matching_activity_log(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every other test was written before the recount: for them the activity
+    log's rows match CreditGuard's own count, so a new restriction is
+    confirmed exactly as the recount would confirm it on a tenant whose log
+    agrees. The recount's own rules are tested in the modules above."""
+    from decimal import Decimal
+
+    from app.services import recount
+
+    if os.environ.get("REVIEW_REAL_DEFAULTS") == "1":
+        return
+    if request.module.__name__.rsplit(".", 1)[-1] in REAL_RECOUNT_MODULES:
+        return
+
+    def prepare(self, session, periods):  # type: ignore[no-untyped-def]
+        return None
+
+    def check(self, session, limit, window):  # type: ignore[no-untyped-def]
+        return recount.Verdict(agrees=True, recount=Decimal(limit.credit_limit))
+
+    monkeypatch.setattr(recount.Recounter, "prepare", prepare)
+    monkeypatch.setattr(recount.Recounter, "check", check)
+
+
 @pytest.fixture
 def db() -> Iterator[Session]:
     session = db_session.get_session_factory()()

@@ -98,6 +98,9 @@ class DryRunRowResponse(BaseModel):
     # How much of credits_used is auto-triage charged to the person from their
     # scans. Null when that setting is off or the limit is not fed by a person.
     auto_triage_attributed: Decimal | None = None
+    # A new restriction of a monthly or quarterly budget: it starts only if a
+    # direct recount of the activity log agrees (not run by the preview).
+    recount_required: bool = False
 
 
 class DryRunResponse(BaseModel):
@@ -109,3 +112,35 @@ class DryRunResponse(BaseModel):
     rows: list[DryRunRowResponse]
     user_roles_truncated: bool = False
     user_roles_note: str | None = None
+
+
+class EnforcementCoverageResponse(BaseModel):
+    """How many of the users who hold an AI role a user restriction can reach.
+
+    See app/services/coverage.py. ``available`` false: computed without
+    reading the tenant's composite roles and groups.
+    """
+
+    computed_at: datetime
+    ai_roles: list[str]
+    protected_roles: list[str]
+    users: int
+    ai_holders: int
+    restrictable: int
+    share: float | None = None
+    via_composite: int
+    via_group: int
+    via_composite_or_group: int
+    protected: int
+    unknown: int
+    composites: dict[str, list[str]] = {}
+    composite_holders: dict[str, int] = {}
+    groups_granting: list[str] = []
+    dedicated_roles: list[str] = []
+    notes: list[str] = []
+    available: bool = True
+    low: bool = False
+    warning: str | None = None
+    # False when no AI holder's role sources could be read: no verdict.
+    determined: bool = True
+    undetermined: str | None = None

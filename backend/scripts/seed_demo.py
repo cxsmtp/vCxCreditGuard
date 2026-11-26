@@ -51,14 +51,14 @@ from app.services.audit import AuditActor, record_audit  # noqa: E402
 from app.services.periods import current_window  # noqa: E402
 
 USERS = [
-    ("u-harsh", "harsh.gokani@example.com", "Harsh", "Gokani", ["Platform"], 148),
-    ("u-sean", "sean.casey@example.com", "Sean", "Casey", ["Payments"], 96),
-    ("u-akash", "akash.singh@example.com", "Akash", "Singh", ["Platform", "Payments"], 61),
-    ("u-tiago", "tiago.torre@example.com", "Tiago", "Torre", ["Payments"], 44),
-    ("u-jeremy", "jeremy.polansky@example.com", "Jeremy", "Polansky", ["Mobile"], 31),
-    ("u-avery", "avery.speller@example.com", "Avery", "Speller", ["Mobile"], 22),
-    ("u-frank", "frank.emery@example.com", "Frank", "Emery", ["Platform"], 12),
-    ("u-julien", "julien.bruinaud@example.com", "Julien", "Bruinaud", ["Payments"], 7),
+    ("u-alice", "alice.archer@example.com", "Alice", "Archer", ["Platform"], 148),
+    ("u-bob", "bob.baker@example.com", "Bob", "Baker", ["Payments"], 96),
+    ("u-carol", "carol.chen@example.com", "Carol", "Chen", ["Platform", "Payments"], 61),
+    ("u-judy", "judy.jones@example.com", "Judy", "Jones", ["Payments"], 44),
+    ("u-liam", "liam.lopez@example.com", "Liam", "Lopez", ["Mobile"], 31),
+    ("u-mia", "mia.moore@example.com", "Mia", "Moore", ["Mobile"], 22),
+    ("u-noah", "noah.nash@example.com", "Noah", "Nash", ["Platform"], 12),
+    ("u-ken", "ken.klein@example.com", "Ken", "Klein", ["Payments"], 7),
 ]
 
 GROUPS = [("g-platform", "Platform"), ("g-payments", "Payments"), ("g-mobile", "Mobile")]
@@ -119,9 +119,10 @@ def seed(admin_username: str, admin_password: str | None) -> None:
                     role_names=[
                         "view-projects",
                         "view-scans",
-                        "view-risk-management",
-                        "view-risk-management-dashboard",
-                        "view-risk-management-tab",
+                        "create-fusion-scan",
+                        "manage-fusion",
+                        "update-llm-scan-mode",
+                        "manage-llm-configuration",
                     ],
                     group_names=groups,
                     last_synced_at=now,
@@ -192,9 +193,9 @@ def seed(admin_username: str, admin_password: str | None) -> None:
         )
 
         limits = [
-            (EntityType.USER, "u-harsh", "Harsh Gokani", 150, True, LimitStatus.RESTRICTED, 150),
-            (EntityType.USER, "u-sean", "Sean Casey", 120, False, LimitStatus.WARNED, 96),
-            (EntityType.USER, "u-akash", "Akash Singh", 200, False, LimitStatus.OK, 61),
+            (EntityType.USER, "u-alice", "Alice Archer", 150, True, LimitStatus.RESTRICTED, 150),
+            (EntityType.USER, "u-bob", "Bob Baker", 120, False, LimitStatus.WARNED, 96),
+            (EntityType.USER, "u-carol", "Carol Chen", 200, False, LimitStatus.OK, 61),
             (EntityType.PROJECT, "p-api", "payments/api", 200, True, LimitStatus.OK, 132),
             (EntityType.PROJECT, "p-web", "payments/web", 100, False, LimitStatus.WARNED, 88),
             (EntityType.GROUP, "g-payments", "Payments", 400, False, LimitStatus.OK, 220),
@@ -260,13 +261,13 @@ def seed(admin_username: str, admin_password: str | None) -> None:
             session,
             category=notification_service.CATEGORY_WARNING,
             severity=Severity.WARNING,
-            title="User Sean Casey reached 80% of its credit limit",
+            title="User Bob Baker reached 80% of its credit limit",
             body="96 of 120 credits used August 2026. The warning threshold is 80%.\n"
             "This limit is monitor only, so reaching the limit will only notify.",
             entity_type=EntityType.USER,
-            entity_id="u-sean",
-            entity_label="Sean Casey",
-            dedupe_key="demo-warn-sean",
+            entity_id="u-bob",
+            entity_label="Bob Baker",
+            dedupe_key="demo-warn-bob",
         )
         notification_service.notify(
             session,

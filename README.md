@@ -27,8 +27,26 @@ point links to the section below that explains it.
 - Reads AI credit use from Checkmarx One on a schedule (every 15 minutes by
   default) for every user, group, project and application
   ([How usage is measured](#how-usage-is-measured)).
+- Counts each billed action from Checkmarx One's credit activity log in the
+  period it happened in, against its project and application **by id** and its
+  person by email or username (the default usage source). Identical actions in
+  the same second are each counted, never merged
+  ([The credit activity log](#the-credit-activity-log-the-default-usage-source)).
+- Falls back to the consumption summary (totals matched by name) while the
+  activity log cannot be read, and never counts the same usage from both.
+  Settings → Schedule & data can use the summary only.
+- Once a day, checks that the activity log adds up to the summary's total over
+  the same 30 days, and shows a mismatch in Diagnose.
+- Integration accounts (bots, Auto-triage, Auto-remediation, accounts you list)
+  count towards their project's budgets, and towards a person's budget only when
+  their project had no active project budget at the time: never towards two user
+  budgets ([Integration accounts](#integration-accounts)).
 - Matches each usage row to a Checkmarx user: exactly where it can, by name
   similarity where not. Unsure matches wait for an admin to confirm
+  ([Attribution](#attribution)).
+- Shows the usage that counts towards no budget, and why: automation (Auto
+  Triage, bots, integrations without an email), people it could not match, and
+  project or application names that match no project (an admin can map them)
   ([Attribution](#attribution)).
 - Can also charge a project's Auto Triage credits to the person whose scan set
   it off, off by default ([Charging auto triage](#charging-auto-triage-to-the-person-who-started-the-scan)).
@@ -68,11 +86,36 @@ point links to the section below that explains it.
   released).
 - Simulation: a dry run of the next cycle showing who would be warned and
   restricted, before anything happens.
+- Enforcement coverage (Simulation and Settings → Enforcement; opening it reads
+  the tenant's composite roles and the AI holders' groups from IAM, bounded and
+  cached for six hours, five minutes when the tenant could not be read): how many of the
+  people holding an AI role a user restriction could actually take it from,
+  how many keep it through a composite role or a group, and how many are
+  protected; it warns when user budgets will not bite and names the tenant's
+  dedicated AI roles, without changing the role list.
 - Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users
   and projects restricts nobody and pauses itself; a pause switch stops new
   restrictions at once; protected roles (`ast-admin`, `iam-admin` by default)
   are never restricted; a sudden fall in reported usage is held until later
   readings confirm it ([Enforcement safety](#enforcement-safety)).
+- Recount before restricting (always on): just before a new restriction of a
+  monthly or quarterly budget, the budget's period is recounted straight from
+  the Checkmarx activity log, independently of CreditGuard's own counters, and
+  the restriction is applied only if that recount is also at or over the
+  limit. When the counts disagree, or the recount cannot be done, nothing new
+  is restricted: a warning says why and Diagnose shows it
+  ([Recount before restricting](#recount-before-restricting)).
+- Readiness checklist (Settings → Enforcement and Diagnose): connected,
+  activity log readable, counts match Checkmarx, self-test passed on a user and
+  a project, dry run reviewed. A new install starts watch-only and turns
+  enforcement on once every item is green, or with an override an admin types
+  (audited) ([Readiness checklist](#readiness-checklist)).
+- Enforcement self-test (Settings → Enforcement, admins only): restricts a
+  chosen user and/or project for real, through the code a budget breach uses,
+  reads it back (and says when a user keeps an AI role through a group or a
+  composite role, so a restriction cannot bite), restores it from its snapshot
+  and checks every setting reads exactly as before, with a per-setting diff and
+  timings ([Enforcement self-test](#enforcement-self-test)).
 
 **Watch and alert**
 
@@ -114,14 +157,20 @@ telemetry, no analytics, and nothing else is contacted.
 | **It acts once a cycle**, not the moment credits are spent. | Usage is read and budgets judged once a cycle (every 15 minutes by default), and Checkmarx can report credits a little after they are spent. Usage in between can take a budget past its limit before the restriction lands, so leave some headroom. A large group or application is restricted over several cycles (at most 1,000 changes a cycle by default; [Sizing and scale](#sizing-and-scale)). |
 | **It restricts access, it does not meter credits.** | It removes roles and turns settings off; it cannot stop an action already running or cap a budget to the exact credit. |
 | **Only roles held directly are removed.** | An AI role a person holds through a group or a composite role stays in effect. CreditGuard says so once and never changes the group or role, because that would affect everyone in it. Remove it there in Checkmarx One, or exempt the person ([Restricting a user, in detail](#what-the-enforcement-actions-actually-are)). |
+| **User budgets may not bite at all.** | A user budget cannot stop someone who gets Fusion through a composite role: `ast-admin` (held by 274 of 296 users on a live tenant, and protected) and `scan-fusion` both contain `create-fusion-scan`, so removing the direct mapping takes nothing away. The fix is on the tenant: give people `ast-scanner` or `ast-risk-manager` (which contain no AI role) plus `create-fusion-scan` directly where they should run Fusion. Check *Enforcement coverage* (Simulation or Settings → Enforcement) before relying on user budgets. Project, group and application budgets do not depend on roles: they turn AI features off on the projects. |
 | **A project budget does not stop people's own AI Triage and AI Remediation.** | Turning project features off leaves what people start themselves working; only a user budget stops that ([What the breach and restriction messages say](#what-the-breach-and-restriction-messages-say)). |
 | **Account-wide Auto Triage may override a project.** | If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project. |
 | **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
-| **The general Risk Management roles are used for now.** | AI Triage and AI Remediation are reached through them today, so a restricted person also loses the Risk Management pages and dashboard. When Checkmarx One's dedicated AI permissions reach your tenant, swap them in under Settings → Enforcement, *Roles a user restriction removes*. |
-| **Figures only cover Checkmarx's lookback window.** | Checkmarx reports totals over a window (at most the last year), not individual events. "Lifetime" means everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened, unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
-| **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution). |
+| **A user restriction removes the Fusion and LLM roles.** | By default `create-fusion-scan` (the role that spends credits), `manage-fusion`, `update-llm-scan-mode` and `manage-llm-configuration`. The composites `scan-fusion` and `fusion-manager` are left alone, because removing them would also take ordinary scanning or tenant-settings rights, and `ai-triage-assist` can never be chosen: removing it breaks Auto Triage. An install that had chosen other roles keeps them (Settings → Enforcement, *Roles a user restriction removes*). |
+| **Monthly and quarterly budgets restrict only on usage the activity log counted.** | Usage the consumption summary counts (after a fallback to it, from a group's own summary row, or with *Usage source: Summary only*), and auto-triage charged to the person who started a scan, still count, warn and show everywhere, but never start a new restriction of a monthly or quarterly budget: from running totals the summary cannot always tell a glitch from a real fall. Such a budget over its limit gets a warning (*over budget on summary totals; not restricted*), and the Overview and Budgets pages show *Restrictions paused for period budgets* while the log is unavailable; so does Diagnose. On a tenant without the activity log no monthly or quarterly budget restricts unless you choose *Summary only* and turn on *Allow restrictions from summary totals (less accurate)* (an install that had chosen *Summary only* before this keeps restricting: the upgrade turns it on). Restrictions already in force stay; lifting works as before; lifetime, custom and count-existing budgets restrict on summary totals as before ([Restrictions from summary totals](#restrictions-from-summary-totals)). |
+| **A new period-budget restriction needs the activity log to agree.** | Before a new restriction of a monthly or quarterly budget, its period is recounted from the Checkmarx activity log, read afresh (the last 30 days, or the last 90 for a quarter or a month that began more than 30 days ago), within the activity page cap and the cycle's time budget. If the log cannot be read, the read is cut short, or the recount is under the limit, nothing new is restricted and a warning says why; this holds with *Summary only* too. The last day or two of a 92-day quarter fall outside the 90-day window, so late in such a quarter the recount can fall short and hold a restriction back (never the other way). The Simulation does not run the recount: it marks such rows *would restrict if the recount agrees*. Restrictions in force, lifts, and lifetime, custom and count-existing budgets are unaffected ([Recount before restricting](#recount-before-restricting)). |
+| **A new install watches only until it is ready.** | A new install starts with enforcement paused (watch-only): it warns but restricts nobody until the readiness checklist is green, or an admin overrides it by typing ENFORCE (audited, with the items that were not green). An existing install keeps its setting and sees the checklist for information. Once enforcement is on the checklist never turns it off; an item that turns red raises a warning ([Readiness checklist](#readiness-checklist)). |
+| **A few cycles of usage are not counted when the usage source switches.** | When the activity log becomes the source (the setting turned on, or the log back after failing), its first read only records what it holds: what happened since the summary's last reading is not counted. When the summary takes over (the setting turned off, the log refused or malformed, or failing for more than an hour), its first two readings count nothing: about two to three cycles are not counted, and a name missing from the summary across the switch counts nothing when it returns. While the log fails for less than an hour nothing new is counted; it is counted when the log answers again. A row reaching the log more than about two hours late is counted only by the daily full read, and only if dated after the switch; rows of the same second that meet at a page boundary wait for a later cycle. A group budget taken over by the log from its own summary row counts no event dated before the takeover, and two group readings count nothing when the row takes it back ([Switching source](#switching-source-and-what-is-not-counted)). |
+| **Figures only cover Checkmarx's lookback window.** | The consumption summary reports totals over a window (at most the last year), and the activity log covers the last 30 days. "Lifetime", custom and count-existing budgets read the summary's totals, so they mean everything in that window. Monthly and quarterly budgets do not count credits spent before the period opened (or before the budget was created), unless the budget is set to ([How usage is measured](#how-usage-is-measured)). |
+| **Unmatched usage counts against nobody.** | Credits reported under a name that matches no Checkmarx user, or an unconfirmed match, count towards no person's budget until an admin maps them (Settings → Attribution); a mapping counts from then on. Automation counts towards a person only by the [integration-account rule](#integration-accounts) (Auto-remediation towards nobody: no scan initiator is traced for it). With the summary as the source, project usage reported under a repository name that is no project (87% of project credits on a live tenant) counts towards no project, group or application budget until mapped; the activity log names projects by id. All of it is shown on the Overview. |
+| **Credits per action are measured, not quoted.** | Checkmarx's listed rate is not what a Fusion or DAST correlation action costs (on a live tenant about 109 credits per Opus 5.5 Fusion scan against a rate of 2). Where they disagree, messages price an action at the feed's average over the lookback window and say so; it is an average, not the cost of one scan. |
 | **It cannot say who undid a restriction.** | Checkmarx One does not report who switched a setting back on. By default each restriction is read back once an hour (`verify_interval_minutes`), so a setting switched back on can stay on for up to about that long, and one undone and redone between two read-backs is not seen. |
-| **Some Checkmarx behaviour is not yet verified on a real tenant.** | Where a person's roles come from (groups, composite roles); the Fusion lock and the repository's Fusion setting; usage rows per group (only ever seen empty; the sum of its projects is used instead); paging of a very long user list; finding a project's repository (without it, PR triage and remediation is skipped there); the names of the default protected roles (check them against your tenant); whether a Fusion setting the project inherited can inherit again after Restore (for now it is restored on the project itself). Each degrades safely and says so rather than guessing ([Remaining unknowns](#remaining-unknowns)). |
+| **Some Checkmarx behaviour is not yet verified on a real tenant.** | Where a person's roles come from (groups, composite roles); the Fusion lock and the repository's Fusion setting; usage rows per group (only ever seen empty; the sum of its projects is used instead); writes of PR triage and remediation and Auto Triage in the shape a live tenant reads them (sent back as read, never tested by a write on one); finding a project's repository (without it, PR triage and remediation is skipped there); whether a Fusion setting the project inherited can inherit again after Restore (for now it is restored on the project itself). Each degrades safely and says so rather than guessing ([Remaining unknowns](#remaining-unknowns)). |
 | **Tested to 2,000 projects on a synthetic tenant.** | Load tested with 2,000 projects and 1,000 users made up for the test, not on a real tenant of that size. Use PostgreSQL above about 500 projects or 300 users ([Sizing and scale](#sizing-and-scale)). |
 | **One instance only.** | A second copy against the same database refuses to start. Availability comes from restarting the one copy, not from running several ([One instance only](#one-instance-only)). |
 | **The database is the only record of how to undo a restriction.** | The in-app backup holds configuration only. Back the database up; after restoring an older one, restrictions made since it was taken have to be given back by hand in Checkmarx One ([Backup and restore](#backup-and-restore)). |
@@ -155,7 +204,7 @@ schedule or on demand via `POST /api/ops/run-cycle`:
    │    users,        snapshots +    usage vs        reversible     │
    │    projects      attribution    limits,         role / AI      │
    │                  (fuzzy match)   period          changes, with │
-   │                                  baselines       an undo snap  │
+   │                                  ledger          an undo snap  │
    │                                      │                         │
    │                                      ▼                         │
    │                              notifications                     │
@@ -168,8 +217,8 @@ schedule or on demand via `POST /api/ops/run-cycle`:
 ```
 
 - **Poll, don't stream.** Checkmarx reports *aggregate totals over a lookback
-  window*, not events, so per-period usage is derived by diffing against a
-  baseline taken when the period opened (see [How usage is measured](#how-usage-is-measured)).
+  window*, not events, so per-period usage is the sum of the increases between
+  readings (see [How usage is measured](#how-usage-is-measured)).
 - **Attribute, don't guess.** Each usage row is matched to a synced user — first
   exactly, then by similarity — and anything uncertain is surfaced for review
   rather than billed to the wrong person.
@@ -264,6 +313,16 @@ requirements, `npm audit`).
 
 This matters more than any other design decision here, and it is not obvious.
 
+There are two sources. By default the **credit activity log**
+(`GET /api/credits/activity`, one row per billed action, with its date and its
+project's id) feeds the budgets of projects, users and applications: see
+[The credit activity log](#the-credit-activity-log-the-default-usage-source).
+The **consumption summary** below is read every cycle all the same: it feeds
+everything the log does not cover (a group's own row, lifetime, custom and
+count-existing budgets, which read its totals), the dashboard and Attribution,
+and it takes over whenever the log cannot be read. With the setting *Usage
+source: Summary only* it is the only source, exactly as before the log was used.
+
 `GET /api/credits/consumption` returns **aggregate totals over a lookback
 window**, not a stream of timestamped events. There are no event ids, no
 timestamps and no project ids in the user view. So per-period usage cannot be
@@ -272,35 +331,281 @@ summed from events. Instead:
 1. Each cycle polls the endpoint per dimension and stores the reported totals
    (`usage_snapshot` and `usage_record`, with each row's raw payload kept for a
    week for audit; see [Data retention](#data-retention)).
-2. When a budget period opens, the total reported at that moment becomes the
-   period's **baseline**.
-3. Usage for the period is `latest reported total - baseline`.
+2. Each reading is compared with the previous one, name by name, and every
+   increase is added to the counter of each budget the name counted towards at
+   that moment (the **usage ledger**, see
+   [Where a name's usage counts](#where-a-names-usage-counts-the-usage-ledger)).
+3. Usage for a monthly or quarterly period is its counter: the increases
+   observed while the period was open.
 
-**The baseline depends on the period type**, because the period type is what says
-whether history should count:
+**Whether history counts depends on the period type:**
 
-| Period | Baseline | Why |
-| ------ | -------- | --- |
-| Lifetime | Zero. Everything reported counts. | "Lifetime" means all credits ever. Discounting history would silently redefine it as "since the limit was created", and a budget of 10 against 13 already spent would read as 0 used and within budget. |
-| Custom range | Zero. Everything reported counts. | The admin chose the window explicitly and expects consumption inside it to count. |
-| Monthly, quarterly | The total reported when the period opened. | The lookback window is wider than the period and the API does not say *when* inside it credits were spent, so counting the lot would let a year of history exhaust a fresh monthly budget on day one. Set `count_existing_usage` on the limit to count it anyway. |
+| Period | Usage | Why |
+| ------ | ----- | --- |
+| Lifetime | Everything reported: the current totals of the names that count towards it. | "Lifetime" means all credits ever. Discounting history would silently redefine it as "since the limit was created", and a budget of 10 against 13 already spent would read as 0 used and within budget. |
+| Custom range | Everything reported, as for lifetime. | The admin chose the window explicitly and expects consumption inside it to count. |
+| Monthly, quarterly | The increases observed during the period. | The lookback window is wider than the period and the API does not say *when* inside it credits were spent, so counting the lot would let a year of history exhaust a fresh monthly budget on day one. Set `count_existing_usage` on the limit to count it anyway (it then counts like a lifetime budget, from the baseline taken when the period opened). |
 
-Whenever a baseline is in play, the Limits page shows the reported total and the
-discounted amount underneath the usage bar, so a project that Checkmarx says used 13
-credits reading as 0 against its budget is explained rather than mysterious.
+The Limits page shows the reported total and the part of it not counted in this
+period underneath the usage bar, so a project that Checkmarx says used 13 credits
+reading as 0 against its budget is explained rather than mysterious.
 
-If the lookback window slides far enough that the reported total falls below the
-baseline, the baseline is lowered to match, so usage never goes negative and a stale
-high baseline cannot mask real consumption.
+For a budget that counts the reported totals, if the lookback window slides far
+enough that the reported total falls below the baseline, the baseline is lowered to
+match, so usage never goes negative and a stale high baseline cannot mask real
+consumption.
 
-Usage per entity level:
+Usage per entity level (period budgets read the activity log while it is the
+source; the summary column is what they read otherwise, and what lifetime,
+custom and count-existing budgets read always):
 
-| Level | Source |
-| ----- | ------ |
-| User | `viewBy=user`, attributed to a synced IAM user; plus, only with auto-triage charging on, their share of the auto triage their scans triggered (see below) |
-| Application | `viewBy=application`, falling back to the sum of its projects |
-| Project | `viewBy=project` |
-| Group | `viewBy=group` when the group appears in the response, otherwise the sum of the group's projects, plus member users when `include_member_usage` is on |
+| Level | Activity log | Summary |
+| ----- | ------------ | ------- |
+| User | events by email, else username, else unmatched (integration accounts: see below); plus, only with auto-triage charging on, their share of the auto triage their scans triggered | `viewBy=user`, attributed to a synced IAM user; plus the same auto-triage share |
+| Application | events whose `applicationIds[0]` is it, or whose project is one of its projects | `viewBy=application`, falling back to the sum of its projects |
+| Project | events whose `projectIds[0]` is it | `viewBy=project` |
+| Group | events of its projects (unless its own summary row feeds it), plus of its members when `include_member_usage` is on, each once | `viewBy=group` when the group appears in the response, otherwise the sum of the group's projects, plus member users when `include_member_usage` is on |
+
+### The credit activity log (the default usage source)
+
+```
+GET /api/credits/activity?period=last_30_days&page=1&size=500&sort_by=date&sort_order=asc
+{"items": [{"date": "2026-11-25T10:21:28Z", "action": "Fusion Scan - Opus 5.5",
+            "creditsUsed": "144.5", "user": "jdoe", "userEmail": "",
+            "projectIds": ["<uuid>"], "applicationIds": [], "scanIds": ["<uuid>"],
+            "scanner": "sast", ...}],
+ "totalItems": 1939, "totalPages": 20, "currentPage": 1}
+```
+
+On a live tenant 30 days held 1,939 rows whose `creditsUsed` (a string) added
+up exactly to the summary's total; every row had one project id and 68 an
+application id; `userEmail` was empty on 1,511 rows. Each cycle reads it first
+(`app/services/activity_source.py`, `app/checkmarx/activity.py`) and adds every
+**new event** to the month's and the quarter's counter, **of the period of the
+event's own date**, of each active budget it counts towards and that was created
+before it happened:
+
+* its project's budgets, by `projectIds[0]` (no name matching);
+* the project's groups' budgets, as the ledger feeds them (not a plain group
+  budget its own summary row feeds);
+* its application's budgets: `applicationIds[0]` and the project's synced
+  applications, once;
+* its person's budget (and group budgets that include member usage): the IAM
+  user by `userEmail`, else by `user` as username (with an admin's mapping and
+  the summary's matching ladder: unambiguous full name, confident similarity),
+  else nobody, and the name is raised under Settings → Attribution to be mapped
+  (from then on);
+* each budget counts an event once (a group budget that includes member usage
+  too, where the summary adds its project and member views).
+
+**No row id, so a multiset.** Identical rows are distinct events (59 of the
+1,939 rows were exact duplicates of another, to the second): nothing is ever
+deduplicated. A row's identity is the fields that describe the action itself
+and are assumed never to change for a past action (date, action, credits,
+project ids, scan ids, scanner), hashed, and `usage_activity_key` keeps how many
+rows of each identity have been seen. Who (user, email) and the application are
+left out because Checkmarx may fill them in or change them later for the same
+action: the new events of an identity count towards a person or an application
+only when every row of it in the read names the same one (which of differing
+rows is new cannot be told), and otherwise only towards its project and what
+the project belongs to (**not counted** towards the person or application then). A
+fetch holding `n` rows of an identity counts `max(0, n − seen)` new events and
+raises `seen` to `n`, in the transaction that feeds the counters, under the
+attribution lock. Nothing is written while Checkmarx is called: every page is
+read first. Keys are pruned 31 days after their date, and an event older than
+that - or than the highest cutoff ever used, should the clock go back - is never
+counted.
+
+**Fetching so that no row is read twice.** Pages are read in ascending order of
+`sort_order=asc`: new rows append at the end, and rows ageing out leave from the
+front, which moves every row one place earlier, so a row near a page boundary
+can be skipped but not read twice. Since each page is a slice of the sorted log
+as of its own request, a row read on one page can turn up again on a later page
+only if every boundary in between has the same date on both sides. So at each
+boundary: a later date on the next page proves no repeat across it; the **same
+date** makes that date *uncertain* this cycle (its rows are neither counted nor
+recorded, and the next read, with a different page size to move the boundaries,
+covers them); an **earlier** date (the order went back) makes the whole fetch
+count nothing. Within a page the dates must not go back, or the log is taken as
+malformed. With that, no identity is ever read more times than the log holds,
+**whether or not the fetch was complete**, so an over-count cannot happen. The
+cross-checks — `totalItems` the same on the first and the last page, and as many
+rows read as it says lie from the first page read to the end — tell whether a
+fetch was complete; an incomplete one is not discarded (what it counted is
+safe), it is recorded (`total_changed`, `rows_mismatch`) and its skips are made
+up by the next reads.
+
+**Cost.** A normal cycle reads from a page before where the last two hours of
+the log began to its end: two or three requests for 100,000 rows in 30 days
+(about 2,000 projects). The overlap makes up a row skipped by drift, or arriving
+up to two hours late. At most *Activity log pages per cycle* (default 40) are
+read, and the cycle's time budget applies; a cycle that stops early counts only
+complete dates (the last date read may continue on the next page) and warns,
+and the next cycles carry on from there. Once a day the whole 30 days are read
+(at most 400 pages), counting rows that arrived late, and their sum is compared
+with the summary's total over `last_30_days` (`viewBy=action`): a difference of
+more than 0.5% (and a credit) shows as a warning in Diagnose (*Usage source*).
+
+#### Switching source, and what is not counted
+
+The same usage is never counted from both sources:
+
+* **The log becomes the source** (the setting turned on, the first cycle after
+  upgrading, or the log back after a fallback): its first fetch only records
+  what it holds and counts nothing, and events dated before that moment are
+  never counted from it. In the same cycle the summary stops feeding the
+  project, user and application views (its readings are still stored, for the
+  dashboard, totals and Attribution). **Not counted:** what happened between the
+  summary's last reading and that first fetch (about one cycle).
+* **The summary takes over** (the setting turned off; a 403, a 404 or a
+  malformed answer, tried again after 6 hours; or a 5xx, timeout or rate limit
+  lasting more than an hour, or a failure of the activity step itself lasting
+  as long): the summary's first two readings of each covered view count
+  nothing, and the following ones count increases as before. Those two
+  readings also rebase the ledger's memory of names of the covered views:
+  every name it remembers (missing, or holding a fall or a ceiling) starts
+  from what it reports in the next reading the completeness checks believe
+  (a return in a doubted reading counts nothing, nor does its recovery),
+  never from a total from before or during the log's era. **Not
+  counted:** what happened between the log's last fetch and the summary's third
+  reading (two to three cycles), and what a name missing across the switch
+  used until it returns. This assumes the summary reports an event no later
+  than about two cycles after the log does (they are the same data: their
+  totals matched exactly).
+* **Group budgets.** The group view is not covered by the log: a plain group
+  budget whose group has a row of its own there is fed by that row; otherwise
+  (and always with member usage) the log feeds it through its projects and
+  members. When the log takes a budget over (the row left, or member usage was
+  switched on), it counts towards it only events dated from that moment on;
+  when the row takes it back, the group view's next two readings count nothing
+  (for every group). **Not counted:** events dated before a takeover that the
+  log counts after it (a backlog after an outage, a late row), and those two
+  group readings.
+* **A shorter outage** keeps the log as the source: nothing new is counted
+  meanwhile (the cycle is not fresh, so no new restriction is applied on it),
+  and what happened is counted when the log answers again.
+* Also not counted: a row that reaches the log more than two hours late and
+  before the next daily full read is counted then, but one dated before the
+  switch never is; rows of one second at a page boundary wait for a later
+  cycle; a row with no date.
+
+#### Restrictions from summary totals
+
+Only usage counted from the activity log can start a new restriction of a
+monthly or quarterly budget. Each counter keeps the log's own part
+(`usage_activity_counter`); evaluation, the Simulation and the safety ceilings
+decide a *new* restriction on that part alone. Auto-triage credits charged to
+the person who started the scan always derive from the summary's project
+readings, so they count towards the figure and warn, but never start a
+restriction either. Usage the summary ledger
+counted still lands in the counter, so the figures, reports and warnings are
+unchanged: a budget over its limit only because of it gets a warning
+notification (*over budget on summary totals; not restricted, because the
+activity log is unavailable*) and the note on the Budgets page, and is not
+restricted. From running totals the summary cannot always tell a glitch from a
+real fall, so it can occasionally over-count; the log cannot.
+
+* A restriction already in force for the period stays in force (and is
+  re-asserted and verified as usual); giving access back when usage is under
+  the limit or the budget is raised works as before.
+* Not affected: lifetime, custom and count-existing budgets, and demo budgets
+  in demo mode. They read current totals, not the ledger's counter, so a glitch
+  there passes instead of being banked.
+* *Usage source: Summary only* is warn-only for monthly and quarterly budgets
+  too, unless *Allow restrictions from summary totals (less accurate)* is on
+  (`usage.summary_restricts`, off by default), which restores the earlier
+  behaviour exactly. Migration `d1e5a7c3b9f2` turns it on for an install that
+  had explicitly chosen *Summary only*, so it keeps restricting.
+* A restriction already started for the period (applied, or pending: being
+  rolled out, or written with an unknown outcome) is carried on; a failed one
+  is not in force and is not retried on summary totals. A budget held on
+  summary totals that the log later takes over its limit is restricted then,
+  and the restriction is announced (the earlier warning does not suppress it).
+* The first cycle with the activity log as the source (after an upgrade,
+  too) raises one notification saying so and what it means for restrictions,
+  and, when the log is not available, how to restrict from summary totals as
+  before.
+* While restrictions are held this way, the Overview and Budgets pages show
+  *Restrictions paused for period budgets* with since when, and Diagnose shows
+  it under *Usage source*.
+
+#### Recount before restricting
+
+The fail-safe on top of the rule above (`app/services/recount.py`, always on,
+no setting). Just before the evaluation applies a **new** restriction of a
+monthly or quarterly budget (pass 3 of the cycle, `_enforce_pending`), the
+budget's usage in the period is counted again, independently: straight from
+the raw rows of `GET /api/credits/activity`, never from `budget_usage`,
+`usage_delta` or the log's own counter. The restriction is applied only when
+that recount is also at or over the limit (the evaluation's own threshold).
+
+* **Where the rows come from.** CreditGuard keeps no raw rows (only how many
+  of each identity it has seen), so the log is read afresh, at most once per
+  cycle and window: `period=last_30_days` for a month that began within the
+  last 30 days, `last_90_days` otherwise and for a quarter. It is read from
+  page 1 to the end after the cycle's transaction has been committed (nothing
+  is held open in the database across the calls), capped by the activity page
+  cap (`activity.max_pages_per_cycle`; 400 pages when that is 0) and the
+  cycle's time budget. Rows of a date met on both sides of a page boundary are
+  counted at most as often as one page shows them: the recount can fall short,
+  never count a row twice.
+* **Who a row counts towards** is the activity source's own mapping: a project
+  by id; an application by id and through the project's synced applications;
+  a person by email or username through the existing resolver, following the
+  [integration-account rule](#integration-accounts); a group through all its
+  projects (and members, with member usage), whichever feed the ledger used. A row counts
+  towards a person or an application only when every row of its identity names
+  the same one, as in the ledger. Only rows dated inside the period, and after
+  the budget was created, count.
+* **When they disagree** nothing is restricted, the budget stays BREACHED, a
+  WARNING (once per budget and period) says *Counts disagree: CreditGuard's
+  count is X, a direct recount of the Checkmarx activity log is Y; not
+  restricted. See Diagnose.*, and the disagreement is recorded (the newest 50,
+  `recount.records`) for Diagnose's *Recount before restricting* check, which
+  otherwise reads *No disagreements.*
+* **When the recount cannot be done** (the log refuses or fails, the page cap
+  or the time budget stops the read, anything errors) nothing new is
+  restricted either, with a warning: the rule fails safe towards not
+  restricting. The next cycle recounts again.
+* **The same gate** applies to the safety ceilings (only what the recount
+  would let start counts towards them; the log is read for that only when the
+  ceiling would trip otherwise). The Simulation and the dry run do not read the
+  log: they mark such a row *Would restrict if the recount agrees*
+  (`recount_required` in `GET /api/preview/dry-run`).
+* **Not affected:** restrictions already in force or started (re-asserted and
+  lifted exactly as before), lifts and credit-increase restores, and lifetime,
+  custom, count-existing and demo budgets, which keep today's rule.
+
+#### Integration accounts
+
+Integration accounts are automation, not people: `[bot]` accounts and known
+bots, `Auto-triage`, `Auto-remediation` (and the other synthetic subjects),
+handles the matcher takes for an integration, and the names an admin lists in
+Settings → Attribution → *Integration accounts* (`attribution.integration_accounts`,
+for an SCM integration's handle). Their usage always counts towards the budgets
+of its project, and the project's groups and application, like any usage.
+Towards a person:
+
+* **if the event's project had an active project budget at the event's date**,
+  towards no user budget: the project budget governs it. When each project
+  budget may have been active is recorded at every activity write and every
+  evaluation (`usage_budget_interval`), so the answer for a past event never
+  changes, also for the auto-triage charges evaluation recomputes. A budget
+  switched off and on again between two of those observations counts as
+  active throughout (**not counted** towards the person then);
+* otherwise `Auto-triage` goes to the person who started the scan through
+  [auto-triage charging](#charging-auto-triage-to-the-person-who-started-the-scan)
+  (when it is on and resolves one; nobody otherwise), and `Auto-remediation` to
+  nobody (no initiator is traced for it). The project-budget rule also applies
+  to those charges for what was observed while the log was the source;
+* any other account becomes a subject under Settings → Attribution: an admin
+  maps it to the person it acts for, or leaves it as its own subject and sets a
+  user budget on it (the Budgets picker offers it as *name (integration
+  account)*, entity id `subject:<name>`; such a budget is monitor only, there
+  is nobody to restrict).
+
+A project budget created mid-period applies from its creation on. An event is
+never charged to two user budgets.
 
 ### The endpoint silently ignores an unrecognised `viewBy`
 
@@ -470,34 +775,249 @@ The listing needs read access to scans (`GET /api/scans/`) for the API key.
 The consumption feed identifies users by display name and email, not by id, and
 inconsistently: some rows carry `email` and `userEmail`, some carry an address in
 `name`, some carry only a display name, and some carry a service-style handle like
-`cx-ryan-wakeham`. Attribution happens in two stages.
+`cx-dave-dawson`. Attribution happens in two stages.
 
 **Exact ladder first.** Email, then an email found in `name`, then username, then
-unambiguous full name. Two people called "Sean Casey" never share a budget: an
+unambiguous full name. Two people called "Bob Baker" never share a budget: an
 ambiguous full name is not matched.
 
 **Similarity for the tail** (`services/subject_matching.py`). A handle the ladder
 cannot place is normalised to a token set — the `cx-` prefix stripped, an email
-reduced to its local part — so `cx-ryan-wakeham`, `Ryan Wakeham` and
-`ryan.wakeham@checkmarx.com` all reduce to `{ryan, wakeham}` and score against
+reduced to its local part — so `cx-dave-dawson`, `Dave Dawson` and
+`dave.dawson@example.com` all reduce to `{dave, dawson}` and score against
 every synced user. The score, deliberately conservative because a wrong match
 bills the wrong person, decides:
 
 | Confidence | Outcome |
 | ---------- | ------- |
 | **≥ 85%**, one clear winner | Attributed automatically and written to the audit log. Still overridable. |
-| **≥ 60%**, or an auto-worthy near-tie between two people | Left **uncounted** and raised as a *dispute* with ranked suggestions to confirm on the Settings page. |
-| below 60% | Unmatched, mapped by hand. Automation handles (`dependabot[bot]`) are flagged and kept out of the queue. |
+| **≥ 60%**, or an auto-worthy near-tie between two people | Left **uncounted** and raised as a *dispute* with ranked suggestions to confirm on the Settings page. A subject that already counted towards a user and becomes disputed (a second person with the same name is synced) keeps counting there, flagged, until an admin resolves it. |
+| below 60% | Unmatched, mapped by hand. Automation is told apart: handles with `[bot]` or a known bot handle (`dependabot`, `renovate`, `snyk-bot`, ...), and integration identities: no email, matching nobody, and a CI phrase in any case (`github-actions`, `GitHub-Actions`, `gitlab-ci`, `azure-pipelines`), an automation token as a whole lowercase part (`-bot`, `_bot`, `-ci`, `svc-`, `-svc`, ...), or, unless the handle is written like a person's name (dotted parts or a Capitalised part: "Paul.Scanner", "lee.sonar", "Mary-Build"), a build word as a whole part (`sonar-scanner`, `build-agent`, `buildserver01`) or a lowercase product or build name (`jenkins`, `gitlab-runner`). Digits, hyphens and underscores alone say nothing, and a token never matches inside a word: "jsmith2", "Jean-Luc", "mary_ann", "jenkinson", "Jenkins", "Runner", "Bob_Builder", "tokenaga", "Priya" and "张伟" stay people. It stays listed in the *Unmatched* tab, marked *Automation* and mappable, but is not chased as a person: no "could not be matched" notice, and one "new automation identity" notice instead, once per subject ever (`unresolved_subject.automation_noticed_at`; subjects already automation at the upgrade are marked without a notice). |
 
 Nothing is ever dropped: every subject lands in `unresolved_subject` with its
 status, and the Settings page groups them into **Disputes**, **Auto-matched** and
 **Unmatched** tabs. An admin mapping always wins over the automatic decision.
 
+Every page counts unmatched people the same way: not mapped, not auto-matched,
+not automation (`ingestion.unresolved_person_filter`), and the "could not be
+matched" notice is raised only for those. Project and application rows under a
+name that is no synced project or application (on a live tenant, 87% of project
+credits were under `org/repo` names absent from `/api/projects`) are counted in
+the cycle record, on the Overview and in Diagnostics, and an admin can map a
+name to a project or application under Settings → Attribution
+(`/api/usage/unmatched-entities`, one row per name in `entity_mapping`); a real
+name match always wins over a mapping, and a mapping to a project that is gone is
+shown as broken and ignored.
+
+#### Where a name's usage counts: the usage ledger
+
+The feed reports, by name, cumulative totals over its lookback window. A period
+budget never counts those totals: every live reading is turned into increases
+(`app/services/ledger.py`), in the transaction that stores the reading and under
+the attribution lock that a mapping takes too (a transaction-scoped advisory lock
+on PostgreSQL, the write lock on SQLite). Neither is held across a call to
+Checkmarx One, so a failed reading leaves nothing behind and the next one is
+measured from the last reading that was stored.
+
+* **A name's increase** is its total now minus its total in the previous live
+  reading of the same view (per action type too). The same row served on two
+  pages (the ranking shifting between page requests) is read once, never added
+  up: rows are told apart by id or email, and a project's, application's or
+  group's name is unique. Different rows of one subject (a person under their
+  email and under their name) are added up. User rows with a display name only
+  are added up when they come on one page (two people may share a name); one
+  on a later page whose name an earlier page of the same reading already had is
+  a repeat (the higher is kept, and the reading is doubted). How many such rows
+  a subject was read as is kept on its row (`display_rows`); when it changes
+  between readings (two people who share a display name split across a page
+  boundary, or joined on one page), the totals are not comparable and that
+  reading counts nothing for the subject. So two real people who share a display
+  name lose what they spend in every interval where the page layout splits or
+  joins them, and while they are split only the higher of the two is followed
+  (the other's usage is not counted): an under-count, limited to subjects read
+  as several display-name-only rows.
+* **A fall** adds nothing. In a reading the completeness checks believe, it is
+  taken as the lookback window rolling past older usage, and the name continues
+  from its new total. This rests on a premise: a complete listing reports each
+  name correctly. A per-name glitch in a reading the checks believe (one name
+  reported low while the listing is complete and no collapse is under way)
+  cannot be told from a roll-down, and its recovery is counted as usage. In a reading they doubt (a row served twice, or fewer rows than the
+  feed says it has, counting rows the parser skips), the fall is not believed at
+  once: the name continues from its previous total (`usage_missing_name`, kind
+  `dip`) until it recovers or a believed reading confirms the fall. Each
+  reading with held falls says so in the cycle's warnings, with the names, and
+  Diagnose shows a *Doubted usage falls* check, for 3 doubted readings or 2
+  hours, whichever comes first. After that the fall is no longer reported, but
+  the total before it stays a ceiling (kind `ceiling`): only usage above it
+  counts, until a believed reading confirms the lower total or the lookback
+  horizon passes. A collapse of the whole feed that is accepted only because it
+  persisted (3 readings over 2 hours) leaves the same ceiling on every name that
+  fell, or is missing from it (kind `collapse`), also when that reading is
+  doubted, and on a fall already held as doubted. The ceiling stays while the
+  name is missing from later readings, is a rename partner meanwhile (a name
+  that may be its rename, new or back, starts under the same ceiling), and is
+  cleared only by rising above it or at the horizon. So an outlasting glitch is
+  never counted when it ends; a real roll-down first
+  reported in doubted readings, or in such a collapse, costs what the name adds
+  below its old total (an under-count). A believed fall to a non-zero total
+  counts as a rise for forgetting: the usage spent meanwhile may be in it.
+* **A name missing from a reading** is remembered with its last total
+  (`usage_missing_name`), so when it returns only what it reported since counts.
+  It is forgotten once its total last rose, fell to a non-zero total or first
+  appeared longer ago than the lookback window plus two days (`last_rise_at`,
+  carried on every reading's rows). The rolling windows count by their length
+  (`last_year` is taken as the last 365 days); `last_month`, the previous
+  calendar month, can hold usage for up to 62 days; the two days cover windows
+  counted in whole days:
+  nothing it reported can be left in the window then, so its return counts in
+  full. A name back after missing readings may have been renamed and renamed
+  back: it starts from the highest of its own last total and those of the names
+  it may have been meanwhile (its entity's remembered names, and any name that
+  left within one org refresh plus an hour), so what another name already
+  counted is never counted again; this can under-count a return in that
+  reading.
+* **A name never seen before counts in full**: it reported nothing in the
+  previous reading, so all of its total is new. Unless it may be a rename: when
+  it counts towards an entity, it starts from the highest last total of that
+  entity's remembered names (however long ago they left, within the lookback
+  window) and of unmatched names that left within one org refresh plus an hour
+  (a rename the sync learnt first); when it counts towards nothing, from the
+  highest of any names that left within one org refresh plus an hour. Per action
+  type too. This applies whenever a project's or user's name changes, or another
+  name leaves the feed as an unmatched one appears; it can under-count a really
+  new name in that reading, never over-count.
+  The very first reading, and a reading taken over another lookback window,
+  count nothing: every total in them is history. A name missing at a change of
+  lookback window starts from whatever it reports when it returns.
+* **Each increase counts towards the entity the name counts towards at that
+  moment** (`usage_delta`, one row per reading and name, unique, so a retried
+  reading cannot count twice), and is added to the counter (`budget_usage`) of
+  every active budget that entity feeds at that moment, for the period the
+  reading was taken in: a user's, and the user's groups' that include members'
+  usage; a project's, its groups' and its applications'. A group or application
+  with a row of its own in its view's latest reading is fed by that row, and
+  otherwise by its projects, decided once per ingest before any view is read; a
+  group's or application's own row that is new, or back after missing readings,
+  counts nothing in that reading nor in the next (its projects fed the budget
+  meanwhile, up to their own read, which comes after the application's); a
+  ceiling it was under stays. More generally, an own row feeds its budget only
+  once its entity had one in both of the two readings before (a row mapped by an
+  admin, or renamed in the feed before the sync, starts feeding a reading
+  later); the reading in between counts towards neither (an under-count).
+  Back on its projects, a budget whose own row left counts only project
+  increases observed wholly after the row's last reading: an increase whose
+  interval spans it (a project missing while the row counted what it spent, then
+  back once the row has left) counts towards neither, since the row may have
+  counted part of it already (an under-count of what that project spent after
+  the row's last reading, in that interval only).
+  Every active budget has a counter per month and per quarter, fed whatever its
+  period type or setting: one that counts usage already reported (lifetime,
+  custom, *count existing usage*) reads its totals instead, and switching it
+  back to monthly or quarterly, or between monthly and quarterly, mid-period
+  loses nothing. (Quarter counters of monthly budgets, and counters of budgets
+  that counted existing usage, start at the upgrade that introduced them.) A
+  budget switched off counts nothing while it is off.
+* **An increase whose interval spans a budget's period start** (the reading
+  before it was taken in an earlier period: downtime, demo mode or a skipped
+  cycle across a rollover) cannot be split, so that budget counts none of it.
+  An increase read before the rollover and evaluated after it counts towards the
+  period it was read in; that period's figure is brought up to date when the
+  next evaluation runs, with what arrived after it was last evaluated only, and
+  never lowered: a later change of the budget's settings never rewrites a
+  closed period.
+* **Usage observed while a name counts towards nothing** (unmatched, deleted,
+  disputed) is kept unattributed. It is claimed by the entity the name comes to
+  match by its own name, only for what was observed in the org refresh plus an
+  hour before that entity was first synced: a project or user created and used
+  before the sync brought it keeps its first usage (not towards a budget
+  created after that usage). A mapping, or resolving a dispute, settles it
+  instead: it is never claimed, and the name counts from then on.
+
+So a mapping, an unmapping, a correction, a rename in either order, a deletion
+and return, a group or application membership change and demo mode only ever
+move usage observed from then on, and no budget loses what it already counted.
+The confirmation after a mapping says exactly that: "Usage reported under *X*
+from now on counts towards *Y*. What it already counted towards *Z* stays
+there." A disputed user match counts towards nobody until an admin resolves it;
+what it counted before stays.
+
+**Budgets that count usage already reported** (lifetime, custom, or *count
+existing usage*), and demo budgets in demo mode, read the current totals of the
+names that count towards them now, history included, by definition. Mapping a
+name to such a budget's entity brings its history in, and unmapping it takes it
+out again.
+
+**What the ledger cannot know.** The feed gives no dates, so these are lost, by
+construction, and never guessed: usage a name reported between its last reading
+under one name and its first under a new one that could not be paired; what a
+new name, or a name back, adds in the reading where it appears, when it may be
+a rename;
+increases hidden by the lookback window rolling past older usage in the same
+interval; what a name adds while a doubted fall of it waits for confirmation
+when the fall is real, and usage below a ceiling kept after an outlasting doubt
+or a persisting collapse; usage in the reading after a change of lookback
+window; an interval that spans a budget's period start; the reading in which a
+group's or application's own row leaves its view, its second reading when it
+appears, and the reading before an own row that starts matching its entity
+feeds it; a project increase whose interval spans the last reading of an own
+row that has since left; what two people who share a display name spend while the page layout
+splits or joins them, and the lower one's usage while they are split; and usage observed while a name
+counted towards nothing that no new entity claims.
+
+The same increases drive the rest: usage after a restriction is the restricted
+user's or project's increases since the restriction (each action type since its
+own restriction, Fusion priced from the increases' Fusion models). An increase is
+read between two readings and cannot be split, so the first one after a
+restriction includes what was used between the reading before it and the
+restriction itself (normally the seconds between a cycle's reading and its
+enforcement). The action mix in notifications is the period counter's (or, when
+an action's count stopped rising while another rose, the readings'); and Auto
+Triage credits charged to people who scan use each project's readings shifted by
+what names joining or leaving it brought (`usage_entity_offset`). Ledger rows
+older than the retention window are pruned, except those of an entity with a
+restriction in force; budget counters are pruned with their period states.
+
+**Upgrading** (migration `b3e8d1f6a9c4`) seeds the counter of every budget
+period still open with the usage it shows (its `credits_used`, less the Auto
+Triage credits charged to people, which are added separately), so no open period
+jumps or loses anything, remembers the names earlier readings had and the latest
+lacks, and starts the ledger from the latest live reading. Migration
+`e2a7c4f9b1d8` adds when each name last rose and the doubt count, and gives the
+open period of every active budget that counts existing usage a counter: what
+the rows of its own entity grew by up to the period's latest live reading, name
+by name, from the highest total any earlier reading of the run gave it (the last
+one before the period and every one in it, so a reading that reported a name
+low is never the start; names in no earlier reading bring nothing), over the
+readings since the lookback window last changed; zero for a budget fed by a
+roll-up, or with fewer than two such readings. Migration `d5b1e8a3c7f2` adds
+`usage_record.display_rows`. A database at the
+unreleased usage-anchor revision `f9c1e4b7a2d3` (now an empty placeholder) loses
+that schema's tables and columns on the way. **Downgrading** drops the ledger
+tables; period budgets then count from the baseline their period opened with.
+Migration `c9f2b6d4e8a1` adds the activity source's tables
+(`usage_activity_key`, `usage_activity_state`) and seeds nothing: the first
+cycle after upgrading only records what the activity log holds (see
+[Switching source](#switching-source-and-what-is-not-counted)); downgrading
+drops them, and the summary feeds every view again from its next reading but one.
+
+**An organisation sync never deletes after a short listing.** Listings are read
+to their reported total (`filteredTotalCount`, else `totalCount`), rows told
+apart by id, even when the server caps its pages; without a total, a short page
+is followed by one more request. A listing that still comes back short, or an
+IAM user listing that reports a shortfall, deletes nothing and keeps everyone's
+group and application links, with a warning. Some servers report a total that
+counts rows the key cannot see: the same short listing (same ids, same total)
+three times in a row is then taken as everything the key can see, said once. A
+repeated page or the page limit never is. Groups come in one IAM call with no
+count: more than one group and more than a fifth of them missing at once is
+acted on only when the next sync misses the same groups. Every complete listing
+is remembered (`org_sync.complete_listings`).
+
 ## What the enforcement actions actually are
 
 | Level breached | What changes |
 | -------------- | ------------ |
-| User | The AI roles are unmapped from the user on the `ast-app` client: the list under Settings → Enforcement (*Roles a user restriction removes*, API field `ai_roles`), by default `view-risk-management`, `view-risk-management-dashboard`, `view-risk-management-tab`. Only roles mapped to the user **directly** can be removed; one held through a group or a composite role is reported, not taken (see below). Nothing else is touched: whether the user can view scans (`view-scans`) stays whatever their Checkmarx permission says |
+| User | The AI roles are unmapped from the user on the `ast-app` client: the list under Settings → Enforcement (*Roles a user restriction removes*, API field `ai_roles`), by default `create-fusion-scan`, `manage-fusion`, `update-llm-scan-mode`, `manage-llm-configuration`. Only roles mapped to the user **directly** can be removed; one held through a group or a composite role is reported, not taken (see below). Nothing else is touched: whether the user can view scans (`view-scans`) stays whatever their Checkmarx permission says |
 | Project | What the limit's **What to turn off for projects** choice selects (`project_actions`): **Auto Triage** is disabled via `PUT /api/ai-agents-coordinator/projects/{id}/configuration`; **PR triage and remediation** is disabled by clearing `remediationSeverities` via `PATCH /api/repos-manager/repo/{repo_id}?projectId={id}`; **Fusion** is turned off by writing `scan.config.ai.fusionEnabled` = `"false"` via `PATCH /api/configuration/project?project-id={id}` and, for a project with a repository, `fusionScanConfig.enabled` = `false` via the same repos-manager `PATCH` |
 | Group | The chosen project actions, on every project in the group |
 | Application | The chosen project actions, on every project in the application |
@@ -524,9 +1044,17 @@ restore never resets branches, severity levels or the Fusion model.
 
 **Restricting a user, in detail.**
 
-* **Which roles.** The default three are *general* Risk Management roles: AI
-  Triage and AI Remediation are reached through them today, so a person
-  restricted also loses the Risk Management pages and dashboard. Settings →
+* **Which roles.** The default is the four plain (non-composite) `ast-app`
+  roles that gate spending AI credits: `create-fusion-scan` (*trigger a Fusion
+  scan*: the one that spends credits), `manage-fusion` (Fusion in the account
+  and project settings), `update-llm-scan-mode` (Fast/Targeted/Full) and
+  `manage-llm-configuration` (LLM opt-in / opt-out). The composites that
+  contain them are not on the list: `scan-fusion` also carries the ordinary
+  scanning roles (`create-scan`, `create-project`, `view-results`, …) and
+  `fusion-manager` also carries `update-tenant-params`, so removing either
+  would over-restrict. `ai-triage-assist`, the built-in role of the AI Triage
+  system user, is refused on save (`forbidden_ai_roles`) and never removed by
+  any restriction, whatever is stored: removing it breaks Auto Triage. Settings →
   Enforcement, *Roles a user restriction removes* (setting
   `enforcement.ai_roles`, API field `ai_roles`), changes the list. Names are
   checked against the roles the tenant actually has on `ast-app`
@@ -538,18 +1066,40 @@ restore never resets branches, severity levels or the Fusion model.
   the same way). A role that looks like an administration role (`*admin*`,
   `manage-*`, `realm-*`, `iam-*`) is saved only with an explicit confirmation
   (API field `confirm_admin_roles: true`; the picker marks such roles and asks
-  first). An upgrade changes nothing: the default is the three roles above.
-* **10 January.** Checkmarx One is to ship dedicated AI Triage and AI
-  Remediation permissions and roles on 10 January. When they are on your
-  tenant, add them to the list and remove the general ones: no code change is
-  needed.
+  first); the default roles never count as such, though two match `manage-*`.
+* **Upgrading from the Risk Management default.** Until 2026-11 the default
+  was `view-risk-management`, `view-risk-management-dashboard` and
+  `view-risk-management-tab`, which do not gate spending AI credits. An install
+  on the default gets the new one; a list an admin chose is kept as it is. A
+  stored list that is exactly the old default, same names in the same order
+  (what *Back to the default* saved), is moved to the new default by migration
+  `c9f2a6e1d4b7`; downgrading moves exactly the new default back. Restrictions
+  in force keep, and give back, the roles they recorded.
+* **Who a user budget cannot stop.** Someone who gets Fusion through a
+  composite role keeps it: `ast-admin` (protected by default, and on a live
+  tenant held by 274 of 296 users) contains all four default roles directly,
+  and `scan-fusion` contains `create-fusion-scan`. *Enforcement coverage* shows
+  them as kept through a composite. The fix is on the tenant: give people
+  `ast-scanner` or `ast-risk-manager` (neither contains an AI role) plus
+  `create-fusion-scan` directly where they should run Fusion. Project, group
+  and application budgets do not depend on roles.
 * **A change applies to restrictions made from then on.** Every user
   restriction records the list it used (`ai_roles` on its undo snapshot).
   Restore gives back exactly the roles that restriction recorded as removed; the
   drift check looks for those roles only; and the pass that returns roles an
   earlier version should not have taken (`view-scans`, once) goes by the
-  recorded list too, the default one for a restriction made before the list
-  was a setting. Protected roles work as before.
+  recorded list too, the Risk Management three for a restriction made before
+  the list was a setting (never today's default). Protected roles work as
+  before.
+* **More credits give the roles back.** Raising a restricted user's budget
+  above their usage (Limits, a bulk edit, a CSV import) or approving a credit
+  request that does so lifts the restriction at once (reason
+  `credit_increased`; the next cycle finishes it if Checkmarx One could not be
+  reached): exactly the roles the restriction recorded as removed are mapped
+  back, whatever the setting says now, and it is audited
+  (`enforcement.reversed`). A role an admin already mapped back by hand is
+  simply mapped again (Keycloak ignores a mapping that exists). Another limit
+  still restricting the user keeps them restricted until it is lifted too.
 * **Where each role comes from.** Before restricting, CreditGuard reads, best
   effort: the user's direct client role mappings (as before), their effective
   client roles (`GET .../users/{id}/role-mappings/clients/{clientUuid}/composite`),
@@ -595,9 +1145,9 @@ restore never resets branches, severity levels or the Fusion model.
   restriction* violation.
 * **Simulation.** The Simulation page and the blast radius in the limit form
   show, for each user who would be restricted, the roles that would be removed
-  (with what each grants: its composite children, and for the default three
-  *Risk Management pages and dashboard; AI Triage/Remediation are reached from
-  here*), the roles that would stay effective and where from, and what could
+  (with what each grants: its composite children, and for each default role a
+  short description, such as *Trigger a Fusion scan: the role that spends AI
+  credits*), the roles that would stay effective and where from, and what could
   not be read. Admins only: a viewer sees which roles a restriction removes,
   and no IAM read is made for them. The tenant is read best effort for the
   request: at most 50 users per preview (the page says when it stopped there),
@@ -882,7 +1432,9 @@ success, entities in warning, entities restricted, unresolved subjects).
 
 React, TypeScript and Tailwind, built by Vite into `backend/app/static` and served
 by the same origin as the API. No CORS in production, no separate deployment, and
-one artefact.
+one artefact. (For a dev server on another origin, `CXCG_ALLOWED_ORIGINS` takes
+exact origins, `scheme://host[:port]`, comma separated; a wildcard is refused at
+start-up.)
 
 | Page | What it does |
 | ---- | ------------ |
@@ -956,7 +1508,9 @@ backend/app/
                  evaluation, enforcement, role_sources (where a user's
                  roles come from), violations, usage_mix, limits_service,
                  notifications, settings_store, pacing (per-cycle budgets and
-                 rotation for large tenants), cycle
+                 rotation for large tenants), cycle, enforcement_selftest
+                 (Settings → Enforcement → Run self-test) with demo_tenant
+                 (the in-process tenant it uses in demo mode)
   updates/       in-app updates: GHCR client, release manifest and signature,
                  installed versions, check / install / rollback / auto-update
   scheduler.py   APScheduler wiring, reconfigurable at runtime
@@ -1051,12 +1605,21 @@ the **raw** body before parsing, and reject a timestamp that is too old. The
 timestamp is inside the signed material precisely so a captured request cannot be
 replayed later with a fresh header.
 
-One deliberate limitation: the webhook target is only checked against the cloud
-metadata addresses and literal link-local addresses. It is not a general egress
-control. Resolving DNS here would add a live lookup to every delivery, turn a DNS
-blip into a delivery failure, and still leave a gap between the check and the
-connection. Posting to an internal host is a supported deployment, so private
-ranges are allowed. Only an Admin can set the URL.
+One deliberate limitation: the webhook target (and the mail server) is only
+refused when it is a cloud metadata or platform address (AWS, GCP, Azure,
+Alibaba Cloud), a link-local address, the unspecified address (`0.0.0.0`, `::`)
+or, for the webhook, a loopback address (a mail relay on the same host is
+allowed). It is not a general egress control: posting to an internal host is a
+supported deployment, so private ranges are allowed. Only an Admin can set the
+URL. The check covers every spelling of an address (`2852039166`, `0xa9fea9fe`,
+`[::ffff:169.254.169.254]`, 6to4, NAT64) and is made again when the request is
+sent and the connection opened, against the addresses the name resolves to at
+that moment; the connection goes to one of exactly those, so a name that
+resolves somewhere harmless when it is saved and to the metadata address later
+(DNS rebinding) is refused. Redirects are not followed. Through an HTTP proxy
+from the environment (`HTTPS_PROXY`) the name is still resolved and checked
+before the request is handed to the proxy; a name this host cannot resolve is
+left to the proxy, whose own egress rules then apply.
 
 ## Data retention
 
@@ -1157,8 +1720,12 @@ change behaviour most:
    `X-CSRF-Token` and compared against the digest on the session row. The check
    lives inside the authentication dependency, so a new state changing route
    cannot ship without it.
-5. **RBAC.** Admin has full control. Viewer is read only. The last active Admin
-   cannot be demoted, disabled or deleted, and no one can demote themselves.
+5. **RBAC.** Admin has full control. A viewer reads, and changes only their own
+   things: their account (password, two factor) and, when an admin has turned
+   self-service on, their own credit requests. Marking the shared
+   notifications read is an Admin action. The last active Admin
+   cannot be demoted, disabled or deleted, and no one can demote themselves;
+   two such changes made at the same moment are taken one after the other.
 6. **Login abuse.** Lockout with exponential backoff per username and source
    address, a slower account-wide counter that catches guessing spread across
    many addresses (an address the account has signed in from before is exempt,
@@ -1277,10 +1844,16 @@ CreditGuard checks what the key may do instead of finding out at the first breac
   at the start of a cycle, and whenever an admin presses **Check again**
   (Settings → Connection → *Key permissions*, or the pop-up).
 - **What it can test:** one small read per call in the table above (`limit=1`
-  style; `GET /api/scans/` only when auto-triage charging is on, a limit turns
+  style, except the projects read, which reads one page of 50 projects to find
+  one linked to a repository; `GET /api/scans/` only when auto-triage charging is on, a limit turns
   Fusion off or a Fusion restriction is in force, or someone presses Check again), on one synced project and one synced user where a call needs one.
   Each is reported as allowed, refused (403), not found, error, or skipped with the
-  reason (for example when no project is linked to a repository yet).
+  reason (for example when no project is linked to a repository yet). The
+  repository read uses a project that has a repository id (from the synced
+  projects, or from the first page of the projects read when none is synced
+  yet), and is *allowed* only when its `remediationSeverities` is in a shape
+  CreditGuard can write back. A check where every read passed says so, and that
+  the writes were not tested.
 - **What it cannot test:** the writes (role mapping `POST`/`DELETE`, the Auto Triage
   `PUT`, the repos-manager `PATCH`, the project configuration `PATCH` that turns
   Fusion off, and the repository Fusion `PATCH`) cannot be tried without changing
@@ -1294,7 +1867,10 @@ CreditGuard checks what the key may do instead of finding out at the first breac
   (policy violations); the action-rates read is optional.
   They are shown as *not tested*, and as *will fail* when the read on the same
   service was refused. The role and group names in the key's access token are
-  shown too (never the token), and a token that lists `realm-management` roles
+  shown too (never the token), with a reminder that they are not the whole
+  story: Checkmarx One applies the roles of the user who owns the key on its
+  side, so on a live tenant a token listing only IAM roles was allowed every
+  platform read. A token that lists `realm-management` roles
   without `manage-users` marks role mapping as *probably refused* (a guess: shown
   as a warning on the card, never on its own a reason for the banner or a red
   verdict).
@@ -1406,7 +1982,7 @@ menu, admins only; *Policy violations* in Jump to), for an admin to follow up:
 | `fusion_scan_during_restriction` | A scan on a project whose Fusion restriction is in force, created after it was applied, whose engines include `ai` and whose `metadata.configs[type=ai].value.fusionEnabled` is true: Fusion ran anyway (a scan started with its own settings). Records the initiator, `sourceOrigin`/`sourceType`, branch, scan id, model and the price from action-rates when known. | Cycle step `violations`, after evaluation |
 | `ai_scan_during_restriction` | The same scan with `fusionEnabled` false (the AI engine ran without Fusion, LLM-based scanning), or not saying. That is the restriction working, so it is recorded silently: one information row per restriction per day with the count (no notification, no audit entry). Whether it costs credits is not known. | Same |
 | `scans_not_checked` | More scans were made on a restricted project since the last look than one cycle's listing reaches (2 pages of 100), so the older ones in between were not checked. Information, once per restriction (its evidence lists the windows and how often). | Same |
-| `usage_after_restriction` | What the restriction is meant to stop (a user's `triage`/`remediation`; a project's `auto_triage` when Auto Triage is turned off, `fusion` when Fusion is) kept rising in the consumption feed after the restriction. Each action type is compared with the reading taken when *its own* restriction was applied (Fusion restricted after Auto Triage is measured from the Fusion restriction). One record per restriction, brought up to date while it keeps rising; credits only when Fusion is priced. | Same |
+| `usage_after_restriction` | What the restriction is meant to stop (a user's `triage`/`remediation`; a project's `auto_triage` when Auto Triage is turned off, `fusion` when Fusion is) kept rising in the consumption feed after the restriction. Each action type counts the ledger's increases for the restricted user or project since *its own* restriction was applied (Fusion restricted after Auto Triage is measured from the Fusion restriction), so a name renamed, mapped or moved meanwhile is neither missed nor counted for its history. One record per restriction, brought up to date while it keeps rising; credits only when Fusion is priced. | Same |
 
 Scans are listed newest first from the later of the restriction's
 `applied_at` and the newest scan already looked at (a per-project cursor),
@@ -1913,8 +2489,9 @@ failure of this tool is restricting many people at once for a wrong reason.
   story. Limits keep being judged on the last believed reading meanwhile, and
   each cycle that holds one reports it as a warning in its result.
 - **Roles a user restriction removes.** The client roles a user restriction
-  takes (API field `ai_roles`; default the three Risk Management roles), picked
-  from the tenant's own roles. Applies to restrictions made from then on. See
+  takes (API field `ai_roles`; default `create-fusion-scan`, `manage-fusion`,
+  `update-llm-scan-mode`, `manage-llm-configuration`), picked from the
+  tenant's own roles; `ai-triage-assist` is refused. Applies to restrictions made from then on. See
   [Restricting a user, in detail](#what-the-enforcement-actions-actually-are).
 - **Fusion lock.** *Lock Fusion against per-scan override* (on by default, API
   field `fusion_lock_override`): when a limit turns Fusion off, also set
@@ -1924,6 +2501,123 @@ failure of this tool is restricting many people at once for a wrong reason.
 - **Unknown outcomes.** If a restriction or restore fails in a way that leaves
   it unclear whether the tenant changed (a timeout, a dropped connection), the
   record says so and the next cycle checks the tenant rather than assuming.
+
+### Readiness checklist
+
+Settings → Enforcement and Diagnose show a **Readiness** card, each item green,
+amber (pending) or red, with a one-line fix and a link to where to fix it
+(`app/services/readiness.py`, `GET /api/readiness`). Every item is computed
+from data the app already has:
+
+1. **Connected to Checkmarx One**: the connection check passes.
+2. **Activity log readable**: the activity log is the usage source and its
+   last read succeeded.
+3. **Counts match Checkmarx**: the latest daily reconciliation of the log's sum
+   with the summary's total is within 0.5% (pending until the first one).
+4. **Self-test passed**: a passed self-test on a user and one on a project in
+   the last 30 days (kinds that were not applicable do not count against it;
+   demo runs do not count).
+5. **Dry run reviewed**: an admin clicked **Reviewed** on the Simulation page
+   after the last budget change.
+
+A **new install** starts watch-only: the data migration `b3e7f1a9c2d5` finds
+an empty database (no account, budget or connection) and leaves enforcement
+paused with the readiness gate set. Turning enforcement on (the Readiness
+card's *Turn enforcement on*, or the pause switch) then needs every item
+green, or an admin's explicit override: typing `ENFORCE`, audited as
+`readiness.override` with the items that were not green. Once enforcement is
+on the gate is gone; the checklist never turns enforcement off again, and an
+item that turns from green to red raises a WARNING and shows on Diagnose.
+**Existing installs** are unchanged: enforcement stays as it was and the
+checklist is information only. Viewers see the checklist; only admins mark the
+dry run reviewed or turn enforcement on.
+
+### Enforcement self-test
+
+Settings → Enforcement → **Enforcement self-test** (admins only; viewers get a
+403) proves on the live tenant that enforcement really works there. Pick a
+user, a project, or both (and, for a project, which of Auto Triage, PR triage
+and remediation and Fusion to test), press *Check what it would change*, read
+exactly what will be changed and for how long, type each target's name, and
+run it. For each target it:
+
+1. reads the current state: the user's direct client roles and effective roles
+   (with where each AI role comes from), or the project's settings;
+2. applies the restriction **through the same code a budget breach uses**
+   (`enforcement.apply_enforcement`, with a stand-in budget that exists for
+   that run only);
+3. reads it back and checks the roles are gone or the settings are off, and
+   for a user reports any AI role still held through a group or a composite
+   role: a restriction that cannot bite;
+4. restores it from the undo snapshot **through the Restore path**;
+5. reads it back again and compares with step 1, setting by setting. Lists are
+   compared regardless of order (Checkmarx may list roles in another order),
+   but exactly otherwise: a role someone granted meanwhile is a difference,
+   and so is a setting that changed where it is set (the level a Fusion value
+   comes from, the AI configuration's `scope` and `allowAiUsage`).
+
+**Fusion inherited from the tenant is not tested.** Restore can only write a
+Fusion value back at the project level, which would pin an inherited value
+there for good (see [Remaining unknowns](#remaining-unknowns) #6). So when the
+read in step 1 shows the project inherits Fusion, the self-test leaves Fusion
+(and the repository's Fusion setting, which goes with it) alone, marks it *not
+applicable* and says so on the check and in the result; the other settings are
+tested as usual. The same goes for Auto Triage when the project's AI agent
+configuration is read with a scope other than `project` (it is inherited):
+writing it back would pin the configuration on the project, so nothing is
+written for it.
+
+The result has a before / restricted / restored diff per setting, pass or fail
+per step and the time each took. The last 20 results are kept, and Diagnose
+shows the last one (passed or failed, and when).
+
+Safety:
+
+- **Refusals.** A target that is restricted now (or may be, after an
+  unconfirmed write), covered by an active budget that has reached its warning
+  threshold (or is warned, breached or restricted this period), exempt, holding
+  a protected role, or the account the API key belongs to is refused, and so
+  is a project with a scan running or queued (if the scan list cannot be read,
+  that is a warning). The reasons are shown; nothing is changed, and the
+  refusal is audited.
+- **The restore always runs**, in a `finally`, whatever a check found or
+  raised. The restriction is an ordinary enforcement record (no budget, period
+  `selftest-<run>`). If its restore fails, or answers OK but does not read back,
+  it is marked as in doubt (`outcome_unknown`) and stays a tracked
+  restriction: a critical notification with *Restore* on it and the exact
+  snapshot is raised, the result shows the snapshot, and the next cycle's
+  sweep lifts it (reason `selftest_cleanup`). It is counted with the
+  restrictions in force meanwhile. A target is never left restricted silently.
+- **A self-test never releases a real budget's restriction.** Lifting one of
+  its restrictions (the sweep, or *Restore* on its alert) uses the
+  `selftest_cleanup` reason, never the admin's: if a real budget restricts the
+  same target by then, what the self-test recorded is handed over to that
+  restriction, which stays in force, and *Restore* says so instead of
+  "Access restored".
+- **No database transaction is held across a Checkmarx call**: what is about to
+  be done is committed first, as for every restriction.
+- **One at a time.** A second self-test is refused while one runs: in the
+  process, and in the database by a partial unique index on the result
+  table's `running` status (so a second process cannot start one either). A
+  run left "running" by a process that stopped is recorded as interrupted
+  after 15 minutes. The self-test holds the target's own lock (the one the
+  cycle takes for each target) from its checks to its last read, so a cycle
+  working on the same target waits for it (and it waits up to 30 seconds for
+  the cycle); the refusal checks and the running-scan check are repeated under
+  that lock.
+- **Audited**: start, every step, the restore and the outcome, in the
+  hash-chained audit log, next to the restriction's own entries. The
+  "restricted" and "restored" notifications the restriction code would raise
+  are not sent; the result says it instead.
+- With enforcement paused, or no budget set to enforce, the self-test still
+  runs (you asked for it) and says that budgets will not restrict anyone until
+  enforcement is on. In demo mode it runs against a small built-in demo tenant
+  (made-up data, nothing leaves the process), only on the demo users and
+  projects, and says so; one demo user keeps a Fusion role through a group, to
+  show a restriction that cannot bite. A demo restriction whose restore
+  failed is retried against the demo tenant by every cycle (demo mode or
+  not), and its Restore button uses the demo tenant too: it is never sent to
+  Checkmarx One.
 
 ### Accounts
 
@@ -2132,7 +2826,7 @@ Run the diagnostic. It answers the question directly and touches nothing:
 
 ```sh
 cd backend
-python -m scripts.diagnose_usage --project "singakash/CxHybrid"
+python -m scripts.diagnose_usage --project "carolorg/CxHybrid"
 python -m scripts.diagnose_usage --user "someone@example.com"
 ```
 
@@ -2150,8 +2844,10 @@ look identical from the outside:
 
 ## Runbook: turning enforcement on for the first time
 
-Recommended order, because the failure mode of this tool is restricting the wrong
-person:
+A new install starts watch-only and shows the
+[readiness checklist](#readiness-checklist) on Settings → Enforcement: the
+steps below turn it green. Recommended order, because the failure mode of this
+tool is restricting the wrong person:
 
 1. Connect with a **read only** API key and leave every limit on its monitor only
    default. Nothing can be restricted, and the write permissions are not needed.
@@ -2160,8 +2856,11 @@ person:
 3. Fix attribution first. An unmatched user is a budget that silently undercounts.
 4. Add exemptions for break glass accounts and any project that must never lose AI
    features.
-5. Switch **one** limit to enforce, on an entity you control, and verify the
-   restriction and the restore both work end to end.
+5. Run the **enforcement self-test** (Settings → Enforcement) on a user and a
+   project you control: it restricts them, reads it back, restores them and
+   checks they read exactly as before. Then switch **one** limit to enforce, on
+   an entity you control, and verify the restriction and the restore both work
+   end to end.
 6. Only then widen. Bulk edit can switch many limits at once, and switching them
    back to monitor only lifts every restriction they caused.
 
@@ -2176,13 +2875,27 @@ They are listed because each has a cost worth knowing about.
    string form older payloads carry. Where it is still absent, the PR
    triage and remediation half of project enforcement is skipped and the record says
    so; Auto Triage is still disabled. A list-repositories endpoint would close this,
-   and this is the most valuable of the remaining gaps.
-2. **Pagination parameters for `/users/v2`.** The endpoint is called without
-   parameters first; if fewer users come back than `filteredCount`, it retries with
-   `page` and `size`. If that makes no progress, the sync warns with the exact
-   shortfall rather than treating a partial list as complete.
+   and this is the most valuable of the remaining gaps. *Seen on a live tenant
+   (2026-11, about 2,000 projects):* `repoId` is an integer on every project
+   imported through an SCM integration (760 of 1,968: GitHub, GitHub App, Azure,
+   Bitbucket, GitLab), next to a string `scmRepoId` that is a different value;
+   projects created otherwise (CLI, MCP, upload) carry `repoUrl` but no `repoId`.
+   The repos-manager read returns `remediationSeverities` wrapped as
+   `{"value": [...], "isEditable": true}`. Both that and a bare list are read,
+   and every write sends back the shape that was read; a shape that is neither
+   is never written (the restriction is left unchanged and reported). That the
+   tenant accepts the wrapped form on a write is not yet verified.
+2. **Pagination parameters for `/users/v2`.** Settled on a live tenant: without
+   parameters it returns the first 100 users and `filteredCount`; `first` (a row
+   offset) and `max` page correctly (`max` up to at least 1,000), and `page` and
+   `size` are ignored (the first 100 come back again). The sync asks once without
+   parameters and then pages with `first` and `max`; if that makes no progress it
+   warns with the exact shortfall rather than treating a partial list as
+   complete.
 3. **The `group` dimension's row shape.** `viewBy=group` is a real dimension but
-   has only ever been observed empty, so the row shape is unverified. Group rows are
+   has only ever been observed empty (also on a live tenant of about 2,000
+   projects: `totalItems` 0 for `last_month`, `last_90_days` and `last_year`), so
+   the row shape is unverified. Group rows are
    matched by id then name like projects, and a group that does not match falls back
    to the local rollup of its projects, which is the behaviour that was there before.
    No guess about an unseen payload can cause a wrong figure.
@@ -2201,7 +2914,10 @@ They are listed because each has a cost worth knowing about.
    used: the mechanisms implemented are Auto Triage, PR triage and remediation and
    Fusion. If that flag
    is the authoritative master switch, adding it is one function in
-   `app/checkmarx/platform.py`.
+   `app/checkmarx/platform.py`. Seen on a live tenant: it is set at the tenant
+   level (`originLevel` `Tenant`, `value` `"true"`, `isPersisted` true,
+   `allowOverride` true), and the project's AI agent configuration carries the
+   same flag at its top level (`"allowAiUsage": true`).
 6. **Removing a project's own Fusion value.** Turning Fusion off writes the
    setting at the project level, also when it was inherited (`originLevel`
    `Tenant` or `Environment`), and Restore can only write the previous value back
@@ -2212,8 +2928,26 @@ They are listed because each has a cost worth knowing about.
    overrides. To verify on a tenant: take a project with an inherited
    `scan.config.ai.fusionEnabled`, set it on the project in the UI, and look for
    the request the UI sends when the project value is reset to the inherited
-   one; if it is a per-key call, Restore can use it for an entry whose
-   `origin_level_before` is not `Project`.
+   one; if it is a per-key call, Restore can use it for an entry recorded as
+   inherited. Seen on a live tenant: an entry the project has no value for
+   still reports `originLevel` `Project`, with an empty value and `isPersisted`
+   false, and after a write it reads `isPersisted` true; an inherited one reports
+   the level it comes from (`Tenant`) with that level's `isPersisted`. So
+   whether the project had its own value is recorded from both
+   (`inherited_before`, `is_persisted_before`) and said in the restriction and
+   restore messages; Restore still writes the previous value back on the
+   project.
+
+   **The effect, plainly:** after a real budget has turned Fusion off on a
+   project that inherited it (with the Fusion lock on, the default, this
+   includes a project that inherited Fusion *off*: the lock alone is written),
+   Restore leaves the project with its own Fusion value. The value is the
+   same, but the project no longer follows the tenant: a later change to
+   Fusion at the tenant level does not reach it until someone resets it to
+   inherited in Checkmarx One. The enforcement self-test does not touch an
+   inherited Fusion value for this reason. Fixing Restore waits for the
+   tenant's "reset to inherited" request to be captured (see above); no
+   guessed `DELETE` is sent.
 
 7. **Where a user's roles come from.** The effective-roles, user-groups,
    group-role-mapping and composite-role reads follow Keycloak's admin REST API
@@ -2224,10 +2958,47 @@ They are listed because each has a cost worth knowing about.
    only as *source unknown*.
 8. **Auto Triage's `allowOverride`.** The project-scope Auto Triage
    configuration carries `allowOverride` (`{"projects": false, "branches":
-   true, ...}` in a captured HAR). What each key means is not documented: it is
+   true, ...}` in a captured HAR; `{"projects": true, "branches": true,
+   "scannerTypes": true, "riskStatuses": true, "severityLevels": true}` on a
+   live tenant, where the same read also lists an `auto_remediation` feature
+   with its own `allowOverride`, and `allowAiUsage` at the top level). The
+   `PUT` sends only `configurations`, every entry as read with only the
+   `auto_triage` entry's `enabled` and `config` changed, so the other feature
+   and every `allowOverride` are kept; `scope` and `projectId` are named by the
+   path, and `allowAiUsage` (the tenant's inherited AI switch) is never echoed,
+   so it cannot be pinned on the project. Restore reads the configuration again
+   first. After the write the configuration is read back: if `auto_remediation`
+   or `allowAiUsage` changed, the outcome is kept in doubt and an alert says so.
+   **Not yet verified:** that this is the body the Checkmarx One UI sends.
+   Capture one HAR of toggling Auto Triage on a project in the UI and compare
+   it before enabling project enforcement on a real tenant. What each
+   `allowOverride` key means is not documented: it is
    recorded verbatim and only used, best effort, for the Simulation's *may not
    hold* warning. That a project cannot override an account-wide ("select
    all") setting is concluded from two read-backs, not from this field.
+
+**Fusion and DAST pricing.** `GET /api/v1/credits/action-rates` lists a
+`credits_per_action` that, on a live tenant (2026-11), was the cost of one
+transaction for triage (1) and remediation (3) only. The consumption feed
+reported 31,024 credits for 285 Opus 5.5 Fusion transactions (about 108.9 each,
+rate 2), about 7.65 per Opus 4.7 transaction (rate 2.5), about 5.4 per Haiku 4.5
+(rate 1.5) and 1,568 credits for 10 DAST correlations (about 156.8, rate 14).
+So a price is the listed rate only when the feed's own credits / transactions
+(action dimension) agree with it within 10%; otherwise the feed's average is
+used, and every message and the Overview's table say which. With no feed figure
+triage and remediation are priced at their rate, but Fusion and DAST correlation
+are not priced at all: the breach and violation messages and the Overview say
+their cost per scan is not known from this tenant's data.
+
+**Other live-tenant observations.** `creditsUsed` arrives as a string
+(`"31024"`, `"252.5"`); no consumption row carries an id (matching is by name,
+the id branch is for payloads that may add one); action rows nest the type and
+count under `actionsPerformed` like every other dimension; the user dimension
+lists the same person more than once (119 rows for 87 subjects), which is
+merged; `/credits/info` carries Checkmarx's own `enforcement` block (state and
+thresholds), shown read only on the Overview. Checkmarx One applies the API key
+owner's roles server-side: a token carrying only IAM roles was allowed every
+platform read.
 
 Settled since the first draft: the `period` parameter accepts exactly
 `last_month`, `last_30_days`, `last_90_days`, `last_180_days` and `last_year`, all

@@ -14,12 +14,15 @@ export function EntityPicker({
   selected,
   onSelect,
   disabled,
+  includeSubjects,
 }: {
   entityType: EntityType;
   onEntityTypeChange: (type: EntityType) => void;
   selected: OrgEntity | null;
   onSelect: (entity: OrgEntity | null) => void;
   disabled?: boolean;
+  /** Also offer integration accounts that are no user (a user budget on one). */
+  includeSubjects?: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<OrgEntity[]>([]);
@@ -34,7 +37,12 @@ export function EntityPicker({
       try {
         const rows = await api.get<OrgEntity[]>(
           "/api/org/entities",
-          { entity_type: entityType, q: query, limit: 25 },
+          {
+            entity_type: entityType,
+            q: query,
+            limit: 25,
+            ...(includeSubjects ? { include_subjects: true } : {}),
+          },
           controller.signal,
         );
         setResults(rows);
@@ -50,7 +58,7 @@ export function EntityPicker({
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [entityType, query]);
+  }, [entityType, query, includeSubjects]);
 
   return (
     <div className="flex flex-col gap-3">

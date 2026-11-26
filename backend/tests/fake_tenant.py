@@ -35,6 +35,11 @@ ALL_ROLES: dict[str, str] = {
     "view-risk-management-tab": "82660f23-52cb-4361-9d49-7abae5e520fa",
     "view-projects": "92660f23-52cb-4361-9d49-7abae5e520fb",
     "view-scans": "a2660f23-52cb-4361-9d49-7abae5e520fc",
+    # The default AI roles (iam.DEFAULT_AI_ROLE_NAMES).
+    "create-fusion-scan": "b2660f23-52cb-4361-9d49-7abae5e520fd",
+    "manage-fusion": "c2660f23-52cb-4361-9d49-7abae5e520fe",
+    "update-llm-scan-mode": "d2660f23-52cb-4361-9d49-7abae5e520ff",
+    "manage-llm-configuration": "e2660f23-52cb-4361-9d49-7abae5e52100",
 }
 
 
@@ -79,6 +84,25 @@ class FakeTenant:
     auto_triage: dict[str, dict[str, Any]] = field(default_factory=dict)
     # repo id -> remediation severities
     repo_severities: dict[str, list[str]] = field(default_factory=dict)
+    # How the repos-manager read carries remediationSeverities, and the only
+    # shape a PATCH is accepted in (anything else answers 400): "wrapped"
+    # ({"value": [...], "isEditable": true}, as on a live tenant), "list" (the
+    # older bare list), or "string" (a shape CreditGuard does not know).
+    repo_severities_shape: str = "wrapped"
+    # The wrapped form's isEditable, as served.
+    repo_severities_editable: bool = True
+    # Every repos-manager PATCH body, as (repo id, body), for assertions.
+    repo_patches: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    # project id -> the auto_remediation feature entry, as a live tenant lists
+    # it next to auto_triage. A PUT that leaves it out resets it (to off, with
+    # no config), the way a tenant that takes the PUT as the whole
+    # configuration would.
+    auto_remediation: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # project id -> the top level allowAiUsage of the AI agent configuration
+    # (inherited from the tenant; True when absent).
+    allow_ai_usage: dict[str, bool] = field(default_factory=dict)
+    # Every Auto Triage PUT body, as (project id, body), for assertions.
+    auto_triage_puts: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     # project id -> scans, in the shape GET /api/scans/ returns them.
     scans: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     # Every GET /api/scans/ query, as parsed parameters, for assertions.
@@ -123,6 +147,22 @@ class FakeTenant:
             },
         ]
     )
+
+    # GET /api/credits/activity rows, as the API returns them (dates as ISO
+    # strings). None: the endpoint answers 404, as on a tenant without it.
+    activity: list[dict[str, Any]] | None = None
+    # Answer the activity log with this status instead.
+    activity_status: int | None = None
+    # Called with the page number before each activity page is served: lets a
+    # test change the log between two page requests (drift).
+    activity_hook: Callable[[int], None] | None = None
+    # Serve at most this many rows per activity page, whatever size is asked.
+    activity_page_cap: int | None = None
+    # Reorders rows of the same date differently on every request.
+    activity_tie_shuffle: Any = None
+    # Serves the activity log newest first, ignoring sort_order.
+    activity_ignore_sort: bool = False
+    activity_requests: list[dict[str, list[str]]] = field(default_factory=list)
 
     # Test controls
     unsupported_views: set[str] = field(default_factory=set)
@@ -289,6 +329,7 @@ class FakeTenant:
                 "severityLevels": ["CRITICAL", "HIGH"],
             },
         }
+        self.auto_remediation[project_id] = _default_auto_remediation()
         self.set_fusion_setting(project_id, value="true", origin="Project", allow_override=True)
 
     def set_fusion_setting(
@@ -298,10 +339,14 @@ class FakeTenant:
         value: str | None,
         origin: str = "Project",
         allow_override: bool = True,
+        is_persisted: bool = True,
     ) -> None:
         """The project's scan settings, as GET /api/configuration/project lists them.
 
-        ``value`` None leaves the Fusion entry out altogether.
+        ``value`` None leaves the Fusion entry out altogether. ``is_persisted``
+        False is an entry the project has no value of its own for: a live
+        tenant still reports it with ``originLevel`` ``Project`` (and an empty
+        value).
         """
         entries: list[dict[str, Any]] = [
             {
@@ -335,7 +380,7 @@ class FakeTenant:
                     "value": value,
                     "valuetype": "Bool",
                     "allowOverride": allow_override,
-                    "isPersisted": True,
+                    "isPersisted": is_persisted,
                 }
             )
         self.project_config[project_id] = entries
@@ -368,7 +413,8 @@ class FakeTenant:
         """Add or replace a viewBy=user consumption row."""
         item: dict[str, Any] = {
             "name": name,
-            "creditsUsed": credits,
+            # A string, as a live tenant sends it.
+            "creditsUsed": str(credits),
             "percentOfTotal": 0.1,
             "actionsPerformed": {
                 "actions": [
@@ -402,8 +448,12 @@ class FakeTenant:
         ``actions`` adds the per action transaction breakdown the real project
         rows carry, for example ``{"auto_triage": 4, "triage": 1}``.
         """
-        item: dict[str, Any] = {"name": name, "creditsUsed": credits, "percentOfTotal": 1.0}
+        # creditsUsed as a string, as a live tenant sends it.
+        item: dict[str, Any] = {"name": name, "creditsUsed": str(credits), "percentOfTotal": 1.0}
         if entity_id:
+            # A live tenant's rows carry no id (they match by name). An id is
+            # kept here for the parser's id branch, which is for payloads that
+            # may carry one in future.
             item["id"] = entity_id
         if actions:
             item["actionsPerformed"] = {
@@ -520,6 +570,9 @@ class FakeTenant:
 
         if path.endswith("/api/credits/consumption"):
             return self._consumption_response(params)
+
+        if path.endswith("/api/credits/activity"):
+            return self._activity_response(params)
 
         if path.endswith("/api/credits/info"):
             if self.credit_info is None:
@@ -674,6 +727,77 @@ class FakeTenant:
             },
         )
 
+    def add_activity(
+        self,
+        *,
+        date: str,
+        credits: str | int | float,
+        project_id: str | None,
+        user: str = "",
+        email: str = "",
+        application_id: str | None = None,
+        action: str = "Triage",
+        scan_id: str | None = None,
+        scanner: str = "sast",
+    ) -> dict[str, Any]:
+        """Append one row of the credit activity log (never merged with an
+        identical one: identical rows are distinct events)."""
+        row: dict[str, Any] = {
+            "date": date,
+            "action": action,
+            "creditsUsed": str(credits),
+            "user": user,
+            "userEmail": email,
+            "projects": [f"name-of-{project_id}"] if project_id else [],
+            "projectIds": [project_id] if project_id else [],
+            "applications": [f"name-of-{application_id}"] if application_id else [],
+            "applicationIds": [application_id] if application_id else [],
+            "scanner": scanner,
+            "risks": [],
+            "environments": [],
+            "environmentIds": [],
+            "scans": [scan_id] if scan_id else [],
+            "scanIds": [scan_id] if scan_id else [],
+        }
+        if self.activity is None:
+            self.activity = []
+        self.activity.append(row)
+        return row
+
+    def _activity_response(self, params: dict[str, list[str]]) -> httpx.Response:
+        self.activity_requests.append(params)
+        if self.activity_status is not None:
+            return httpx.Response(self.activity_status, json={"message": "forced failure"})
+        if self.activity is None:
+            return httpx.Response(404, json={"message": "no fake route for activity"})
+        page = int(params.get("page", ["1"])[0])
+        if self.activity_hook is not None:
+            self.activity_hook(page)
+        size = int(params.get("size", ["100"])[0])
+        if self.activity_page_cap:
+            size = min(size, self.activity_page_cap)
+        # A stable sort by date: rows of one date keep the order they were
+        # added in, unless a shuffle reorders them for this request.
+        rows = list(self.activity)
+        if self.activity_tie_shuffle is not None:
+            self.activity_tie_shuffle.shuffle(rows)
+        rows.sort(key=lambda row: _parse(row["date"]))
+        descending = params.get("sort_order", ["desc"])[0] != "asc" or self.activity_ignore_sort
+        if descending:
+            rows.reverse()
+        start = (page - 1) * size
+        window = rows[start : start + size]
+        total_pages = -(-len(rows) // size) if rows else 0
+        return httpx.Response(
+            200,
+            json={
+                "items": window,
+                "totalItems": len(rows),
+                "totalPages": total_pages,
+                "currentPage": page,
+            },
+        )
+
     def _scans_response(self, params: dict[str, list[str]]) -> httpx.Response:
         """GET /api/scans/: newest first, filtered by project, branch and from-date."""
         self.scan_queries.append(params)
@@ -726,6 +850,8 @@ class FakeTenant:
                     kept = dict(update)
                     if self.drop_config_lock and kept.get("allowOverride") is False:
                         kept["allowOverride"] = entry.get("allowOverride")
+                    # Written at the project level: it now has a value of its own.
+                    kept["isPersisted"] = True
                     entries[index] = {**entry, **kept}
                     break
             else:
@@ -751,36 +877,66 @@ class FakeTenant:
         return httpx.Response(204)
 
     def _auto_triage_response(self, request: httpx.Request, path: str) -> httpx.Response:
+        """The project's AI agent configuration, in the shape a live tenant
+        returns it: ``auto_triage`` and ``auto_remediation``, each with its
+        ``allowOverride``, and a top level ``allowAiUsage``. A PUT is taken as
+        the whole configuration: a feature it leaves out is reset."""
         project_id = path.split("/projects/")[1].split("/configuration")[0]
         state = self.auto_triage.setdefault(
             project_id, {"enabled": False, "config": {"branches": ["main"]}}
         )
+        remediation = self.auto_remediation.setdefault(project_id, _default_auto_remediation())
         if request.method == "GET":
+            configurations: list[dict[str, Any]] = [
+                {
+                    "feature": "auto_triage",
+                    "enabled": state["enabled"],
+                    "config": state["config"],
+                    "allowOverride": self.auto_triage_allow_override.get(
+                        project_id,
+                        {
+                            "projects": True,
+                            "branches": True,
+                            "scannerTypes": True,
+                            "riskStatuses": True,
+                            "severityLevels": True,
+                        },
+                    ),
+                }
+            ]
+            if remediation:
+                configurations.append(json.loads(json.dumps(remediation)))
             return httpx.Response(
                 200,
                 json={
                     "scope": "project",
                     "projectId": project_id,
-                    "configurations": [
-                        {
-                            "feature": "auto_triage",
-                            "enabled": state["enabled"],
-                            "config": state["config"],
-                            "allowOverride": self.auto_triage_allow_override.get(
-                                project_id, {"branches": True, "projects": True}
-                            ),
-                        }
-                    ],
+                    "allowAiUsage": self.allow_ai_usage.get(project_id, True),
+                    "configurations": configurations,
                 },
             )
         body = json.loads(request.content or b"{}")
         if self.ignore_auto_triage_writes:
             return httpx.Response(200, json={"status": "ok"})
+        self.auto_triage_puts.append((project_id, body))
+        seen_remediation = False
         for entry in body.get("configurations", []):
             if entry.get("feature") == "auto_triage":
                 state["enabled"] = bool(entry.get("enabled"))
                 if entry.get("config"):
                     state["config"] = entry["config"]
+                if "allowOverride" in entry:
+                    self.auto_triage_allow_override[project_id] = entry["allowOverride"]
+            elif entry.get("feature") == "auto_remediation":
+                seen_remediation = True
+                self.auto_remediation[project_id] = json.loads(json.dumps(entry))
+        if not seen_remediation and remediation:
+            # Left out of the PUT: reset, as the whole configuration was replaced.
+            self.auto_remediation[project_id] = {
+                "feature": "auto_remediation",
+                "enabled": False,
+                "config": {},
+            }
         return httpx.Response(200, json={"status": "ok"})
 
     def _repo_response(
@@ -790,9 +946,18 @@ class FakeTenant:
         if request.method == "GET":
             if "projectId" not in params:
                 return httpx.Response(400, json={"message": "projectId is required"})
+            severities = list(self.repo_severities.get(repo_id, []))
+            served: Any = severities
+            if self.repo_severities_shape == "wrapped":
+                served = {"value": severities, "isEditable": self.repo_severities_editable}
+            elif self.repo_severities_shape == "null":
+                served = {"value": None, "isEditable": True}
+            elif self.repo_severities_shape == "string":
+                served = ",".join(severities)
             settings: dict[str, Any] = {
                 "id": repo_id,
-                "remediationSeverities": self.repo_severities.get(repo_id, []),
+                "prDecorationEnabled": {"value": True, "isEditable": True},
+                "remediationSeverities": served,
             }
             if repo_id in self.repo_fusion:
                 settings["fusionScanConfig"] = dict(self.repo_fusion[repo_id])
@@ -802,8 +967,19 @@ class FakeTenant:
         if "projectId" not in params:
             return httpx.Response(400, json={"message": "projectId is required"})
         body = json.loads(request.content or b"{}")
-        if "remediationSeverities" in body and not self.drop_pr_remediation_writes:
-            self.repo_severities[repo_id] = list(body.get("remediationSeverities", []))
+        self.repo_patches.append((repo_id, body))
+        if "remediationSeverities" in body:
+            sent = body["remediationSeverities"]
+            if self.repo_severities_shape == "wrapped":
+                ok = isinstance(sent, dict) and isinstance(sent.get("value"), list)
+                values = sent.get("value") if ok else None
+            else:
+                ok = isinstance(sent, list)
+                values = sent
+            if not ok:
+                return httpx.Response(400, json={"message": "remediationSeverities: bad shape"})
+            if not self.drop_pr_remediation_writes:
+                self.repo_severities[repo_id] = list(values or [])
         if isinstance(body.get("fusionScanConfig"), dict) and not self.drop_repo_fusion_writes:
             self.repo_fusion[repo_id] = dict(body["fusionScanConfig"])
         return httpx.Response(200, json={"status": "ok"})
@@ -859,6 +1035,33 @@ def _public_scan(row: dict[str, Any], *, detail: bool = False) -> dict[str, Any]
     return out
 
 
+def _default_auto_remediation() -> dict[str, Any]:
+    """The auto_remediation feature entry, as a live tenant lists it (synthetic)."""
+    return {
+        "feature": "auto_remediation",
+        "enabled": True,
+        "config": {
+            "branches": ["main"],
+            "scannerTypes": ["SAST", "SCA"],
+            "riskStates": ["CONFIRMED"],
+            "riskStatuses": ["NEW"],
+            "severityLevels": ["CRITICAL", "HIGH"],
+            "riskAggregation": False,
+            "aggregationLimit": 50,
+        },
+        "allowOverride": {
+            "projects": True,
+            "branches": True,
+            "scannerTypes": True,
+            "riskStates": True,
+            "riskStatuses": True,
+            "severityLevels": True,
+            "riskAggregation": True,
+            "aggregationLimit": True,
+        },
+    }
+
+
 def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -878,27 +1081,27 @@ def populated_tenant() -> FakeTenant:
     tenant.add_group(group_id="grp-payments", name="Payments")
 
     tenant.add_user(
-        user_id="user-harsh",
-        username="harsh.gokani@checkmarx.com",
-        email="harsh.gokani@checkmarx.com",
-        first_name="Harsh",
-        last_name="Gokani",
+        user_id="user-alice",
+        username="alice.archer@example.com",
+        email="alice.archer@example.com",
+        first_name="Alice",
+        last_name="Archer",
         groups=["AA-Platform"],
     )
     tenant.add_user(
-        user_id="user-sean",
-        username="sean.casey@checkmarx.com",
-        email="sean.casey@checkmarx.com",
-        first_name="Sean",
-        last_name="Casey",
+        user_id="user-bob",
+        username="bob.baker@example.com",
+        email="bob.baker@example.com",
+        first_name="Bob",
+        last_name="Baker",
         groups=["Payments"],
     )
     tenant.add_user(
-        user_id="user-akash",
-        username="akash",
-        email="akash.singh@checkmarx.com",
-        first_name="Akash",
-        last_name="Singh",
+        user_id="user-carol",
+        username="carol",
+        email="carol.chen@example.com",
+        first_name="Carol",
+        last_name="Chen",
         groups=["AA-Platform", "Payments"],
     )
 
@@ -914,13 +1117,13 @@ def populated_tenant() -> FakeTenant:
 
     # Resolvable by email, by display name, and not at all.
     tenant.set_user_credits(
-        name="Harsh Gokani",
-        email="harsh.gokani@checkmarx.com",
+        name="Alice Archer",
+        email="alice.archer@example.com",
         credits=3,
         actions={"remediation": 1},
     )
-    tenant.set_user_credits(name="Sean Casey", credits=5, actions={"triage": 5})
-    tenant.set_user_credits(name="departed.person@checkmarx.com", credits=7)
+    tenant.set_user_credits(name="Bob Baker", credits=5, actions={"triage": 5})
+    tenant.set_user_credits(name="departed.person@example.com", credits=7)
 
     tenant.set_entity_credits(
         view="application", name="Payments", credits=12, entity_id="app-payments"
@@ -930,13 +1133,26 @@ def populated_tenant() -> FakeTenant:
     tenant.set_entity_credits(
         view="project", name="platform/tools", credits=2, entity_id="proj-tools"
     )
+    # The action dimension in the shape a live tenant returns it: the action's
+    # display name, credits as a string, and the transactions nested under
+    # actionsPerformed like every other dimension (no id).
     tenant.consumption["action"] = [
-        {"name": "triage", "actionType": "triage", "transactionCount": 9, "creditsUsed": 9},
-        {
-            "name": "remediation",
-            "actionType": "remediation",
-            "transactionCount": 2,
-            "creditsUsed": 6,
-        },
+        action_row("Triage", credits="9", action_type="triage", transactions=9),
+        action_row("Remediation", credits="6", action_type="remediation", transactions=2),
     ]
     return tenant
+
+
+def action_row(
+    name: str, *, credits: str | int | float, action_type: str, transactions: int
+) -> dict[str, Any]:
+    """One viewBy=action row, in the shape a live tenant returns it."""
+    return {
+        "name": name,
+        "creditsUsed": credits,
+        "percentOfTotal": 1.0,
+        "actionsPerformed": {
+            "actions": [{"actionType": action_type, "transactionCount": transactions}],
+            "total": transactions,
+        },
+    }

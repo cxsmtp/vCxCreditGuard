@@ -76,6 +76,15 @@ def get_scheduler() -> BackgroundScheduler:
     return _scheduler
 
 
+def is_running() -> bool:
+    """True once this process's scheduler has started and until it is shut down.
+
+    False when it never started: a process created without it (tests, a
+    second instance that does not run cycles) or one whose start failed.
+    """
+    return _scheduler is not None and bool(_scheduler.running)
+
+
 def start() -> None:
     scheduler = get_scheduler()
     trigger = _build_trigger()

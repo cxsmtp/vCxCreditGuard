@@ -30,6 +30,15 @@ from tests.fake_tenant import ALL_ROLES, FakeTenant, populated_tenant
 
 ACTOR = AuditActor.system("test")
 AUGUST = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _readings_in_august(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Readings are taken in the month these tests evaluate: the ledger counts
+    an increase towards the period it was observed in."""
+    monkeypatch.setattr(ingestion, "utcnow", lambda: datetime(2026, 8, 11, 11, 0, tzinfo=UTC))
+
+
 PERIOD = "2026-08"
 
 
@@ -68,13 +77,13 @@ def has_ai_roles(tenant: FakeTenant, user_id: str) -> bool:
 
 
 def breach_two_users(db: Session):
-    """Harsh and Sean both go over an enforced limit in the same cycle."""
+    """Alice and Bob both go over an enforced limit in the same cycle."""
     tenant, client = synced(db)
-    limit_on(db, "user-harsh")
-    limit_on(db, "user-sean")
+    limit_on(db, "user-alice")
+    limit_on(db, "user-bob")
     evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)  # baseline
-    tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
-    tenant.set_user_credits(name="Sean Casey", credits=60)
+    tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
+    tenant.set_user_credits(name="Bob Baker", credits=60)
     ingestion.ingest_usage(db, client)
     return tenant, client
 
@@ -92,7 +101,7 @@ class TestSafetyCeiling:
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
 
         # Not one of them, not the first few: nobody.
-        assert has_ai_roles(tenant, "user-harsh") and has_ai_roles(tenant, "user-sean")
+        assert has_ai_roles(tenant, "user-alice") and has_ai_roles(tenant, "user-bob")
         assert result.enforced == 0 and result.deferred == 2
         assert result.enforcement_paused and "safety ceiling of 1" in result.enforcement_paused
         assert db.scalar(select(func.count()).select_from(EnforcementAction)) == 0
@@ -110,11 +119,16 @@ class TestSafetyCeiling:
         set_ceiling(db, 1)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
 
-        # Even with a single limit now over the line, nothing is applied.
-        tenant.set_user_credits(name="Sean Casey", credits=5)
-        ingestion.ingest_usage(db, client)
+        # Even with a single limit now over the line, nothing is applied. (Bob's
+        # limit is switched off: a lower reading no longer takes back usage a
+        # period has counted, see app/services/ledger.py.)
+        from app.models.limits import CreditLimit
+
+        for limit in db.scalars(select(CreditLimit).where(CreditLimit.entity_id == "user-bob")):
+            limit.is_active = False
+        db.commit()
         again = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert again.enforced == 0 and has_ai_roles(tenant, "user-harsh")
+        assert again.enforced == 0 and has_ai_roles(tenant, "user-alice")
         # One alert, not one per cycle.
         assert (
             db.scalar(
@@ -130,14 +144,14 @@ class TestSafetyCeiling:
         db.commit()
         resumed = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         assert resumed.enforced == 1
-        assert not has_ai_roles(tenant, "user-harsh")
+        assert not has_ai_roles(tenant, "user-alice")
 
     def test_within_the_ceiling_enforcement_is_normal(self, db: Session) -> None:
         tenant, client = breach_two_users(db)
         set_ceiling(db, 2)
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         assert result.enforced == 2 and result.enforcement_paused is None
-        assert not has_ai_roles(tenant, "user-harsh") and not has_ai_roles(tenant, "user-sean")
+        assert not has_ai_roles(tenant, "user-alice") and not has_ai_roles(tenant, "user-bob")
 
     def test_restrictions_already_in_place_do_not_count_towards_it(self, db: Session) -> None:
         tenant, client = breach_two_users(db)
@@ -161,18 +175,18 @@ class TestPause:
     def test_a_pause_stops_new_restrictions_but_not_restores(self, db: Session) -> None:
         tenant, client = breach_two_users(db)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert not has_ai_roles(tenant, "user-harsh")
+        assert not has_ai_roles(tenant, "user-alice")
 
         settings_store.set_value(db, settings_store.KEY_ENFORCEMENT_PAUSED, True)
         db.commit()
-        # Harsh's budget is raised while enforcement is paused: access comes back.
-        harsh = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-harsh"))
-        harsh.credit_limit = 10_000
+        # Alice's budget is raised while enforcement is paused: access comes back.
+        alice = db.scalar(select(CreditLimit).where(CreditLimit.entity_id == "user-alice"))
+        alice.credit_limit = 10_000
         db.commit()
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert result.restored == 1 and has_ai_roles(tenant, "user-harsh")
-        # Sean stays as he was: not re-checked, not released.
-        assert not has_ai_roles(tenant, "user-sean")
+        assert result.restored == 1 and has_ai_roles(tenant, "user-alice")
+        # Bob stays as he was: not re-checked, not released.
+        assert not has_ai_roles(tenant, "user-bob")
 
     def test_the_settings_api_pauses_and_resumes_with_a_reason(
         self, admin_client: TestClient
@@ -206,26 +220,26 @@ class TestProtectedIdentities:
     def test_the_api_keys_own_account_is_never_restricted(self, db: Session) -> None:
         tenant, client = synced(db)
         connection_service.save_connection(
-            db, api_key=make_api_key(subject="user-harsh"), actor=ACTOR
+            db, api_key=make_api_key(subject="user-alice"), actor=ACTOR
         )
         db.commit()
-        limit = limit_on(db, "user-harsh")
+        limit = limit_on(db, "user-alice")
 
-        assert enforcement.plan_targets(db, entity_type="user", entity_id="user-harsh") == []
+        assert enforcement.plan_targets(db, entity_type="user", entity_id="user-alice") == []
         outcome = enforcement.apply_enforcement(
             db, client, limit=limit, period_key=PERIOD, actor=ACTOR
         )
         assert outcome.applied == [] and outcome.failed == []
-        assert has_ai_roles(tenant, "user-harsh")
+        assert has_ai_roles(tenant, "user-alice")
         # Anyone else is still restricted as normal.
-        other = limit_on(db, "user-sean")
+        other = limit_on(db, "user-bob")
         enforcement.apply_enforcement(db, client, limit=other, period_key=PERIOD, actor=ACTOR)
-        assert not has_ai_roles(tenant, "user-sean")
+        assert not has_ai_roles(tenant, "user-bob")
 
     def test_a_tenant_administrator_is_not_restricted(self, db: Session) -> None:
-        tenant = _with_admin_role(populated_tenant(), "user-harsh")
+        tenant = _with_admin_role(populated_tenant(), "user-alice")
         tenant, client = synced(db, tenant)
-        limit = limit_on(db, "user-harsh")
+        limit = limit_on(db, "user-alice")
 
         for _ in range(3):
             outcome = enforcement.apply_enforcement(
@@ -234,7 +248,7 @@ class TestProtectedIdentities:
             # A decision, not a failure: the cycle is not degraded by it.
             assert outcome.applied == [] and outcome.failed == []
             assert any("protected role (ast-admin)" in note for note in outcome.skipped)
-        assert has_ai_roles(tenant, "user-harsh")
+        assert has_ai_roles(tenant, "user-alice")
         assert not [r for r in tenant.requests if r[0] == "DELETE"]
 
         # Nothing was attempted, so there is nothing that could be "in force"...
@@ -258,11 +272,11 @@ class TestProtectedIdentities:
     ) -> None:
         from app.services import preview_service
 
-        tenant = _with_admin_role(populated_tenant(), "user-harsh")
+        tenant = _with_admin_role(populated_tenant(), "user-alice")
         tenant, client = synced(db, tenant)
-        limit_on(db, "user-harsh")
+        limit_on(db, "user-alice")
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
 
         projection = preview_service.dry_run(db, now=AUGUST)
@@ -273,17 +287,17 @@ class TestProtectedIdentities:
         """The plan is made from the last sync; the tenant is asked again at the
         moment of restricting."""
         tenant, client = synced(db)
-        tenant.role_mappings["user-harsh"] = [*ALL_ROLES, "ast-admin"]
+        tenant.role_mappings["user-alice"] = [*ALL_ROLES, "ast-admin"]
         ALL_ROLES["ast-admin"] = "b2660f23-52cb-4361-9d49-7abae5e520fd"
         try:
-            limit = limit_on(db, "user-harsh")
+            limit = limit_on(db, "user-alice")
             outcome = enforcement.apply_enforcement(
                 db, client, limit=limit, period_key=PERIOD, actor=ACTOR
             )
         finally:
             del ALL_ROLES["ast-admin"]
         assert outcome.applied == [] and outcome.failed == []
-        assert has_ai_roles(tenant, "user-harsh")
+        assert has_ai_roles(tenant, "user-alice")
         action = db.scalar(select(EnforcementAction))
         assert enforcement.may_be_in_force(action) is False
 
@@ -291,36 +305,36 @@ class TestProtectedIdentities:
         self, db: Session
     ) -> None:
         tenant, client = synced(db)
-        limit = limit_on(db, "user-harsh")
+        limit = limit_on(db, "user-alice")
         enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
-        assert not has_ai_roles(tenant, "user-harsh")
+        assert not has_ai_roles(tenant, "user-alice")
 
         # They are given the administrator role; the next sync records it.
-        _with_admin_role(tenant, "user-harsh")
+        _with_admin_role(tenant, "user-alice")
         org_sync.sync_org_model(db, client)
         db.commit()
 
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         assert result.restored == 1
-        assert has_ai_roles(tenant, "user-harsh")
+        assert has_ai_roles(tenant, "user-alice")
         action = db.scalar(select(EnforcementAction))
         db.refresh(action)
         assert action.status == EnforcementStatus.REVERSED
         assert action.reversal_reason == enforcement.PROTECTED_REASON
         # And it is not taken away again on later cycles.
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert has_ai_roles(tenant, "user-harsh")
+        assert has_ai_roles(tenant, "user-alice")
 
     def test_the_protected_roles_are_configurable(self, db: Session) -> None:
-        tenant = _with_admin_role(populated_tenant(), "user-harsh")
+        tenant = _with_admin_role(populated_tenant(), "user-alice")
         tenant, client = synced(db, tenant)
         settings_store.set_value(db, settings_store.KEY_PROTECTED_ROLES, "")
         db.commit()
-        limit = limit_on(db, "user-harsh")
+        limit = limit_on(db, "user-alice")
         outcome = enforcement.apply_enforcement(
             db, client, limit=limit, period_key=PERIOD, actor=ACTOR
         )
-        assert len(outcome.applied) == 1 and not has_ai_roles(tenant, "user-harsh")
+        assert len(outcome.applied) == 1 and not has_ai_roles(tenant, "user-alice")
 
 
 class TestChangesThatCouldNotBeUndone:
@@ -512,7 +526,7 @@ class TestCeilingCountsOnlyWhatWouldReallyChange:
         tenant, client = breach_two_users(db)
         set_ceiling(db, 2)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert not has_ai_roles(tenant, "user-harsh") and not has_ai_roles(tenant, "user-sean")
+        assert not has_ai_roles(tenant, "user-alice") and not has_ai_roles(tenant, "user-bob")
         set_ceiling(db, 1)
         return tenant, client
 
@@ -540,13 +554,13 @@ class TestCeilingCountsOnlyWhatWouldReallyChange:
         assert result.enforcement_paused is None
 
     def test_protected_users_do_not_count(self, db: Session) -> None:
-        tenant = _with_admin_role(_with_admin_role(populated_tenant(), "user-harsh"), "user-sean")
+        tenant = _with_admin_role(_with_admin_role(populated_tenant(), "user-alice"), "user-bob")
         tenant, client = synced(db, tenant)
-        limit_on(db, "user-harsh")
-        limit_on(db, "user-sean")
+        limit_on(db, "user-alice")
+        limit_on(db, "user-bob")
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
-        tenant.set_user_credits(name="Sean Casey", credits=60)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
+        tenant.set_user_credits(name="Bob Baker", credits=60)
         ingestion.ingest_usage(db, client)
         set_ceiling(db, 1)
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -559,6 +573,8 @@ class TestCeilingCountsOnlyWhatWouldReallyChange:
         settings_store.set_value(db, settings_store.KEY_MAX_NEW_TARGETS, 1)
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)  # baseline
+        # The application's own row feeds its budget from its third reading (ninth review).
+        ingestion.ingest_usage(db, client)
         tenant.set_entity_credits(
             view="application", name="Payments", credits=500, entity_id="app-payments"
         )
@@ -586,7 +602,7 @@ class TestResuming:
 
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         assert result.enforcement_paused is None and result.enforced == 2
-        assert not has_ai_roles(tenant, "user-harsh") and not has_ai_roles(tenant, "user-sean")
+        assert not has_ai_roles(tenant, "user-alice") and not has_ai_roles(tenant, "user-bob")
         # The waiver was for that batch only.
         assert settings_store.enforcement_guard(db).ceiling_waived_once is False
 
@@ -632,7 +648,7 @@ class TestPauseIsImmediate:
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
 
         assert result.enforced == 1 and result.deferred == 1
-        restricted = [u for u in ("user-harsh", "user-sean") if not has_ai_roles(tenant, u)]
+        restricted = [u for u in ("user-alice", "user-bob") if not has_ai_roles(tenant, u)]
         assert len(restricted) == 1
 
     def test_the_breach_notice_does_not_claim_a_restriction_while_paused(self, db: Session) -> None:
@@ -657,7 +673,7 @@ class TestPauseIsImmediate:
         monkeypatch.setattr(evaluation, "_about_to_start_restricting", boom)
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         assert result.enforced == 0 and result.evaluated == 2
-        assert has_ai_roles(tenant, "user-harsh")
+        assert has_ai_roles(tenant, "user-alice")
         assert any("safety check" in error for error in result.errors)
 
 
@@ -666,17 +682,17 @@ class TestProtectionAppliesAfterTheFact:
         self, db: Session
     ) -> None:
         tenant, client = synced(db)
-        limit = limit_on(db, "user-harsh")
+        limit = limit_on(db, "user-alice")
         enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
-        assert not has_ai_roles(tenant, "user-harsh")
+        assert not has_ai_roles(tenant, "user-alice")
 
         # The connection is then switched to a key that belongs to that user.
         connection_service.save_connection(
-            db, api_key=make_api_key(subject="user-harsh"), actor=ACTOR
+            db, api_key=make_api_key(subject="user-alice"), actor=ACTOR
         )
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert has_ai_roles(tenant, "user-harsh")
+        assert has_ai_roles(tenant, "user-alice")
 
 
 class TestBackupsDoNotLoosenTheGuard:

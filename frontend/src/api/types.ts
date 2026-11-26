@@ -274,10 +274,21 @@ export interface ConnectionTestResult {
 }
 
 export interface ActionBreakdownItem {
+  /** As Checkmarx reports it ("Fusion Scan - Opus 5.5"); a normalised type when
+   * the breakdown is derived from per-user counts. */
   action_type: string;
   credits: string;
   transactions: number | null;
   percent_of_total: number | null;
+  /** The normalised type ("fusion"), for a stable colour. */
+  action_bucket?: string | null;
+  /** Credits / transactions as the feed reports them. */
+  credits_per_transaction?: string | null;
+  /** The listed rate (credits per action), when Checkmarx lists one. */
+  listed_rate?: string | null;
+  /** What CreditGuard prices one transaction at: the listed rate, or the feed's
+   * average where the rate does not match it. */
+  price_source?: "rate" | "observed" | null;
 }
 
 export interface TrendPoint {
@@ -299,6 +310,8 @@ export interface TopConsumer {
   resolved: boolean;
   /** Auto-triage credits charged to this person from scans they started (setting on). */
   auto_triage_attributed?: string | null;
+  /** Users only: automation (Auto Triage, a bot, an integration identity), not a person. */
+  automation?: boolean;
 }
 
 export interface StatusTiles {
@@ -332,6 +345,71 @@ export interface Dashboard {
   tiles: StatusTiles;
   unavailable_dimensions: string[];
   credit_pool: CreditPoolInfo | null;
+  attribution?: AttributionSummary | null;
+}
+
+export interface UnmatchedEntities {
+  count: number;
+  credits: string;
+  total_credits: string;
+  top: { name: string; credits: string }[];
+}
+
+/** Usage that counts towards no limit, and why (latest readings). */
+export interface AttributionSummary {
+  unmatched_people: number;
+  unmatched_people_credits: string;
+  automation: number;
+  automation_credits: string;
+  user_total_credits: string;
+  projects: UnmatchedEntities;
+  applications: UnmatchedEntities;
+}
+
+export interface UnmatchedEntity {
+  view: "project" | "application";
+  subject_key: string;
+  name: string;
+  credits: string;
+  mapped_entity_id: string | null;
+  mapped_label: string | null;
+  /** Mapped to a project or application that is no longer synced: ignored. */
+  mapping_broken?: boolean;
+  /** Mapped, but the name now matches a synced entity by itself, which wins. */
+  overridden?: boolean;
+  overridden_by?: string | null;
+  /** After a mapping: where the name's usage counts from now on. */
+  confirmation?: string | null;
+  /** Keyset paging: the next page starts after this row, from these readings. */
+  cursor?: string | null;
+  readings?: string | null;
+}
+
+/** Whether a user restriction can bite (GET /api/preview/coverage). */
+export interface EnforcementCoverage {
+  computed_at: string;
+  ai_roles: string[];
+  protected_roles: string[];
+  users: number;
+  ai_holders: number;
+  restrictable: number;
+  share: number | null;
+  via_composite: number;
+  via_group: number;
+  via_composite_or_group: number;
+  protected: number;
+  unknown: number;
+  composites: Record<string, string[]>;
+  composite_holders: Record<string, number>;
+  groups_granting: string[];
+  dedicated_roles: string[];
+  notes: string[];
+  available: boolean;
+  low: boolean;
+  warning: string | null;
+  /** False when no AI holder's roles could be read: no verdict either way. */
+  determined?: boolean;
+  undetermined?: string | null;
 }
 
 export interface CreditPoolInfo {
@@ -341,6 +419,13 @@ export interface CreditPoolInfo {
   collected_at: string | null;
   assigned: string;
   over_allocation: string | null;
+  /** Checkmarx's own credit enforcement, as /credits/info reports it (read only). */
+  checkmarx_enforcement?: {
+    state?: string;
+    consumptionPct?: number;
+    warningThresholdPct?: number;
+    cutoffThresholdPct?: number;
+  } | null;
 }
 
 export interface LimitPeriodState {
@@ -610,6 +695,17 @@ export interface AppSettings {
   allowed_accents: string[];
   self_service_requests: boolean;
   charge_auto_triage_to_scan_initiator: boolean;
+  /** Where project, user and application budgets get their usage: the credit
+   * activity log (with the summary as fallback) or the summary only. */
+  usage_source: "activity" | "summary";
+  /** With the summary only: whether summary totals may restrict period budgets. */
+  summary_restricts: boolean;
+  allowed_usage_sources?: string[];
+  /** Pages of the activity log one cycle may read (0 = no cap). */
+  activity_max_pages_per_cycle: number;
+  /** Extra integration account names (besides [bot] accounts, Auto-triage, Auto-remediation). */
+  integration_accounts: string[];
+  usage_source_status?: UsageSourceStatus | null;
   report_email_enabled: boolean;
   credit_unit_cost: number;
   demo_mode: boolean;
@@ -639,6 +735,24 @@ export interface AppSettings {
   attribution_requests_per_cycle: number;
   read_concurrency: number;
   cycle_time_budget_pct: number;
+}
+
+export interface UsageSourceStatus {
+  setting: string;
+  status: "active" | "inactive" | "fallback" | "off";
+  active_since?: string | null;
+  last_success_at?: string | null;
+  failing_since?: string | null;
+  retry_after?: string | null;
+  last_error?: string | null;
+  reconciliation?: {
+    status?: string;
+    at?: string;
+    period?: string;
+    activity_credits?: string;
+    summary_credits?: string | null;
+    reason?: string;
+  } | null;
 }
 
 export interface SchedulerStatus {
@@ -671,6 +785,8 @@ export interface SubjectSuggestion {
 export type SubjectStatus = "unmatched" | "disputed" | "auto_matched";
 
 export interface UnresolvedSubject {
+  /** After a mapping: what moved, and how budgets count it. */
+  confirmation?: string | null;
   id: number;
   subject_key: string;
   subject_name: string | null;
@@ -905,6 +1021,8 @@ export interface DryRunRow {
   note: string | null;
   /** The auto-triage part of credits_used, when charged to scan initiators. */
   auto_triage_attributed?: string | null;
+  /** A new period-budget restriction: it starts only if a direct recount of the activity log agrees. */
+  recount_required?: boolean;
 }
 
 export interface DryRunResult {
@@ -969,4 +1087,139 @@ export interface ViolationList {
   total: number;
   /** Open violations to follow up (information rows are never counted). */
   open: number;
+}
+
+/* ------------------------------------------------ enforcement self-test */
+
+export type SelfTestStatus =
+  | "running"
+  | "passed"
+  | "warning"
+  | "failed"
+  | "restore_failed"
+  | "interrupted";
+
+export type SelfTestProjectAction = "auto_triage" | "pr_remediation" | "fusion";
+
+export interface SelfTestRefusal {
+  target_type: "user" | "project" | null;
+  target_id: string | null;
+  label: string | null;
+  code: string;
+  reason: string;
+}
+
+/** POST /api/settings/selftest/check: what a self-test would change, or why not. */
+export interface SelfTestPlan {
+  allowed: boolean;
+  busy: boolean;
+  demo: boolean;
+  targets: {
+    target_type: "user" | "project";
+    target_id: string;
+    label: string;
+    kinds: string[];
+    changes: string[];
+  }[];
+  refusals: SelfTestRefusal[];
+  warnings: string[];
+  notes: string[];
+  duration: string;
+}
+
+export interface SelfTestStep {
+  step: string;
+  label: string;
+  ok: boolean;
+  ms: number;
+  detail: string;
+}
+
+export interface SelfTestSettingRow {
+  setting: string;
+  before: unknown;
+  restricted: unknown;
+  restored: unknown;
+  changed: boolean;
+  restored_equal: boolean;
+  owned_by: string | null;
+}
+
+export interface SelfTestTargetReport {
+  target_type: "user" | "project";
+  target_id: string;
+  label: string;
+  status: SelfTestStatus;
+  summary: string;
+  ms: number;
+  kinds: { kind: string; outcome: string; detail: string; action_id?: number | null }[];
+  steps: SelfTestStep[];
+  settings: SelfTestSettingRow[];
+  cannot_bite: { role: string; via: string[] }[];
+  warnings: string[];
+  failures: string[];
+  restore: {
+    ok: boolean | null;
+    held: number[];
+    detail?: string;
+    actions: {
+      action_id: number;
+      kind: string;
+      needed: boolean;
+      restored: boolean;
+      detail: string;
+      held?: boolean;
+      snapshot?: Record<string, unknown>;
+    }[];
+  };
+}
+
+export interface SelfTestResult {
+  id: number;
+  started_at: string;
+  finished_at: string | null;
+  status: SelfTestStatus;
+  actor_name: string | null;
+  demo: boolean;
+  user_id: string | null;
+  user_label: string | null;
+  project_id: string | null;
+  project_label: string | null;
+  summary: string | null;
+  result: {
+    notes?: string[];
+    warnings?: string[];
+    targets?: SelfTestTargetReport[];
+  };
+}
+
+/** GET /api/settings/selftest */
+export interface SelfTestListing {
+  running: boolean;
+  demo: boolean;
+  notes: string[];
+  keep: number;
+  results: SelfTestResult[];
+}
+
+// ---- Readiness checklist (Settings → Enforcement, Diagnose) ----
+
+export type ReadinessStatus = "green" | "amber" | "red";
+
+export interface ReadinessItem {
+  key: string;
+  label: string;
+  status: ReadinessStatus;
+  detail: string;
+  hint: string;
+  link: string;
+}
+
+export interface Readiness {
+  items: ReadinessItem[];
+  gate_active: boolean;
+  enforcement_on: boolean;
+  all_green: boolean;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
 }

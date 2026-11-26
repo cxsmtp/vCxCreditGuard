@@ -64,7 +64,7 @@ def test_unattributed_usage_warns(tenant: FakeTenant, db: Session) -> None:
     now = utcnow()
     db.add(
         UnresolvedSubject(
-            subject_key="ghost@acme.com",
+            subject_key="ghost@example.com",
             subject_name="Ghost",
             credits_used=5,
             times_seen=1,

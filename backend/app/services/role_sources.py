@@ -45,6 +45,7 @@ from sqlalchemy.orm import Session
 from app.checkmarx import iam
 from app.checkmarx.client import CheckmarxClient, listeners_paused, single_attempt
 from app.checkmarx.errors import (
+    CheckmarxAuthError,
     CheckmarxError,
     CheckmarxRateLimitError,
     CheckmarxUnavailableError,
@@ -65,6 +66,7 @@ T = TypeVar("T")
 
 # Why reads stopped under a ReadBudget, in words.
 STOPPED_UNAVAILABLE = "Checkmarx IAM did not answer"
+STOPPED_REFUSED = "Checkmarx One refused the API key"
 
 
 @dataclass(slots=True)
@@ -264,6 +266,13 @@ class RoleSourceReader:
             logger.info("IAM read failed (%s): %s", what, exc)
             if budget is not None and budget.stopped is None:
                 budget.stopped = STOPPED_UNAVAILABLE
+            return None
+        except CheckmarxAuthError as exc:
+            # The key is refused (revoked, wrong tenant): every read after this
+            # one would ask for a token again and be refused the same way.
+            logger.info("IAM read refused (%s): %s", what, exc)
+            if budget is not None and budget.stopped is None:
+                budget.stopped = STOPPED_REFUSED
             return None
         except CheckmarxError as exc:
             logger.info("IAM read failed (%s): %s", what, exc)
@@ -536,6 +545,10 @@ class ClientRoleListing:
         return frozenset(role.name for role in self.roles)
 
 
+# How long a failed listing is remembered before it is tried again.
+CLIENT_ROLE_FAILURE_CACHE_SECONDS = 60.0
+
+
 def reset_client_role_cache() -> None:
     global _listing_cache
     with _listing_lock:
@@ -572,10 +585,18 @@ def tenant_client_roles(session: Session, *, fresh: bool = False) -> ClientRoleL
         roles = iam.fetch_client_roles(client, client_uuid=uuid)
     except CheckmarxError as exc:
         logger.info("Could not list the tenant's client roles: %s", exc)
-        return ClientRoleListing(
+        failed = ClientRoleListing(
             available=False,
-            message=f"The tenant's roles could not be read from Checkmarx One: {exc}",
+            message=(
+                "The tenant's roles could not be read from Checkmarx One: "
+                f"{error_text.public_error(exc)}"
+            ),
         )
+        # Remembered briefly, so a refused key does not ask for a token on
+        # every page that lists roles.
+        with _listing_lock:
+            _listing_cache = (key, now + CLIENT_ROLE_FAILURE_CACHE_SECONDS, failed)
+        return failed
     except Exception as exc:  # noqa: BLE001 - listing roles must never break a page
         logger.warning("Could not list the tenant's client roles", exc_info=True)
         return ClientRoleListing(

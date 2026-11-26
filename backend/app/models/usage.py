@@ -105,11 +105,16 @@ class UsageRecord(Base):
     transactions: Mapped[int | None] = mapped_column(Integer)
     # Per action breakdown: {"triage": 3, "remediation": 1}
     actions: Mapped[dict | None] = mapped_column(JSONColumn)
-    # The row as the feed sent it. Kept for a week (RAW_KEEP_DAYS in
-    # app/services/retention.py), and for as long as the snapshot is one a
-    # reader needs it on (the latest, the readings a period's usage breakdown
-    # starts from) or the row matched no entity; then cleared to save space.
     raw: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    # When the name's total last rose (or it first appeared), carried from
+    # reading to reading by the ledger. Once that is older than the lookback
+    # window, nothing the name reported can still be in it.
+    last_rise_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # User view: how many display-name-only rows (no id, no email) the
+    # subject was read as. When it changes between readings, two people who
+    # share a display name were split or joined by the page layout, and the
+    # ledger counts nothing for that reading.
+    display_rows: Mapped[int | None] = mapped_column(Integer)
 
     snapshot: Mapped[UsageSnapshot] = relationship(back_populates="records")
 
@@ -163,6 +168,163 @@ class UnresolvedSubject(Base):
     match_score: Mapped[float | None] = mapped_column(Float)
     # Ranked candidates: [{"user_id", "label", "score"}], best first.
     suggestions: Mapped[list | None] = mapped_column(JSONColumn)
+    # When the "new automation identity" notice was raised for this subject
+    # (once ever; the notice itself is pruned by retention).
+    automation_noticed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+class EntityMapping(Base):
+    """An admin's mapping of a consumption name that matches no project or
+    application to the one it belongs to (Settings → Attribution).
+
+    One row per (dimension, reported name), so two admins mapping different
+    names at once can never overwrite each other. A real name match always
+    wins over a mapping; a mapping to an entity that is gone is ignored.
+    """
+
+    __tablename__ = "entity_mapping"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # "project" or "application".
+    view_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The reported name, lowercased and trimmed (the usage record's subject key).
+    subject_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    mapped_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    mapped_by: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (UniqueConstraint("view_by", "subject_key", name="entity_mapping_subject"),)
+
+
+class UsageDelta(Base):
+    """One reading's increase of one reported name: the usage ledger.
+
+    The consumption feed reports cumulative totals over its lookback window.
+    Every live reading compares each name with its total in the previous live
+    reading of the same view and records the increase, attributed to the
+    entity the name counts towards at that moment (``entity_id``; None while it
+    counts towards nothing). Period budgets add these up (``BudgetUsage``), so
+    a mapping, a rename, a deletion or a group change only ever moves usage
+    observed from then on: history is never imported, and usage already
+    counted is never taken back. See app/services/ledger.py for the rules.
+
+    ``actions`` holds the increase per action type (``"fusion_model:<key>"``
+    entries per Fusion model). ``since`` is when the name's previous total was
+    read, so the increase happened between ``since`` and ``observed_at``; it
+    counts towards the budget period both fall in, and towards none when the
+    interval spans the period's start. A row for a name that counted towards
+    nothing may be claimed later (``claimed_at``) by an entity synced shortly
+    after it was observed, so a project created and used before the sync
+    brought it keeps its usage.
+    """
+
+    __tablename__ = "usage_delta"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Not a foreign key: thinning old readings must not take the ledger along.
+    snapshot_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    view_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    entity_type: Mapped[str | None] = mapped_column(String(16))
+    entity_id: Mapped[str | None] = mapped_column(String(64))
+    credits: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    actions: Mapped[dict | None] = mapped_column(JSONColumn)
+    observed_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    since: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "view_by", "subject_key", name="usage_delta_reading"),
+        Index("ix_usage_delta_entity", "view_by", "entity_id", "observed_at"),
+        Index("ix_usage_delta_subject", "view_by", "subject_key"),
+        Index("ix_usage_delta_observed", "observed_at"),
+    )
+
+
+class UsageMissingName(Base):
+    """A name whose last total the ledger keeps, because the latest live
+    reading does not give it.
+
+    ``kind`` "missing": the reading lacked the name. Its return adds only what
+    it reported since, and a new name of the same entity (a rename), or one
+    appearing as it left, starts from it. Dropped once older than the lookback
+    window: nothing of that total can be left in the window then.
+
+    ``kind`` "dip": the name fell in a reading the completeness checks doubted
+    (a short or repeated page). The fall is not believed: the name continues
+    from this total until it recovers, a believed reading confirms the fall, or
+    the fall persists through ``ledger.DIP_MAX_DOUBTS`` doubted readings or
+    ``ledger.DIP_MAX_AGE``, whichever comes first.
+
+    ``kind`` "rebase": missing when the lookback window changed; it starts
+    afresh when it returns.
+    """
+
+    __tablename__ = "usage_missing_name"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    view_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    last_total: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    last_actions: Mapped[dict | None] = mapped_column(JSONColumn)
+    missing_since: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    # When the reading that last gave ``last_total`` was taken.
+    last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    period_param: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The entity the name counted towards in that reading.
+    entity_id: Mapped[str | None] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="missing")
+    # When the name's total last rose (forgotten once that is older than the
+    # lookback window), and how many doubted readings a dip has held through.
+    last_rise_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    doubts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        UniqueConstraint("view_by", "subject_key", name="usage_missing_name_subject"),
+    )
+
+
+class BudgetUsage(Base):
+    """A budget's usage counter for one period, from the ledger: the
+    increases observed in that period (whose interval lies within it) while a
+    name counted towards an entity that fed the budget. Every active budget is
+    fed, whatever its period type; one that counts usage already reported does
+    not read its counter. Pruned with the period states.
+    """
+
+    __tablename__ = "budget_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    limit_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_limit.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    period_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    credits: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False, default=Decimal("0"))
+    actions: Mapped[dict | None] = mapped_column(JSONColumn)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+
+    __table_args__ = (UniqueConstraint("limit_id", "period_key", name="budget_usage_period"),)
+
+
+class UsageEntityOffset(Base):
+    """How far a project's reported Auto Triage figure has been shifted by names
+    joining or leaving it (a mapping, a rename, a move, a name missing from a
+    reading and back) rather than by usage. Auto Triage attribution subtracts it,
+    so a project's reading moves only by Auto Triage observed while a name
+    counted towards the project (see app/services/ledger.py)."""
+
+    __tablename__ = "usage_entity_offset"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    view_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    auto_triage_transactions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    auto_triage_credits: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4), nullable=False, default=Decimal("0")
+    )
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+
+    __table_args__ = (UniqueConstraint("view_by", "entity_id", name="usage_entity_offset_entity"),)
 
 
 class AutoTriageCharge(Base):

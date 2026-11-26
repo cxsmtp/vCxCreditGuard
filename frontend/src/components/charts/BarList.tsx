@@ -105,9 +105,16 @@ export function BarList({ items, emptyTitle, emptyDescription, unavailable }: Pr
                         item.label
                       )}
                     </span>
-                    {!item.resolved && (
-                      <Badge tone="warning">Not matched to a user</Badge>
-                    )}
+                    {!item.resolved &&
+                      (item.automation ? (
+                        <Badge tone="info">Automation</Badge>
+                      ) : (
+                        <Badge tone="warning">
+                          {item.entity_type === "user"
+                            ? "Not matched to a user"
+                            : `Not matched to a ${item.entity_type}`}
+                        </Badge>
+                      ))}
                     {item.status === "restricted" && <Badge tone="critical">Restricted</Badge>}
                     {item.status === "breached" && <Badge tone="critical">Over limit</Badge>}
                     {item.status === "warned" && <Badge tone="warning">Near limit</Badge>}

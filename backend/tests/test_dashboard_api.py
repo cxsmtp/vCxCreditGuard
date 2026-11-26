@@ -62,14 +62,17 @@ class TestDashboard:
         body = admin_client.get("/api/dashboard").json()
         assert float(body["tenant_total_credits"]) == 15.0
         actions = {item["action_type"]: item for item in body["breakdown"]}
-        assert set(actions) == {"triage", "remediation"}
-        assert float(actions["triage"]["credits"]) == 9.0
+        # As Checkmarx reports the names, not lowercased.
+        assert set(actions) == {"Triage", "Remediation"}
+        assert float(actions["Triage"]["credits"]) == 9.0
+        assert actions["Triage"]["action_bucket"] == "triage"
+        assert float(actions["Remediation"]["credits_per_transaction"]) == 3.0
 
     def test_top_consumers_per_dimension(
         self, admin_client: TestClient, tenant: FakeTenant
     ) -> None:
         body = admin_client.get("/api/dashboard").json()
-        assert [item["label"] for item in body["top_users"]][0] == "departed.person@checkmarx.com"
+        assert [item["label"] for item in body["top_users"]][0] == "departed.person@example.com"
         assert float(body["top_users"][0]["credits"]) == 7.0
         assert {item["label"] for item in body["top_projects"]} == {
             "payments/api",
@@ -83,7 +86,7 @@ class TestDashboard:
     ) -> None:
         body = admin_client.get("/api/dashboard").json()
         departed = next(
-            item for item in body["top_users"] if item["label"] == "departed.person@checkmarx.com"
+            item for item in body["top_users"] if item["label"] == "departed.person@example.com"
         )
         assert departed["resolved"] is False
         assert departed["entity_id"] is None
@@ -159,15 +162,15 @@ class TestEntitySearch:
     ) -> None:
         rows = admin_client.get("/api/org/entities?entity_type=user").json()
         assert len(rows) == 3
-        harsh = next(row for row in rows if row["entity_id"] == "user-harsh")
-        assert harsh["label"] == "Harsh Gokani"
-        assert harsh["secondary"] == "harsh.gokani@checkmarx.com"
+        alice = next(row for row in rows if row["entity_id"] == "user-alice")
+        assert alice["label"] == "Alice Archer"
+        assert alice["secondary"] == "alice.archer@example.com"
 
     def test_search_matches_name_and_email(
         self, admin_client: TestClient, tenant: FakeTenant
     ) -> None:
-        assert len(admin_client.get("/api/org/entities?entity_type=user&q=gokani").json()) == 1
-        assert len(admin_client.get("/api/org/entities?entity_type=user&q=Sean").json()) == 1
+        assert len(admin_client.get("/api/org/entities?entity_type=user&q=archer").json()) == 1
+        assert len(admin_client.get("/api/org/entities?entity_type=user&q=Bob").json()) == 1
 
     def test_search_matches_project_names(
         self, admin_client: TestClient, tenant: FakeTenant
@@ -180,16 +183,16 @@ class TestEntitySearch:
     ) -> None:
         admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         )
-        admin_client.post("/api/exemptions", json={"entity_type": "user", "entity_id": "user-sean"})
+        admin_client.post("/api/exemptions", json={"entity_type": "user", "entity_id": "user-bob"})
         rows = {
             row["entity_id"]: row
             for row in admin_client.get("/api/org/entities?entity_type=user").json()
         }
-        assert rows["user-harsh"]["has_limit"] is True
-        assert rows["user-sean"]["is_exempt"] is True
-        assert rows["user-akash"]["has_limit"] is False
+        assert rows["user-alice"]["has_limit"] is True
+        assert rows["user-bob"]["is_exempt"] is True
+        assert rows["user-carol"]["has_limit"] is False
 
     def test_deleted_entities_are_hidden_by_default(
         self, admin_client: TestClient, db: Session, tenant: FakeTenant
@@ -217,7 +220,7 @@ class TestAuditApi:
     def test_lists_entries_newest_first(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         )
         body = admin_client.get("/api/audit").json()
         assert body["total"] >= 2
@@ -227,7 +230,7 @@ class TestAuditApi:
     def test_filters_by_action(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         )
         body = admin_client.get("/api/audit?action=limit.created").json()
         assert body["total"] == 1
@@ -236,9 +239,9 @@ class TestAuditApi:
     def test_free_text_search(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         )
-        assert admin_client.get("/api/audit?q=Harsh").json()["total"] >= 1
+        assert admin_client.get("/api/audit?q=Alice").json()["total"] >= 1
 
     def test_pagination(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         first = admin_client.get("/api/audit?limit=1&offset=0").json()
@@ -255,7 +258,7 @@ class TestUnresolvedSubjects:
     def test_they_are_listed(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         rows = admin_client.get("/api/usage/unresolved").json()
         assert len(rows) == 1
-        assert rows[0]["subject_key"] == "departed.person@checkmarx.com"
+        assert rows[0]["subject_key"] == "departed.person@example.com"
         assert float(rows[0]["credits_used"]) == 7.0
 
     def test_mapping_attributes_future_usage(
@@ -263,17 +266,17 @@ class TestUnresolvedSubjects:
     ) -> None:
         subject_id = admin_client.get("/api/usage/unresolved").json()[0]["id"]
         response = admin_client.post(
-            f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-akash"}
+            f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-carol"}
         )
         assert response.status_code == httpx.codes.OK
-        assert response.json()["mapped_user_label"] == "Akash Singh"
+        assert response.json()["mapped_user_label"] == "Carol Chen"
 
         client = connection_service.get_client(db)
         ingestion.ingest_usage(db, client)
         db.commit()
         from app.models.enums import UsageView
 
-        assert float(ingestion.latest_totals(db, UsageView.USER)["user-akash"]) == 7.0
+        assert float(ingestion.latest_totals(db, UsageView.USER)["user-carol"]) == 7.0
 
     def test_mapping_attributes_immediately(
         self, admin_client: TestClient, db: Session, tenant: FakeTenant
@@ -281,33 +284,33 @@ class TestUnresolvedSubjects:
         """The latest snapshot is re-pointed on the spot, without a fresh cycle."""
         subject_id = admin_client.get("/api/usage/unresolved").json()[0]["id"]
         body = admin_client.post(
-            f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-akash"}
+            f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-carol"}
         ).json()
         # The response reflects the new attribution for the GUI to render at once.
-        assert body["counts_towards_user_id"] == "user-akash"
-        assert body["counts_towards_label"] == "Akash Singh"
+        assert body["counts_towards_user_id"] == "user-carol"
+        assert body["counts_towards_label"] == "Carol Chen"
 
         from app.models.enums import UsageView
 
         # No new ingest has run, yet the credits already count towards the user.
-        assert float(ingestion.latest_totals(db, UsageView.USER)["user-akash"]) == 7.0
+        assert float(ingestion.latest_totals(db, UsageView.USER)["user-carol"]) == 7.0
 
     def test_clearing_a_mapping_reverts_the_snapshot(
         self, admin_client: TestClient, db: Session, tenant: FakeTenant
     ) -> None:
         subject_id = admin_client.get("/api/usage/unresolved").json()[0]["id"]
-        admin_client.post(f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-akash"})
+        admin_client.post(f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-carol"})
         admin_client.post(f"/api/usage/unresolved/{subject_id}/map", json={"user_id": None})
 
         from app.models.enums import UsageView
 
-        assert "user-akash" not in ingestion.latest_totals(db, UsageView.USER)
+        assert "user-carol" not in ingestion.latest_totals(db, UsageView.USER)
 
     def test_mapping_is_audited(
         self, admin_client: TestClient, db: Session, tenant: FakeTenant
     ) -> None:
         subject_id = admin_client.get("/api/usage/unresolved").json()[0]["id"]
-        admin_client.post(f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-akash"})
+        admin_client.post(f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-carol"})
         assert db.scalar(
             select(AuditLogEntry).where(AuditLogEntry.action == "usage.subject_mapped")
         )
@@ -323,7 +326,7 @@ class TestUnresolvedSubjects:
 
     def test_mapping_can_be_cleared(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         subject_id = admin_client.get("/api/usage/unresolved").json()[0]["id"]
-        admin_client.post(f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-akash"})
+        admin_client.post(f"/api/usage/unresolved/{subject_id}/map", json={"user_id": "user-carol"})
         response = admin_client.post(
             f"/api/usage/unresolved/{subject_id}/map", json={"user_id": None}
         )
@@ -332,7 +335,7 @@ class TestUnresolvedSubjects:
     def test_viewer_cannot_map(self, viewer_client: TestClient, tenant: FakeTenant) -> None:
         rows = viewer_client.get("/api/usage/unresolved").json()
         response = viewer_client.post(
-            f"/api/usage/unresolved/{rows[0]['id']}/map", json={"user_id": "user-akash"}
+            f"/api/usage/unresolved/{rows[0]['id']}/map", json={"user_id": "user-carol"}
         )
         assert response.status_code == httpx.codes.FORBIDDEN
 
@@ -522,7 +525,7 @@ class TestCsv:
     ) -> None:
         admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         )
         response = admin_client.get("/api/limits/export")
         assert response.status_code == httpx.codes.OK
@@ -530,14 +533,14 @@ class TestCsv:
         assert "attachment" in response.headers["content-disposition"]
         lines = response.text.strip().splitlines()
         assert lines[0].startswith("entity_type,entity_id")
-        assert "user-harsh" in lines[1]
+        assert "user-alice" in lines[1]
 
     def test_a_round_trip_import_is_a_no_op_update(
         self, admin_client: TestClient, tenant: FakeTenant
     ) -> None:
         admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 10},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 10},
         )
         exported = admin_client.get("/api/limits/export").text
         response = admin_client.post(
@@ -556,7 +559,7 @@ class TestCsv:
     def test_dry_run_writes_nothing(
         self, admin_client: TestClient, db: Session, tenant: FakeTenant
     ) -> None:
-        csv_content = "entity_type,entity_id,credit_limit\nuser,user-harsh,50\n"
+        csv_content = "entity_type,entity_id,credit_limit\nuser,user-alice,50\n"
         response = admin_client.post(
             "/api/limits/import?dry_run=true",
             files={"file": ("limits.csv", csv_content, "text/csv")},
@@ -569,7 +572,7 @@ class TestCsv:
     ) -> None:
         csv_content = (
             "entity_type,entity_id,credit_limit,period_type,warning_threshold_pct,enforce\n"
-            "user,user-harsh,50,monthly,70,true\n"
+            "user,user-alice,50,monthly,70,true\n"
             "project,proj-api,80,quarterly,90,false\n"
         )
         response = admin_client.post(
@@ -578,16 +581,16 @@ class TestCsv:
         )
         assert response.json()["created"] == 2
         limits = {row["entity_id"]: row for row in admin_client.get("/api/limits").json()}
-        assert limits["user-harsh"]["credit_limit"] == 50
-        assert limits["user-harsh"]["warning_threshold_pct"] == 70
-        assert limits["user-harsh"]["enforce"] is True
+        assert limits["user-alice"]["credit_limit"] == 50
+        assert limits["user-alice"]["warning_threshold_pct"] == 70
+        assert limits["user-alice"]["enforce"] is True
         assert limits["proj-api"]["period_type"] == "quarterly"
 
     def test_an_absent_enforce_column_means_monitor_only(
         self, admin_client: TestClient, tenant: FakeTenant
     ) -> None:
         """An import must not be able to switch on enforcement by omission."""
-        csv_content = "entity_type,entity_id,credit_limit\nuser,user-harsh,50\n"
+        csv_content = "entity_type,entity_id,credit_limit\nuser,user-alice,50\n"
         admin_client.post(
             "/api/limits/import?dry_run=false",
             files={"file": ("limits.csv", csv_content, "text/csv")},
@@ -598,7 +601,7 @@ class TestCsv:
         self, admin_client: TestClient, db: Session, tenant: FakeTenant
     ) -> None:
         csv_content = (
-            "entity_type,entity_id,credit_limit\nuser,user-harsh,50\nuser,user-does-not-exist,10\n"
+            "entity_type,entity_id,credit_limit\nuser,user-alice,50\nuser,user-does-not-exist,10\n"
         )
         response = admin_client.post(
             "/api/limits/import?dry_run=false",
@@ -614,14 +617,14 @@ class TestCsv:
     ) -> None:
         response = admin_client.post(
             "/api/limits/import",
-            files={"file": ("limits.csv", "entity_type,entity_id\nuser,user-harsh\n", "text/csv")},
+            files={"file": ("limits.csv", "entity_type,entity_id\nuser,user-alice\n", "text/csv")},
         )
         assert "credit_limit" in response.json()["errors"][0]
 
     def test_duplicate_rows_are_rejected(
         self, admin_client: TestClient, tenant: FakeTenant
     ) -> None:
-        csv_content = "entity_type,entity_id,credit_limit\nuser,user-harsh,10\nuser,user-harsh,20\n"
+        csv_content = "entity_type,entity_id,credit_limit\nuser,user-alice,10\nuser,user-alice,20\n"
         response = admin_client.post(
             "/api/limits/import", files={"file": ("limits.csv", csv_content, "text/csv")}
         )
@@ -654,7 +657,7 @@ class TestCsv:
 
     def test_a_utf8_bom_is_tolerated(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         """Excel writes a BOM, and admins export limits from Excel."""
-        content = "﻿entity_type,entity_id,credit_limit\nuser,user-harsh,10\n".encode()
+        content = "﻿entity_type,entity_id,credit_limit\nuser,user-alice,10\n".encode()
         response = admin_client.post(
             "/api/limits/import", files={"file": ("limits.csv", content, "text/csv")}
         )
@@ -676,7 +679,7 @@ class TestCsvService:
     def test_custom_periods_round_trip(self, db: Session, tenant: FakeTenant) -> None:
         content = (
             "entity_type,entity_id,credit_limit,period_type,custom_period_start,custom_period_end\n"
-            "user,user-harsh,10,custom,2026-01-01T00:00:00Z,2026-06-30T00:00:00Z\n"
+            "user,user-alice,10,custom,2026-01-01T00:00:00Z,2026-06-30T00:00:00Z\n"
         )
         result = limits_csv.import_limits(db, content=content, actor=ACTOR, dry_run=False)
         db.commit()
@@ -689,46 +692,46 @@ class TestCsvService:
     def test_a_custom_period_without_a_start_is_an_error(
         self, db: Session, tenant: FakeTenant
     ) -> None:
-        content = "entity_type,entity_id,credit_limit,period_type\nuser,user-harsh,10,custom\n"
+        content = "entity_type,entity_id,credit_limit,period_type\nuser,user-alice,10,custom\n"
         result = limits_csv.import_limits(db, content=content, actor=ACTOR)
         assert any("custom_period_start" in error for error in result.errors)
 
     def test_member_usage_on_a_non_group_is_an_error(self, db: Session, tenant: FakeTenant) -> None:
         content = (
-            "entity_type,entity_id,credit_limit,include_member_usage\nuser,user-harsh,10,true\n"
+            "entity_type,entity_id,credit_limit,include_member_usage\nuser,user-alice,10,true\n"
         )
         result = limits_csv.import_limits(db, content=content, actor=ACTOR)
         assert any("group limits" in error for error in result.errors)
 
     def test_row_outcomes_describe_what_would_happen(self, db: Session, tenant: FakeTenant) -> None:
-        content = "entity_type,entity_id,credit_limit,enforce\nuser,user-harsh,10,true\n"
+        content = "entity_type,entity_id,credit_limit,enforce\nuser,user-alice,10,true\n"
         result = limits_csv.import_limits(db, content=content, actor=ACTOR)
         assert result.rows[0].action == "create"
         assert "enforcing" in (result.rows[0].detail or "")
 
     def test_blank_rows_are_ignored(self, db: Session, tenant: FakeTenant) -> None:
-        content = "entity_type,entity_id,credit_limit\n\nuser,user-harsh,10\n\n"
+        content = "entity_type,entity_id,credit_limit\n\nuser,user-alice,10\n\n"
         result = limits_csv.import_limits(db, content=content, actor=ACTOR)
         assert result.errors == []
         assert result.created == 1
 
     @pytest.mark.parametrize("value", ["true", "TRUE", "yes", "1", "on"])
     def test_truthy_spellings(self, db: Session, tenant: FakeTenant, value: str) -> None:
-        content = f"entity_type,entity_id,credit_limit,enforce\nuser,user-harsh,10,{value}\n"
+        content = f"entity_type,entity_id,credit_limit,enforce\nuser,user-alice,10,{value}\n"
         result = limits_csv.import_limits(db, content=content, actor=ACTOR)
         assert result.errors == []
         assert "enforcing" in (result.rows[0].detail or "")
 
     def test_a_nonsense_boolean_is_an_error(self, db: Session, tenant: FakeTenant) -> None:
-        content = "entity_type,entity_id,credit_limit,enforce\nuser,user-harsh,10,maybe\n"
+        content = "entity_type,entity_id,credit_limit,enforce\nuser,user-alice,10,maybe\n"
         result = limits_csv.import_limits(db, content=content, actor=ACTOR)
         assert any("maybe" in error for error in result.errors)
 
     def test_export_includes_usage_context(self, db: Session, tenant: FakeTenant) -> None:
         limit = CreditLimit(
             entity_type=EntityType.USER,
-            entity_id="user-sean",
-            entity_label="Sean Casey",
+            entity_id="user-bob",
+            entity_label="Bob Baker",
             credit_limit=10,
             period_type="monthly",
         )
@@ -740,4 +743,4 @@ class TestCsvService:
 
         content = limits_csv.export_limits(db)
         assert "credits_used,period_key,status" in content.splitlines()[0]
-        assert "user-sean" in content
+        assert "user-bob" in content

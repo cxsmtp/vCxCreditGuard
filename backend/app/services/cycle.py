@@ -41,6 +41,7 @@ from app.models.usage import CreditBalanceSnapshot, SchedulerLock, SchedulerRun
 from app.services import (
     auto_triage_attribution,
     delivery,
+    enforcement_selftest,
     error_text,
     evaluation,
     ingestion,
@@ -55,6 +56,7 @@ from app.services import (
 )
 from app.services import connection as connection_service
 from app.services.audit import AuditActor, record_audit
+from app.services.usage_mix import format_credits
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +379,16 @@ def _execute_steps(session: Session, result: CycleResult, *, force_org_sync: boo
                 actor=actor,
             ).as_stats()
 
+    def selftest_demo() -> None:
+        # A demo self-test's restriction its restore left behind lives in the
+        # in-process demo tenant: retried here, in demo mode or not, never
+        # against the live tenant.
+        retried = enforcement_selftest.retry_demo_holds(session, actor=actor)
+        if retried:
+            result.steps["selftest_demo"] = {"restored": retried}
+
+    _run_step(session, result, "selftest_demo", selftest_demo, degrades_run=False)
+
     # Demo mode: touch no live tenant - no sync, ingestion or enforcement. Still
     # evaluate the seeded data with no client (so demo limits get period state and
     # warnings without any Checkmarx write), and still deliver notifications and
@@ -462,6 +474,7 @@ def _execute_tenant_steps(
     def sync_org() -> None:
         org_result = org_sync.sync_org_model(session, client, actor=actor)
         result.steps["org_sync"] = org_result.as_stats()
+        _note_duplicate_groups(session, org_result.duplicate_group_names)
         if org_result.warnings:
             _warn(session, "org_sync", "; ".join(org_result.warnings))
             result.status = RunStatus.PARTIAL
@@ -526,6 +539,9 @@ def _execute_tenant_steps(
             latest.total_credits == balance.total
             and latest.used_credits == balance.used
             and latest.available_credits == balance.available
+            # Checkmarx's own enforcement block (state, thresholds) is shown on
+            # the dashboard, so a change there is a new reading too.
+            and _enforcement_block(latest.raw) == _enforcement_block(balance.raw)
         )
         if not unchanged:
             session.add(
@@ -623,6 +639,15 @@ def _execute_tenant_steps(
             _warn(session, "violations", "; ".join(found.errors[:5]))
 
     _run_step(session, result, "violations", detect_violations, degrades_run=False)
+
+    # The readiness checklist: an item that turns red once enforcement is on
+    # raises a warning. It never changes enforcement.
+    def readiness_drift() -> None:
+        from app.services import readiness
+
+        result.steps["readiness"] = {"drifted": readiness.check_drift(session)}
+
+    _run_step(session, result, "readiness", readiness_drift, degrades_run=False)
 
     # Step 4: push notifications out. A delivery failure is never allowed to affect
     # the cycle's own status: the Notification Center already has the record, and an
@@ -749,18 +774,46 @@ def _warn(session: Session, step: str, message: str) -> None:
     )
 
 
+def _enforcement_block(raw: Any) -> Any:
+    return raw.get("enforcement") if isinstance(raw, dict) else None
+
+
+def _note_duplicate_groups(session: Session, names: list[str]) -> None:
+    """Repeated group names: a warning raised once per distinct set.
+
+    A property of the tenant rather than a failed step, so it neither marks
+    the run partial nor raises an error every cycle. The set is kept for
+    Diagnostics, and a new notice is raised only when the set changes.
+    """
+    import hashlib
+
+    names = sorted(set(names))
+    if names == settings_store.duplicate_group_names(session):
+        return
+    settings_store.set_value(session, settings_store.KEY_DUPLICATE_GROUP_NAMES, names)
+    if not names:
+        return
+    digest = hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
+    notifications.notify(
+        session,
+        category=notifications.CATEGORY_SYNC_ERROR,
+        severity=Severity.WARNING,
+        title="Some group names are not unique",
+        body=org_sync.duplicate_groups_message(names),
+        dedupe_key=f"org_sync:duplicate_groups:{digest}",
+    )
+
+
 def _notify_unresolved(session: Session) -> None:
     """Tell the admin about consumption that could not be attributed to a user."""
     from app.models.usage import UnresolvedSubject
 
+    # The same rows every page counts as unmatched people: an auto-matched
+    # subject's credits do count towards a user, and automation (a bot, an
+    # integration identity) is not a person to chase. Scan initiators are
+    # raised by the auto-triage step, in its own words.
     rows = list(
-        session.scalars(
-            select(UnresolvedSubject).where(
-                UnresolvedSubject.mapped_user_id.is_(None),
-                # Scan initiators are raised by the auto-triage step, in its own words.
-                UnresolvedSubject.view_by != auto_triage_attribution.SOURCE_SCAN_INITIATOR,
-            )
-        )
+        session.scalars(select(UnresolvedSubject).where(*ingestion.unresolved_person_filter()))
     )
     for row in rows:
         notifications.notify(
@@ -772,7 +825,7 @@ def _notify_unresolved(session: Session) -> None:
                 f"{row.subject_name or row.subject_key}"
             ),
             body=(
-                f"{row.credits_used} credits are reported against "
+                f"{format_credits(row.credits_used)} credits are reported against "
                 f"{row.subject_name or row.subject_key}"
                 f"{f' ({row.subject_email})' if row.subject_email else ''}, which does not "
                 "match any synced Checkmarx user. That usage is not counted towards any "
@@ -781,3 +834,56 @@ def _notify_unresolved(session: Session) -> None:
             ),
             dedupe_key=notifications.attribution_key(row.subject_key),
         )
+
+    from app.models.audit import Notification
+
+    # Automation is never chased as a person, but a new automation identity is
+    # still said once, so a person wrongly taken for one is not silent. Once
+    # per subject ever: the subject row keeps the mark, so a notice read and
+    # cleared away is not raised again (and subjects that were automation
+    # before the upgrade were marked by the migration, without a burst).
+    for row in session.scalars(
+        select(UnresolvedSubject).where(
+            UnresolvedSubject.mapped_user_id.is_(None),
+            UnresolvedSubject.is_bot.is_(True),
+            UnresolvedSubject.automation_noticed_at.is_(None),
+            UnresolvedSubject.view_by != auto_triage_attribution.SOURCE_SCAN_INITIATOR,
+        )
+    ):
+        name = row.subject_name or row.subject_key
+        notifications.notify(
+            session,
+            category=notifications.CATEGORY_ATTRIBUTION,
+            severity=Severity.INFO,
+            title=f"New automation identity found: {name}",
+            body=(
+                f"{format_credits(row.credits_used)} credits are reported against {name}, "
+                "which looks like automation (a bot, or a CI or SCM integration with no email) "
+                "rather than a person, so it is shown as automation and counts towards no user "
+                "limit. If it is a person, map it to their user under Settings → Attribution."
+            ),
+            dedupe_key=f"automation:{row.subject_key}",
+        )
+        row.automation_noticed_at = utcnow()
+
+    # "Could not be matched" notices raised before a subject was found to be
+    # automation, auto-matched or mapped (including by earlier versions) no
+    # longer stand: marked read, once.
+    settled = [
+        notifications.bounded_key(notifications.attribution_key(key))
+        for key in session.scalars(
+            select(UnresolvedSubject.subject_key).where(
+                UnresolvedSubject.mapped_user_id.is_not(None)
+                | (UnresolvedSubject.status == "auto_matched")
+                | UnresolvedSubject.is_bot.is_(True)
+            )
+        )
+    ]
+    for start in range(0, len(settled), 500):
+        chunk = settled[start : start + 500]
+        for notice in session.scalars(
+            select(Notification).where(
+                Notification.dedupe_key.in_(chunk), Notification.read_at.is_(None)
+            )
+        ):
+            notice.read_at = utcnow()

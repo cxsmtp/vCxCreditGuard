@@ -39,6 +39,27 @@ function colorFor(actionType: string, index: number): string {
   return ACTION_SLOTS[actionType] ?? FALLBACK_SLOTS[index % FALLBACK_SLOTS.length]!;
 }
 
+/** The name as Checkmarx reports it; a normalised type gets its label. */
+function labelOf(row: ActionBreakdownItem): string {
+  if (row.action_type === "other") return "Other";
+  return row.action_bucket ? row.action_type : actionLabel(row.action_type);
+}
+
+/** "108.86 (feed; rate 2)": what one action cost, and whether that is the listed rate. */
+function priceOf(row: ActionBreakdownItem): string {
+  if (!row.credits_per_transaction) {
+    // Fusion and DAST correlation are not priced at their listed rate.
+    const bucket = row.action_bucket ?? row.action_type;
+    return bucket === "fusion" || bucket === "dast_correlation" ? "not known" : "";
+  }
+  const per = formatCredits(row.credits_per_transaction);
+  if (row.price_source === "observed") {
+    return row.listed_rate ? `${per} (feed; rate ${formatCredits(row.listed_rate)})` : `${per} (feed)`;
+  }
+  if (row.price_source === "rate") return `${per} (rate)`;
+  return per;
+}
+
 interface Props {
   items: ActionBreakdownItem[];
   /** True when the API reported transactions but no per action credit split. */
@@ -75,6 +96,14 @@ export function BreakdownChart({ items }: Props) {
         ]
       : head;
 
+  // A fixed colour per action type while each type has one row. When several
+  // rows share a type (one per Fusion model), every row takes the colour of its
+  // position instead, so no two rows look alike.
+  const buckets = rows.map((row) => row.action_bucket ?? row.action_type);
+  const shared = new Set(buckets).size < buckets.length;
+  const slotOf = (row: ActionBreakdownItem) =>
+    shared ? `row:${row.action_type}` : (row.action_bucket ?? row.action_type);
+  const anyPrice = rows.some((row) => row.credits_per_transaction || priceOf(row));
   const usesCredits = rows.some((row) => Number(row.credits) > 0);
   const valueOf = (row: ActionBreakdownItem) =>
     usesCredits ? Number(row.credits) : (row.transactions ?? 0);
@@ -85,7 +114,7 @@ export function BreakdownChart({ items }: Props) {
       <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
           {usesCredits
-            ? "Credits by action type for the reported window."
+            ? "Credits by action type for the reported window. The listed rate is not what a Fusion or DAST action costs on every tenant: the table shows what each one cost, from the feed."
             : "Actions by type. Checkmarx reports one credit figure per user rather than per action, so this view counts actions."}
         </p>
         <button
@@ -106,15 +135,27 @@ export function BreakdownChart({ items }: Props) {
               <Th align="right">Credits</Th>
               <Th align="right">Actions</Th>
               <Th align="right">Share</Th>
+              {anyPrice && (
+                <Th align="right">
+                  <span title="Credits per action as the feed reports them. 'rate': the listed rate matches; 'feed': it does not, and the feed's average is what CreditGuard uses.">
+                    Per action
+                  </span>
+                </Th>
+              )}
             </tr>
           </thead>
           <tbody>
             {rows.map((row) => (
               <tr key={row.action_type}>
-                <Td>{row.action_type === "other" ? "Other" : actionLabel(row.action_type)}</Td>
+                <Td>{labelOf(row)}</Td>
                 <Td align="right">{usesCredits ? formatCredits(row.credits) : ""}</Td>
                 <Td align="right">{formatNumber(row.transactions)}</Td>
                 <Td align="right">{formatPercent(row.percent_of_total, 1)}</Td>
+                {anyPrice && (
+                  <Td align="right">
+                    {priceOf(row)}
+                  </Td>
+                )}
               </tr>
             ))}
           </tbody>
@@ -125,7 +166,7 @@ export function BreakdownChart({ items }: Props) {
             {rows.map((row, index) => {
               const value = valueOf(row);
               const share = (value / maxValue) * 100;
-              const label = row.action_type === "other" ? "Other" : actionLabel(row.action_type);
+              const label = labelOf(row);
               return (
                 <li
                   key={row.action_type}
@@ -138,7 +179,7 @@ export function BreakdownChart({ items }: Props) {
                       <span
                         aria-hidden="true"
                         className="inline-block size-2 shrink-0 rounded-sm"
-                        style={{ background: colorFor(row.action_type, index) }}
+                        style={{ background: colorFor(slotOf(row), index) }}
                       />
                       <span className="truncate font-medium">{label}</span>
                     </span>
@@ -160,7 +201,7 @@ export function BreakdownChart({ items }: Props) {
                       className="h-full transition-[width] duration-300"
                       style={{
                         width: `${Math.max(share, value > 0 ? 1.5 : 0)}%`,
-                        background: colorFor(row.action_type, index),
+                        background: colorFor(slotOf(row), index),
                         borderTopRightRadius: 4,
                         borderBottomRightRadius: 4,
                         opacity: hovered && hovered !== row.action_type ? 0.55 : 1,
@@ -183,9 +224,9 @@ export function BreakdownChart({ items }: Props) {
                   <span
                     aria-hidden="true"
                     className="inline-block size-2 rounded-sm"
-                    style={{ background: colorFor(row.action_type, index) }}
+                    style={{ background: colorFor(slotOf(row), index) }}
                   />
-                  {row.action_type === "other" ? "Other" : actionLabel(row.action_type)}
+                  {labelOf(row)}
                 </li>
               ))}
             </ul>

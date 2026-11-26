@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.checkmarx.client import CheckmarxClient
+from app.db import locking
 from app.db.base import utcnow
 from app.models.enums import EntityType, PeriodType, RequestStatus, Severity
 from app.models.limits import CreditLimit, CreditRequest
@@ -55,6 +56,9 @@ def create_request(
 ) -> CreditRequest:
     if data.requested_limit < 0:
         raise RequestError("A requested limit cannot be negative.")
+    # The checks below count pending requests, so two filed at the same moment
+    # must not both count before either is written: one filing at a time.
+    locking.serialize(session, locking.CREDIT_REQUEST_FILING_LOCK_KEY)
     # One open request per entity: a second one adds nothing an admin can act
     # on, and a stream of them is how a queue gets flooded.
     duplicate = session.scalar(
@@ -157,6 +161,11 @@ def approve_request(
     unblocking someone. Without a client the budget is still applied and the next
     cycle catches up.
     """
+    # Locked and read again first: two decisions on one request at the same
+    # moment (two admins, or an admin and the automation) must not both find it
+    # pending, or it would be granted twice, or end up denied with its grant
+    # applied.
+    locking.lock_row(session, request)
     if request.status != RequestStatus.PENDING:
         raise RequestStateError("Only a pending request can be approved.")
     target = request.requested_limit if approved_limit is None else approved_limit
@@ -256,6 +265,7 @@ def approve_request(
 def deny_request(
     session: Session, *, request: CreditRequest, actor: AuditActor, note: str | None = None
 ) -> CreditRequest:
+    locking.lock_row(session, request)  # see approve_request
     if request.status != RequestStatus.PENDING:
         raise RequestStateError("Only a pending request can be denied.")
     request.status = RequestStatus.DENIED
@@ -379,6 +389,10 @@ def auto_decide_pending(
                 auto_approved_increase=increase,
             )
             session.commit()
+        except RequestStateError:
+            # Decided by an admin since the list above was read.
+            session.rollback()
+            continue
         except Exception:
             session.rollback()
             logger.exception("Auto-approval of credit request %s failed", request_id)

@@ -40,7 +40,7 @@ from app.services import (
 )
 from app.services.audit import AuditActor
 from tests.conftest import USING_SQLITE, make_api_key
-from tests.fake_tenant import FakeTenant, populated_tenant
+from tests.fake_tenant import FakeTenant, action_row, populated_tenant
 
 ACTOR = AuditActor.system("test")
 PERIOD = "2026-08"
@@ -184,6 +184,17 @@ class TestRates:
 
     def test_priced_fusion_in_the_breach_message(self, db: Session, monkeypatch) -> None:
         tenant = _connected(db, monkeypatch)
+        # The feed confirms the listed rate (8 credits for 4 Opus 5.5 scans), so
+        # the rate is the price; without that it would not be (see
+        # test_real_tenant_usage).
+        tenant.consumption["action"].append(
+            action_row(
+                "Fusion Scan - Opus 5.5",
+                credits="8",
+                action_type="fusion_scan_-_opus_5.5",
+                transactions=4,
+            )
+        )
         tenant.set_entity_credits(
             view="project",
             name="payments/web",
@@ -223,7 +234,8 @@ class TestRates:
 
         month = utcnow().strftime("%B %Y")
         assert breach.body.startswith(
-            f"4 of 3 credits used in {month}: Fusion scan (Opus 5.5) 2 scans = 4 credits.\n"
+            f"4 of 3 credits used in {month}: Fusion scan (Opus 5.5) 2 scans = 4 credits "
+            "(2 per scan, the listed rate).\n"
         ), breach.body
         assert "cannot switch Fusion off yet" not in breach.body
         assert "Auto Triage, PR triage and remediation and Fusion are turned off" in breach.body
@@ -616,7 +628,7 @@ class TestChoice:
     def test_user_limits_cannot_choose(self, db: Session) -> None:
         setup_tenant(db)
         with pytest.raises(limits_service.LimitError):
-            make_limit(db, entity_type=EntityType.USER, entity_id="user-harsh", actions=["fusion"])
+            make_limit(db, entity_type=EntityType.USER, entity_id="user-alice", actions=["fusion"])
 
     def test_empty_or_unknown_is_refused(self, db: Session) -> None:
         with pytest.raises(limits_service.LimitError):
@@ -653,7 +665,7 @@ class TestChoice:
             "/api/limits",
             json={
                 "entity_type": "user",
-                "entity_id": "user-harsh",
+                "entity_id": "user-alice",
                 "credit_limit": 5,
                 "project_actions": ["fusion"],
             },
@@ -685,7 +697,7 @@ class TestChoice:
         db.commit()
         db.expire_all()
         assert api.project_actions == ["fusion"]
-        bad = "entity_type,entity_id,credit_limit,project_actions\nuser,user-harsh,3,fusion\n"
+        bad = "entity_type,entity_id,credit_limit,project_actions\nuser,user-alice,3,fusion\n"
         assert limits_csv.import_limits(db, content=bad, actor=ACTOR, dry_run=True).errors
 
     def test_preview_shows_fusion_and_the_guard_counts_it(self, db: Session) -> None:
@@ -1610,13 +1622,17 @@ class TestPricesAndNames:
         from app.services import violations
 
         rates = {
-            "fusion_scan___claude_opus_5.5": (Decimal("9"), "Fusion Scan - Claude Opus 5.5"),
-            "fusion_scan___haiku_4.5": (Decimal("1.5"), "Fusion Scan - Haiku 4.5"),
+            "fusion_scan___claude_opus_5.5": usage_mix.ActionPrice(
+                Decimal("9"), "Fusion Scan - Claude Opus 5.5", usage_mix.PRICE_RATE
+            ),
+            "fusion_scan___haiku_4.5": usage_mix.ActionPrice(
+                Decimal("1.5"), "Fusion Scan - Haiku 4.5", usage_mix.PRICE_RATE
+            ),
         }
         assert violations._fusion_price("opus-5.5", rates) is None
         assert violations._fusion_price("5.5", rates) is None
-        assert violations._fusion_price("claude-opus-5.5", rates) == Decimal("9")
-        assert violations._fusion_price("Haiku 4.5", rates) == Decimal("1.5")
+        assert violations._fusion_price("claude-opus-5.5", rates).per_transaction == Decimal("9")
+        assert violations._fusion_price("Haiku 4.5", rates).per_transaction == Decimal("1.5")
 
     @pytest.mark.parametrize("raw", ["fusion_sast", "fusionsomething", "Fusion Report"])
     def test_other_fusion_types_stay_visible(self, raw: str) -> None:

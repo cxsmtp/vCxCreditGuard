@@ -20,7 +20,7 @@ from app.schemas.limits import (
     NotificationResponse,
 )
 from app.services import connection as connection_service
-from app.services import enforcement
+from app.services import enforcement, enforcement_selftest
 from app.services import notifications as notification_service
 
 logger = logging.getLogger(__name__)
@@ -98,7 +98,10 @@ def list_notifications(
 
 
 @router.post("/read")
-def mark_read(payload: MarkReadRequest, ctx: CurrentUser, db: DbSession) -> dict[str, int]:
+def mark_read(payload: MarkReadRequest, ctx: AdminUser, db: DbSession) -> dict[str, int]:
+    """Mark notifications read. Admins only: there is one read state, shared by
+    everyone, and a viewer (read only) must not clear what the admins have not
+    seen yet."""
     marked = notification_service.mark_read(db, notification_ids=payload.notification_ids)
     db.commit()
     return {"marked_read": marked}
@@ -262,7 +265,8 @@ def restore_access(action_id: int, ctx: AdminUser, db: DbSession) -> dict[str, o
         }
 
     try:
-        client = connection_service.get_client(db)
+        # A demo self-test's restriction lives in the built-in demo tenant.
+        client = enforcement_selftest.client_for(action, lambda: connection_service.get_client(db))
     except CheckmarxError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -274,7 +278,13 @@ def restore_access(action_id: int, ctx: AdminUser, db: DbSession) -> dict[str, o
 
     try:
         restored = enforcement.restore_action(
-            db, client, action=action, actor=ctx.actor, reason=enforcement.ADMIN_REASON
+            db,
+            client,
+            action=action,
+            actor=ctx.actor,
+            # A self-test's restriction is cleaned up as such: a real budget's
+            # restriction on the same target stays in force.
+            reason=enforcement_selftest.restore_reason_for(action, enforcement.ADMIN_REASON),
         )
     except CheckmarxError as exc:
         db.commit()  # keep the failure notification and audit entry
@@ -290,7 +300,20 @@ def restore_access(action_id: int, ctx: AdminUser, db: DbSession) -> dict[str, o
         ) from exc
 
     db.commit()
+    label = action.target_label or action.target_id
+    if enforcement_selftest.is_selftest_action(action):
+        holding = enforcement_selftest.budgets_still_restricting(db, action)
+        if holding:
+            budgets = ", ".join(sorted({row.entity_label or row.entity_id for row in holding}))
+            return {
+                "restored": False,
+                "message": (
+                    f"The self-test's change was undone, but a real budget still restricts "
+                    f"{label} ({budgets}), so access was not given back. It is given back when "
+                    "that budget lifts its restriction, or with Restore on that restriction."
+                ),
+            }
     return {
         "restored": restored,
-        "message": f"Access restored for {action.target_label or action.target_id}.",
+        "message": f"Access restored for {label}.",
     }

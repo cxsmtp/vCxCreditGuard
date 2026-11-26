@@ -6,12 +6,13 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from app.api.deps import AuthContext, CurrentUser, DbSession
+from app.api.deps import AdminUser, AuthContext, CurrentUser, DbSession
 from app.models.enums import EntityType
 from app.schemas.preview import (
     BlastRadiusResponse,
     DryRunResponse,
     DryRunRowResponse,
+    EnforcementCoverageResponse,
     KeptRolePreviewResponse,
     ProjectWarningResponse,
     RemovedRolePreviewResponse,
@@ -19,7 +20,7 @@ from app.schemas.preview import (
     UserRolesPreviewResponse,
 )
 from app.services import connection as connection_service
-from app.services import limits_service, preview_service, settings_store
+from app.services import coverage, limits_service, preview_service, settings_store
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +199,36 @@ def get_dry_run(ctx: CurrentUser, db: DbSession) -> DryRunResponse:
                 ),
                 note=row.note,
                 auto_triage_attributed=row.auto_triage_attributed,
+                recount_required=row.recount_required,
             )
             for row in result.rows
         ],
     )
+
+
+@router.get("/coverage", response_model=EnforcementCoverageResponse | None)
+def get_enforcement_coverage(
+    ctx: AdminUser, db: DbSession, refresh: bool = False
+) -> EnforcementCoverageResponse | None:
+    """Whether a user restriction can bite: the share of AI-role holders it could
+    take AI access from, how many keep it through composite roles or groups,
+    and how many are protected.
+
+    Cached; computed again when older than a few hours or on ``refresh``, with
+    the bounded role-source reads enforcement uses. Never changes the tenant or
+    the configured role list. Without a connection (or in demo mode) it is
+    computed from the synced roles alone, and says so.
+    """
+    client = None
+    if not settings_store.demo_mode(db):
+        try:
+            client = connection_service.optional_client(db)
+        except Exception:  # noqa: BLE001 - a page must render without the tenant
+            logger.warning("No Checkmarx client for the coverage check", exc_info=True)
+    report = coverage.current(db, client, refresh=refresh)
+    if report is None and client is None:
+        # Nothing usable cached and no tenant to read: from the synced data alone.
+        report = coverage.from_synced_data(db)
+    # None: being computed by another request (or it failed); the page says
+    # it is not available yet rather than waiting or showing another key's.
+    return EnforcementCoverageResponse(**report) if report else None

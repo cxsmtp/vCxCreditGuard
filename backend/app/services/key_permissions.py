@@ -757,6 +757,8 @@ def _outcome(call: Callable[[], Any]) -> tuple[str, str | None]:
         raise
     except CheckmarxRateLimitError:
         return STATUS_ERROR, "Checkmarx asked CreditGuard to slow down (429). Check again later."
+    except platform.PrSeveritiesShapeError as exc:
+        return STATUS_ERROR, f"The read was allowed, but its answer could not be used: {exc}"[:400]
     except CheckmarxResponseError as exc:
         if exc.status_code is not None:
             return STATUS_ERROR, f"Checkmarx answered {exc.status_code}."
@@ -778,10 +780,21 @@ def _run_probes(
     found: dict[str, Any] = {}
 
     def projects() -> None:
-        payload = client.get_json(platform.PROJECTS_PATH, params={"limit": 1, "offset": 0})
+        # One page, so a project linked to a repository can be found for the
+        # repository read: on a live tenant the first project had no repoId and
+        # that read was skipped, while 760 of 1,968 had one.
+        payload = client.get_json(
+            platform.PROJECTS_PATH, params={"limit": _PROBE_PROJECTS, "offset": 0}
+        )
         items = payload.get("projects") if isinstance(payload, dict) else payload
-        if isinstance(items, list) and items and isinstance(items[0], dict):
-            found["project"] = platform.parse_project(items[0])
+        parsed = [
+            project
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, dict) and (project := platform.parse_project(item)) is not None
+        ]
+        if parsed:
+            found["project"] = parsed[0]
+            found["repo_project"] = next((p for p in parsed if p.repo_id), None)
 
     def client_lookup() -> None:
         targets.client_uuid = iam.resolve_platform_client_uuid(client)
@@ -823,8 +836,9 @@ def _run_probes(
     listed = found.get("project")
     if project_id is None and listed is not None:
         project_id = listed.id
-    if repo is None and listed is not None and listed.repo_id:
-        repo = (listed.repo_id, listed.id)
+    with_repo = found.get("repo_project")
+    if repo is None and with_repo is not None and with_repo.repo_id:
+        repo = (with_repo.repo_id, with_repo.id)
 
     if "scans" in skip:
         results["scans"] = (STATUS_SKIPPED, skip["scans"])
@@ -867,12 +881,7 @@ def _run_probes(
         )
     else:
         repo_id, repo_project = repo
-        results["repo_read"] = _outcome(
-            lambda: client.get_json(
-                platform.REPO_SETTINGS_PATH.format(repo_id=repo_id),
-                params={"projectId": repo_project},
-            )
-        )
+        results["repo_read"] = _outcome(lambda: _read_repo(client, repo_id, repo_project))
         targets.resource_results[("repo_read", repo_id)] = results["repo_read"][0]
 
     results["iam_clients"] = _outcome(client_lookup)
@@ -910,6 +919,22 @@ def _run_probes(
     return results
 
 
+# Projects read by the "projects" check, to find one with a repository id.
+_PROBE_PROJECTS = 50
+
+
+def _read_repo(client: CheckmarxClient, repo_id: str, project_id: str) -> None:
+    """Read a repository's settings, and fail unless the PR triage and
+    remediation setting in them is in a shape CreditGuard can write back: a
+    read that is allowed but cannot be used is not "ok"."""
+    payload = client.get_json(
+        platform.REPO_SETTINGS_PATH.format(repo_id=repo_id), params={"projectId": project_id}
+    )
+    if not isinstance(payload, dict):
+        raise CheckmarxResponseError("The repository settings were not an object.")
+    platform.parse_pr_severities(payload.get(platform.PR_SEVERITIES_FIELD))
+
+
 def _read_resource(
     client: CheckmarxClient, check_id: str, resource: str, repo_projects: dict[str, str]
 ) -> str:
@@ -928,12 +953,7 @@ def _read_resource(
         project_id = repo_projects.get(resource)
         if project_id is None:
             return _RESOURCE_GONE
-        return _outcome(
-            lambda: client.get_json(
-                platform.REPO_SETTINGS_PATH.format(repo_id=resource),
-                params={"projectId": project_id},
-            )
-        )[0]
+        return _outcome(lambda: _read_repo(client, resource, project_id))[0]
     if check_id == "iam_user_roles":
         user_id, _, client_uuid = resource.partition("/")
         if not user_id or not client_uuid:
@@ -1296,7 +1316,12 @@ def assess(report: dict[str, Any] | None, ctx: Context) -> dict[str, Any] | None
             "for a token. See the connection test."
         )
     else:
-        summary = "The Checkmarx API key has every permission CreditGuard checked."
+        summary = (
+            "The Checkmarx API key passed every read CreditGuard checked. Writes (removing AI "
+            "roles, turning Auto Triage, PR triage and remediation and Fusion off) were not "
+            "tested: they cannot be without changing the tenant, so each is confirmed the "
+            "first time CreditGuard makes it."
+        )
 
     claims = report.get("token") or None
     return {
@@ -1403,7 +1428,10 @@ def _explain(
 
 def _roles_lines(claims: dict[str, Any] | None) -> list[str]:
     if not claims or not claims.get("readable"):
-        return ["The key's access token does not list its roles in a readable form."]
+        return [
+            "The key's access token does not list its roles in a readable form.",
+            _SERVER_SIDE_ROLES,
+        ]
     lines: list[str] = []
     if claims.get("realm_roles"):
         lines.append(f"Tenant roles: {', '.join(claims['realm_roles'])}")
@@ -1413,7 +1441,18 @@ def _roles_lines(claims: dict[str, Any] | None) -> list[str]:
         lines.append(f"Roles: {', '.join(claims['roles'])}")
     if claims.get("groups"):
         lines.append(f"Groups: {', '.join(claims['groups'])}")
-    return lines or ["The key's access token lists no roles."]
+    lines = lines or ["The key's access token lists no roles."]
+    # Seen on a live tenant: a token carrying only IAM roles was allowed every
+    # platform read, because the key's owner holds ast-admin.
+    lines.append(_SERVER_SIDE_ROLES)
+    return lines
+
+
+_SERVER_SIDE_ROLES = (
+    "This list is not the whole story: Checkmarx One applies the roles of the user who owns "
+    "the API key on its side, and the token does not carry them. The checks above, not this "
+    "list, say what the key may do."
+)
 
 
 # ------------------------------------------------------------- persistence

@@ -17,7 +17,12 @@ const FEATURES: FeatureGroup[] = [
     title: "Measure and attribute",
     items: [
       "Reads AI credit use from Checkmarx One on a schedule (every 15 minutes by default) for every user, group, project and application.",
+      "Counts each billed action from Checkmarx One's credit activity log in the period it happened in, against its project and application by id and its person by email or username (the default usage source). Identical actions in the same second are each counted, never merged.",
+      "Falls back to the consumption summary (totals matched by name) while the activity log cannot be read, and never counts the same usage from both. Settings → Schedule & data can use the summary only.",
+      "Once a day, checks that the activity log adds up to the summary's total over the same 30 days, and shows a mismatch in Diagnose.",
+      "Integration accounts (bots, Auto-triage, Auto-remediation, accounts you list) count towards their project's budgets, and towards a person's budget only when their project had no active project budget at the time: never towards two user budgets.",
       "Matches each usage row to a Checkmarx user: exactly where it can, by name similarity where not. Unsure matches wait for an admin to confirm.",
+      "Shows the usage that counts towards no budget, and why: automation (Auto Triage, bots, integrations without an email), people it could not match, and project or application names that match no project (an admin can map them).",
       "Can also charge a project's Auto Triage credits to the person whose scan set it off (off by default).",
       "Overview of spend over time, by action type and by top consumers, with each budget marked.",
       "Explains a figure: each budget shows what Checkmarx reported and what the period's starting point discounted.",
@@ -43,10 +48,14 @@ const FEATURES: FeatureGroup[] = [
       "Records what was there before every change; Restore access puts it back in one click.",
       "Gives access back by itself when usage drops under budget, the budget is raised or a new period starts (unless the budget is set to hold until released).",
       "Simulation: a dry run of the next cycle showing who would be warned and restricted, before anything happens.",
+      "Enforcement coverage: how many of the people holding an AI role a user restriction could actually take it from, and why not the rest (composite roles, groups, protected roles), with a warning when user budgets will not bite. It never changes the role list.",
+      "Recount before restricting (always on): before a new restriction of a monthly or quarterly budget, CreditGuard recounts the budget's period straight from the Checkmarx activity log, independently of its own counters, and restricts only if that recount is also at or over the limit. If the counts disagree, or the recount cannot be done, it warns instead and Diagnose shows it.",
+      "Readiness checklist (Settings → Enforcement and Diagnose): connection, activity log, counts matching Checkmarx, a passed self-test on a user and a project, and a reviewed dry run. A new install starts watch-only and turns enforcement on once every item is green, or with an audited override typed by an admin.",
       "Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users and projects restricts nobody and pauses itself.",
       "A pause switch stops new restrictions at once; warnings and giving access back carry on.",
       "Protected roles (ast-admin and iam-admin by default) are never restricted.",
       "A sudden fall in reported usage is held, not believed, until later readings confirm it.",
+      "Enforcement self-test: restricts a chosen user or project for real through the budget-breach code, reads it back (saying when a role kept through a group or composite means it cannot bite), restores it and checks every setting reads exactly as before. Refuses anything restricted, near a budget, protected or mid-scan; the restore always runs.",
     ],
   },
   {
@@ -113,6 +122,23 @@ const LIMITATIONS: Limitation[] = [
     ),
   },
   {
+    title: "User budgets may not bite at all.",
+    group: "enforcement",
+    meaning: (
+      <>
+        A user budget cannot stop someone who gets Fusion through a composite
+        role: ast-admin (held by 274 of 296 users on a live tenant, and
+        protected) and scan-fusion both contain create-fusion-scan, so
+        removing the direct mapping takes nothing away. The fix is on the
+        tenant: give people ast-scanner or ast-risk-manager, which contain no
+        AI role, plus create-fusion-scan directly where they should run Fusion.
+        Check Enforcement coverage (Simulation or Settings → Enforcement)
+        before relying on user budgets. Project, group and application budgets
+        do not depend on roles: they turn AI features off on the projects.
+      </>
+    ),
+  },
+  {
     title:
       "A project budget does not stop people's own AI Triage and AI Remediation.",
     group: "enforcement",
@@ -148,15 +174,93 @@ const LIMITATIONS: Limitation[] = [
     ),
   },
   {
-    title: "The general Risk Management roles are used for now.",
+    title: "A user restriction removes the Fusion and LLM roles.",
     group: "enforcement",
     meaning: (
       <>
-        AI Triage and AI Remediation are reached through them today, so a
-        restricted person also loses the Risk Management pages and dashboard.
-        When Checkmarx One's dedicated AI permissions reach your tenant, swap
-        them in under Settings → Enforcement,{" "}
-        <i>Roles a user restriction removes</i>.
+        By default create-fusion-scan (the role that spends credits),
+        manage-fusion, update-llm-scan-mode and manage-llm-configuration. The
+        composites scan-fusion and fusion-manager are left alone, because
+        removing them would also take ordinary scanning or tenant settings
+        rights, and ai-triage-assist can never be chosen: removing it breaks
+        Auto Triage. An install that had chosen other roles keeps them
+        (Settings → Enforcement, <i>Roles a user restriction removes</i>).
+      </>
+    ),
+  },
+  {
+    title: "Monthly and quarterly budgets restrict only on usage the activity log counted.",
+    group: "enforcement",
+    meaning: (
+      <>
+        Usage the consumption summary counts (after a fallback to it, from a
+        group&apos;s own summary row, or with the summary only), and auto-triage
+        charged to the person who started a scan, still count and warn, but
+        never start a new restriction of a monthly or quarterly
+        budget: from running totals the summary cannot always tell a glitch
+        from a real fall. Such a budget over its limit is warned, not
+        restricted, and Overview, Budgets and Diagnose show that restrictions
+        are paused. Without the activity log, monthly and quarterly budgets
+        restrict only with Summary only and &ldquo;Allow restrictions from
+        summary totals&rdquo; on. Restrictions already in force stay; lifetime,
+        custom and count-existing budgets restrict as before.
+      </>
+    ),
+  },
+  {
+    title: "A new period-budget restriction needs the activity log to agree.",
+    group: "enforcement",
+    meaning: (
+      <>
+        Before a new restriction of a monthly or quarterly budget, the
+        budget&apos;s period is recounted from the Checkmarx activity log
+        (read afresh: the last 30 days, or the last 90 for a quarter or an
+        older month, within the activity page cap and the cycle&apos;s time
+        budget). When the log cannot be read, the read is cut short, or the
+        recount is under the limit, nothing new is restricted and a warning
+        says why; this applies with Summary only too. The last day or two of a
+        92-day quarter fall outside the 90-day window, so a recount late in
+        such a quarter can fall short and hold a restriction back. Simulation
+        does not run the recount: it marks such rows &ldquo;would restrict if
+        the recount agrees&rdquo;. Restrictions in force, lifts, and lifetime,
+        custom and count-existing budgets are unaffected.
+      </>
+    ),
+  },
+  {
+    title: "A new install watches only until it is ready.",
+    group: "enforcement",
+    meaning: (
+      <>
+        A new install starts with enforcement paused (watch-only): it warns
+        but restricts nobody until the readiness checklist is green or an
+        admin overrides it by typing ENFORCE (audited). An existing install
+        keeps its setting and sees the checklist for information. Once
+        enforcement is on the checklist never turns it off; an item that turns
+        red raises a warning.
+      </>
+    ),
+  },
+  {
+    title: "A few cycles of usage are not counted when the usage source switches.",
+    group: "data",
+    meaning: (
+      <>
+        When the activity log becomes the source (the setting turned on, or
+        the log back after failing), its first read only records what it holds,
+        so what happened since the summary&apos;s last reading is not counted.
+        When the summary takes over (the setting turned off, the log refused or
+        malformed, or failing for more than an hour), its first two readings
+        count nothing, so about two to three cycles are not counted, and a name
+        missing from the summary across the switch counts nothing when it
+        returns. A group budget the log takes over from the group&apos;s own
+        summary row counts no event dated before the takeover, and two group
+        readings count nothing when the row takes it back. While the log
+        fails for less than an hour nothing new is counted; it is counted when
+        the log answers again. A row that reaches the log more than about two
+        hours late is counted only by the daily full read, and only if it is
+        dated after the switch. Rows of the same second that meet at a page
+        boundary wait for a later cycle.
       </>
     ),
   },
@@ -165,10 +269,12 @@ const LIMITATIONS: Limitation[] = [
     group: "data",
     meaning: (
       <>
-        Checkmarx reports totals over a window (at most the last year), not
-        individual events. "Lifetime" means everything in that window. Monthly
-        and quarterly budgets do not count credits spent before the period
-        opened, unless the budget is set to.
+        The consumption summary reports totals over a window (at most the last
+        year), and the activity log covers the last 30 days. "Lifetime",
+        custom and count-existing budgets read the summary's totals, so they
+        mean everything in that window. Monthly and quarterly budgets do not
+        count credits spent before the period opened (or before the budget was
+        created), unless the budget is set to.
       </>
     ),
   },
@@ -179,7 +285,26 @@ const LIMITATIONS: Limitation[] = [
       <>
         Credits reported under a name that matches no Checkmarx user, or an
         unconfirmed match, count towards no person's budget until an admin maps
-        them (Settings → Attribution).
+        them (Settings → Attribution); a mapping counts from then on. Automation
+        counts towards a person only by the integration-account rule (and
+        Auto-remediation towards nobody: no scan initiator is traced for it).
+        With the summary as the source, project usage reported under a
+        repository name that is no project counts towards no project, group or
+        application budget until mapped; the activity log names projects by id.
+        All of it is shown on the Overview.
+      </>
+    ),
+  },
+  {
+    title: "Credits per action are measured, not quoted.",
+    group: "data",
+    meaning: (
+      <>
+        Checkmarx's listed rate is not what a Fusion or DAST correlation action
+        costs (on a live tenant about 109 credits per Opus 5.5 Fusion scan
+        against a rate of 2). Where they disagree, messages price an action at
+        the feed's average over the lookback window and say so; it is an
+        average, not the cost of one scan.
       </>
     ),
   },
@@ -208,14 +333,14 @@ const LIMITATIONS: Limitation[] = [
             usage rows per group (only ever seen empty; the sum of its projects
             is used instead);
           </li>
-          <li>paging of a very long user list;</li>
+          <li>
+            writes of PR triage and remediation and Auto Triage in the shape a
+            live tenant reads them (sent back as read, not yet tested by a
+            write on one);
+          </li>
           <li>
             finding a project's repository (without it, PR triage and
             remediation is skipped there);
-          </li>
-          <li>
-            the names of the default protected roles: check them against your
-            tenant;
           </li>
           <li>
             whether a Fusion setting the project inherited can inherit again

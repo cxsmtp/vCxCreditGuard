@@ -12,6 +12,7 @@ import type {
   RestoreResult,
   SchedulerStatus,
   UnresolvedSubject,
+  UsageSourceStatus,
   UtilityAccount,
   WatchdogStatus,
 } from "../api/types";
@@ -32,6 +33,7 @@ import {
   Spinner,
   Table,
   Td,
+  Textarea,
   Th,
   Toggle,
 } from "../components/ui";
@@ -43,6 +45,10 @@ import { applyAccent, useToast } from "../lib/ui-context";
 import { LookPicker } from "../components/AppShell";
 import { StatTile } from "../components/StatTile";
 import { UpdatesPanel } from "../components/UpdatesPanel";
+import { CoveragePanel } from "../components/CoveragePanel";
+import { ReadinessPanel } from "../components/ReadinessPanel";
+import { SelfTestPanel } from "../components/SelfTestPanel";
+import { EntityMappingCard } from "../components/EntityMappingCard";
 import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
 /** Unsaved edits. The last three are write only: the server never sends the
@@ -250,7 +256,9 @@ export function SettingsPage({
     try {
       // An administration-like AI role is saved only with an explicit
       // confirmation: one given in the picker's dialog, or one already saved.
-      const adminLike = (changes.ai_roles ?? []).filter(isAdminLikeRole);
+      const adminLike = (changes.ai_roles ?? []).filter(
+        (name) => isAdminLikeRole(name) && !(current?.default_ai_roles ?? []).includes(name),
+      );
       const confirmed =
         adminLike.length > 0 &&
         adminLike.every(
@@ -459,6 +467,46 @@ export function SettingsPage({
           description="How the consumption endpoint is queried. Budget periods are derived from a baseline, so this window only has to be at least as wide as your widest budget period."
         >
           <div className="flex flex-col gap-5">
+            <Field
+              label="Usage source"
+              hint="Activity log (default): project, user and application budgets count each billed action from Checkmarx One's credit activity log, by project and application id, in the period it happened in; the consumption summary takes over while the log cannot be read. Summary only: usage comes from the consumption summary, matched by name, as before. At each switch the first reading of the new source counts nothing, so the usage of a cycle or two around it is not counted."
+            >
+              <Select
+                value={value("usage_source") ?? "activity"}
+                disabled={!isAdmin}
+                onChange={(event) =>
+                  set({ usage_source: event.target.value as AppSettings["usage_source"] })
+                }
+              >
+                <option value="activity">Activity log (default)</option>
+                <option value="summary">Summary only</option>
+              </Select>
+            </Field>
+            {(value("usage_source") ?? "activity") === "summary" && (
+              <Toggle
+                checked={value("summary_restricts") ?? false}
+                disabled={!isAdmin}
+                onChange={(next) => set({ summary_restricts: next })}
+                label="Allow restrictions from summary totals (less accurate)"
+                description="Off (the default): with the summary only, a monthly or quarterly budget over its limit is warned, not restricted, because from running totals the summary cannot always tell a glitch from a real fall. On: it restricts as before the activity log was used. Lifetime, custom and count-existing budgets restrict either way."
+              />
+            )}
+            <UsageSourceNote status={current.usage_source_status ?? null} />
+            <Field
+              label="Activity log pages per cycle (most)"
+              hint="A normal cycle reads the last couple of hours of the log (a page or two). After downtime more is read, over several cycles if needed: a cycle that stops early counts only what it read completely and says so. 0: no cap."
+            >
+              <Input
+                type="number"
+                min={0}
+                max={100000}
+                value={String(value("activity_max_pages_per_cycle") ?? 40)}
+                disabled={!isAdmin}
+                onChange={(event) =>
+                  set({ activity_max_pages_per_cycle: Number(event.target.value) })
+                }
+              />
+            </Field>
             <Field
               label="Lookback window"
               hint="How far back the consumption endpoint reports. It must be at least as wide as your widest budget period, or consumption inside a period but outside the window is invisible."
@@ -717,6 +765,9 @@ export function SettingsPage({
             />
           </Card>
           )}
+          {section === "enforcement" && <ReadinessPanel isAdmin={isAdmin} />}
+          {section === "enforcement" && <CoveragePanel isAdmin={isAdmin} />}
+          {section === "enforcement" && <SelfTestPanel isAdmin={isAdmin} />}
           {section === "enforcement" && (
           <div id="enforcement-safety">
             <Card
@@ -949,6 +1000,14 @@ export function SettingsPage({
             />
           )}
           {section === "attribution" && (
+            <IntegrationAccountsCard
+              isAdmin={isAdmin}
+              saved={current.integration_accounts ?? []}
+              edited={draft.integration_accounts !== undefined}
+              onChange={(next) => set({ integration_accounts: next })}
+            />
+          )}
+          {section === "attribution" && (
             <AttributionCard
               isAdmin={isAdmin}
               subjects={unresolved.data ?? []}
@@ -956,6 +1015,7 @@ export function SettingsPage({
               onChanged={() => unresolved.reload()}
             />
           )}
+          {section === "attribution" && <EntityMappingCard isAdmin={isAdmin} />}
           {isAdmin && section === "operations" && <OperationsCard />}
           {isAdmin && section === "updates" && <UpdatesPanel onChanged={onSettingsSaved} />}
           {isAdmin && section === "accounts" && <AccountsCard />}
@@ -982,6 +1042,91 @@ export function SettingsPage({
         </div>
       )}
     </>
+  );
+}
+
+/* ------------------------------------------------------------ usage source */
+
+function UsageSourceNote({ status }: { status: UsageSourceStatus | null }) {
+  if (!status || status.setting !== "activity") return null;
+  const reconciliation = status.reconciliation;
+  let text: string;
+  if (status.status === "active") {
+    text = `The activity log is the source${
+      status.last_success_at ? `, last read ${formatRelative(status.last_success_at)}` : ""
+    }.`;
+    if (status.failing_since) {
+      text += ` It has failed since ${formatDateTime(status.failing_since)}: nothing new is counted until it answers.`;
+    }
+    if (reconciliation?.status === "match") {
+      text += ` Its sum matched the summary (${reconciliation.summary_credits} credits, ${reconciliation.period?.replace(/_/g, " ")}).`;
+    } else if (reconciliation?.status === "mismatch") {
+      text += ` Its sum (${reconciliation.activity_credits}) did not match the summary (${reconciliation.summary_credits}): see Diagnose.`;
+    }
+  } else if (status.status === "fallback") {
+    text = `The activity log could not be read (${status.last_error ?? "unknown error"}); the consumption summary is the source until it answers again.`;
+  } else {
+    text = status.last_error
+      ? `The activity log is not available on this tenant (${status.last_error}); the consumption summary is used.`
+      : "The activity log becomes the source at the next cycle.";
+  }
+  return <InfoNote>{text}</InfoNote>;
+}
+
+function IntegrationAccountsCard({
+  isAdmin,
+  saved,
+  edited,
+  onChange,
+}: {
+  isAdmin: boolean;
+  saved: string[];
+  edited: boolean;
+  onChange: (next: string[]) => void;
+}) {
+  const savedText = saved.join("\n");
+  const [text, setText] = useState(savedText);
+  useEffect(() => {
+    // Back to the saved list once it is saved or the draft is discarded.
+    if (!edited) setText(savedText);
+  }, [savedText, edited]);
+  return (
+    <Card
+      title="Integration accounts"
+      description="Accounts the credit activity log reports usage under that are automation, not people."
+    >
+      <InfoNote>
+        Usage of an integration account always counts towards its project&apos;s budget, and the
+        project&apos;s groups and application. It counts towards a user budget only when its project had
+        no active project budget when it happened: Auto-triage and Auto-remediation then count
+        towards the person who started the scan (when charging auto-triage to the scan initiator is
+        on), and any other account towards the person an admin maps it to below, or towards a user
+        budget set on the account itself (pick it under Budgets). An event is never charged to two
+        user budgets. Recognised by themselves: [bot] accounts and known bots, Auto-triage,
+        Auto-remediation, and handles that name a CI or SCM integration.
+      </InfoNote>
+      <div className="mt-4">
+        <Field
+          label="More integration accounts"
+          hint="One name per line (or comma separated), as the activity log reports it; case does not matter."
+        >
+          <Textarea
+            rows={4}
+            value={text}
+            disabled={!isAdmin}
+            onChange={(event) => {
+              setText(event.target.value);
+              onChange(
+                event.target.value
+                  .split(/[\n,]/)
+                  .map((name) => name.trim())
+                  .filter(Boolean),
+              );
+            }}
+          />
+        </Field>
+      </div>
+    </Card>
   );
 }
 
@@ -1254,7 +1399,7 @@ const TAB_BLURB: Record<AttributionTab, string> = {
   matched:
     "Counted towards a user's limits — either matched automatically at high confidence, or mapped by you. Change any that look wrong.",
   unmatched:
-    "No user resembled the reported handle closely enough to suggest. Map these by hand. Automation accounts (bots) are listed here too and are never counted.",
+    "No user resembled the reported handle closely enough to suggest. Map these by hand. Automation (bots, and integration identities with no email) is listed here too, marked as such: it counts towards no user limit and raises no alert.",
 };
 
 const SUBJECT_VIEW: ViewColumn<UnresolvedSubject>[] = [
@@ -1412,11 +1557,12 @@ function AttributionCard({
   async function mapSubject(subject: UnresolvedSubject, userId: string | null) {
     setBusyId(subject.id);
     try {
-      await api.post(`/api/usage/unresolved/${subject.id}/map`, { user_id: userId });
+      const saved = await api.post<UnresolvedSubject>(`/api/usage/unresolved/${subject.id}/map`, {
+        user_id: userId,
+      });
       toast.success(
-        userId
-          ? "Confirmed. This usage now counts towards that user."
-          : "Mapping cleared.",
+        saved.confirmation ??
+          (userId ? "Confirmed. This usage now counts towards that user." : "Mapping cleared."),
       );
       await onChanged();
     } catch (caught) {
@@ -1431,11 +1577,12 @@ function AttributionCard({
     if (!mapping) return;
     setBusy(true);
     try {
-      await api.post(`/api/usage/unresolved/${mapping.id}/map`, { user_id: userId });
+      const saved = await api.post<UnresolvedSubject>(`/api/usage/unresolved/${mapping.id}/map`, {
+        user_id: userId,
+      });
       toast.success(
-        userId
-          ? "Mapped. This usage now counts towards that user."
-          : "Mapping cleared.",
+        saved.confirmation ??
+          (userId ? "Mapped. This usage now counts towards that user." : "Mapping cleared."),
       );
       setMapping(null);
       setQuery("");
@@ -1487,6 +1634,13 @@ function AttributionCard({
       <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
         {TAB_BLURB[tab]}
       </p>
+      <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
+        Automation (a [bot] account, Auto-triage, an integration such as an SCM connector) counts
+        towards nobody&apos;s user budget when its project had an active project budget at the time:
+        the project budget is where it is governed. Otherwise map it to the person it acts for, or
+        leave it unmapped and set a user budget on the account itself. One event is never charged to
+        two user budgets.
+      </p>
 
       {loading ? (
         <Spinner />
@@ -1521,8 +1675,11 @@ function AttributionCard({
                 <Td>
                   <span className="text-sm">{subject.subject_name ?? subject.subject_key}</span>
                   {subject.is_bot && (
-                    <span className="ml-1.5">
-                      <Badge tone="neutral">Bot</Badge>
+                    <span
+                      className="ml-1.5"
+                      title="Looks like automation, not a person: a [bot] account, or a handle with no email that names a CI, SCM or build integration (such as -bot, -ci, svc-, GitHub-Actions, sonar-scanner, jenkins or buildserver01). It counts towards no user. Map it if it is a person after all."
+                    >
+                      <Badge tone="info">Automation</Badge>
                     </span>
                   )}
                   {subject.source === "scan_initiator" && (
@@ -2214,6 +2371,9 @@ function isAdminLikeRole(name: string): boolean {
   );
 }
 
+/** Roles the server refuses as AI roles: removing ai-triage-assist breaks Auto Triage. */
+const NEVER_AI_ROLES = ["ai-triage-assist"];
+
 /** The client roles a user restriction removes, picked from the tenant's own roles. */
 function AiRolesPicker({
   isAdmin,
@@ -2240,10 +2400,13 @@ function AiRolesPicker({
   const [confirming, setConfirming] = useState<string | null>(null);
   const listing = roles.data;
   const isProtected = (name: string) => protectedRoles.includes(name.toLowerCase());
-  const adminLike = (name: string) => byName.get(name)?.admin_like ?? isAdminLikeRole(name);
+  // The defaults are never treated as admin roles (manage-fusion matches manage-*).
+  const adminLike = (name: string) =>
+    byName.get(name)?.admin_like ?? (isAdminLikeRole(name) && !defaults.includes(name));
+  const isNever = (name: string) => NEVER_AI_ROLES.includes(name.toLowerCase());
 
   function add(name: string) {
-    if (isProtected(name)) return;
+    if (isProtected(name) || isNever(name)) return;
     if (adminLike(name)) {
       setConfirming(name);
       return;
@@ -2265,13 +2428,18 @@ function AiRolesPicker({
       <p className="text-sm font-medium">Roles a user restriction removes</p>
       <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
         The client roles (on <code>ast-app</code>) taken from a person who goes over a user
-        budget. The default is the three general Risk Management roles AI Triage and AI
-        Remediation are reached through, so a restricted person also loses the Risk Management
-        pages. When Checkmarx One ships dedicated AI Triage and Remediation roles (announced for
-        10 January), add them here and remove the general ones. A change applies only to
-        restrictions made from then on: a restriction in force keeps, and gives back, exactly
-        the roles it recorded. A role a person holds through a group or a composite role is not
-        taken away by removing their direct mapping; CreditGuard says so when it happens.
+        budget. The default is the Fusion and LLM roles: <code>create-fusion-scan</code> (the role
+        that spends credits), <code>manage-fusion</code>, <code>update-llm-scan-mode</code> and{" "}
+        <code>manage-llm-configuration</code>. Composites such as <code>scan-fusion</code> or{" "}
+        <code>fusion-manager</code> also carry ordinary scanning or tenant-settings rights, so
+        removing them over-restricts; <code>ai-triage-assist</code> is refused, because removing it
+        breaks Auto Triage. A change applies only to restrictions made from then on: a restriction
+        in force keeps, and gives back, exactly the roles it recorded. A role a person holds
+        through a group or a composite role is not taken away by removing their direct mapping:
+        a user budget cannot stop someone who gets Fusion through <code>ast-admin</code> or{" "}
+        <code>scan-fusion</code>. The fix is on the tenant: give people <code>ast-scanner</code> or{" "}
+        <code>ast-risk-manager</code> plus <code>create-fusion-scan</code> directly where wanted.
+        Project budgets do not depend on roles.
       </p>
       <div className="mt-2 flex flex-wrap gap-1.5">
         {value.map((name) => {
@@ -2322,11 +2490,13 @@ function AiRolesPicker({
                   <option
                     key={role.name}
                     value={role.name}
-                    disabled={isProtected(role.name)}
+                    disabled={isProtected(role.name) || isNever(role.name)}
                   >
                     {role.name}
                     {role.composite ? " (composite)" : ""}
-                    {isProtected(role.name)
+                    {isNever(role.name)
+                      ? " (AI Triage system role: cannot be an AI role)"
+                      : isProtected(role.name)
                       ? " (protected: cannot be an AI role)"
                       : adminLike(role.name)
                         ? " ⚠ admin role"

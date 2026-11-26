@@ -15,9 +15,9 @@ from tests.fake_tenant import FakeTenant
 REAL_SAMPLE = {
     "items": [
         {
-            "name": "Aslesha Nargolkar",
-            "email": "aslesha.nargolkar@checkmarx.com",
-            "userEmail": "aslesha.nargolkar@checkmarx.com",
+            "name": "Erin Ellis",
+            "email": "erin.ellis@example.com",
+            "userEmail": "erin.ellis@example.com",
             "creditsUsed": 1,
             "percentOfTotal": 0.1,
             "actionsPerformed": {
@@ -26,7 +26,7 @@ REAL_SAMPLE = {
             },
         },
         {
-            "name": "Aaron Zhou",
+            "name": "Felix Fisher",
             "creditsUsed": 1,
             "percentOfTotal": 0.1,
             "actionsPerformed": {
@@ -35,7 +35,7 @@ REAL_SAMPLE = {
             },
         },
         {
-            "name": "jonathan.davis@checkmarx.com",
+            "name": "grace.green@example.com",
             "creditsUsed": 1,
             "percentOfTotal": 0.1,
             "actionsPerformed": {
@@ -44,9 +44,9 @@ REAL_SAMPLE = {
             },
         },
         {
-            "name": "Harsh Gokani",
-            "email": "harsh.gokani@checkmarx.com",
-            "userEmail": "harsh.gokani@checkmarx.com",
+            "name": "Alice Archer",
+            "email": "alice.archer@example.com",
+            "userEmail": "alice.archer@example.com",
             "creditsUsed": 3,
             "percentOfTotal": 0.3,
             "actionsPerformed": {
@@ -55,7 +55,7 @@ REAL_SAMPLE = {
             },
         },
         {
-            "name": "Matthew Torkington",
+            "name": "Matthew Ingram",
             "creditsUsed": 4,
             "percentOfTotal": 0.39,
             "actionsPerformed": {
@@ -84,20 +84,20 @@ class TestParsePage:
     def test_email_fields_are_preferred_for_the_subject_key(self) -> None:
         page = usage.parse_usage_page(REAL_SAMPLE)
         item = page.items[0]
-        assert item.subject_key == "aslesha.nargolkar@checkmarx.com"
-        assert item.subject_name == "Aslesha Nargolkar"
-        assert item.subject_email == "aslesha.nargolkar@checkmarx.com"
+        assert item.subject_key == "erin.ellis@example.com"
+        assert item.subject_name == "Erin Ellis"
+        assert item.subject_email == "erin.ellis@example.com"
 
     def test_display_name_only_rows_key_on_the_name(self) -> None:
         item = usage.parse_usage_page(REAL_SAMPLE).items[1]
-        assert item.subject_key == "aaron zhou"
+        assert item.subject_key == "felix fisher"
         assert item.subject_email is None
 
     def test_an_email_in_the_name_field_is_treated_as_an_email(self) -> None:
         """Several real rows carry the address in name and no email field."""
         item = usage.parse_usage_page(REAL_SAMPLE).items[2]
-        assert item.subject_key == "jonathan.davis@checkmarx.com"
-        assert item.subject_email == "jonathan.davis@checkmarx.com"
+        assert item.subject_key == "grace.green@example.com"
+        assert item.subject_email == "grace.green@example.com"
 
     def test_credits_are_decimal_not_float(self) -> None:
         item = usage.parse_usage_page(REAL_SAMPLE).items[3]
@@ -119,7 +119,7 @@ class TestParsePage:
         assert usage.parse_usage_page(REAL_SAMPLE).items[4].percent_of_total == 0.39
 
     def test_raw_row_is_retained_for_audit(self) -> None:
-        assert usage.parse_usage_page(REAL_SAMPLE).items[0].raw["name"] == "Aslesha Nargolkar"
+        assert usage.parse_usage_page(REAL_SAMPLE).items[0].raw["name"] == "Erin Ellis"
 
 
 class TestParseEdgeCases:
@@ -231,3 +231,72 @@ class TestFetchUsage:
         pages = list(usage.fetch_usage(tenant.client(), view_by=UsageView.USER))
         assert len(pages) == 1
         assert pages[0].items == []
+
+
+class TestLiveTenantShapes:
+    """Shapes a live tenant returned (2026-11), with synthetic values."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("31024", Decimal("31024")),
+            ("252.5", Decimal("252.5")),
+            (" 43.5 ", Decimal("43.5")),
+            ("1e3", Decimal("1000")),
+            (7, Decimal("7")),
+            (2.5, Decimal("2.5")),
+            (0.1, Decimal("0.1")),
+            (None, Decimal("0")),
+        ],
+    )
+    def test_credits_in_every_numeric_form(self, value, expected: Decimal) -> None:
+        assert usage.parse_credits(value) == expected
+
+    @pytest.mark.parametrize(
+        "value", ["", "n/a", "1,234.5", "1.234,5", "NaN", "Infinity", "-inf", True, [], {}]
+    )
+    def test_anything_else_is_zero_not_a_guess(self, value) -> None:
+        assert usage.parse_credits(value) == Decimal("0")
+
+    def test_an_action_row_nests_its_type_like_every_other_row(self) -> None:
+        row = {
+            "name": "Fusion Scan - Opus 5.5",
+            "creditsUsed": "31024",
+            "percentOfTotal": 78.56,
+            "actionsPerformed": {
+                "actions": [{"actionType": "fusion_scan_-_opus_5.5", "transactionCount": 285}],
+                "total": 285,
+            },
+        }
+        item = usage.parse_usage_item(row)
+        assert item is not None
+        assert item.subject_name == "Fusion Scan - Opus 5.5"
+        assert item.credits_used == Decimal("31024")
+        assert item.transactions == 285
+        assert item.actions == {ActionType.FUSION.value: 285}
+        # No id on a live row: matching is by name.
+        assert item.reported_id is None
+
+    def test_an_older_flat_action_row_is_still_read(self) -> None:
+        item = usage.parse_usage_item(
+            {"name": "triage", "actionType": "triage", "transactionCount": 9, "creditsUsed": 9}
+        )
+        assert item is not None
+        assert item.actions == {ActionType.TRIAGE.value: 9}
+        assert item.credits_used == Decimal("9")
+
+    def test_a_project_row_has_a_name_and_no_id(self) -> None:
+        item = usage.parse_usage_item(
+            {
+                "name": "example-org/example-repo",
+                "creditsUsed": "120",
+                "percentOfTotal": 1.5,
+                "actionsPerformed": {
+                    "actions": [{"actionType": "triage", "transactionCount": 120}],
+                    "total": 120,
+                },
+            }
+        )
+        assert item is not None
+        assert item.subject_key == "example-org/example-repo"
+        assert item.reported_id is None

@@ -4,15 +4,15 @@ Everything that knows the shape of that response lives in this one module, so a
 change to the payload is a single file edit. Callers get ``ParsedUsagePage``
 objects and never touch the JSON.
 
-Observed response shape (viewBy=user):
+Observed response shape (viewBy=user), from a live tenant (2026-11):
 
     {
       "items": [
         {
-          "name": "Aslesha Nargolkar",
-          "email": "aslesha.nargolkar@checkmarx.com",
-          "userEmail": "aslesha.nargolkar@checkmarx.com",
-          "creditsUsed": 1,
+          "name": "Jane Example",
+          "email": "jane@example.com",
+          "userEmail": "jane@example.com",
+          "creditsUsed": "1",
           "percentOfTotal": 0.1,
           "actionsPerformed": {
             "actions": [{"actionType": "triage", "transactionCount": 1}],
@@ -23,14 +23,31 @@ Observed response shape (viewBy=user):
       "totalItems": 44, "totalPages": 3, "currentPage": 1
     }
 
+Every dimension uses the same row shape. ``project`` and ``application`` rows
+carry only ``name`` (no id; a project row's name can be an ``org/repo`` that is
+no synced project), and ``action`` rows name the action as Checkmarx displays
+it, with the type and its transactions nested like any other row:
+
+    {"name": "Fusion Scan - Opus 5.5", "creditsUsed": "31024", "percentOfTotal": 78.56,
+     "actionsPerformed": {"actions": [{"actionType": "fusion_scan_-_opus_5.5",
+                                       "transactionCount": 285}], "total": 285}}
+
+A flat action row (``actionType``/``transactionCount`` at the top level) is
+still read, for older payloads.
+
 Robustness choices, each because of something visible in the real data:
 
 * ``email`` and ``userEmail`` are both optional, and several rows carry an email
   address in ``name`` instead. Identity resolution therefore works from a
   normalised key rather than trusting any single field.
 * ``creditsUsed`` is not the same as ``actionsPerformed.total``: a remediation can
-  cost 3 credits for 1 transaction. Credits are the budget currency, transactions
-  are only reported for context.
+  cost 3 credits for 1 transaction, and a Fusion scan far more than its listed
+  rate. Credits are the budget currency, transactions are only reported for
+  context.
+* ``creditsUsed`` arrives as a string (``"31024"``, ``"252.5"``); integers and
+  floats are accepted too. See :func:`parse_credits`.
+* No row carries an id. Matching is by name; the id fields read below
+  (``reported_id``) are for payloads that may carry one in future.
 * Unknown ``actionType`` values are kept under their raw name rather than dropped,
   so a newly billed action type still counts against budgets.
 """
@@ -158,19 +175,37 @@ def fusion_model(raw: str | None) -> str | None:
     return " ".join(word[:1].upper() + word[1:] for word in words)
 
 
-def _to_decimal(value: Any) -> Decimal:
-    """Coerce a reported credit figure without ever raising.
+def parse_credits(value: Any) -> Decimal:
+    """A reported credit figure as a Decimal, without ever raising.
 
-    A row we cannot parse must not abort the whole poll, and it must not be
-    invented as a non zero cost either, so it lands as zero and is logged.
+    Accepts what the feed sends: a numeric string (``"31024"``, ``" 252.5 "``,
+    ``"1e3"``), an int or a float. A row we cannot parse must not abort the whole
+    poll, and it must not be invented as a non zero cost either, so it lands as
+    zero and is logged. That covers booleans, NaN and infinities, and localised
+    strings (``"1,234.5"``, ``"1.234,5"``), whose meaning is ambiguous and is not
+    guessed.
     """
     if value is None:
         return Decimal("0")
+    if isinstance(value, bool):
+        logger.warning("Could not parse a creditsUsed value of type bool")
+        return Decimal("0")
     try:
-        return Decimal(str(value))
+        if isinstance(value, int):
+            parsed = Decimal(value)
+        elif isinstance(value, float):
+            parsed = Decimal(repr(value))
+        elif isinstance(value, str):
+            parsed = Decimal(value.strip())
+        else:
+            raise TypeError(type(value).__name__)
     except (InvalidOperation, ValueError, TypeError):
         logger.warning("Could not parse a creditsUsed value of type %s", type(value).__name__)
         return Decimal("0")
+    if not parsed.is_finite():
+        logger.warning("Ignored a creditsUsed value that is not a finite number")
+        return Decimal("0")
+    return parsed
 
 
 def _first_string(item: dict[str, Any], *keys: str) -> str | None:
@@ -218,6 +253,8 @@ def parse_usage_item(item: dict[str, Any]) -> ParsedUsageItem | None:
     """Normalise one row of ``items``. Returns None for a row with no identity."""
     name = _first_string(item, "name", "displayName", "userName", "username")
     email = _first_string(item, "userEmail", "email", "userPrincipalName")
+    # No row seen on a live tenant carries an id; matching is by name. Read in
+    # case a future payload adds one (an id then wins over the name).
     reported_id = _first_string(item, "id", "userId", "applicationId", "projectId")
 
     # Several rows carry the address in ``name`` and no email field at all.
@@ -244,7 +281,8 @@ def parse_usage_item(item: dict[str, Any]) -> ParsedUsageItem | None:
                 action = normalise_action_type(entry.get("actionType"))
                 count = entry.get("transactionCount")
                 actions[action] = actions.get(action, 0) + (count if isinstance(count, int) else 0)
-    # The action dimension reports the type in the row itself rather than nested.
+    # An older, flat action row: the type in the row itself rather than nested.
+    # A live tenant nests it under actionsPerformed like every other dimension.
     elif looks_like_action_row(item):
         actions[normalise_action_type(_first_string(item, "actionType", "action", "name"))] = (
             item.get("transactionCount") if isinstance(item.get("transactionCount"), int) else 0
@@ -255,7 +293,7 @@ def parse_usage_item(item: dict[str, Any]) -> ParsedUsageItem | None:
         subject_key=subject_key,
         subject_name=name,
         subject_email=email,
-        credits_used=_to_decimal(item.get("creditsUsed", item.get("credits"))),
+        credits_used=parse_credits(item.get("creditsUsed", item.get("credits"))),
         percent_of_total=float(percent) if isinstance(percent, int | float) else None,
         transactions=transactions,
         actions=actions,

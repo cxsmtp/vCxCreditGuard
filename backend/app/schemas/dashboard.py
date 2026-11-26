@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -14,10 +14,21 @@ from app.schemas.connection import KeyPermissionSummary
 
 
 class ActionBreakdownItem(BaseModel):
+    # As Checkmarx reports it ("Fusion Scan - Opus 5.5").
     action_type: str
     credits: Decimal
     transactions: int | None = None
     percent_of_total: float | None = None
+    # The normalised type ("fusion"), for a stable colour.
+    action_bucket: str | None = None
+    # Credits / transactions as the feed reports them.
+    credits_per_transaction: Decimal | None = None
+    # GET /api/v1/credits/action-rates, when it lists the action.
+    listed_rate: Decimal | None = None
+    # What CreditGuard prices one transaction at: "rate" (the listed rate,
+    # which the feed agrees with) or "observed" (the feed's average, because
+    # the rate does not match it). Null when neither is known.
+    price_source: str | None = None
 
 
 class TrendPoint(BaseModel):
@@ -46,6 +57,29 @@ class TopConsumerItem(BaseModel):
     # initiators: what this person is charged for auto triage inside the
     # lookback window, on top of ``credits``.
     auto_triage_attributed: Decimal | None = None
+    # Users only: automation (Auto Triage, a bot, an integration identity),
+    # shown as such rather than as an unmatched person.
+    automation: bool = False
+
+
+class UnmatchedEntitiesInfo(BaseModel):
+    count: int = 0
+    credits: Decimal = Decimal("0")
+    total_credits: Decimal = Decimal("0")
+    # The largest few, as reported: [{"name", "credits"}].
+    top: list[dict[str, str]] = []
+
+
+class AttributionSummaryInfo(BaseModel):
+    """Usage that counts towards no limit, and why (latest readings)."""
+
+    unmatched_people: int = 0
+    unmatched_people_credits: Decimal = Decimal("0")
+    automation: int = 0
+    automation_credits: Decimal = Decimal("0")
+    user_total_credits: Decimal = Decimal("0")
+    projects: UnmatchedEntitiesInfo = UnmatchedEntitiesInfo()
+    applications: UnmatchedEntitiesInfo = UnmatchedEntitiesInfo()
 
 
 class StatusTiles(BaseModel):
@@ -78,6 +112,9 @@ class CreditPoolInfo(BaseModel):
     collected_at: datetime | None = None
     assigned: Decimal = Decimal("0")
     over_allocation: Decimal | None = None
+    # Checkmarx's own credit enforcement as /credits/info reports it, read only:
+    # {"state", "consumptionPct", "warningThresholdPct", "cutoffThresholdPct"}.
+    checkmarx_enforcement: dict[str, str | int | float] | None = None
 
 
 class DashboardResponse(BaseModel):
@@ -97,6 +134,7 @@ class DashboardResponse(BaseModel):
     tiles: StatusTiles
     unavailable_dimensions: list[str]
     credit_pool: CreditPoolInfo | None = None
+    attribution: AttributionSummaryInfo | None = None
 
 
 class OrgEntity(BaseModel):
@@ -166,11 +204,43 @@ class UnresolvedSubjectResponse(BaseModel):
     # who started scans whose auto triage is charged to people (only raised
     # while that setting is on). Both are mapped the same way.
     source: str = "consumption"
+    # After a mapping: where the subject's usage counts from now on.
+    confirmation: str | None = None
 
 
 class MapSubjectRequest(StrictModel):
     # Null clears an existing mapping.
     user_id: str | None = Field(default=None, max_length=64)
+
+
+class UnmatchedEntityResponse(BaseModel):
+    """A project or application name in the consumption feed that matches no
+    synced entity (or that an admin mapped to one)."""
+
+    view: str
+    subject_key: str
+    name: str
+    credits: Decimal
+    mapped_entity_id: str | None = None
+    mapped_label: str | None = None
+    # Mapped to a project or application that is no longer synced: ignored.
+    mapping_broken: bool = False
+    # Mapped, but the name now matches a synced entity by itself, which wins.
+    overridden: bool = False
+    overridden_by: str | None = None
+    # After a mapping: where the name's usage counts from now on.
+    confirmation: str | None = None
+    # Keyset paging: pass the last row's cursor as ``after``, and ``readings``
+    # back, for the next page.
+    cursor: str | None = None
+    readings: str | None = None
+
+
+class MapEntityRequest(StrictModel):
+    view: Literal["project", "application"]
+    subject_key: str = Field(min_length=1, max_length=320)
+    # Null clears an existing mapping.
+    entity_id: str | None = Field(default=None, max_length=64)
 
 
 class SettingsResponse(BaseModel):
@@ -231,6 +301,20 @@ class SettingsResponse(BaseModel):
     # Charge each project's auto-triage credits also to the person whose scan
     # triggered it. Off by default.
     charge_auto_triage_to_scan_initiator: bool = False
+    # Where period budgets of projects, users and applications get their
+    # usage: "activity" (the credit activity log, with the summary as its
+    # fallback) or "summary" (the consumption summary only).
+    usage_source: str = "activity"
+    allowed_usage_sources: list[str] = Field(default_factory=list)
+    # With the summary only: whether summary-counted usage may restrict period
+    # budgets (off: they warn; usage the activity log counted always may).
+    summary_restricts: bool = False
+    activity_max_pages_per_cycle: int = 40
+    # Extra integration account names (besides "[bot]" accounts, Auto-triage
+    # and Auto-remediation).
+    integration_accounts: list[str] = Field(default_factory=list)
+    # The activity source's state, for the Settings page.
+    usage_source_status: dict[str, Any] | None = None
     current_schedule_description: str
     # Pacing for large tenants (per cycle; 0 = no budget). See pacing.py.
     verify_interval_minutes: int = 60
@@ -282,6 +366,10 @@ class SettingsUpdateRequest(StrictModel):
     # that look like administration roles (settings_store.ADMIN_ROLE_PATTERNS).
     confirm_admin_roles: bool | None = None
     charge_auto_triage_to_scan_initiator: bool | None = None
+    usage_source: str | None = Field(default=None, max_length=16)
+    summary_restricts: bool | None = None
+    activity_max_pages_per_cycle: int | None = Field(default=None, ge=0, le=100_000)
+    integration_accounts: list[str] | None = Field(default=None, max_length=200)
     verify_interval_minutes: int | None = Field(default=None, ge=0, le=10080)
     max_verifications_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)
     max_writes_per_cycle: int | None = Field(default=None, ge=0, le=1_000_000)

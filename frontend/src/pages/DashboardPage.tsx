@@ -1,7 +1,13 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { ApiError, api } from "../api/client";
-import type { CreditPoolInfo, CycleRun, Dashboard, UnresolvedSubject } from "../api/types";
+import type {
+  AttributionSummary,
+  CreditPoolInfo,
+  CycleRun,
+  Dashboard,
+  UnresolvedSubject,
+} from "../api/types";
 import { BarList } from "../components/charts/BarList";
 import { BreakdownChart } from "../components/charts/BreakdownChart";
 import { TrendChart } from "../components/charts/TrendChart";
@@ -9,6 +15,7 @@ import { StatTile } from "../components/StatTile";
 import { DiagnosticsPanel } from "../components/DiagnosticsPanel";
 import { Button, Card, ErrorNote, InfoNote, PageHeader, Spinner, Tabs } from "../components/ui";
 import { useInterval, useResource } from "../hooks/useResource";
+import { UsageSourceBanner } from "../components/UsageSourceBanner";
 import { formatCredits, formatDateTime, formatNumber, formatRelative } from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
@@ -72,9 +79,15 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
   const data = dashboard.data;
   const tiles = data.tiles;
   // Not counted towards anyone: no manual mapping, no auto-match, and not a bot.
+  // The count is the server's (the same on every page); the list only adds credits
+  // when the summary is not there.
   const unmatched = (unresolved.data ?? []).filter(
     (row) => !row.counts_towards_user_id && !row.is_bot && row.source !== "scan_initiator",
   );
+  const unmatchedPeople = data.attribution?.unmatched_people ?? tiles.unresolved_subjects;
+  const unmatchedCredits =
+    data.attribution?.unmatched_people_credits ??
+    unmatched.reduce((sum, row) => sum + Number(row.credits_used), 0);
 
   const consumers = {
     users: data.top_users,
@@ -101,6 +114,7 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
           )
         }
       />
+      <UsageSourceBanner />
 
       <div className="mb-5">
         <DiagnosticsPanel />
@@ -130,15 +144,12 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
           </InfoNote>
         </div>
       )}
-      {unmatched.length > 0 && (
+      {unmatchedPeople > 0 && (
         <div className="mb-5">
           <InfoNote tone="warning">
-            {formatNumber(unmatched.length)} consumption{" "}
-            {unmatched.length === 1 ? "row" : "rows"} could not be matched to a Checkmarx user, so{" "}
-            {formatCredits(
-              unmatched.reduce((sum, row) => sum + Number(row.credits_used), 0),
-            )}{" "}
-            credits are not counted towards any user limit.{" "}
+            {formatNumber(unmatchedPeople)} {unmatchedPeople === 1 ? "person" : "people"} in the
+            consumption feed could not be matched to a Checkmarx user, so{" "}
+            {formatCredits(unmatchedCredits)} credits are not counted towards any user limit.{" "}
             <Link to="/settings/attribution#unmatched" className="underline">
               Map them under Settings → Attribution
             </Link>
@@ -184,16 +195,19 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
 
       <CreditPoolCard pool={data.credit_pool} />
 
+      {data.attribution && <AttributionCard summary={data.attribution} isAdmin={isAdmin} />}
+
       <div className="grid gap-6 lg:grid-cols-3">
         <Card
           title="Credits consumed over time"
           description="Difference between consecutive polls"
-          className="lg:col-span-2"
+          className="min-w-0 lg:col-span-2"
         >
           <TrendChart points={data.trend} />
         </Card>
 
-        <Card title="By action type" description="What the credits were spent on">
+        {/* min-w-0: a grid item may otherwise grow to its table's width on a phone. */}
+        <Card title="By action type" description="What the credits were spent on" className="min-w-0">
           <BreakdownChart items={data.breakdown} />
         </Card>
       </div>
@@ -310,6 +324,26 @@ function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
           {!known && <span>Tenant balance not read yet — showing budget allocation only.</span>}
         </div>
 
+        {pool.checkmarx_enforcement && (
+          <div className="mt-3">
+            <InfoNote tone={pool.checkmarx_enforcement.state === "normal" ? "info" : "warning"}>
+              Checkmarx One's own credit enforcement (read only):{" "}
+              {pool.checkmarx_enforcement.state ? (
+                <strong>{pool.checkmarx_enforcement.state}</strong>
+              ) : (
+                "state not reported"
+              )}
+              {pool.checkmarx_enforcement.consumptionPct !== undefined &&
+                `, ${pool.checkmarx_enforcement.consumptionPct}% consumed`}
+              {pool.checkmarx_enforcement.warningThresholdPct !== undefined &&
+                `; it warns at ${pool.checkmarx_enforcement.warningThresholdPct}%`}
+              {pool.checkmarx_enforcement.cutoffThresholdPct !== undefined &&
+                ` and cuts off at ${pool.checkmarx_enforcement.cutoffThresholdPct}%`}
+              . CreditGuard does not change it.
+            </InfoNote>
+          </div>
+        )}
+
         {over && (
           <div className="mt-3">
             <InfoNote tone="warning">
@@ -319,6 +353,89 @@ function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
             </InfoNote>
           </div>
         )}
+      </Card>
+    </div>
+  );
+}
+
+/**
+ * Usage that counts towards no limit, and why. Automation and unmatched
+ * project or application names are shown, never silently dropped.
+ */
+function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; isAdmin: boolean }) {
+  const rows: { key: string; label: string; count: number; credits: string; total: string; note: string }[] = [];
+  if (summary.automation > 0) {
+    rows.push({
+      key: "automation",
+      label: summary.automation === 1 ? "Automation identity" : "Automation identities",
+      count: summary.automation,
+      credits: summary.automation_credits,
+      total: summary.user_total_credits,
+      note:
+        "Auto Triage, bots and integrations without an email. Counted tenant wide and on projects, towards no user limit; not a person to chase.",
+    });
+  }
+  if (summary.unmatched_people > 0) {
+    rows.push({
+      key: "people",
+      label: summary.unmatched_people === 1 ? "Person not matched" : "People not matched",
+      count: summary.unmatched_people,
+      credits: summary.unmatched_people_credits,
+      total: summary.user_total_credits,
+      note: "Reported under a name or address that matches no synced user.",
+    });
+  }
+  for (const [key, label, found] of [
+    ["projects", "project", summary.projects],
+    ["applications", "application", summary.applications],
+  ] as const) {
+    if (found.count > 0) {
+      const names = found.top.slice(0, 3).map((entry) => entry.name).join(", ");
+      rows.push({
+        key,
+        label: `${label[0]!.toUpperCase()}${label.slice(1)} names not matched`,
+        count: found.count,
+        credits: found.credits,
+        total: found.total_credits,
+        note: `Usage under a repository name that matches no ${label} in Checkmarx One (such as ${names}). It counts towards no ${label}, group or application limit.`,
+      });
+    }
+  }
+  if (rows.length === 0) return null;
+  return (
+    <div className="mb-6">
+      <Card
+        title="Usage counted towards no limit"
+        description="From the latest readings. Shown so nothing is dropped silently."
+        actions={
+          isAdmin && (
+            <Link to="/settings/attribution#unmatched" className="text-xs underline">
+              Map under Settings → Attribution
+            </Link>
+          )
+        }
+      >
+        <ul className="flex flex-col gap-3">
+          {rows.map((row) => {
+            const share = Number(row.total) > 0 ? (Number(row.credits) / Number(row.total)) * 100 : null;
+            return (
+              <li key={row.key} className="text-[13px]">
+                <div className="flex flex-wrap items-baseline justify-between gap-2">
+                  <span className="font-medium">
+                    {formatNumber(row.count)} {row.label.toLowerCase()}
+                  </span>
+                  <span className="tabular" style={{ color: "var(--text-secondary)" }}>
+                    {formatCredits(row.credits)} credits
+                    {share !== null && ` (${share.toFixed(share < 10 ? 1 : 0)}% of ${formatCredits(row.total)})`}
+                  </span>
+                </div>
+                <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                  {row.note}
+                </p>
+              </li>
+            );
+          })}
+        </ul>
       </Card>
     </div>
   );

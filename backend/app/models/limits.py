@@ -182,7 +182,10 @@ class LimitPeriodState(Base):
         Numeric(18, 4), nullable=False, default=Decimal("0")
     )
     # The cumulative figure the Checkmarx API reported when this period opened.
-    # credits_used = reported_total - baseline_credits.
+    # A budget that counts usage already reported (lifetime, custom, count
+    # existing usage) uses credits_used = reported_total - baseline_credits; a
+    # period budget counts its ledger counter (BudgetUsage), and this is then
+    # only informational (reported_total - credits_used).
     baseline_credits: Mapped[Decimal] = mapped_column(
         Numeric(18, 4), nullable=False, default=Decimal("0")
     )

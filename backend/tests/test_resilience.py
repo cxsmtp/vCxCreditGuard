@@ -57,6 +57,15 @@ from tests.fake_tenant import FakeTenant, populated_tenant
 
 ACTOR = AuditActor.system("test")
 AUGUST = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def readings_in_august(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Readings are taken in the month these tests evaluate: the ledger counts
+    an increase towards the period it was observed in."""
+    monkeypatch.setattr(ingestion, "utcnow", lambda: datetime(2026, 8, 11, 11, 0, tzinfo=UTC))
+
+
 PERIOD = "2026-08"
 
 
@@ -68,11 +77,11 @@ def synced(db: Session, tenant: FakeTenant | None = None):
     return tenant, client
 
 
-def harsh_limit(db: Session, *, credit_limit: int = 1, enforce: bool = True) -> CreditLimit:
+def alice_limit(db: Session, *, credit_limit: int = 1, enforce: bool = True) -> CreditLimit:
     limit = CreditLimit(
         entity_type=EntityType.USER,
-        entity_id="user-harsh",
-        entity_label="Harsh Gokani",
+        entity_id="user-alice",
+        entity_label="Alice Archer",
         credit_limit=credit_limit,
         period_type=PeriodType.MONTHLY,
         enforce=enforce,
@@ -83,8 +92,8 @@ def harsh_limit(db: Session, *, credit_limit: int = 1, enforce: bool = True) -> 
     return limit
 
 
-def harsh_has_ai_roles(tenant: FakeTenant) -> bool:
-    return all(role in tenant.role_mappings["user-harsh"] for role in AI_ROLE_NAMES)
+def alice_has_ai_roles(tenant: FakeTenant) -> bool:
+    return all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
 
 def snapshots(db: Session, view: str = "user") -> list[UsageSnapshot]:
@@ -264,7 +273,7 @@ class TestCollapsedReadsAreHeld:
 
     def test_reads_that_disagree_with_each_other_are_not_accepted(self, db: Session) -> None:
         tenant, client = synced(db)
-        tenant.set_user_credits(name="Sean Casey", credits=1000)
+        tenant.set_user_credits(name="Bob Baker", credits=1000)
         ingestion.ingest_usage(db, client, views=(UsageView.USER,))
         real_rows = list(tenant.consumption["user"])
 
@@ -300,7 +309,7 @@ class TestCollapsedReadsAreHeld:
         tenant, client = synced(db)
         ingestion.ingest_usage(db, client, views=(UsageView.USER,))
         # 15 -> 12 credits: old usage ageing out of the window, not a collapse.
-        tenant.set_user_credits(name="departed.person@checkmarx.com", credits=4)
+        tenant.set_user_credits(name="departed.person@example.com", credits=4)
         result = ingestion.ingest_usage(db, client, views=(UsageView.USER,))
         assert result.dimensions["user"].held is False
 
@@ -314,17 +323,17 @@ class TestCollapsedReadsAreHeld:
         assert result.dimensions["user"].held is False
 
     def test_a_collapsed_read_does_not_lift_and_then_reapply_restrictions(
-        self, db: Session
+        self, db: Session, readings_in_august: None
     ) -> None:
         """The failure this exists to prevent, end to end."""
         tenant, client = synced(db)
         ingestion.ingest_usage(db, client)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
 
         # Checkmarx answers 200 with nothing for one cycle.
         real_rows = list(tenant.consumption["user"])
@@ -333,7 +342,7 @@ class TestCollapsedReadsAreHeld:
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
 
         # Still restricted, on the same single action: nothing was lifted.
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
         actions = list(db.scalars(select(EnforcementAction)))
         assert [a.status for a in actions] == [EnforcementStatus.APPLIED]
         state = db.scalar(select(LimitPeriodState).where(LimitPeriodState.limit_id == limit.id))
@@ -353,7 +362,7 @@ class TestCollapsedReadsAreHeld:
 class TestUndoSnapshotIsDurableBeforeTheTenantIsChanged:
     def test_the_snapshot_is_committed_before_roles_are_removed(self, db: Session) -> None:
         tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         seen: list[dict | None] = []
 
         def at_request(request: httpx.Request) -> None:
@@ -378,7 +387,7 @@ class TestUndoSnapshotIsDurableBeforeTheTenantIsChanged:
     def test_a_crash_after_the_tenant_write_can_still_be_undone(self, db: Session) -> None:
         """The process dies after Checkmarx was changed but before it was recorded."""
         tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
 
         class Crash(BaseException):
             pass
@@ -398,7 +407,7 @@ class TestUndoSnapshotIsDurableBeforeTheTenantIsChanged:
                 db, crashing_client, limit=limit, period_key=PERIOD, actor=ACTOR
             )
         db.rollback()
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
 
         # A fresh process finds the intent and what was taken.
         tenant.handler = original  # type: ignore[method-assign]
@@ -420,7 +429,7 @@ class TestUndoSnapshotIsDurableBeforeTheTenantIsChanged:
             assert enforcement.restore_action(
                 session, client, action=action, actor=ACTOR, reason="admin"
             )
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
 
 class TestUnrecordedRestrictionsAreStillLifted:
@@ -428,7 +437,7 @@ class TestUnrecordedRestrictionsAreStillLifted:
 
     def _crash_mid_enforcement(self, db: Session):
         tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
 
         class Crash(BaseException):
             pass
@@ -448,7 +457,7 @@ class TestUnrecordedRestrictionsAreStillLifted:
             )
         db.rollback()
         tenant.handler = original  # type: ignore[method-assign]
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
         action = db.scalar(select(EnforcementAction))
         db.refresh(action)
         assert action.status == EnforcementStatus.PENDING
@@ -457,7 +466,7 @@ class TestUnrecordedRestrictionsAreStillLifted:
     def test_an_admin_can_restore_it(self, db: Session) -> None:
         tenant, client, _limit, action = self._crash_mid_enforcement(db)
         assert enforcement.restore_action(db, client, action=action, actor=ACTOR, reason="admin")
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
         assert action.status == EnforcementStatus.REVERSED
 
     def test_the_cycle_lifts_it_when_the_limit_stops_enforcing(self, db: Session) -> None:
@@ -467,19 +476,19 @@ class TestUnrecordedRestrictionsAreStillLifted:
         )
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
     def test_rollover_lifts_it(self, db: Session) -> None:
         tenant, client, _limit, _action = self._crash_mid_enforcement(db)
         ingestion.ingest_usage(db, client)
         september = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
         evaluation.evaluate_all(db, client=client, now=september, actor=ACTOR)
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
     def test_a_write_checkmarx_refused_is_not_treated_as_a_restriction(self, db: Session) -> None:
         """The key can read roles but not change them: nothing was taken."""
         tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         tenant.fail_requests[("DELETE", "/role-mappings/")] = 403
         outcome = enforcement.apply_enforcement(
             db, client, limit=limit, period_key=PERIOD, actor=ACTOR
@@ -490,7 +499,7 @@ class TestUnrecordedRestrictionsAreStillLifted:
         # The read succeeded, so there is a snapshot - but the outcome is known.
         assert action.undo_snapshot["removed_roles"]
         assert enforcement.may_be_in_force(action) is False
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
         # So nothing tries to "restore" it, cycle after cycle, once the limit
         # stops enforcing.
@@ -514,7 +523,7 @@ class TestUnrecordedRestrictionsAreStillLifted:
 
     def test_a_refused_write_is_simply_retried_on_the_next_breach(self, db: Session) -> None:
         tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         tenant.fail_requests[("DELETE", "/role-mappings/")] = 403
         enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
         tenant.fail_requests.clear()
@@ -523,17 +532,19 @@ class TestUnrecordedRestrictionsAreStillLifted:
             db, client, limit=limit, period_key=PERIOD, actor=ACTOR
         )
         assert len(outcome.applied) == 1
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
         action = db.scalar(select(EnforcementAction))
         assert enforcement.OUTCOME_UNKNOWN not in action.undo_snapshot
 
-    def test_an_outcome_in_doubt_is_undone_and_can_be_enforced_again(self, db: Session) -> None:
+    def test_an_outcome_in_doubt_is_undone_and_can_be_enforced_again(
+        self, db: Session, readings_in_august: None
+    ) -> None:
         """A 5xx on the write: Checkmarx may or may not have made the change."""
         tenant, client = synced(db)
         ingestion.ingest_usage(db, client)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         tenant.fail_requests[("DELETE", "/role-mappings/")] = 500
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -550,7 +561,7 @@ class TestUnrecordedRestrictionsAreStillLifted:
         db.commit()
         db.refresh(action)
         assert action.status == EnforcementStatus.REVERSED
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
         # ...and that automatic lift does not stop a later breach being enforced.
         limits_service.update_limit(
@@ -558,7 +569,7 @@ class TestUnrecordedRestrictionsAreStillLifted:
         )
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
 
     def test_the_admin_api_lists_and_restores_it(
         self, admin_client: TestClient, db: Session, monkeypatch: pytest.MonkeyPatch
@@ -572,7 +583,7 @@ class TestUnrecordedRestrictionsAreStillLifted:
         response = admin_client.post(f"/api/notifications/enforcements/{action.id}/restore")
         assert response.status_code == httpx.codes.OK, response.text
         assert response.json()["restored"] is True
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
 
 class TestPersistentFailuresAreNotNoisy:
@@ -580,7 +591,7 @@ class TestPersistentFailuresAreNotNoisy:
         self, db: Session
     ) -> None:
         tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         tenant.fail_requests[("DELETE", "/role-mappings/")] = 403
         for _ in range(4):
             outcome = enforcement.apply_enforcement(
@@ -603,16 +614,18 @@ class TestPersistentFailuresAreNotNoisy:
 
 
 class TestRestoreIsDurable:
-    def test_a_failed_admin_restore_is_completed_by_the_cycle_not_undone(self, db: Session) -> None:
+    def test_a_failed_admin_restore_is_completed_by_the_cycle_not_undone(
+        self, db: Session, readings_in_august: None
+    ) -> None:
         tenant, client = synced(db)
         ingestion.ingest_usage(db, client)
-        harsh_limit(db)
+        alice_limit(db)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         action = db.scalar(select(EnforcementAction))
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
 
         # The admin presses Restore while Checkmarx is refusing writes.
         tenant.fail_requests[("POST", "/role-mappings/")] = 503
@@ -628,10 +641,10 @@ class TestRestoreIsDurable:
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         db.refresh(action)
         assert action.status == EnforcementStatus.REVERSED
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
         # And, being an admin's decision, it holds for the rest of the period.
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
     def test_a_restore_that_keeps_failing_alerts_once_a_day_not_every_cycle(
         self, db: Session
@@ -671,7 +684,7 @@ class TestLockOrder:
         from app.core.config import get_settings
 
         tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         limit_id = limit.id
         path = get_settings().database_url.removeprefix("sqlite:///")
         observed: list[str] = []
@@ -721,7 +734,7 @@ class TestLockOrder:
         assert admin_outcome == {"ok": True}
         # The admin's change came second and wins: the restriction is lifted, and
         # both halves are in the audit trail in the order they happened.
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
         with session_scope() as session:
             actions = [
                 row.action
@@ -734,7 +747,7 @@ class TestLockOrder:
 class TestRestoreRace:
     def test_restore_acts_on_the_committed_state_not_a_stale_copy(self, db: Session) -> None:
         tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
         action = db.scalar(select(EnforcementAction))
         assert action.status == EnforcementStatus.APPLIED
@@ -745,7 +758,7 @@ class TestRestoreRace:
             assert enforcement.restore_action(
                 other, client, action=theirs, actor=ACTOR, reason="admin"
             )
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
         writes_before = [r for r in tenant.requests if r[0] != "GET"]
 
         # This session still holds the row as APPLIED. It must notice, not replay.
@@ -758,7 +771,7 @@ class TestRestoreRace:
 
     def test_enforcement_respects_a_restore_committed_by_another_session(self, db: Session) -> None:
         tenant, client = synced(db)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
         action = db.scalar(select(EnforcementAction))
 
@@ -777,7 +790,7 @@ class TestRestoreRace:
             db, client, limit=limit, period_key=PERIOD, actor=ACTOR
         )
         assert outcome.applied == [] and outcome.reconciled == []
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
 
 # ------------------------------------------------------- lifting restrictions
@@ -785,9 +798,9 @@ class TestRestoreRace:
 
 def _restricted(db: Session):
     tenant, client = synced(db)
-    limit = harsh_limit(db)
+    limit = alice_limit(db)
     enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
-    assert not harsh_has_ai_roles(tenant)
+    assert not alice_has_ai_roles(tenant)
     return tenant, client, limit
 
 
@@ -808,14 +821,14 @@ class TestAFailedLiftIsCompletedLater:
                 select(AuditLogEntry).where(AuditLogEntry.action == "limit.updated")
             )
             assert session.scalar(select(EnforcementAction.status)) == EnforcementStatus.APPLIED
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
 
         # Checkmarx comes back: the next cycle finishes the job.
         tenant.fail_paths.clear()
         ingestion.ingest_usage(db, client)
         result = evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         assert result.restored == 1
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
     def test_an_exemption_stands_and_its_lift_is_retried(self, db: Session) -> None:
         tenant, client, _limit = _restricted(db)
@@ -823,18 +836,18 @@ class TestAFailedLiftIsCompletedLater:
         limits_service.add_exemption(
             db,
             entity_type=EntityType.USER,
-            entity_id="user-harsh",
+            entity_id="user-alice",
             reason="lead",
             actor=ACTOR,
             client=client,
         )
         db.commit()
         assert db.scalar(select(Exemption)) is not None
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
 
         tenant.fail_paths.clear()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
         action = db.scalar(select(EnforcementAction))
         db.refresh(action)
         assert action.reversal_reason == enforcement.EXEMPTED_REASON
@@ -855,15 +868,15 @@ class TestAFailedLiftIsCompletedLater:
         # The limit was deleted while no connection was available.
         limits_service.delete_limit(db, limit=limit, actor=ACTOR, client=None)
         db.commit()
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
 
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
 
 
 class TestApprovalIsOneUnitOfWork:
     def test_nothing_of_an_approval_is_committed_before_all_of_it_is_written(
-        self, db: Session
+        self, db: Session, readings_in_august: None
     ) -> None:
         """Approving lifts a restriction, and lifting commits. The commit must
         come after the request is marked approved, not half way through."""
@@ -873,18 +886,18 @@ class TestApprovalIsOneUnitOfWork:
 
         tenant, client = synced(db)
         ingestion.ingest_usage(db, client)
-        limit = harsh_limit(db)
+        limit = alice_limit(db)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        tenant.set_user_credits(name="Harsh Gokani", email="harsh.gokani@checkmarx.com", credits=50)
+        tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
         ingestion.ingest_usage(db, client)
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
-        assert not harsh_has_ai_roles(tenant)
+        assert not alice_has_ai_roles(tenant)
 
         request = requests_service.create_request(
             db,
             data=requests_service.RequestInput(
                 entity_type=EntityType.USER,
-                entity_id="user-harsh",
+                entity_id="user-alice",
                 requested_limit=1000,
                 reason="release week",
             ),
@@ -906,7 +919,7 @@ class TestApprovalIsOneUnitOfWork:
         db.commit()
 
         assert seen == [(RequestStatus.APPROVED, 1000)]
-        assert harsh_has_ai_roles(tenant)
+        assert alice_has_ai_roles(tenant)
         with session_scope() as session:
             assert session.get(CreditLimit, limit.id).granted_by_request_id == request.id
 
@@ -914,7 +927,7 @@ class TestApprovalIsOneUnitOfWork:
 class TestBulkEditKeepsRejectedValuesOut:
     def test_a_rejected_change_is_not_committed_by_a_later_commit(self, db: Session) -> None:
         synced(db)
-        limit = harsh_limit(db, credit_limit=10)
+        limit = alice_limit(db, credit_limit=10)
         with pytest.raises(limits_service.LimitError):
             limits_service.update_limit(db, limit=limit, changes={"credit_limit": -5}, actor=ACTOR)
         db.commit()  # what the bulk endpoint does after collecting the error
@@ -1069,7 +1082,7 @@ class TestReadThenWriteUnderConcurrency:
         another request commits in between, this one must still succeed: on
         SQLite a transaction that pinned a snapshot at its first read would fail
         outright instead."""
-        limit = harsh_limit(db, credit_limit=10)
+        limit = alice_limit(db, credit_limit=10)
 
         reader = get_session_factory()()
         writer = get_session_factory()()
@@ -1101,7 +1114,7 @@ class TestBusyDatabase:
         monkeypatch.setattr(limits_routes.limits_service, "create_limit", busy)
         response = admin_client.post(
             "/api/limits",
-            json={"entity_type": "user", "entity_id": "user-harsh", "credit_limit": 5},
+            json={"entity_type": "user", "entity_id": "user-alice", "credit_limit": 5},
         )
         assert response.status_code == httpx.codes.SERVICE_UNAVAILABLE
         assert response.headers["Retry-After"] == "5"

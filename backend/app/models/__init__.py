@@ -6,6 +6,12 @@ both discover tables through ``Base.metadata``.
 
 from app.db.base import Base
 from app.db.length_guard import install_length_guards  # noqa: E402
+from app.models.activity import (
+    ActivityBudgetCounter,
+    ActivityEventCount,
+    ActivitySourceState,
+    ProjectBudgetInterval,
+)
 from app.models.audit import AuditLogEntry, Notification
 from app.models.auth import LoginAttempt, PasswordResetToken, UtilitySession, UtilityUser
 from app.models.connection import AppSetting, CxConnection
@@ -25,14 +31,20 @@ from app.models.org import (
     CxProjectGroup,
     CxUser,
 )
+from app.models.selftest import EnforcementSelfTest
 from app.models.usage import (
     AutoTriageCharge,
     AutoTriageProjectState,
+    BudgetUsage,
     CreditBalanceSnapshot,
     DimensionState,
+    EntityMapping,
     SchedulerLock,
     SchedulerRun,
     UnresolvedSubject,
+    UsageDelta,
+    UsageEntityOffset,
+    UsageMissingName,
     UsageRecord,
     UsageSnapshot,
 )
@@ -42,6 +54,10 @@ from app.models.violations import PolicyViolation
 install_length_guards(Base)
 
 __all__ = [
+    "ActivityBudgetCounter",
+    "ActivityEventCount",
+    "ActivitySourceState",
+    "ProjectBudgetInterval",
     "AppSetting",
     "AuditLogEntry",
     "AutoTriageCharge",
@@ -60,6 +76,8 @@ __all__ = [
     "CxUser",
     "DimensionState",
     "EnforcementAction",
+    "EnforcementSelfTest",
+    "EntityMapping",
     "Exemption",
     "LimitPeriodState",
     "LoginAttempt",
@@ -69,6 +87,10 @@ __all__ = [
     "SchedulerLock",
     "SchedulerRun",
     "UnresolvedSubject",
+    "BudgetUsage",
+    "UsageDelta",
+    "UsageEntityOffset",
+    "UsageMissingName",
     "UsageRecord",
     "UsageSnapshot",
     "UtilitySession",

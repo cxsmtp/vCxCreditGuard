@@ -91,6 +91,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
@@ -114,6 +115,7 @@ from app.models.usage import (
     AutoTriageCharge,
     AutoTriageProjectState,
     UnresolvedSubject,
+    UsageEntityOffset,
     UsageRecord,
     UsageSnapshot,
 )
@@ -383,6 +385,27 @@ def project_readings(
             transactions=known.transactions + count,
             credits=known.credits + auto_triage_share(record, price),
             certain=known.certain and certain,
+        )
+    # A name that joined or left a project (a mapping, a rename, a move, a
+    # name missing from a reading and back) shifts the project's figure by
+    # its whole Auto Triage history. The usage ledger keeps that shift per
+    # project (``UsageEntityOffset``), so the reading moves only by Auto Triage
+    # observed while a name counted towards the project: no history is ever
+    # charged to whoever scanned (app/services/ledger.py).
+    offsets = {
+        row.entity_id: row
+        for row in session.scalars(
+            select(UsageEntityOffset).where(UsageEntityOffset.view_by == UsageView.PROJECT.value)
+        )
+    }
+    for project_id, reading in list(readings.items()):
+        offset = offsets.get(project_id)
+        if reading is None or offset is None:
+            continue
+        readings[project_id] = ProjectReading(
+            transactions=max(0, reading.transactions - int(offset.auto_triage_transactions or 0)),
+            credits=max(ZERO, reading.credits - Decimal(offset.auto_triage_credits or 0)),
+            certain=reading.certain,
         )
     return readings
 
@@ -719,14 +742,20 @@ def attributed_usage(
     exclude_projects: set[str] | frozenset[str] = frozenset(),
     counts_existing: bool,
     since: datetime | None,
+    skip: Callable[[AttributedPart], bool] | None = None,
 ) -> AttributedUsage:
-    """Sum the parts for these people, under the limit's period rule."""
+    """Sum the parts for these people, under the limit's period rule.
+
+    ``skip``: parts no user budget counts (the integration-account rule of the
+    activity source, app/services/activity_source.py ``initiator_skip``)."""
     grouped: dict[tuple[str, str, str], list[Decimal]] = {}
     counted_total = ZERO
     window_total = ZERO
     for user_id in user_ids:
         for part in model.parts_for(user_id):
             if part.project_id in exclude_projects:
+                continue
+            if skip is not None and skip(part):
                 continue
             counts = counts_existing or (
                 part.basis == BASIS_OBSERVED
@@ -937,7 +966,12 @@ def collect(
             # increase stays on the project. The other projects go on.
             session.rollback()
             if isinstance(exc, CheckmarxError):
-                message = f"Scans of project {task.project_id} could not be read: {exc}"
+                # Shown in the Notification Center (viewers too) and sent by
+                # mail and webhook: redacted like every other error shown there.
+                message = (
+                    f"Scans of project {task.project_id} could not be read: "
+                    f"{error_text.public_error(exc)}"
+                )
                 logger.warning("Auto-triage attribution: %s", message)
             else:
                 message = (

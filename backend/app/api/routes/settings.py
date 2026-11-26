@@ -18,7 +18,14 @@ from app.schemas.dashboard import (
     SettingsResponse,
     SettingsUpdateRequest,
 )
-from app.services import delivery, pacing, role_sources, settings_store
+from app.services import (
+    activity_source,
+    delivery,
+    pacing,
+    readiness,
+    role_sources,
+    settings_store,
+)
 from app.services.audit import record_audit
 
 logger = logging.getLogger(__name__)
@@ -34,6 +41,10 @@ _PUBLIC_FIELDS: dict[str, str] = {
     "org_refresh_minutes": settings_store.KEY_ORG_REFRESH_MINUTES,
     "usage_period_param": settings_store.KEY_USAGE_PERIOD,
     "usage_page_size": settings_store.KEY_USAGE_PAGE_SIZE,
+    "usage_source": settings_store.KEY_USAGE_SOURCE,
+    "summary_restricts": settings_store.KEY_SUMMARY_RESTRICTS,
+    "activity_max_pages_per_cycle": settings_store.KEY_ACTIVITY_MAX_PAGES,
+    "integration_accounts": settings_store.KEY_INTEGRATION_ACCOUNTS,
     "retention_days": settings_store.KEY_RETENTION_DAYS,
     "retention_thin_snapshots": settings_store.KEY_RETENTION_THIN_SNAPSHOTS,
     "notify_min_severity": settings_store.KEY_NOTIFY_MIN_SEVERITY,
@@ -105,6 +116,12 @@ def _read(db) -> SettingsResponse:  # type: ignore[no-untyped-def]
         org_refresh_minutes=int(values.get(settings_store.KEY_ORG_REFRESH_MINUTES, 30)),
         usage_period_param=str(values.get(settings_store.KEY_USAGE_PERIOD) or "last_year"),
         usage_page_size=int(values.get(settings_store.KEY_USAGE_PAGE_SIZE, 100)),
+        usage_source=settings_store.usage_source(db),
+        summary_restricts=bool(values.get(settings_store.KEY_SUMMARY_RESTRICTS) is True),
+        allowed_usage_sources=list(settings_store.USAGE_SOURCES),
+        activity_max_pages_per_cycle=settings_store.activity_max_pages(db),
+        integration_accounts=settings_store.integration_accounts(db),
+        usage_source_status=activity_source.describe(db),
         retention_days=int(values.get(settings_store.KEY_RETENTION_DAYS, 365)),
         retention_thin_snapshots=settings_store.thin_snapshots(db),
         notify_min_severity=values.get(settings_store.KEY_NOTIFY_MIN_SEVERITY) or Severity.WARNING,
@@ -197,6 +214,22 @@ def update_settings(
                 },
             )
 
+    if "usage_source" in changes and changes["usage_source"] not in settings_store.USAGE_SOURCES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_usage_source",
+                "message": (
+                    f"{changes['usage_source']!r} is not a usage source. "
+                    f"Choose one of: {', '.join(settings_store.USAGE_SOURCES)}."
+                ),
+            },
+        )
+    if "integration_accounts" in changes:
+        changes["integration_accounts"] = settings_store.normalise_account_names(
+            changes["integration_accounts"] or []
+        )
+
     if "ui_accent" in changes:
         accent = str(changes["ui_accent"])
         if accent not in settings_store.ALLOWED_ACCENTS:
@@ -235,6 +268,31 @@ def update_settings(
 
     before = _read(db).model_dump(exclude={"current_schedule_description"})
     audited_changes: dict[str, object] = {}
+    if (
+        changes.get("enforcement_paused") is False
+        and settings_store.enforcement_guard(db).paused
+        and readiness.gate_active(db)
+    ):
+        # Leaving watch-only on a new install: every readiness item green, or
+        # the typed override on the Readiness card (POST /api/readiness/enable).
+        current = readiness.report(db)
+        if not current.all_green:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "readiness_not_green",
+                    "message": (
+                        "Enforcement is in watch-only onboarding and not every readiness item "
+                        "is green. Fix them, or use Turn enforcement on in the Readiness card "
+                        f"and type {readiness.OVERRIDE_WORD}."
+                    ),
+                    "items": [
+                        {"key": item.key, "label": item.label, "status": item.status}
+                        for item in current.not_green()
+                    ],
+                },
+            )
+        readiness.apply_leave(db, actor=ctx.actor, current=current, override=False)
 
     for field, value in changes.items():
         if field in _SECRET_FIELDS:
@@ -358,7 +416,8 @@ def _validated_ai_roles(  # type: ignore[no-untyped-def]
 ) -> list[str]:
     """The AI role list, checked against the roles the tenant actually has.
 
-    A protected role is refused: its holders are never restricted, so a list
+    ``ai-triage-assist`` (iam.NEVER_AI_ROLE_NAMES) is always refused: removing
+    it breaks Auto Triage. A protected role is refused: its holders are never restricted, so a list
     that names it would silently restrict nobody who holds it. A role that looks
     like an administration role (settings_store.ADMIN_ROLE_PATTERNS) is refused
     unless the request confirms it (``confirm_admin_roles``). When the tenant's
@@ -373,6 +432,20 @@ def _validated_ai_roles(  # type: ignore[no-untyped-def]
                 "code": "invalid_ai_roles",
                 "message": "Name at least one role: with none, a user restriction would "
                 "remove nothing.",
+            },
+        )
+    never = [name for name in names if iam.never_removed(name)]
+    if never:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "forbidden_ai_roles",
+                "message": (
+                    f"{', '.join(never)} cannot be an AI role: it is the built-in role of the "
+                    "AI Triage system user, and removing it breaks Auto Triage. Remove it from "
+                    "the list."
+                ),
+                "roles": never,
             },
         )
     _refuse_protected_ai_roles(names, protected)

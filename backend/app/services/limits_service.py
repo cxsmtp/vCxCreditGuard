@@ -23,10 +23,11 @@ from sqlalchemy.orm import Session
 from app.checkmarx.client import CheckmarxClient
 from app.checkmarx.errors import CheckmarxError
 from app.db.base import utcnow
+from app.models.activity import SUBJECT_PREFIX, is_subject_entity, subject_entity_id
 from app.models.enums import PROJECT_ACTION_ORDER, EntityType
 from app.models.limits import CreditLimit, Exemption, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
-from app.services import evaluation
+from app.services import error_text, evaluation
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -134,10 +135,35 @@ def resolve_entity_label(session: Session, *, entity_type: str, entity_id: str) 
     model = _ENTITY_MODELS.get(EntityType(entity_type))
     if model is None:
         return None
+    if entity_type == EntityType.USER and is_subject_entity(entity_id):
+        return subject_label(session, entity_id)
     row = session.get(model, entity_id)
     if row is None:
         return None
     return row.display_name if isinstance(row, CxUser) else row.name
+
+
+def subject_label(session: Session, entity_id: str) -> str | None:
+    """The label of a user budget set on an integration account (no IAM user)."""
+    from app.models.usage import UnresolvedSubject
+
+    key = entity_id[len(SUBJECT_PREFIX) :]
+    row = None
+    if "~" not in key:
+        row = session.scalar(select(UnresolvedSubject).where(UnresolvedSubject.subject_key == key))
+    if row is None:
+        row = next(
+            (
+                candidate
+                for candidate in session.scalars(
+                    select(UnresolvedSubject).where(UnresolvedSubject.is_bot.is_(True))
+                )
+                if subject_entity_id(candidate.subject_key) == entity_id
+            ),
+            None,
+        )
+    name = (row.subject_name or row.subject_key) if row is not None else key
+    return f"{name} (integration account)"
 
 
 def _validate(session: Session, data: LimitInput) -> None:
@@ -439,7 +465,7 @@ def delete_limit(
     except CheckmarxError as exc:
         raise LimitRestoreError(
             "The limit was not deleted because the restrictions it applied could not be "
-            f"lifted in Checkmarx One: {exc}"
+            f"lifted in Checkmarx One: {error_text.public_error(exc)}"
         ) from exc
     record_audit(
         session,
@@ -561,7 +587,7 @@ def add_exemption(
 
     # An exemption that leaves an existing restriction in place would be a trap.
     if client is not None:
-        from app.services import enforcement
+        from app.services import enforcement, enforcement_selftest
 
         for action in enforcement.active_actions_for(
             session, entity_type=entity_type, entity_id=entity_id
@@ -569,7 +595,8 @@ def add_exemption(
             try:
                 enforcement.restore_action(
                     session,
-                    client,
+                    # A demo self-test's restriction lives in the demo tenant.
+                    enforcement_selftest.client_for(action, lambda: client),
                     action=action,
                     actor=actor,
                     reason=enforcement.EXEMPTED_REASON,

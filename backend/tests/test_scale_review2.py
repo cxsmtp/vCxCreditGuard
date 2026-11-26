@@ -365,8 +365,8 @@ def test_unknown_outcomes_failing_lifts_and_deleted_users_are_counted(
     limit = group_limit(db)
     user = CreditLimit(
         entity_type=EntityType.USER,
-        entity_id="user-sean",
-        entity_label="Sean",
+        entity_id="user-bob",
+        entity_label="Bob",
         credit_limit=1,
         period_type=PeriodType.MONTHLY,
         enforce=True,
@@ -384,7 +384,7 @@ def test_unknown_outcomes_failing_lifts_and_deleted_users_are_counted(
         "enabled_before": True,
     }
     doubtful.created_at = utcnow() - timedelta(hours=5)
-    db.get(CxUser, "user-sean").is_deleted = True
+    db.get(CxUser, "user-bob").is_deleted = True
     db.commit()
     # The limit off, and lifting fails: still in force, counted.
     tenant.fail_requests[("PATCH", "/ai-agents-coordinator/projects/proj-m01")] = 500

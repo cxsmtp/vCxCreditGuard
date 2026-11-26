@@ -23,6 +23,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import quote
@@ -454,6 +455,7 @@ class CheckmarxClient:
         offset_param: str = "offset",
         limit_param: str = "limit",
         offset_is_page_number: bool = False,
+        listing: Listing | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield items across an offset/limit paginated collection.
 
@@ -463,10 +465,21 @@ class CheckmarxClient:
 
         ``offset_is_page_number`` covers the IAM style endpoints that page by
         index rather than by record offset.
+
+        A page shorter than asked for is not taken as the last one while the
+        reported total (``filteredTotalCount``, else ``totalCount``) says more
+        rows exist: a server that caps its pages below ``limit`` is read to the
+        end. Without a total, a short page is followed by one more request,
+        and only an empty answer ends the listing. ``listing`` (when given) is
+        told whether the read was complete: a caller must not treat rows it
+        did not get as gone (soft-delete them) after an incomplete one.
         """
+        listing = listing if listing is not None else Listing()
         offset = 0
         page = 0
         seen = 0
+        total: int | None = None
+        previous_first: Any = None
         while page < MAX_PAGES:
             page_params = dict(params or {})
             page_params[limit_param] = page_size
@@ -474,24 +487,72 @@ class CheckmarxClient:
 
             payload = self.get_json(path, base=base, params=page_params)
             items = _extract_items(payload, items_key)
+            reported = _extract_total(payload)
+            if reported is not None:
+                total = reported
+            listing.total = total
             if not items:
+                distinct = len(listing.ids) if listing.ids else seen
+                if total is not None and distinct < total:
+                    listing.incomplete(f"{distinct} of {total} rows could be read", "shortfall")
                 return
+            first = items[0].get("id", items[0]) if isinstance(items[0], dict) else items[0]
+            if page and first == previous_first:
+                # The same page again: the server ignores the offset.
+                listing.incomplete(f"the listing repeated itself after {seen} rows", "repeated")
+                return
+            previous_first = first
 
             yield from items
+            for item in items:
+                if isinstance(item, dict) and item.get("id") is not None:
+                    listing.ids.add(str(item["id"]))
             seen += len(items)
+            # Rows told apart by id: a listing whose order shifts while it is
+            # read can repeat one row and skip another, and must not then look
+            # complete by its count alone.
+            distinct = len(listing.ids) if listing.ids else seen
+            listing.read = distinct
             page += 1
             offset += len(items)
 
-            if len(items) < page_size:
+            if total is not None:
+                if distinct >= total:
+                    return
+                if offset_is_page_number and len(items) < page_size:
+                    # A short page by index cannot be continued without
+                    # skipping rows.
+                    listing.incomplete(f"{distinct} of {total} rows could be read", "shortfall")
+                    return
+                continue
+            if len(items) < page_size and offset_is_page_number:
                 return
 
-            total = _extract_total(payload)
-            if total is not None and seen >= total:
-                return
-
+        listing.incomplete(
+            f"stopped at the {MAX_PAGES} page safety limit after {seen} rows", "page_limit"
+        )
         logger.warning(
             "Pagination of %s stopped at the %d page safety limit", redact(path), MAX_PAGES
         )
+
+
+@dataclass
+class Listing:
+    """Whether a paginated read got every row the collection has."""
+
+    complete: bool = True
+    total: int | None = None
+    read: int = 0
+    note: str | None = None
+    # "shortfall" (fewer distinct rows than the reported total), "repeated"
+    # (the server ignored the offset) or "page_limit".
+    reason: str | None = None
+    ids: set[str] = field(default_factory=set)
+
+    def incomplete(self, note: str, reason: str) -> None:
+        self.complete = False
+        self.note = note
+        self.reason = reason
 
 
 def _extract_items(payload: Any, items_key: str | None) -> list[dict[str, Any]]:
@@ -513,7 +574,8 @@ def _extract_items(payload: Any, items_key: str | None) -> list[dict[str, Any]]:
 def _extract_total(payload: Any) -> int | None:
     if not isinstance(payload, dict):
         return None
-    for key in ("totalCount", "filteredTotalCount", "total", "totalItems"):
+    # The filtered count is what the listing's rows add up to when both exist.
+    for key in ("filteredTotalCount", "totalCount", "total", "totalItems"):
         value = payload.get(key)
         if isinstance(value, int):
             return value

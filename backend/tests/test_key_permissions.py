@@ -246,7 +246,7 @@ class TestVerdict:
         assert key_permissions.current_report(db)["verdict"] == key_permissions.VERDICT_LIMITED
 
         # A user limit does not need the project configuration calls.
-        add_limit(db, EntityType.USER, "user-harsh", enforce=True)
+        add_limit(db, EntityType.USER, "user-alice", enforce=True)
         assert key_permissions.current_report(db)["verdict"] == key_permissions.VERDICT_LIMITED
 
         add_limit(db, EntityType.APPLICATION, "app-payments", enforce=True)
@@ -343,7 +343,7 @@ class TestRuntimeRefusals:
         assert key_permissions.current_report(db)["verdict"] == key_permissions.VERDICT_OK
 
         tenant.fail_requests[("DELETE", "/role-mappings/")] = 403
-        limit = add_limit(db, EntityType.USER, "user-harsh", enforce=True)
+        limit = add_limit(db, EntityType.USER, "user-alice", enforce=True)
         outcome = enforcement.apply_enforcement(
             db, tenant.client(), limit=limit, period_key=PERIOD, actor=ACTOR
         )
@@ -359,7 +359,7 @@ class TestRuntimeRefusals:
         assert denial["path"] == (
             "/auth/admin/realms/<tenant>/users/{userId}/role-mappings/clients/{clientUuid}"
         )
-        assert "user-harsh" not in str(report["runtime_denials"])
+        assert "user-alice" not in str(report["runtime_denials"])
         assert len(permission_notifications(db)) == 1
 
         # The probes cannot see it, so an automatic re-check keeps it...
@@ -618,11 +618,11 @@ class TestBreachMessages:
         self, db: Session, tenant: FakeTenant
     ) -> None:
         assert cycle.run_cycle(trigger="manual", force_org_sync=True).status == RunStatus.SUCCESS
-        add_limit(db, EntityType.USER, "user-harsh", enforce=True, credit_limit=5)
+        add_limit(db, EntityType.USER, "user-alice", enforce=True, credit_limit=5)
         cycle.run_cycle(trigger="manual")
         tenant.set_user_credits(
-            name="Harsh Gokani",
-            email="harsh.gokani@checkmarx.com",
+            name="Alice Archer",
+            email="alice.archer@example.com",
             credits=20,
             actions={"remediation": 1, "triage": 2, "fusion": 10},
         )
@@ -736,7 +736,7 @@ class TestRuntimeRefusalsClear:
     ) -> None:
         synced(db, tenant)
         check(db)
-        limit = add_limit(db, EntityType.USER, "user-harsh", enforce=True)
+        limit = add_limit(db, EntityType.USER, "user-alice", enforce=True)
         tenant.fail_requests[("DELETE", "/role-mappings/")] = 403
         enforcement.apply_enforcement(
             db, tenant.client(), limit=limit, period_key=PERIOD, actor=ACTOR
@@ -886,7 +886,7 @@ class TestAttention:
         self, db: Session, tenant: FakeTenant
     ) -> None:
         synced(db, tenant)
-        add_limit(db, EntityType.USER, "user-harsh", enforce=True)
+        add_limit(db, EntityType.USER, "user-alice", enforce=True)
         tenant.access_token = access_token_with(client_roles={"realm-management": ["view-users"]})
         report = check(db)
         checks = by_id(report)
@@ -1168,7 +1168,7 @@ class TestRefusalsNotNeededNow:
     def _refuse_role_removal(self, db: Session, tenant: FakeTenant):
         synced(db, tenant)
         check(db)
-        limit = add_limit(db, EntityType.USER, "user-harsh", enforce=True)
+        limit = add_limit(db, EntityType.USER, "user-alice", enforce=True)
         tenant.fail_requests[("DELETE", "/role-mappings/")] = 403
         enforcement.apply_enforcement(
             db, tenant.client(), limit=limit, period_key=PERIOD, actor=ACTOR

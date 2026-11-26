@@ -36,7 +36,7 @@ from app.models.enums import (
     LimitStatus,
 )
 from app.models.limits import CreditLimit, EnforcementAction, effective_project_actions
-from app.services import enforcement, evaluation, role_sources, settings_store
+from app.services import enforcement, evaluation, recount, role_sources, settings_store
 from app.services.periods import PeriodError, current_window
 
 
@@ -523,6 +523,9 @@ class DryRunRow:
     # How much of credits_used is auto-triage charged from scans; None when that
     # setting is off or the limit is not fed by a person's usage.
     auto_triage_attributed: Decimal | None = None
+    # A new restriction of a monthly or quarterly budget: it starts only if the
+    # independent recount of the activity log agrees (app/services/recount.py).
+    recount_required: bool = False
 
 
 @dataclass(slots=True)
@@ -683,11 +686,28 @@ def _project_one(
     blast: BlastRadius | None = None
     would_enforce = False
     note: str | None = None
+    recount_required = False
+    on_summary = (
+        evaluation.summary_hold(
+            session,
+            limit=limit,
+            window=window,
+            index=index,
+            credits_used=credits_used,
+            attributed=auto_triage,
+        )
+        if projected == LimitStatus.BREACHED and limit.enforce and not exempt
+        else None
+    )
+    if on_summary is not None and evaluation.restriction_started(session, limit.id, window.key):
+        on_summary = None  # a restriction in force stays (and is shown as such)
     if projected == LimitStatus.BREACHED:
         if exempt:
             note = "Would breach, but the entity is exempt."
         elif not limit.enforce:
             note = "Would breach, but the limit is monitor only."
+        elif on_summary is not None:
+            note = f"Would breach on summary totals, but not be restricted, because {on_summary}."
         else:
             blast = blast_radius(
                 session,
@@ -715,6 +735,9 @@ def _project_one(
                     "Would breach and enforce, but no Checkmarx connection is configured, "
                     "so the restriction would be deferred until one is."
                 )
+            if would_enforce and recount.applies(session, limit, window):
+                recount_required = True
+                note = f"{note} {recount.PREVIEW_NOTE}" if note else recount.PREVIEW_NOTE
 
     return DryRunRow(
         limit_id=limit.id,
@@ -733,4 +756,5 @@ def _project_one(
         note=note,
         period_key=window.key,
         auto_triage_attributed=auto_triage,
+        recount_required=recount_required,
     )

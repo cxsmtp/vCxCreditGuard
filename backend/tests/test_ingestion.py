@@ -62,13 +62,13 @@ class TestSnapshots:
         client = synced(db, tenant)
         ingestion.ingest_usage(db, client)
         db.commit()
-        tenant.set_user_credits(name="Sean Casey", credits=9, actions={"triage": 9})
+        tenant.set_user_credits(name="Bob Baker", credits=9, actions={"triage": 9})
         ingestion.ingest_usage(db, client)
         db.commit()
 
         snapshots = list(db.scalars(select(UsageSnapshot).where(UsageSnapshot.view_by == "user")))
         assert len(snapshots) == 2
-        assert ingestion.latest_totals(db, UsageView.USER)["user-sean"] == Decimal("9")
+        assert ingestion.latest_totals(db, UsageView.USER)["user-bob"] == Decimal("9")
 
     def test_pagination_is_walked(self, db: Session) -> None:
         tenant = FakeTenant()
@@ -89,7 +89,7 @@ class TestAttribution:
         client = synced(db, tenant)
         ingestion.ingest_usage(db, client)
         db.commit()
-        assert ingestion.latest_totals(db, UsageView.USER)["user-harsh"] == Decimal("3")
+        assert ingestion.latest_totals(db, UsageView.USER)["user-alice"] == Decimal("3")
 
     def test_matches_on_display_name_when_there_is_no_email(self, db: Session) -> None:
         """The real feed has rows with a display name and nothing else."""
@@ -97,7 +97,7 @@ class TestAttribution:
         client = synced(db, tenant)
         ingestion.ingest_usage(db, client)
         db.commit()
-        assert ingestion.latest_totals(db, UsageView.USER)["user-sean"] == Decimal("5")
+        assert ingestion.latest_totals(db, UsageView.USER)["user-bob"] == Decimal("5")
 
     def test_matches_an_email_carried_in_the_name_field(self, db: Session) -> None:
         tenant = FakeTenant()
@@ -112,8 +112,8 @@ class TestAttribution:
 
     def test_matches_on_username_when_it_is_not_an_email(self, db: Session) -> None:
         tenant = FakeTenant()
-        tenant.add_user(user_id="u1", username="akash", email="akash.singh@example.com")
-        tenant.set_user_credits(name="akash", credits=6)
+        tenant.add_user(user_id="u1", username="carol", email="carol.chen@example.com")
+        tenant.set_user_credits(name="carol", credits=6)
         client = synced(db, tenant)
         ingestion.ingest_usage(db, client)
         db.commit()
@@ -123,12 +123,12 @@ class TestAttribution:
         """Two people with the same name must not share one budget."""
         tenant = FakeTenant()
         tenant.add_user(
-            user_id="u1", username="sean.casey@a.com", first_name="Sean", last_name="Casey"
+            user_id="u1", username="bob.baker@example.com", first_name="Bob", last_name="Baker"
         )
         tenant.add_user(
-            user_id="u2", username="s.casey@b.com", first_name="Sean", last_name="Casey"
+            user_id="u2", username="s.baker@example.org", first_name="Bob", last_name="Baker"
         )
-        tenant.set_user_credits(name="Sean Casey", credits=5)
+        tenant.set_user_credits(name="Bob Baker", credits=5)
         client = synced(db, tenant)
         ingestion.ingest_usage(db, client)
         db.commit()
@@ -144,7 +144,7 @@ class TestAttribution:
 
         row = db.scalar(
             select(UnresolvedSubject).where(
-                UnresolvedSubject.subject_key == "departed.person@checkmarx.com"
+                UnresolvedSubject.subject_key == "departed.person@example.com"
             )
         )
         assert row is not None
@@ -152,7 +152,7 @@ class TestAttribution:
         assert result.dimensions["user"].unresolved == 1
         # The usage record still exists, just without an entity.
         record = db.scalar(
-            select(UsageRecord).where(UsageRecord.subject_key == "departed.person@checkmarx.com")
+            select(UsageRecord).where(UsageRecord.subject_key == "departed.person@example.com")
         )
         assert record is not None
         assert record.entity_id is None
@@ -167,7 +167,7 @@ class TestAttribution:
 
         row = db.scalar(
             select(UnresolvedSubject).where(
-                UnresolvedSubject.subject_key == "departed.person@checkmarx.com"
+                UnresolvedSubject.subject_key == "departed.person@example.com"
             )
         )
         assert row is not None
@@ -181,16 +181,16 @@ class TestAttribution:
 
         row = db.scalar(
             select(UnresolvedSubject).where(
-                UnresolvedSubject.subject_key == "departed.person@checkmarx.com"
+                UnresolvedSubject.subject_key == "departed.person@example.com"
             )
         )
         assert row is not None
-        row.mapped_user_id = "user-akash"
+        row.mapped_user_id = "user-carol"
         db.commit()
 
         ingestion.ingest_usage(db, client)
         db.commit()
-        assert ingestion.latest_totals(db, UsageView.USER)["user-akash"] == Decimal("7")
+        assert ingestion.latest_totals(db, UsageView.USER)["user-carol"] == Decimal("7")
 
     def test_applications_and_projects_match_by_id_then_name(self, db: Session) -> None:
         tenant = populated_tenant()
@@ -276,34 +276,34 @@ class TestFuzzyAttribution:
     def _tenant_with_handle(self, reported_as: str, credits: int = 4) -> FakeTenant:
         tenant = FakeTenant()
         tenant.add_user(
-            user_id="user-ryan",
-            username="ryan.wakeham@checkmarx.com",
-            email="ryan.wakeham@checkmarx.com",
-            first_name="Ryan",
-            last_name="Wakeham",
+            user_id="user-dave",
+            username="dave.dawson@example.com",
+            email="dave.dawson@example.com",
+            first_name="Dave",
+            last_name="Dawson",
         )
         tenant.set_user_credits(name=reported_as, credits=credits)
         return tenant
 
     def test_a_cx_handle_is_auto_matched_to_its_user(self, db: Session) -> None:
-        tenant = self._tenant_with_handle("cx-ryan-wakeham")
+        tenant = self._tenant_with_handle("cx-dave-dawson")
         client = synced(db, tenant)
         result = ingestion.ingest_usage(db, client)
         db.commit()
 
         # Its credits count towards the user, and it is not flagged as unmatched.
-        assert ingestion.latest_totals(db, UsageView.USER)["user-ryan"] == Decimal("4")
+        assert ingestion.latest_totals(db, UsageView.USER)["user-dave"] == Decimal("4")
         assert result.dimensions["user"].auto_matched == 1
         assert result.dimensions["user"].unresolved == 0
 
         row = db.scalar(select(UnresolvedSubject))
         assert row is not None
         assert row.status == "auto_matched"
-        assert row.suggested_user_id == "user-ryan"
+        assert row.suggested_user_id == "user-dave"
         assert row.match_score == 1.0
 
     def test_an_auto_match_is_audited_once(self, db: Session) -> None:
-        tenant = self._tenant_with_handle("cx-ryan-wakeham")
+        tenant = self._tenant_with_handle("cx-dave-dawson")
         client = synced(db, tenant)
         ingestion.ingest_usage(db, client)
         db.commit()
@@ -316,10 +316,10 @@ class TestFuzzyAttribution:
             )
         )
         assert len(entries) == 1
-        assert entries[0].after["suggested_user_id"] == "user-ryan"
+        assert entries[0].after["suggested_user_id"] == "user-dave"
 
     def test_a_first_name_only_is_disputed_with_suggestions(self, db: Session) -> None:
-        tenant = self._tenant_with_handle("ryan")
+        tenant = self._tenant_with_handle("dave")
         client = synced(db, tenant)
         result = ingestion.ingest_usage(db, client)
         db.commit()
@@ -332,7 +332,7 @@ class TestFuzzyAttribution:
         row = db.scalar(select(UnresolvedSubject))
         assert row is not None
         assert row.status == "disputed"
-        assert row.suggestions[0]["user_id"] == "user-ryan"
+        assert row.suggestions[0]["user_id"] == "user-dave"
 
     def test_a_bot_handle_is_flagged_and_not_disputed(self, db: Session) -> None:
         tenant = self._tenant_with_handle("dependabot[bot]")
@@ -350,7 +350,7 @@ class TestFuzzyAttribution:
     def test_a_review_row_is_cleared_once_the_subject_resolves_exactly(self, db: Session) -> None:
         # A subject reported by an email whose user has not synced yet.
         tenant = FakeTenant()
-        tenant.set_user_credits(name="Ryan Wakeham", email="ryan.wakeham@checkmarx.com", credits=4)
+        tenant.set_user_credits(name="Dave Dawson", email="dave.dawson@example.com", credits=4)
         client = synced(db, tenant)
         ingestion.ingest_usage(db, client)
         db.commit()
@@ -359,18 +359,18 @@ class TestFuzzyAttribution:
         # Once the user is synced, the same subject resolves exactly and the
         # stale review row is dropped rather than left dangling.
         tenant.add_user(
-            user_id="user-ryan",
-            username="ryan.wakeham@checkmarx.com",
-            email="ryan.wakeham@checkmarx.com",
-            first_name="Ryan",
-            last_name="Wakeham",
+            user_id="user-dave",
+            username="dave.dawson@example.com",
+            email="dave.dawson@example.com",
+            first_name="Dave",
+            last_name="Dawson",
         )
         org_sync.sync_org_model(db, client)
         db.commit()
         ingestion.ingest_usage(db, client)
         db.commit()
         assert db.scalar(select(UnresolvedSubject)) is None
-        assert ingestion.latest_totals(db, UsageView.USER)["user-ryan"] == Decimal("4")
+        assert ingestion.latest_totals(db, UsageView.USER)["user-dave"] == Decimal("4")
 
 
 def test_latest_totals_is_empty_before_any_ingestion(db: Session) -> None:
