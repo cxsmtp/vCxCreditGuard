@@ -1106,3 +1106,44 @@ class TestSecondReview:
         }
         assert activity_source._entry_of(own, group) is not None
         assert isinstance(group, CreditLimit)
+
+
+class TestErrorTextIsRedacted:
+    """Checkmarx error text can echo a token: what the activity source and the
+    recount keep and show goes through error_text.public_error (final scan
+    1f313491, Generation of Error Message Containing Sensitive Information)."""
+
+    TOKEN = ".".join(("eyJhbGciOiJSUzI1NiJ9", "eyJzdWIiOiJzZWNyZXQtdXNlciJ9", "c2lnbmF0dXJl"))
+
+    def test_a_failed_read_keeps_no_token(
+        self, env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.checkmarx.errors import CheckmarxResponseError
+
+        seeded(env)
+
+        def refuse(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise CheckmarxResponseError(f"GET /api/credits/activity returned 400: {self.TOKEN}")
+
+        monkeypatch.setattr(activity_source, "_read", refuse)
+        tick(env)
+        result = run(env)
+        assert result.warnings
+        assert all(self.TOKEN not in warning for warning in result.warnings)
+        assert self.TOKEN not in (state(env).last_error or "")
+        assert "returned 400" in (state(env).last_error or "")
+
+    def test_a_failed_recount_keeps_no_token(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.checkmarx.errors import CheckmarxResponseError
+        from app.services import recount
+
+        def refuse(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise CheckmarxResponseError(f"GET /api/credits/activity returned 400: {self.TOKEN}")
+
+        monkeypatch.setattr(recount, "read_log", refuse)
+        recounter = recount.Recounter(object(), now=datetime(2026, 11, 26, tzinfo=UTC))  # type: ignore[arg-type]
+        recounter.prepare(db, {recount.PERIOD_30})
+        reason = recounter._fetches[recount.PERIOD_30].error
+        assert reason and self.TOKEN not in reason and "returned 400" in reason

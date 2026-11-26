@@ -57,7 +57,7 @@ from app.db.base import utcnow
 from app.models.activity import is_subject_entity
 from app.models.enums import EntityType, PeriodType, Severity
 from app.models.limits import CreditLimit
-from app.services import activity_source, notifications, pacing, settings_store
+from app.services import activity_source, error_text, notifications, pacing, settings_store
 from app.services.periods import PeriodError, PeriodWindow, current_window
 
 logger = logging.getLogger(__name__)
@@ -258,9 +258,12 @@ class Recounter:
             else:
                 try:
                     fetch.events = read_log(self.client, period, max_pages)
+                except RecountUnavailable as exc:
+                    # Our own reason (a cap reached, a log out of order): safe to show.
+                    fetch.error = str(exc)[:500]
                 except Exception as exc:  # noqa: BLE001 - no recount, never a restriction
                     logger.warning("The recount could not read the activity log: %s", exc)
-                    fetch.error = str(exc)[:500] or exc.__class__.__name__
+                    fetch.error = error_text.public_error(exc)[:500]
             self._fetches[period] = fetch
 
     def check(self, session: Session, limit: CreditLimit, window: PeriodWindow) -> Verdict:

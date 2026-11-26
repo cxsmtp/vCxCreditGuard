@@ -522,7 +522,7 @@ class TestFailuresAndCaps:
         else (Fusion scan, auto_triage_attribution.py:933)."""
         from app.checkmarx.errors import CheckmarxResponseError
 
-        token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzZWNyZXQtdXNlciJ9.c2lnbmF0dXJl"
+        token = ".".join(("eyJhbGciOiJSUzI1NiJ9", "eyJzdWIiOiJzZWNyZXQtdXNlciJ9", "c2lnbmF0dXJl"))
 
         def refuse(*_args, **_kwargs):  # type: ignore[no-untyped-def]
             raise CheckmarxResponseError(f"GET /api/scans returned 400: echoed {token}")

@@ -169,7 +169,7 @@ from app.models.org import (
     CxProjectGroup,
 )
 from app.models.usage import BudgetUsage, UnresolvedSubject, UsageSnapshot
-from app.services import pacing, settings_store, subject_matching
+from app.services import error_text, pacing, settings_store, subject_matching
 
 logger = logging.getLogger(__name__)
 
@@ -821,7 +821,7 @@ def _read(client: CheckmarxClient, plan: _Plan) -> _Read:
         try:
             read.summary_total = _summary_total(client, plan.reconcile_view)
         except CheckmarxError as exc:
-            read.summary_error = str(exc)
+            read.summary_error = error_text.public_error(exc)
     return read
 
 
@@ -1347,7 +1347,7 @@ def _failed(
 ) -> ActivityResult:
     from app.services import ingestion
 
-    message = str(exc)[:2000]
+    message = error_text.public_error(exc)[:2000]
     ingestion.attribution_lock(session)
     state = _state_for_write(session)
     state.last_error = message

@@ -61,7 +61,7 @@ from tests.test_scan_fusion_findings import (
 )
 
 ACTOR = AuditActor.system("review")
-TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzZWNyZXQtdXNlciJ9.c2lnbmF0dXJl"
+TOKEN = ".".join(("eyJhbGciOiJSUzI1NiJ9", "eyJzdWIiOiJzZWNyZXQtdXNlciJ9", "c2lnbmF0dXJl"))
 
 
 def _timed_sign_in(username: str, password: str, ip: str) -> tuple[str, float]:

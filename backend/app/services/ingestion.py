@@ -41,7 +41,7 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
-from app.services import activity_source, ledger, subject_matching
+from app.services import activity_source, error_text, ledger, subject_matching
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome, UserProfile
 
@@ -513,7 +513,7 @@ def ingest_usage(
                 logger.warning("Dimension %s is a silent fallback to the user view", view)
         except (CheckmarxNotFoundError, CheckmarxResponseError) as exc:
             session.rollback()
-            message = str(exc)
+            message = error_text.public_error(exc)
             if view == UsageView.USER:
                 # The user dimension is the one everything else depends on, so it
                 # is never written off: an odd answer is a failed read, retried
