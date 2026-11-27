@@ -149,9 +149,9 @@ def test_simulation_and_dry_run_use_the_same_rule(
     spend_and_count(world, 7)
     row = next(r for r in preview_service.dry_run(db).rows if r.limit_id == limit.id)
     assert row.projected_status == LimitStatus.BREACHED and row.would_enforce
-    assert row.note is not None and row.note.startswith(
-        "Would restrict early: 3 credits left, at the headroom of 3."
-    )
+    # The early note joins whatever else the row says (here: no connection yet).
+    assert row.note is not None
+    assert "Would restrict early: 3 credits left, at the headroom of 3." in row.note
 
 
 def test_a_headroom_never_restricts_an_unused_budget(
