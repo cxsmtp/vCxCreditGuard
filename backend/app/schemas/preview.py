@@ -110,6 +110,7 @@ class DryRunResponse(BaseModel):
     generated_at: datetime
     would_enforce_count: int
     would_warn_count: int
+    would_breach_count: int = 0
     affected_projects: int
     affected_users: int
     rows: list[DryRunRowResponse]

@@ -230,6 +230,11 @@ def _to_response(
                     if state.status in (LimitStatus.BREACHED, LimitStatus.RESTRICTED)
                     else None
                 ),
+                status_note=(
+                    state.status_note
+                    if state.status in (LimitStatus.BREACHED, LimitStatus.RESTRICTED)
+                    else None
+                ),
             )
             if index is None and limit.entity_type in {EntityType.USER, EntityType.GROUP}:
                 index = _attribution_index(db)

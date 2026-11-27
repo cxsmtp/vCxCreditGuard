@@ -25,6 +25,7 @@ import {
 import { FilterNote, Pager, useTableView, type ViewColumn } from "../components/tableView";
 import { useInterval, useResource } from "../hooks/useResource";
 import { enforcementLabel, formatDateTime, formatRelative, humanise } from "../lib/format";
+import { notificationCategoryLabel } from "../lib/notifications";
 import { useToast } from "../lib/ui-context";
 
 const SEVERITY_TONES: Record<Severity, "info" | "warning" | "critical" | "serious"> = {
@@ -36,7 +37,7 @@ const SEVERITY_TONES: Record<Severity, "info" | "warning" | "critical" | "seriou
 
 const CATEGORIES = [
   { value: "", label: "All categories" },
-  { value: "warning", label: "Warnings" },
+  { value: "warning", label: "Budget" },
   { value: "enforcement", label: "Enforcement" },
   { value: "restoration", label: "Restorations" },
   { value: "attribution", label: "Attribution" },
@@ -346,7 +347,7 @@ export function NotificationsPage({
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge tone={SEVERITY_TONES[item.severity]}>{humanise(item.severity)}</Badge>
-                    <Badge tone="neutral">{humanise(item.category)}</Badge>
+                    <Badge tone="neutral">{notificationCategoryLabel(item.category)}</Badge>
                     <span className="text-sm font-medium">{item.title}</span>
                   </div>
                   {item.body && (

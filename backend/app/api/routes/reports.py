@@ -38,6 +38,7 @@ def _projection_to_response(p: reporting_service.Projection) -> ProjectionRespon
         days_to_exhaustion=p.days_to_exhaustion,
         exhaustion_at=p.exhaustion_at,
         will_breach=p.will_breach,
+        already_over=p.already_over,
     )
 
 
@@ -61,6 +62,7 @@ def report_summary(ctx: CurrentUser, db: DbSession) -> ReportResponse:
         limits_total=report.limits_total,
         limits_enforcing=report.limits_enforcing,
         breaching_soon=report.breaching_soon,
+        already_over=report.already_over,
         impact=_impact_to_response(report.impact)
         if report.impact
         else ImpactResponse(

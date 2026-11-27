@@ -161,6 +161,9 @@ class LimitPeriodStateResponse(BaseModel):
     # "X credits left, below the headroom of Y".
     headroom_credits: Decimal | None = None
     restricted_early: str | None = None
+    # Why a period over its limit is, or is not, restricted (held by the recount,
+    # deferred, protected, cannot fully bite, monitor only, ...).
+    status_note: str | None = None
 
 
 class LimitResponse(BaseModel):
@@ -281,9 +284,15 @@ class SchedulerStatusResponse(BaseModel):
     schedule: str
     enabled: bool
     next_run_at: datetime | None
+    # The last full cycle: when it finished (or started, while it runs), and
+    # how it went; and when the last full cycle without a problem finished.
     last_run_at: datetime | None
     last_run_status: str | None
     last_success_at: datetime | None
+    # The fast check (app/services/fastcheck.py), reported on its own.
+    fast_check_enabled: bool = False
+    last_fast_check_at: datetime | None = None
+    last_fast_check_result: str | None = None
     entities_in_warning: int
     entities_restricted: int
     unread_notifications: int

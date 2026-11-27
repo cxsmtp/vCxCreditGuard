@@ -434,10 +434,10 @@ export function SettingsPage({
               <KeyValue label="Next run">
                 {status.data?.next_run_at ? formatRelative(status.data.next_run_at) : "Not scheduled"}
               </KeyValue>
-              <KeyValue label="Last run">
+              <KeyValue label="Last full cycle">
                 {status.data?.last_run_at ? formatDateTime(status.data.last_run_at) : "Never"}
               </KeyValue>
-              <KeyValue label="Last run status">
+              <KeyValue label="Last full cycle status">
                 {status.data?.last_run_status ? (
                   <Badge
                     tone={
@@ -454,8 +454,17 @@ export function SettingsPage({
                   "Never run"
                 )}
               </KeyValue>
-              <KeyValue label="Last success">
-                {status.data?.last_success_at ? formatRelative(status.data.last_success_at) : "Never"}
+              <KeyValue label="Last full cycle without problems">
+                {status.data?.last_success_at ? formatDateTime(status.data.last_success_at) : "Never"}
+              </KeyValue>
+              <KeyValue label="Last fast check">
+                {!status.data?.fast_check_enabled
+                  ? "Off"
+                  : status.data.last_fast_check_at
+                    ? `${formatRelative(status.data.last_fast_check_at)}${
+                        status.data.last_fast_check_result ? `: ${status.data.last_fast_check_result}` : ""
+                      }`
+                    : "Not run yet"}
               </KeyValue>
             </div>
           </div>

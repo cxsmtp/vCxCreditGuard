@@ -41,7 +41,7 @@ from app.checkmarx.errors import (
 )
 from app.db.base import utcnow
 from app.models.activity import is_subject_entity
-from app.models.audit import AuditLogEntry
+from app.models.audit import AuditLogEntry, Notification
 from app.models.enums import (
     LEGACY_PROJECT_ACTIONS,
     EnforcementKind,
@@ -514,6 +514,77 @@ def protected_users(session: Session, user_ids: Iterable[str]) -> set[str]:
                 if {str(name).lower() for name in (names or [])} & roles:
                     found.add(user_id)
     return found
+
+
+PROTECTION_ENDED = "enforcement.protection_ended"
+
+
+def _note_protection_ended(
+    session: Session, *, limit: CreditLimit, period_key: str, actor: AuditActor
+) -> None:
+    """A user said to be protected earlier in this period is restricted now.
+
+    Protection is judged afresh every cycle (the user's roles as last synced
+    and as read now, the protected roles, the API key's account), and the
+    "protected" notice is raised once per period. When the judgement changes,
+    the restriction must not follow that notice unexplained: this says, once
+    per limit and period, that the user is no longer protected and why.
+    """
+    action_ids = list(
+        session.scalars(
+            select(EnforcementAction.id).where(
+                EnforcementAction.limit_id == limit.id,
+                EnforcementAction.period_key == period_key,
+                EnforcementAction.kind == EnforcementKind.REMOVE_USER_ROLES,
+            )
+        )
+    )
+    keys = [notifications.bounded_key(notifications.protected_key(limit.id, period_key))]
+    keys += [notifications.bounded_key(notifications.not_restricted_key(i)) for i in action_ids]
+    earlier = session.scalar(
+        select(Notification)
+        .where(Notification.dedupe_key.in_(keys), Notification.title.like("%but protected"))
+        .order_by(Notification.created_at.desc())
+        .limit(1)
+    )
+    if earlier is None:
+        return
+    label = limit.entity_label or limit.entity_id
+    roles = settings_store.enforcement_guard(session).protected_roles
+    now = (
+        f"{label} holds none of the protected roles ({', '.join(sorted(roles))}) now"
+        if roles
+        else "no role is protected now (Settings → Enforcement)"
+    )
+    since = earlier.created_at.strftime("%Y-%m-%d %H:%M UTC")
+    raised = notifications.notify(
+        session,
+        category=notifications.CATEGORY_ENFORCEMENT,
+        severity=Severity.WARNING,
+        title=f"{label} is no longer protected",
+        body=(
+            f"{label} was not restricted at {since} because they were protected "
+            f"({earlier.title}). That no longer holds: {now}, and it is not the account "
+            "the API key belongs to. They are over budget, so they are restricted now."
+        ),
+        entity_type=limit.entity_type,
+        entity_id=limit.entity_id,
+        entity_label=limit.entity_label,
+        dedupe_key=f"protection_ended:{limit.id}:{period_key}",
+    )
+    if raised is not None:
+        record_audit(
+            session,
+            action=PROTECTION_ENDED,
+            actor=actor,
+            target_type=TARGET_USER,
+            target_id=limit.entity_id,
+            target_label=label,
+            detail=(
+                f"Reported as protected in {period_key} at {since}; no longer protected: {now}. "
+                "Restricted."
+            ),
+        )
 
 
 def target_released(session: Session, action: EnforcementAction) -> str | None:
@@ -1217,6 +1288,8 @@ def _enforce_target(
         )
     session.flush()
     outcome.applied.append(action)
+    if target.kind == EnforcementKind.REMOVE_USER_ROLES:
+        _note_protection_ended(session, limit=limit, period_key=period_key, actor=actor)
 
     record_audit(
         session,
@@ -1253,7 +1326,7 @@ def _enforce_target(
         entity_type=limit.entity_type,
         entity_id=limit.entity_id,
         entity_label=limit.entity_label,
-        dedupe_key=notifications.enforcement_key(action.id),
+        dedupe_key=notifications.enforcement_key(action.id, action.applied_at),
         enforcement_action_id=action.id,
     )
     if target.kind == EnforcementKind.REMOVE_USER_ROLES and snapshot.get("kept_effective"):
@@ -3148,6 +3221,32 @@ def may_be_in_force(action: EnforcementAction) -> bool:
     )
 
 
+def restricted_entities(session: Session) -> set[tuple[str, str]]:
+    """The budgets' entities (type, id) with a restriction in force now.
+
+    In force: applied, or written with an outcome in doubt (it may be in
+    place). What every page counts as "entities restricted": the Overview,
+    Reports and the scheduler status, from this one place. A budget that is
+    over its limit without a restriction (held, deferred, protected) is not
+    restricted, whatever its period's status.
+    """
+    from app.services import enforcement_selftest
+
+    found = {
+        (str(entity_type), str(entity_id))
+        for entity_type, entity_id in session.execute(
+            select(EnforcementAction.entity_type, EnforcementAction.entity_id)
+            .where(EnforcementAction.status == EnforcementStatus.APPLIED)
+            .distinct()
+        )
+    }
+    found.update(
+        (str(action.entity_type), str(action.entity_id))
+        for action in enforcement_selftest.unsettled_in_force(session)
+    )
+    return found
+
+
 def restore_action(
     session: Session,
     client: CheckmarxClient,
@@ -3314,11 +3413,16 @@ def _restore_action_locked(
         category=notifications.CATEGORY_RESTORATION,
         severity=Severity.INFO,
         title=_restoration_title(action),
-        body=_restoration_body(action, snapshot, reason),
+        body=_restoration_body(
+            action,
+            snapshot,
+            reason,
+            limit=session.get(CreditLimit, action.limit_id) if action.limit_id else None,
+        ),
         entity_type=action.entity_type,
         entity_id=action.entity_id,
         entity_label=action.entity_label,
-        dedupe_key=notifications.restoration_key(action.id),
+        dedupe_key=notifications.restoration_key(action.id, action.reversed_at),
         enforcement_action_id=action.id,
     )
     # Committed here, inside the lock, and before any further network call so the
@@ -4016,7 +4120,13 @@ def _restoration_title(action: EnforcementAction) -> str:
     return f"Project {action.target_label}: PR triage and remediation re-enabled"
 
 
-def _restoration_body(action: EnforcementAction, snapshot: dict[str, Any], reason: str) -> str:
+def _restoration_body(
+    action: EnforcementAction,
+    snapshot: dict[str, Any],
+    reason: str,
+    *,
+    limit: CreditLimit | None = None,
+) -> str:
     explanation = {
         "admin": "An administrator restored access from the Notification Center.",
         "period_rollover": "A new budget period started, so the restriction was lifted.",
@@ -4060,6 +4170,14 @@ def _restoration_body(action: EnforcementAction, snapshot: dict[str, Any], reaso
     else:
         severities = snapshot.get("severities_before") or []
         detail = f"PR remediation severities restored to: {', '.join(severities) or 'none'}."
+    if limit is not None and limit.is_active:
+        # The limit in force now, not the one the restriction was applied under.
+        entity = limit.entity_label or limit.entity_id
+        explanation += (
+            f" The {limit.entity_type} limit on {entity} is now "
+            f"{credits_text.credits(limit.credit_limit)} credits"
+            + ("." if limit.enforce else ", monitor only.")
+        )
     return f"{explanation}\n{detail}"
 
 

@@ -6,6 +6,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session
 
 from app.api.deps import AdminUser, CurrentUser, DbSession
 from app.checkmarx.errors import CheckmarxError
@@ -72,29 +73,68 @@ def list_notifications(
         db.scalars(query.order_by(Notification.created_at.desc()).limit(limit).offset(offset))
     )
 
-    # Only actions that are, or may still be, in force can be restored.
-    action_ids = [row.enforcement_action_id for row in rows if row.enforcement_action_id]
-    restorable: set[int] = set()
-    if action_ids:
-        restorable = {
-            action.id
-            for action in db.scalars(
-                select(EnforcementAction).where(
-                    EnforcementAction.id.in_(action_ids),
-                    EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES),
-                )
-            )
-            if enforcement.may_be_in_force(action)
-        }
+    restorable = _restorable(db, rows)
 
     return NotificationListResponse(
-        items=[
-            _to_response(row, can_restore=bool(row.enforcement_action_id in restorable))
-            for row in rows
-        ],
+        items=[_to_response(row, can_restore=row.id in restorable) for row in rows],
         total=total,
         unread=notification_service.unread_count(db),
     )
+
+
+def _restorable(db: Session, rows: list[Notification]) -> set[int]:
+    """The notifications that offer Restore access: those about a restriction
+    in force now, said since it was (last) applied.
+
+    A restriction lifted and applied again keeps its row, so its older notices
+    (the "restored" one, a warning from before) point at a restriction in
+    force again; they describe what is over, and offer nothing.
+    """
+    action_ids = {
+        row.enforcement_action_id
+        for row in rows
+        if row.enforcement_action_id and row.category != notification_service.CATEGORY_RESTORATION
+    }
+    if not action_ids:
+        return set()
+    in_force = {
+        action.id: action
+        for action in db.scalars(
+            select(EnforcementAction).where(
+                EnforcementAction.id.in_(action_ids),
+                EnforcementAction.status.in_(enforcement.RESTORABLE_STATUSES),
+            )
+        )
+        if enforcement.may_be_in_force(action)
+    }
+    if not in_force:
+        return set()
+    lifted = dict(
+        db.execute(
+            select(Notification.enforcement_action_id, func.max(Notification.created_at))
+            .where(
+                Notification.enforcement_action_id.in_(list(in_force)),
+                Notification.category == notification_service.CATEGORY_RESTORATION,
+            )
+            .group_by(Notification.enforcement_action_id)
+        ).all()
+    )
+    found: set[int] = set()
+    for row in rows:
+        action = in_force.get(row.enforcement_action_id or 0)
+        if action is None or row.category == notification_service.CATEGORY_RESTORATION:
+            continue
+        since = [
+            moment
+            for moment in (
+                action.applied_at if action.status == EnforcementStatus.APPLIED else None,
+                lifted.get(action.id),
+            )
+            if moment is not None
+        ]
+        if all(row.created_at >= moment for moment in since):
+            found.add(row.id)
+    return found
 
 
 @router.post("/read")

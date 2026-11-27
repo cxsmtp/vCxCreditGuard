@@ -453,6 +453,8 @@ export interface LimitPeriodState {
   headroom_credits?: string | null;
   /** "X credits left, below the headroom of Y" while restricted before the limit. */
   restricted_early?: string | null;
+  /** Why a period over its limit is, or is not, restricted (held, deferred, protected, ...). */
+  status_note?: string | null;
 }
 
 export type AttributionBasis = "observed" | "estimated" | "unattributed";
@@ -770,9 +772,14 @@ export interface SchedulerStatus {
   schedule: string;
   enabled: boolean;
   next_run_at: string | null;
+  /** The last full cycle: when it finished (or started, while it runs) and how it went. */
   last_run_at: string | null;
   last_run_status: string | null;
+  /** When the last full cycle without a problem finished. */
   last_success_at: string | null;
+  fast_check_enabled?: boolean;
+  last_fast_check_at?: string | null;
+  last_fast_check_result?: string | null;
   entities_in_warning: number;
   entities_restricted: number;
   unread_notifications: number;
@@ -892,6 +899,8 @@ export interface Projection {
   days_to_exhaustion: number | null;
   exhaustion_at: string | null;
   will_breach: boolean;
+  /** At or over the limit already: not a projected breach, and no date it runs out on. */
+  already_over?: boolean;
 }
 
 export interface ReportImpact {
@@ -907,7 +916,9 @@ export interface ReportSummary {
   generated_at: string;
   limits_total: number;
   limits_enforcing: number;
+  /** Projected to go over by the period's end, not over yet. */
   breaching_soon: number;
+  already_over?: number;
   impact: ReportImpact;
   projections: Projection[];
 }
@@ -1042,6 +1053,8 @@ export interface DryRunResult {
   generated_at: string;
   would_enforce_count: number;
   would_warn_count: number;
+  /** Over the limit (or restricting early), restricted or not. */
+  would_breach_count?: number;
   affected_projects: number;
   affected_users: number;
   rows: DryRunRow[];

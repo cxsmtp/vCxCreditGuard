@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.db.base import utcnow
 from app.models.enums import EnforcementStatus, LimitStatus
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
-from app.services import credits_text, evaluation, settings_store
+from app.services import credits_text, enforcement, evaluation, settings_store
 from app.services.periods import PeriodError, current_window
 
 # A day in seconds, as a Decimal, for burn-rate arithmetic.
@@ -42,6 +42,9 @@ class Projection:
     days_to_exhaustion: float | None
     exhaustion_at: datetime | None
     will_breach: bool
+    # At or over the limit already: not "projected to breach", and it has no
+    # date it runs out on (it has run out).
+    already_over: bool = False
 
 
 @dataclass(slots=True)
@@ -61,7 +64,9 @@ class Report:
     limits_enforcing: int
     projections: list[Projection] = field(default_factory=list)
     impact: Impact | None = None
+    # Projected to go over by the period's end, not over yet.
     breaching_soon: int = 0
+    already_over: int = 0
 
 
 def forward_projection(
@@ -125,13 +130,14 @@ def _project(
     days_to_exhaustion: float | None = None
     exhaustion_at: datetime | None = None
     remaining = Decimal(limit.credit_limit) - credits_used
+    already_over = remaining <= 0
     if remaining > 0 and burn_per_day > 0:
         days = remaining / burn_per_day
         days_to_exhaustion = float(days)
         exhaustion_at = moment + _timedelta_days(days)
-    elif remaining <= 0:
+    elif already_over:
+        # Run out already: no date in the future to give.
         days_to_exhaustion = 0.0
-        exhaustion_at = moment
 
     will_breach = projected_end >= Decimal(limit.credit_limit)
 
@@ -150,6 +156,7 @@ def _project(
         days_to_exhaustion=days_to_exhaustion,
         exhaustion_at=exhaustion_at,
         will_breach=will_breach,
+        already_over=already_over,
     )
 
 
@@ -207,14 +214,7 @@ def impact_summary(
         )
         or 0
     )
-    entities_restricted = int(
-        session.scalar(
-            select(func.count(func.distinct(EnforcementAction.entity_id))).where(
-                EnforcementAction.status == EnforcementStatus.APPLIED
-            )
-        )
-        or 0
-    )
+    entities_restricted = len(enforcement.restricted_entities(session))
     warnings_active = int(
         session.scalar(
             select(func.count())
@@ -253,7 +253,8 @@ def build_report(session: Session, *, now: datetime | None = None) -> Report:
         limits_enforcing=limits_enforcing,
         projections=projections,
         impact=impact,
-        breaching_soon=sum(1 for p in projections if p.will_breach),
+        breaching_soon=sum(1 for p in projections if p.will_breach and not p.already_over),
+        already_over=sum(1 for p in projections if p.already_over),
     )
 
 
@@ -333,6 +334,7 @@ def report_as_text(report: Report) -> str:
         f"Generated: {report.generated_at.isoformat()}",
         "",
         f"Limits: {report.limits_total} ({report.limits_enforcing} enforcing)",
+        f"Already over their limit: {report.already_over}",
         f"Projected to breach this period: {report.breaching_soon}",
     ]
     if report.impact is not None:
@@ -350,12 +352,17 @@ def report_as_text(report: Report) -> str:
     if report.projections:
         lines += ["", "Projections (soonest to run out first):"]
         for p in report.projections[:25]:
-            when = p.exhaustion_at.date().isoformat() if p.exhaustion_at else "not this period"
+            if p.already_over:
+                outlook = "already over"
+            elif p.exhaustion_at:
+                outlook = f"exhausts {p.exhaustion_at.date().isoformat()}"
+            else:
+                outlook = "exhausts not this period"
             lines.append(
                 f"  {p.entity_label or p.entity_id} ({p.entity_type}): "
                 f"{credits_text.credits(p.credits_used)} of "
                 f"{credits_text.credits(p.credit_limit)} used, "
                 f"~{credits_text.credits(p.projected_period_end)} by period end, "
-                f"exhausts {when}"
+                f"{outlook}"
             )
     return "\n".join(lines)

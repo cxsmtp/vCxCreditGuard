@@ -284,7 +284,17 @@ function rolloutNote(limit: Limit) {
   }
   const total = period?.rollout_total ?? null;
   const done = period?.rollout_done ?? null;
-  if (total == null || done == null || done >= total) return null;
+  if (total == null || done == null || done >= total) {
+    // Over the limit: why it is, or is not, restricted (held by the recount,
+    // deferred, protected, cannot fully bite, monitor only, ...).
+    const note = period?.status_note;
+    if (!note || (period?.status !== "breached" && period?.status !== "restricted")) return null;
+    return (
+      <span className="text-xs" style={{ color: "var(--status-warning)" }} title={note}>
+        {note}
+      </span>
+    );
+  }
   const noun = limit.entity_type === "user" ? "users" : "projects";
   return (
     <span
