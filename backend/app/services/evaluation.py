@@ -77,6 +77,7 @@ from app.models.org import (
 from app.models.usage import BudgetUsage
 from app.services import (
     auto_triage_attribution,
+    credits_text,
     enforcement,
     error_text,
     ingestion,
@@ -2294,7 +2295,8 @@ def _notify_warning(
             f"{limit.entity_type.capitalize()} {entity} reached {percent:.0f}% of its credit limit"
         ),
         body=(
-            f"{state.credits_used} of {limit.credit_limit} credits used "
+            f"{credits_text.credits(state.credits_used)} of "
+            f"{credits_text.credits(limit.credit_limit)} credits used "
             f"{describe_window(window)}. The warning threshold is "
             f"{limit.warning_threshold_pct}%.\n"
             f"{'Enforcement is on' if limit.enforce else 'This limit is monitor only'}, "

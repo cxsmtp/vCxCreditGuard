@@ -1,9 +1,9 @@
 """Enforcement coverage: whether a user restriction can actually bite.
 
-Synthetic tenant shaped like the live one (2026-11): a protected composite role
-(``ast-admin``) holding every default AI role and held by most users, another
-composite (``scan-fusion``), a group granting an AI role, and dedicated AI
-roles on the tenant.
+Synthetic tenant shaped like the live one (2026-11): a composite role
+(``ast-admin``, protected only where an admin lists it) holding every default
+AI role and held by most users, another composite (``scan-fusion``), a group
+granting an AI role, and dedicated AI roles on the tenant.
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ def connected(db: Session, monkeypatch: pytest.MonkeyPatch):
 def test_who_a_user_restriction_can_reach(db: Session, connected: FakeTenant) -> None:
     report = coverage.compute(db, connected.client())
     assert report.ai_holders == 10
-    assert report.protected == 7
+    assert report.protected == 0  # no role is protected by default
     assert report.via_composite == 8
     assert report.via_group == 1
     assert report.via_composite_or_group == 9
@@ -101,6 +101,16 @@ def test_who_a_user_restriction_can_reach(db: Session, connected: FakeTenant) ->
     assert "ai-remediation-run" in warning and "never changes the list" in warning
     assert "ai-triage-assist" not in warning
     assert "ast-scanner or ast-risk-manager" in warning and "create-fusion-scan" in warning
+
+
+def test_a_listed_protected_role_is_counted(db: Session, connected: FakeTenant) -> None:
+    settings_store.set_value(db, settings_store.KEY_PROTECTED_ROLES, "ast-admin")
+    db.commit()
+    report = coverage.compute(db, connected.client())
+    assert report.protected == 7
+    assert report.restrictable == 1
+    warning = report.warning()
+    assert warning is not None and "7 hold a protected role (ast-admin)" in warning
 
 
 def test_it_only_reads_and_never_changes_the_role_list(db: Session, connected: FakeTenant) -> None:
@@ -138,6 +148,8 @@ def test_diagnostics_shows_a_low_coverage(db: Session, connected: FakeTenant) ->
 
 
 def test_without_a_tenant_only_protection_is_counted(db: Session, connected: FakeTenant) -> None:
+    settings_store.set_value(db, settings_store.KEY_PROTECTED_ROLES, "ast-admin")
+    db.commit()
     report = coverage.compute(db, None)
     assert report.available is False
     assert report.protected == 7

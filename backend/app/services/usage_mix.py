@@ -52,7 +52,7 @@ from app.models.enums import (
 from app.models.limits import CreditLimit, LimitPeriodState
 from app.models.org import CxApplicationProject, CxGroupMembership, CxProjectGroup
 from app.models.usage import UsageRecord, UsageSnapshot
-from app.services import ingestion, ledger, settings_store
+from app.services import credits_text, ingestion, ledger, settings_store
 from app.services.periods import PeriodWindow, describe_window
 
 logger = logging.getLogger(__name__)
@@ -677,11 +677,8 @@ def for_period(session: Session, limit: CreditLimit, period_key: str) -> UsageMi
 
 
 def format_credits(value: Decimal | int | float) -> str:
-    """4, 2.5, 0.25: no trailing zeros, no exponent."""
-    if isinstance(value, int):
-        return str(value)
-    text = f"{Decimal(str(value)).normalize():f}"
-    return text.rstrip("0").rstrip(".") if "." in text else text
+    """4.0, 2.5, 1,365.5: the one-decimal wording shared by every message."""
+    return credits_text.credits(value)
 
 
 _number = format_credits

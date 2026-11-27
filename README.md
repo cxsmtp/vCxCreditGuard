@@ -95,9 +95,20 @@ point links to the section below that explains it.
   dedicated AI roles, without changing the role list.
 - Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users
   and projects restricts nobody and pauses itself; a pause switch stops new
-  restrictions at once; protected roles (`ast-admin`, `iam-admin` by default)
-  are never restricted; a sudden fall in reported usage is held until later
+  restrictions at once; a sudden fall in reported usage is held until later
   readings confirm it ([Enforcement safety](#enforcement-safety)).
+- Everyone over an enforcing user budget is restricted, administrators
+  included. Where someone keeps an AI role through a composite role
+  (`ast-admin` contains `create-fusion-scan`) or a group, CreditGuard removes
+  what it can (nothing, if no AI role is mapped to them directly), records it
+  in the audit log, raises a warning once per period ("is over budget and was
+  restricted, but keeps ... through ...; the restriction cannot stop them using
+  Fusion") naming what to remove in Checkmarx One, and the Simulation shows
+  "Would enforce: Yes (cannot fully bite: keeps ... through ...)".
+- The account the API key belongs to is never restricted: restricting it could
+  remove rights CreditGuard needs to restore others. It is audited and reported
+  instead. Protected roles (none by default) can be listed under Settings →
+  Enforcement to shield their holders the same way.
 - Recount before restricting (always on): just before a new restriction of a
   monthly or quarterly budget, the budget's period is recounted straight from
   the Checkmarx activity log, independently of CreditGuard's own counters, and
@@ -157,7 +168,7 @@ telemetry, no analytics, and nothing else is contacted.
 | **It acts once a cycle**, not the moment credits are spent. | Usage is read and budgets judged once a cycle (every 15 minutes by default), and Checkmarx can report credits a little after they are spent. Usage in between can take a budget past its limit before the restriction lands, so leave some headroom. A large group or application is restricted over several cycles (at most 1,000 changes a cycle by default; [Sizing and scale](#sizing-and-scale)). |
 | **It restricts access, it does not meter credits.** | It removes roles and turns settings off; it cannot stop an action already running or cap a budget to the exact credit. |
 | **Only roles held directly are removed.** | An AI role a person holds through a group or a composite role stays in effect. CreditGuard says so once and never changes the group or role, because that would affect everyone in it. Remove it there in Checkmarx One, or exempt the person ([Restricting a user, in detail](#what-the-enforcement-actions-actually-are)). |
-| **User budgets may not bite at all.** | A user budget cannot stop someone who gets Fusion through a composite role: `ast-admin` (held by 274 of 296 users on a live tenant, and protected) and `scan-fusion` both contain `create-fusion-scan`, so removing the direct mapping takes nothing away. The fix is on the tenant: give people `ast-scanner` or `ast-risk-manager` (which contain no AI role) plus `create-fusion-scan` directly where they should run Fusion. Check *Enforcement coverage* (Simulation or Settings → Enforcement) before relying on user budgets. Project, group and application budgets do not depend on roles: they turn AI features off on the projects. |
+| **User budgets may not bite at all.** | A user budget cannot stop someone who gets Fusion through a composite role: `ast-admin` (held by 274 of 296 users on a live tenant) and `scan-fusion` both contain `create-fusion-scan`, so removing the direct mapping takes nothing away. Such a person is still restricted, and CreditGuard warns once per period that the restriction cannot fully bite and what to remove. The fix is on the tenant: give people `ast-scanner` or `ast-risk-manager` (which contain no AI role) plus `create-fusion-scan` directly where they should run Fusion. Check *Enforcement coverage* (Simulation or Settings → Enforcement) before relying on user budgets. Project, group and application budgets do not depend on roles: they turn AI features off on the projects. |
 | **A project budget does not stop people's own AI Triage and AI Remediation.** | Turning project features off leaves what people start themselves working; only a user budget stops that ([What the breach and restriction messages say](#what-the-breach-and-restriction-messages-say)). |
 | **Account-wide Auto Triage may override a project.** | If Auto Triage is switched on for the whole account and projects cannot override it, turning it off on one project does not hold. CreditGuard notices on the second read-back and says so once: turn it off in the account's Auto Triage settings, or exempt the project. |
 | **Turning Fusion off is not airtight.** | A scan started with its own settings may still run Fusion; the lock against that is not verified. The AI engine can still run without Fusion, and whether that costs credits is not known. Such scans are recorded as [policy violations](#policy-violations). |
@@ -1076,8 +1087,8 @@ restore never resets branches, severity levels or the Fusion model.
   `c9f2a6e1d4b7`; downgrading moves exactly the new default back. Restrictions
   in force keep, and give back, the roles they recorded.
 * **Who a user budget cannot stop.** Someone who gets Fusion through a
-  composite role keeps it: `ast-admin` (protected by default, and on a live
-  tenant held by 274 of 296 users) contains all four default roles directly,
+  composite role keeps it: `ast-admin` (on a live tenant held by 274 of 296
+  users; no longer protected by default) contains all four default roles directly,
   and `scan-fusion` contains `create-fusion-scan`. *Enforcement coverage* shows
   them as kept through a composite. The fix is on the tenant: give people
   `ast-scanner` or `ast-risk-manager` (neither contains an AI role) plus
@@ -2478,11 +2489,19 @@ failure of this tool is restricting many people at once for a wrong reason.
   for one cycle's write budget (see [Sizing and scale](#sizing-and-scale)) is
   judged once, when it starts: its continuation on the next cycles is not
   counted as new, but users or projects added to the limit since are.
-- **Protected roles.** A user holding one of the listed Checkmarx roles
-  (default `ast-admin`, `iam-admin`) is never restricted, and is released if
-  the role is granted later. They still get the warning. **Check these names
-  against your tenant**: they have not been verified on a live one, and a name
-  that matches nothing protects nobody.
+- **Protected roles.** None by default: everyone over budget is restricted,
+  and a restriction a composite role or a group keeps from biting is reported
+  as such (audit log, one warning per user per period, and "cannot fully bite"
+  in the Simulation). A user holding one of the Checkmarx roles listed here is
+  never restricted, and is released if the role is granted later; they still
+  get the warning. An install that stored the old default (`ast-admin`,
+  `iam-admin`) is switched to none by migration `a4d8e2c6f1b9`; any other
+  list is kept. **Check listed names against your tenant**: a name that
+  matches nothing protects nobody.
+- **The API key's own account** is never restricted, whatever the setting:
+  restricting it could remove rights CreditGuard needs to restore others. The
+  Simulation and the warning say exactly that, and it is audited each period it
+  would have been restricted.
 - **Held readings.** If the tenant suddenly reports less than half the usage it
   did a moment ago for a dimension, the reading is held rather than believed,
   until at least three readings in a row over at least two hours tell the same

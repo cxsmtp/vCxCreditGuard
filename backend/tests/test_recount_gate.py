@@ -92,8 +92,8 @@ def test_disagree_no_restriction_a_warning_and_diagnose_shows_it(
     warned = warnings_about_recount(db)
     assert len(warned) == 1 and warned[0].severity == "warning"
     assert warned[0].body is not None and warned[0].body.startswith(
-        "Counts disagree: CreditGuard's count is 6, a direct recount of the Checkmarx "
-        "activity log is 0; not restricted. See Diagnose."
+        "Counts disagree: CreditGuard's count is 6.0, a direct recount of the Checkmarx "
+        "activity log is 0.0; not restricted. See Diagnose."
     )
     # Deduplicated per budget and period: the next cycle does not warn again.
     world.tick()
@@ -103,7 +103,7 @@ def test_disagree_no_restriction_a_warning_and_diagnose_shows_it(
     assert len(entries) == 1 and entries[0]["kind"] == recount.DISAGREE
     assert entries[0]["times"] == 2
     check = next(c for c in diagnostics.run_diagnostics(db).checks if c.key == "recount")
-    assert check.status == diagnostics.WARN and "the activity log 0" in check.detail
+    assert check.status == diagnostics.WARN and "the activity log 0.0" in check.detail
     assert check.label == "Recount before restricting"
 
 

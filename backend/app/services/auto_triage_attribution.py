@@ -119,7 +119,14 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
-from app.services import error_text, ingestion, notifications, pacing, settings_store
+from app.services import (
+    credits_text,
+    error_text,
+    ingestion,
+    notifications,
+    pacing,
+    settings_store,
+)
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome
 
@@ -1806,7 +1813,8 @@ def _sync_initiator_subjects(session: Session, model: AttributionModel, now: dat
                     title=f"Auto-triage credits could not be charged to a person: {info.initiator}",
                     body=(
                         f"Scans started by {info.initiator} triggered auto triage worth "
-                        f"{_q(info.credits)} credits, but {info.initiator} does not match any "
+                        f"{credits_text.credits(info.credits)} credits, but {info.initiator} "
+                        "does not match any "
                         "synced Checkmarx user, so those credits count against the project only. "
                         "If they belong to a person (a bot or integration acting for someone), "
                         "map it to that user under Settings → Attribution."

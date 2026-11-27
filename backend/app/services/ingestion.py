@@ -41,7 +41,7 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
-from app.services import activity_source, error_text, ledger, subject_matching
+from app.services import activity_source, credits_text, error_text, ledger, subject_matching
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome, UserProfile
 
@@ -814,7 +814,8 @@ def _hold_reason(
         )
         return None
     return (
-        f"Checkmarx reported {total} credits by {view}, down from {previous.total_credits} "
+        f"Checkmarx reported {credits_text.credits(total)} credits by {view}, down from "
+        f"{credits_text.credits(previous.total_credits)} "
         f"on the last accepted read. A collapse like that is usually a faulty answer "
         f"rather than real usage, so it is being held back and limits are still judged "
         f"on the previous figures. It is accepted once it has persisted for at least "

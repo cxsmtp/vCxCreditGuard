@@ -835,13 +835,13 @@ export function SettingsPage({
                 </Field>
                 <Field
                   label="Protected roles"
-                  hint="Comma separated Checkmarx One role names. A user holding any of them is never restricted automatically; an admin is told instead. The account your API key belongs to is always protected."
+                  hint="Comma separated Checkmarx One role names; none by default. A user holding any of them is never restricted automatically; an admin is told instead. The account your API key belongs to is always protected: restricting it could remove rights CreditGuard needs to restore others."
                 >
                   <Input
                     disabled={!isAdmin}
                     value={value("protected_roles") ?? ""}
                     onChange={(event) => set({ protected_roles: event.target.value })}
-                    placeholder="ast-admin, iam-admin"
+                    placeholder="None (everyone over budget is restricted)"
                     spellCheck={false}
                   />
                 </Field>
@@ -1059,9 +1059,9 @@ function UsageSourceNote({ status }: { status: UsageSourceStatus | null }) {
       text += ` It has failed since ${formatDateTime(status.failing_since)}: nothing new is counted until it answers.`;
     }
     if (reconciliation?.status === "match") {
-      text += ` Its sum matched the summary (${reconciliation.summary_credits} credits, ${reconciliation.period?.replace(/_/g, " ")}).`;
+      text += ` Its sum matched the summary (${formatCredits(reconciliation.summary_credits)} credits, ${reconciliation.period?.replace(/_/g, " ")}).`;
     } else if (reconciliation?.status === "mismatch") {
-      text += ` Its sum (${reconciliation.activity_credits}) did not match the summary (${reconciliation.summary_credits}): see Diagnose.`;
+      text += ` Its sum (${formatCredits(reconciliation.activity_credits)}) did not match the summary (${formatCredits(reconciliation.summary_credits)}): see Diagnose.`;
     }
   } else if (status.status === "fallback") {
     text = `The activity log could not be read (${status.last_error ?? "unknown error"}); the consumption summary is the source until it answers again.`;

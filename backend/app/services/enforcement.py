@@ -59,6 +59,7 @@ from app.models.limits import (
 )
 from app.models.org import CxApplicationProject, CxProject, CxProjectGroup, CxUser
 from app.services import (
+    credits_text,
     error_text,
     ingestion,
     key_permissions,
@@ -440,6 +441,24 @@ class ProtectedTarget(NotRestricted):
 PROTECTED_REASON = "protected"
 
 
+# Why the API key's own account is never restricted, in the words every
+# notification, audit entry and Simulation row uses.
+API_KEY_OWNER_REASON = (
+    "it is the account the Checkmarx One API key belongs to: restricting it could remove "
+    "rights CreditGuard needs to restore others"
+)
+
+
+def protection_remedy(why: str) -> str:
+    """What the admin can do about a protected user, depending on why."""
+    if why == API_KEY_OWNER_REASON:
+        return (
+            "Raise it with them, or connect CreditGuard with an API key of an account that "
+            "does not use AI features."
+        )
+    return "Raise it with them, or change the protected roles under Settings → Enforcement."
+
+
 def protected_user_ids(session: Session) -> frozenset[str]:
     """Tenant users the utility never restricts.
 
@@ -466,7 +485,7 @@ def protection_reason(
     has just read them from the tenant, on their roles as they are now.
     """
     if user_id in protected_user_ids(session):
-        return "it is the account the Checkmarx One API key belongs to"
+        return API_KEY_OWNER_REASON
     if protected_roles is None:
         protected_roles = settings_store.enforcement_guard(session).protected_roles
     if not protected_roles:
@@ -757,8 +776,7 @@ def apply_enforcement(
                 title=f"{label} is over budget but protected",
                 body=(
                     f"{label} has gone over their credit limit, but their AI access is "
-                    f"not removed automatically because {why}. Raise it with them, or "
-                    "change the protected roles under Settings → Enforcement."
+                    f"not removed automatically because {why}. {protection_remedy(why)}"
                 ),
                 entity_type=limit.entity_type,
                 entity_id=limit.entity_id,
@@ -1212,6 +1230,12 @@ def _enforce_target(
         detail=(
             f"Limit on {limit.entity_type} {limit.entity_label or limit.entity_id} "
             f"was breached in {period_key}."
+            + (
+                f" {_cannot_bite_audit(target.target_label or target.target_id, snapshot)}"
+                if target.kind == EnforcementKind.REMOVE_USER_ROLES
+                and snapshot.get("kept_effective")
+                else ""
+            )
         ),
     )
     notifications.notify(
@@ -1263,6 +1287,72 @@ def _not_effective_lines(target_label: str, snapshot: dict[str, Any]) -> list[st
     return lines
 
 
+def _kept_by_source(
+    snapshot: dict[str, Any],
+) -> list[tuple[list[str], list[role_sources.RoleSource]]]:
+    """The AI roles kept, grouped by where they come from, in a stable order."""
+    grouped: dict[tuple[role_sources.RoleSource, ...], list[str]] = {}
+    for name, sources in role_sources.kept_from_entries(snapshot.get("kept_effective")).items():
+        grouped.setdefault(tuple(sources), []).append(name)
+    return [(names, list(sources)) for sources, names in grouped.items()]
+
+
+def _kept_phrase(kept: list[tuple[list[str], list[role_sources.RoleSource]]]) -> str:
+    """ "create-fusion-scan, manage-fusion through role ast-admin; ... through group /G" """
+    return "; ".join(
+        f"{', '.join(names)} through {role_sources.describe_sources(sources)}"
+        for names, sources in kept
+    )
+
+
+def _remedy(sources: Iterable[role_sources.RoleSource]) -> str:
+    """What to change in Checkmarx One so the restriction bites."""
+    steps: list[str] = []
+    for source in sources:
+        if source.kind == role_sources.SOURCE_COMPOSITE and source.group:
+            step = f"remove {source.role} from group {source.group}"
+        elif source.kind == role_sources.SOURCE_COMPOSITE:
+            step = f"remove {source.role} from them"
+        elif source.kind == role_sources.SOURCE_GROUP:
+            step = f"take them out of group {source.group}"
+        else:
+            step = "find where they get it and remove that from them"
+        if step not in steps:
+            steps.append(step)
+    text = " and ".join(steps) or "find where they get it and remove that from them"
+    return f"{text[0].upper()}{text[1:]} in Checkmarx One to make it bite."
+
+
+def cannot_bite_sentence(target_label: str, snapshot: dict[str, Any]) -> str | None:
+    """The one-paragraph warning for a restriction a composite role or a group
+    keeps from biting, or None when nothing is kept."""
+    kept = _kept_by_source(snapshot)
+    if not kept:
+        return None
+    through = _kept_phrase(kept)
+    sources = [source for _names, group in kept for source in group]
+    return (
+        f"{target_label} is over budget and was restricted, but keeps {through}; the "
+        f"restriction cannot stop them using Fusion. {_remedy(sources)}"
+    )
+
+
+def _nothing_removed(snapshot: dict[str, Any]) -> bool:
+    return not snapshot.get("removed_roles")
+
+
+def _cannot_bite_audit(target_label: str, snapshot: dict[str, Any]) -> str:
+    """The audit detail's addition for a restriction that cannot fully bite."""
+    kept = _kept_by_source(snapshot)
+    through = _kept_phrase(kept)
+    if _nothing_removed(snapshot):
+        return (
+            f"Nothing to remove, kept through composite or group: {target_label} has no AI "
+            f"role mapped directly (nothing was written to Checkmarx One) and keeps {through}."
+        )
+    return f"Cannot fully bite: {target_label} keeps {through}."
+
+
 def _report_not_effective(
     session: Session,
     *,
@@ -1280,15 +1370,15 @@ def _report_not_effective(
     """
     label = target.target_label or target.target_id
     lines = _not_effective_lines(label, snapshot)
-    if not lines:
+    headline = cannot_bite_sentence(label, snapshot)
+    if not lines or headline is None:
         return
     body = (
-        "\n".join(lines)
-        + "\nThe restriction is not effective for "
-        + ("this role" if len(lines) == 1 else "these roles")
-        + ". Remove it from the group or role in Checkmarx One, or add the user to an "
-        "exemption. CreditGuard does not change groups or composite roles: that would take "
-        "the role from everyone else who holds it that way."
+        headline
+        + "\n"
+        + "\n".join(lines)
+        + "\nOr add the user to an exemption. CreditGuard does not change groups or composite "
+        "roles: that would take the role from everyone else who holds it that way."
     )
     unread = snapshot.get("role_sources_unread") or []
     if unread:
@@ -1297,7 +1387,7 @@ def _report_not_effective(
         session,
         category=notifications.CATEGORY_ENFORCEMENT,
         severity=Severity.WARNING,
-        title=f"{label} keeps AI access through a group or role",
+        title=f"{label} restricted, but keeps AI access through a group or role",
         body=body,
         entity_type=limit.entity_type,
         entity_id=limit.entity_id,
@@ -1322,8 +1412,11 @@ def _report_not_effective(
             target_type=AUDIT_TARGET_ACTION,
             target_id=str(action.id),
             target_label=label,
-            after={"kept_effective": snapshot.get("kept_effective")},
-            detail=" ".join(lines),
+            after={
+                "kept_effective": snapshot.get("kept_effective"),
+                "nothing_removed": _nothing_removed(snapshot),
+            },
+            detail=f"{_cannot_bite_audit(label, snapshot)} {' '.join(lines)}",
         )
 
 
@@ -1778,8 +1871,7 @@ def _capture_user_roles(
     if why is not None:
         raise ProtectedTarget(
             f"{target.target_label}'s AI access is not removed automatically because "
-            f"{why}. Raise it with them, or change the protected roles under "
-            "Settings → Enforcement.",
+            f"{why}. {protection_remedy(why)}",
             label=target.target_label,
         )
     ai_roles = settings_store.ai_role_names(session)
@@ -3863,7 +3955,7 @@ def _enforcement_body(
     entity = limit.entity_label or limit.entity_id
     lines = [
         f"The {limit.entity_type} limit on {entity} was reached in {period_key} "
-        f"({limit.credit_limit} credits).",
+        f"({credits_text.credits(limit.credit_limit)} credits).",
     ]
     if mix is not None:
         lines.append(

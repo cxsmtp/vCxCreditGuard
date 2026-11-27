@@ -645,10 +645,15 @@ class TestRefusals:
             roles=[*AI_ROLE_NAMES, "ast-admin"],
         )
         _tenant, client = setup_tenant(db, tenant)
+        # No role is protected by default; an admin's list is honoured.
+        settings_store.set_value(db, settings_store.KEY_PROTECTED_ROLES, "ast-admin, iam-admin")
+        db.commit()
         assert self.refused(db, client, user="user-root") == ["protected"]
 
     def test_a_protected_role_granted_since_the_sync(self, db: Session) -> None:
         tenant, client = setup_tenant(db)
+        settings_store.set_value(db, settings_store.KEY_PROTECTED_ROLES, "ast-admin, iam-admin")
+        db.commit()
         tenant.add_client_role("iam-admin")
         tenant.role_mappings["user-alice"].append("iam-admin")
         before = list(tenant.role_mappings["user-alice"])

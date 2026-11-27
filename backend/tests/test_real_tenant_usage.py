@@ -210,11 +210,11 @@ class TestPricing:
             select(Notification).where(Notification.title.like("%reached its credit limit"))
         )
         assert breach is not None
-        # Never "2 scans = 4 credits": the listed rate is not the price here.
-        assert "= 4 credits" not in breach.body
-        assert "2 scans = about 217.71 credits" in breach.body, breach.body
+        # Never "2 scans = 4.0 credits": the listed rate is not the price here.
+        assert "= 4.0 credits" not in breach.body
+        assert "2 scans = about 217.7 credits" in breach.body, breach.body
         assert "the average observed in the consumption feed" in breach.body
-        assert "the listed rate of 2 does not match it" in breach.body
+        assert "the listed rate of 2.0 does not match it" in breach.body
 
     def test_fusion_share_weighs_counts_by_what_a_transaction_costs(self) -> None:
         mix = usage_mix.UsageMix(
