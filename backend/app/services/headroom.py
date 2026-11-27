@@ -45,6 +45,7 @@ from app.models.enums import ActionType, EntityType
 from app.models.fastpath import FusionScanCost
 from app.models.limits import CreditLimit
 from app.models.org import CxApplicationProject, CxProjectGroup
+from app.services import credits_text, wording
 
 ZERO = Decimal("0")
 CENT = Decimal("0.01")
@@ -90,7 +91,7 @@ class Headroom:
         whose = "this budget's" if self.source == AUTO_ENTITY else "the whole tenant's"
         text = (
             f"Automatic: {_fmt(self.credits)} credits, the median cost of {whose} "
-            f"{self.samples} Fusion scan(s) in the last 30 days"
+            f"{wording.plural(self.samples, 'Fusion scan')} in the last 30 days"
         )
         if self.chosen is not None and self.chosen != self.credits:
             text += f" ({_fmt(self.chosen)}, held to half the limit)"
@@ -98,7 +99,7 @@ class Headroom:
 
 
 def _fmt(value: Decimal) -> str:
-    return f"{value.quantize(CENT).normalize():f}"
+    return credits_text.credits(value)
 
 
 def restrict_at(limit: CreditLimit, headroom: Headroom) -> Decimal:

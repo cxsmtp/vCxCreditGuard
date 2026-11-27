@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.db.base import utcnow
 from app.models.enums import EnforcementStatus, LimitStatus
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
-from app.services import credits_text, evaluation, settings_store
+from app.services import credits_text, evaluation, settings_store, wording
 from app.services.periods import PeriodError, current_window
 
 # A day in seconds, as a Decimal, for burn-rate arithmetic.
@@ -340,7 +340,7 @@ def report_as_text(report: Report) -> str:
             "",
             "Impact right now:",
             f"  Active restrictions: {report.impact.active_restrictions} "
-            f"across {report.impact.entities_restricted} entity(ies)",
+            f"across {wording.plural(report.impact.entities_restricted, 'entity', 'entities')}",
             "  Credits over budget on enforced limits: "
             f"{credits_text.credits(report.impact.credits_over_budget)}",
             f"  Entities warned: {report.impact.warnings_active}",

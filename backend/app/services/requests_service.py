@@ -22,7 +22,14 @@ from app.db import locking
 from app.db.base import utcnow
 from app.models.enums import EntityType, PeriodType, RequestStatus, Severity
 from app.models.limits import CreditLimit, CreditRequest
-from app.services import credits_text, error_text, limits_service, notifications, settings_store
+from app.services import (
+    credits_text,
+    error_text,
+    limits_service,
+    notifications,
+    settings_store,
+    wording,
+)
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -368,7 +375,11 @@ def auto_decide_pending(
             if policy.auto_approve_expiry_days > 0
             else None
         )
-        window = f" for {policy.auto_approve_expiry_days} day(s)" if expires_at is not None else ""
+        window = (
+            f" for {wording.plural(policy.auto_approve_expiry_days, 'day')}"
+            if expires_at is not None
+            else ""
+        )
         # Each grant is its own transaction, so one failure rolls back only that
         # request and the batch continues, rather than half-applying a grant or
         # poisoning the cycle. (Not a savepoint: lifting a restriction commits as
@@ -382,7 +393,7 @@ def auto_decide_pending(
                 expires_at=expires_at,
                 note=(
                     "Auto-approved by hands-off automation: an increase of "
-                    f"{credits_text.credits(increase)} credit(s) is within the "
+                    f"{credits_text.credits(increase)} credits is within the "
                     f"{credits_text.credits(policy.auto_approve_max_increase)}-credit "
                     f"cap{window}."
                 ),
@@ -489,7 +500,8 @@ def revert_expired_grants(
             failures.append(f"request {request_id}: {error_text.public_error(exc)}")
     if failures:
         raise GrantExpiryError(
-            f"{len(failures)} expired grant(s) could not be rolled back and will be "
+            f"{wording.plural(len(failures), 'expired grant')} could not be rolled back and "
+            "will be "
             f"retried: {'; '.join(failures)}"
         )
     return reverted

@@ -126,6 +126,7 @@ from app.services import (
     notifications,
     pacing,
     settings_store,
+    wording,
 )
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome
@@ -954,8 +955,10 @@ def collect(
                 f"{budget.max_requests or 'no'} requests)"
             )
             message = (
-                f"Auto-triage attribution reached {why}; {len(left)} project(s) are left on the "
-                "project for now and caught up on the next cycle (the longest waiting first)."
+                f"Auto-triage attribution reached {why}; {wording.plural(len(left), 'project')} "
+                f"{'is' if len(left) == 1 else 'are'} left on the project for now and caught up on "
+                "the next cycle "
+                "(the longest waiting first)."
             )
             result.warnings.append(message)
             logger.warning(message)
@@ -996,7 +999,8 @@ def collect(
                 result.deferred += sum(1 for item in left if isinstance(item, _Increase))
                 if left:
                     result.warnings.append(
-                        f"Checkmarx did not answer, so {len(left)} more project(s) are left "
+                        f"Checkmarx did not answer, so {len(left):,} more "
+                        f"{wording.noun(len(left), 'project is', 'projects are')} left "
                         "for the next cycle."
                     )
                 break

@@ -247,7 +247,7 @@ class TestMonitorOnly:
         assert db.scalar(select(EnforcementAction)) is None
 
         notification = db.scalar(
-            select(Notification).where(Notification.title.like("%reached its credit limit%"))
+            select(Notification).where(Notification.title.like("%reached their credit limit%"))
         )
         assert notification is not None
         assert "monitor only" in (notification.body or "")
@@ -362,7 +362,7 @@ class TestEnforcement:
         assert result.enforced == 0
         assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
         notification = db.scalar(
-            select(Notification).where(Notification.title.like("%reached its credit limit%"))
+            select(Notification).where(Notification.title.like("%reached their credit limit%"))
         )
         assert notification is not None
         assert "exemption list" in (notification.body or "")

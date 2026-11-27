@@ -18,7 +18,15 @@ import {
 import { FilterNote, Pager, usePaged, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import type { ExportColumn } from "../lib/export";
-import { entityLabel, formatCredits, formatDate, formatDateTime } from "../lib/format";
+import {
+  countNoun,
+  entityLabel,
+  formatCredits,
+  formatDate,
+  formatDateTime,
+  formatNumber,
+  formatPercent,
+} from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
 const PROJECTION_COLUMNS: ExportColumn<Projection>[] = [
@@ -49,7 +57,7 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
     setEmailing(true);
     try {
       const result = await api.post<{ sent: boolean; recipients: number }>("/api/reports/email");
-      if (result.sent) toast.success(`Report emailed to ${result.recipients} recipient(s).`);
+      if (result.sent) toast.success(`Report emailed to ${countNoun(result.recipients, "recipient")}.`);
     } catch (caught) {
       toast.error(caught instanceof ApiError ? caught.message : "The report could not be emailed.");
     } finally {
@@ -97,8 +105,8 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
             <StatTile
               label="Active restrictions"
-              value={String(data.impact.active_restrictions)}
-              detail={`${data.impact.entities_restricted} entity(ies)`}
+              value={formatNumber(data.impact.active_restrictions)}
+              detail={countNoun(data.impact.entities_restricted, "entity", "entities")}
               tone={data.impact.active_restrictions > 0 ? "critical" : "neutral"}
             />
             <StatTile
@@ -109,13 +117,13 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
             />
             <StatTile
               label="Projected to breach"
-              value={String(data.breaching_soon)}
+              value={formatNumber(data.breaching_soon)}
               detail="This period, at current burn"
               tone={data.breaching_soon > 0 ? "warning" : "neutral"}
             />
             <StatTile
               label="Enforcing limits"
-              value={`${data.limits_enforcing} / ${data.limits_total}`}
+              value={`${formatNumber(data.limits_enforcing)} / ${formatNumber(data.limits_total)}`}
               detail="Enforce / total"
             />
           </div>
@@ -123,7 +131,8 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
           {data.impact.monitor_only_breaches > 0 && (
             <Card>
               <p className="text-sm">
-                {data.impact.monitor_only_breaches} monitor-only limit(s) are over budget but not
+                {countNoun(data.impact.monitor_only_breaches, "monitor-only limit")}{" "}
+                {data.impact.monitor_only_breaches === 1 ? "is" : "are"} over budget but not
                 restricting anything. Turn on enforcement from the Budgets page if you want them to
                 act.
               </p>
@@ -168,13 +177,13 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
                         {formatCredits(p.credits_used)} / {formatCredits(p.credit_limit)}
                       </Td>
                       <Td align="right" className="tabular">
-                        {formatCredits(Number(p.burn_per_day).toFixed(1))}
+                        {formatCredits(p.burn_per_day)}
                       </Td>
                       <Td align="right" className="tabular">
-                        {formatCredits(Number(p.projected_period_end).toFixed(0))}
+                        {formatCredits(p.projected_period_end)}
                         {p.percent_at_period_end != null && (
                           <span className="ml-1 text-xs" style={{ color: "var(--text-muted)" }}>
-                            ({p.percent_at_period_end.toFixed(0)}%)
+                            ({formatPercent(p.percent_at_period_end)})
                           </span>
                         )}
                       </Td>
@@ -290,7 +299,9 @@ function ChargebackCard({
             </span>
             {data.unassigned_limits > 0 && (
               <span>
-                {data.unassigned_limits} limit(s) have no business unit and are not attributed.
+                {countNoun(data.unassigned_limits, "limit")}{" "}
+                {data.unassigned_limits === 1 ? "has" : "have"} no business unit and{" "}
+                {data.unassigned_limits === 1 ? "is" : "are"} not attributed.
               </span>
             )}
           </div>

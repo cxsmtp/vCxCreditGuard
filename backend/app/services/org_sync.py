@@ -40,7 +40,7 @@ from app.models.org import (
     CxProjectGroup,
     CxUser,
 )
-from app.services import settings_store
+from app.services import settings_store, wording
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,8 @@ def duplicate_groups_message(names: list[str]) -> str:
     """What repeated group names mean, for the notice and Diagnostics."""
     shown = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
     return (
-        f"{len(names)} group name(s) are not unique in this tenant ({shown}). Memberships "
+        f"{wording.plural(len(names), 'group name')} {'is' if len(names) == 1 else 'are'} not "
+        f"unique in this tenant ({shown}). Memberships "
         "reported by name alone cannot be attributed for those groups, so their group "
         "limits may undercount. Rename the groups in Checkmarx One to make them unique."
     )
@@ -346,7 +347,8 @@ def _sync_users(
 
     if unresolved_group_names and warn_unresolved:
         result.warnings.append(
-            f"{len(unresolved_group_names)} group name(s) on users did not match any known "
+            f"{wording.plural(len(unresolved_group_names), 'group name')} on users did not match "
+            "any known "
             f"group ({', '.join(sorted(unresolved_group_names)[:5])}). Those memberships "
             "are not counted towards group limits."
         )
@@ -460,7 +462,8 @@ def _sync_applications(
 
     if unknown_links:
         result.warnings.append(
-            f"{unknown_links} application to project link(s) reference projects that are not "
+            f"{wording.plural(unknown_links, 'application to project link')} "
+            f"{'references' if unknown_links == 1 else 'reference'} projects that are not "
             "visible to this API key. Application limits may undercount. Check the service "
             "account's project permissions."
         )

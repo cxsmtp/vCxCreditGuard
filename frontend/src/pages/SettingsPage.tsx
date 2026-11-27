@@ -40,7 +40,14 @@ import {
 import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import { downloadText, timestampedName } from "../lib/export";
-import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
+import {
+  countNoun,
+  formatCredits,
+  formatDateTime,
+  formatPercent,
+  formatRelative,
+  runStatusLabel,
+} from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 import { LookPicker } from "../components/AppShell";
 import { StatTile } from "../components/StatTile";
@@ -50,6 +57,7 @@ import { ReadinessPanel } from "../components/ReadinessPanel";
 import { SelfTestPanel } from "../components/SelfTestPanel";
 import { FastPathPanel } from "../components/FastPathPanel";
 import { EntityMappingCard } from "../components/EntityMappingCard";
+import { TwoFactorAdvisory } from "../components/TwoFactorAdvisory";
 import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
 /** Unsaved edits. The last three are write only: the server never sends the
@@ -311,7 +319,7 @@ export function SettingsPage({
       if (result.status === "success") toast.success("Cycle finished.");
       else if (result.status === "skipped")
         toast.info(`Cycle skipped: ${result.skipped_reason ?? "unknown reason"}`);
-      else toast.error(`Cycle status ${result.status}. ${result.errors.join("; ")}`);
+      else toast.error(`Cycle ${runStatusLabel(result.status).toLowerCase()}. ${result.errors.join("; ")}`);
       await Promise.all([status.reload(), unresolved.reload()]);
     } catch (caught) {
       toast.error(caught instanceof ApiError ? caught.message : "The cycle could not be started.");
@@ -390,14 +398,14 @@ export function SettingsPage({
                 >
                   {current.allowed_interval_minutes.map((minutes) => (
                     <option key={minutes} value={minutes}>
-                      {minutes < 60 ? `Every ${minutes} minutes` : "Every hour"}
+                      {minutes < 60 ? `Every ${countNoun(minutes, "minute")}` : "Every hour"}
                     </option>
                   ))}
                   {!current.allowed_interval_minutes.includes(
                     Number(value("schedule_interval_minutes") ?? 15),
                   ) && (
                     <option value={String(value("schedule_interval_minutes"))}>
-                      Every {value("schedule_interval_minutes")} minutes (custom)
+                      Every {countNoun(Number(value("schedule_interval_minutes")), "minute")} (custom)
                     </option>
                   )}
                 </Select>
@@ -448,7 +456,7 @@ export function SettingsPage({
                           : "warning"
                     }
                   >
-                    {status.data.last_run_status}
+                    {runStatusLabel(status.data.last_run_status)}
                   </Badge>
                 ) : (
                   "Never run"
@@ -577,6 +585,14 @@ export function SettingsPage({
           }
         >
           <div className="flex flex-col gap-5">
+            {!current.webhook_url_configured &&
+              !(current.smtp_host && current.smtp_from && current.smtp_recipients?.trim()) && (
+                <InfoNote tone="warning">
+                  No delivery channel is set up: alerts are only shown in the Notification Center,
+                  so nobody is told when a budget is breached. Set up email (an SMTP host, a from
+                  address and at least one recipient) or a webhook, save, then use Send a test.
+                </InfoNote>
+              )}
             {testResult && (
               <InfoNote tone={testResult.ok ? "good" : "critical"}>
                 {Object.entries(testResult.channels).map(([channel, outcome]) => (
@@ -736,7 +752,7 @@ export function SettingsPage({
                 title="Your look"
                 description="Standard or Command Center, light or dark. Remembered on this device."
               >
-                <LookPicker />
+                <LookPicker onAppearancePage />
               </Card>
               <AppearanceCard
                 isAdmin={isAdmin}
@@ -1418,7 +1434,7 @@ const ACCOUNT_VIEW: ViewColumn<UtilityAccount>[] = [
 ];
 
 function confidence(score: number | null | undefined): string {
-  return score == null ? "" : `${Math.round(score * 100)}%`;
+  return score == null ? "" : formatPercent(score * 100);
 }
 
 // A subject is counted when its credits currently reach a user's budget — an
@@ -1696,7 +1712,8 @@ function AttributionCard({
                     </span>
                   )}
                   <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
-                    Seen {subject.times_seen} times, last {formatRelative(subject.last_seen_at)}
+                    Seen {subject.times_seen === 1 ? "once" : `${countNoun(subject.times_seen, "time")}`}, last{" "}
+                    {formatRelative(subject.last_seen_at)}
                   </span>
                 </Td>
                 <Td align="right">
@@ -1860,8 +1877,8 @@ function OperationsCard() {
       const parsed = JSON.parse(await file.text());
       const result = await api.post<RestoreResult>("/api/ops/restore", parsed);
       toast.success(
-        `Restored ${result.limits_created + result.limits_updated} limit(s), ` +
-          `${result.settings} setting(s), ${result.exemptions} override(s).`,
+        `Restored ${countNoun(result.limits_created + result.limits_updated, "limit")}, ` +
+          `${countNoun(result.settings, "setting")}, ${countNoun(result.exemptions, "override")}.`,
       );
       await Promise.all([attestation.reload(), watchdog.reload()]);
     } catch (caught) {
@@ -1964,6 +1981,9 @@ function AccountsCard() {
     [],
   );
   const view = useTableView(accounts.data ?? [], ACCOUNT_VIEW);
+  const adminsWithoutTotp = (accounts.data ?? []).filter(
+    (account) => account.role === "admin" && !account.totp_enabled,
+  );
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<UtilityAccount | null>(null);
   const [resettingTotp, setResettingTotp] = useState<UtilityAccount | null>(null);
@@ -2081,6 +2101,18 @@ function AccountsCard() {
       {accounts.initialLoading ? (
         <Spinner />
       ) : (
+        <>
+        {adminsWithoutTotp.length > 0 && (
+          <div className="mb-4">
+            <TwoFactorAdvisory scope="accounts">
+              {countNoun(adminsWithoutTotp.length, "admin account")}{" "}
+              {adminsWithoutTotp.length === 1 ? "has" : "have"} no two factor authentication (
+              {adminsWithoutTotp.map((account) => account.username).join(", ")}). An admin can
+              restrict tenant users, so each admin should set it up under Your account. It is
+              recommended, not required.
+            </TwoFactorAdvisory>
+          </div>
+        )}
         <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
           <thead>
             <tr>
@@ -2173,6 +2205,7 @@ function AccountsCard() {
             ))}
           </tbody>
         </Table>
+        </>
       )}
 
       <Modal

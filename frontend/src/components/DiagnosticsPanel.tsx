@@ -4,6 +4,7 @@ import type { Diagnostics, DiagnosticStatus } from "../api/types";
 import { useResource } from "../hooks/useResource";
 import { formatRelative } from "../lib/format";
 import { ReadinessPanel } from "./ReadinessPanel";
+import { TwoFactorAdvisory } from "./TwoFactorAdvisory";
 import { Spinner, type BadgeTone } from "./ui";
 
 const STATUS_TONE: Record<DiagnosticStatus, BadgeTone> = {
@@ -18,6 +19,12 @@ const STATUS_DOT: Record<DiagnosticStatus, string> = {
   fail: "var(--status-critical)",
 };
 
+const STATUS_LABEL: Record<DiagnosticStatus, string> = {
+  ok: "OK",
+  warn: "Warning",
+  fail: "Failing",
+};
+
 const OVERALL_LABEL: Record<DiagnosticStatus, string> = {
   ok: "All systems healthy",
   warn: "Needs attention",
@@ -27,9 +34,18 @@ const OVERALL_LABEL: Record<DiagnosticStatus, string> = {
 /**
  * A self-diagnosis panel. Collapsed by default to a single status line; expand
  * it to see each check. Read-only, so it is safe for viewers too.
+ *
+ * ``defaultOpen``: start expanded (the /diagnose page). ``needsTwoFactor``: the
+ * signed-in admin has no two factor, so a dismissible advisory is shown.
  */
-export function DiagnosticsPanel() {
-  const [open, setOpen] = useState(false);
+export function DiagnosticsPanel({
+  defaultOpen = false,
+  needsTwoFactor = false,
+}: {
+  defaultOpen?: boolean;
+  needsTwoFactor?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
   const diag = useResource<Diagnostics>(
     (signal) => api.get("/api/ops/diagnostics", undefined, signal),
     [],
@@ -66,6 +82,12 @@ export function DiagnosticsPanel() {
         </span>
       </button>
 
+      {needsTwoFactor && (
+        <div className="border-t border-hairline px-5 py-3">
+          <TwoFactorAdvisory />
+        </div>
+      )}
+
       {open && (
         <div className="border-t border-hairline px-5 py-4">
           {diag.error ? (
@@ -100,7 +122,7 @@ export function DiagnosticsPanel() {
                                   : "var(--status-good-text)",
                           }}
                         >
-                          {check.status}
+                          {STATUS_LABEL[check.status] ?? check.status}
                         </span>
                       </p>
                       <p className="mt-0.5 text-xs" style={{ color: "var(--text-secondary)" }}>

@@ -1116,7 +1116,7 @@ class TestCleanup:
             .where(AuditLogEntry.action == "enforcement.reversed")
             .order_by(AuditLogEntry.id.desc())
         )
-        assert "selftest_cleanup" in entry.detail
+        assert entry.detail == "Access restored (a self-test's restriction was cleaned up)."
         notice = db.scalar(select(Notification).where(Notification.title.like("%restored%")))
         assert notice is not None and "self-test" in notice.body
 

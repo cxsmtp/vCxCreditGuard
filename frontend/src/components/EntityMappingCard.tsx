@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { ApiError, api } from "../api/client";
 import type { OrgEntity, UnmatchedEntity } from "../api/types";
 import { useResource } from "../hooks/useResource";
-import { formatCredits } from "../lib/format";
+import { formatCredits, withArticle } from "../lib/format";
 import { useToast } from "../lib/ui-context";
 import {
   Badge,
@@ -182,7 +182,7 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
                       setQuery(row.name.split("/").pop() ?? "");
                     }}
                   >
-                    {row.mapped_entity_id ? "Change" : `Map to a ${row.view}`}
+                    {row.mapped_entity_id ? "Change" : `Map to ${withArticle(row.view)}`}
                   </button>
                 </Td>
               </tr>
@@ -200,7 +200,7 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
 
       <Modal
         open={mapping !== null}
-        title={mapping ? `Map this usage to a ${mapping.view}` : ""}
+        title={mapping ? `Map this usage to ${withArticle(mapping.view)}` : ""}
         description={mapping ? `Reported as ${mapping.name}` : ""}
         onClose={() => setMapping(null)}
       >

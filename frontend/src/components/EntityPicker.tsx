@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import type { EntityType, OrgEntity } from "../api/types";
-import { entityLabel } from "../lib/format";
+import { entityLabel, withArticle } from "../lib/format";
 import { Badge, Field, Input, Select, Spinner } from "./ui";
 
 /**
@@ -80,7 +80,7 @@ export function EntityPicker({
       </Field>
 
       <Field
-        label={`Find a ${entityType}`}
+        label={`Find ${withArticle(entityType)}`}
         hint={selected ? undefined : "Type to search the synced organisation model."}
       >
         <Input

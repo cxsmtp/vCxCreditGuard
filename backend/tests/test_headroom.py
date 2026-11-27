@@ -81,9 +81,9 @@ def test_fixed_headroom_restricts_early_with_its_own_message(
     notice = breach_notice(db)
     assert notice is not None
     assert notice.title == "User Alice Archer is nearly out of credits"
-    assert "Restricted early: 3 credits left, at the headroom of 3." in (notice.body or "")
+    assert "Restricted early: 3.0 credits left, at the headroom of 3.0." in (notice.body or "")
     evaluated = next(e for e in result.evaluations if e.limit.id == limit.id)
-    assert evaluated.note == "Restricted early: 3 credits left, at the headroom of 3."
+    assert evaluated.note == "Restricted early: 3.0 credits left, at the headroom of 3.0."
 
 
 def test_off_is_unchanged(db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -96,7 +96,7 @@ def test_off_is_unchanged(db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     spend_and_count(world, 1)  # exactly at the limit: restricted, as before
     assert world.evaluate().enforced == 1 and world.restricted()
     notice = breach_notice(db)
-    assert notice is not None and notice.title.endswith("reached its credit limit")
+    assert notice is not None and notice.title.endswith("reached their credit limit")
     assert "Restricted early" not in (notice.body or "")
 
 
@@ -150,7 +150,7 @@ def test_simulation_and_dry_run_use_the_same_rule(
     row = next(r for r in preview_service.dry_run(db).rows if r.limit_id == limit.id)
     assert row.projected_status == LimitStatus.BREACHED and row.would_enforce
     assert row.note is not None and row.note.startswith(
-        "Would restrict early: 3 credits left, at the headroom of 3."
+        "Would restrict early: 3.0 credits left, at the headroom of 3.0."
     )
 
 
@@ -176,7 +176,7 @@ def test_automatic_headroom_from_the_budgets_own_fusion_scans(
     limit = budget(world, headroom_auto=True)
     found = headroom.for_limit(db, limit)
     assert found.source == headroom.AUTO_ENTITY and found.credits == Decimal("3")
-    assert "median cost of this budget's 3 Fusion scan(s)" in found.describe()
+    assert "median cost of this budget's 3 Fusion scans" in found.describe()
     spend_and_count(world, 7)
     assert world.evaluate().enforced == 1 and world.restricted()
 
@@ -251,7 +251,7 @@ def test_the_budget_api_takes_and_shows_a_headroom(admin_client, db: Session) ->
     body = created.json()
     assert body["headroom_credits"] == 4 and body["headroom_auto"] is False
     assert Decimal(str(body["headroom_effective"])) == Decimal("4")
-    assert body["headroom_description"] == "4 credits (fixed)."
+    assert body["headroom_description"] == "4.0 credits (fixed)."
     changed = admin_client.patch(
         f"/api/limits/{body['id']}", json={"headroom_credits": None, "headroom_auto": True}
     )

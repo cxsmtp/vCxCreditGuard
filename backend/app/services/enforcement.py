@@ -68,6 +68,7 @@ from app.services import (
     role_sources,
     settings_store,
     usage_mix,
+    wording,
 )
 from app.services.audit import AuditActor, record_audit
 
@@ -91,6 +92,26 @@ DESELECTED_REASON = "action_deselected"
 # Period key prefix of the enforcement self-test's restrictions (they have no
 # limit). See app/services/enforcement_selftest.py.
 SELFTEST_PERIOD_PREFIX = "selftest-"
+
+# Why a restriction was lifted, in the words an audit entry shows. The stored
+# reversal_reason keeps its code; only the sentence uses these.
+_REASON_TEXT: dict[str, str] = {
+    ADMIN_REASON: "an administrator restored access",
+    EXEMPTED_REASON: "an exemption was granted",
+    DESELECTED_REASON: "the limit no longer turns this off",
+    "credit_increased": "the limit was raised or usage is within budget again",
+    "limit_removed": "the limit was removed or disabled",
+    "period_rollover": "a new budget period started",
+    "protected": "the target holds a protected role",
+    "selftest": "the self-test put it back",
+    "selftest_cleanup": "a self-test's restriction was cleaned up",
+}
+
+
+def reason_text(reason: str | None) -> str:
+    """A lift reason in plain words: "a new budget period started", not "period_rollover"."""
+    code = str(reason or "")
+    return _REASON_TEXT.get(code) or code.replace("_", " ") or "no reason recorded"
 
 
 def is_selftest(action: EnforcementAction) -> bool:
@@ -444,7 +465,7 @@ PROTECTED_REASON = "protected"
 # Why the API key's own account is never restricted, in the words every
 # notification, audit entry and Simulation row uses.
 API_KEY_OWNER_REASON = (
-    "it is the account the Checkmarx One API key belongs to: restricting it could remove "
+    "this is the account the Checkmarx One API key belongs to: restricting it could remove "
     "rights CreditGuard needs to restore others"
 )
 
@@ -3227,8 +3248,10 @@ def _restore_action_locked(
             before={"kind": action.kind, "restricted": True},
             after={"kind": action.kind, "restricted": True, "still_restricted_by": len(siblings)},
             detail=(
-                f"This limit no longer restricts {action.target_label} ({reason}), but "
-                f"{len(siblings)} other limit(s) still do, so nothing was changed in "
+                f"This limit no longer restricts {action.target_label} "
+                f"({reason_text(reason)}), but "
+                f"{wording.plural(len(siblings), 'other limit')} still "
+                f"{'does' if len(siblings) == 1 else 'do'}, so nothing was changed in "
                 "Checkmarx One."
             ),
         )
@@ -3331,11 +3354,14 @@ def _reversal_detail(reason: str, *, was_applied: bool, also_lifted: int) -> str
     if not was_applied:
         return (
             "A restriction whose outcome was never confirmed was undone to be safe "
-            f"({reason}): its previous state was put back."
+            f"({reason_text(reason)}): its previous state was put back."
         )
-    detail = f"Access restored ({reason})."
+    detail = f"Access restored ({reason_text(reason)})."
     if also_lifted:
-        detail += f" {also_lifted} other limit(s) restricting it were lifted too."
+        detail += (
+            f" {wording.plural(also_lifted, 'other limit')} restricting it "
+            f"{'was' if also_lifted == 1 else 'were'} lifted too."
+        )
     return detail
 
 

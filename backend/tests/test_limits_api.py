@@ -443,7 +443,7 @@ class TestOpsApi:
     ) -> None:
         admin_client.post("/api/ops/run-cycle?force_org_sync=true")
         body = admin_client.get("/api/ops/status").json()
-        assert body["schedule"] == "every 15 minute(s)"
+        assert body["schedule"] == "every 15 minutes"
         assert body["enabled"] is True
         assert body["last_run_status"] in {"success", "partial"}
         assert body["unresolved_subjects"] == 1

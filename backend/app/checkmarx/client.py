@@ -494,7 +494,7 @@ class CheckmarxClient:
             if not items:
                 distinct = len(listing.ids) if listing.ids else seen
                 if total is not None and distinct < total:
-                    listing.incomplete(f"{distinct} of {total} rows could be read", "shortfall")
+                    listing.incomplete(f"{distinct:,} of {total:,} rows could be read", "shortfall")
                 return
             first = items[0].get("id", items[0]) if isinstance(items[0], dict) else items[0]
             if page and first == previous_first:
@@ -522,7 +522,7 @@ class CheckmarxClient:
                 if offset_is_page_number and len(items) < page_size:
                     # A short page by index cannot be continued without
                     # skipping rows.
-                    listing.incomplete(f"{distinct} of {total} rows could be read", "shortfall")
+                    listing.incomplete(f"{distinct:,} of {total:,} rows could be read", "shortfall")
                     return
                 continue
             if len(items) < page_size and offset_is_page_number:

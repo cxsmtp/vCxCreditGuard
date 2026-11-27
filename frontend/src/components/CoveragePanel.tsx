@@ -2,7 +2,7 @@ import { useState } from "react";
 import { ApiError, api } from "../api/client";
 import type { EnforcementCoverage } from "../api/types";
 import { useResource } from "../hooks/useResource";
-import { formatNumber, formatRelative } from "../lib/format";
+import { formatNumber, formatPercent, formatRelative } from "../lib/format";
 import { useToast } from "../lib/ui-context";
 import { Badge, Button, Card, InfoNote, Spinner } from "./ui";
 
@@ -36,7 +36,7 @@ export function CoveragePanel({ isAdmin }: { isAdmin: boolean }) {
   }
 
   const data = coverage.data;
-  const percent = data?.share === null || data?.share === undefined ? null : Math.round(data.share * 100);
+  const percent = data?.share === null || data?.share === undefined ? null : data.share * 100;
 
   return (
     <Card
@@ -70,7 +70,7 @@ export function CoveragePanel({ isAdmin }: { isAdmin: boolean }) {
                   ? "Their roles could not be read"
                   : percent === null
                     ? "No one holds an AI role"
-                    : `${percent}% of AI-role holders whose roles were read`
+                    : `${formatPercent(percent)} of AI-role holders whose roles were read`
               }
               tone={data.low ? "critical" : "neutral"}
             />

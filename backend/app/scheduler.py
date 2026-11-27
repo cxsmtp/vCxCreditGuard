@@ -16,7 +16,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.db import instance_guard
 from app.db.session import get_engine, session_scope
-from app.services import settings_store
+from app.services import settings_store, wording
 from app.services.cycle import run_cycle
 
 logger = logging.getLogger(__name__)
@@ -189,7 +189,7 @@ def describe_schedule() -> str:
         return "disabled"
     if config.mode == "cron" and config.cron:
         return f"cron {config.cron} (UTC)"
-    return f"every {config.interval_minutes} minute(s)"
+    return f"every {wording.plural(config.interval_minutes, 'minute')}"
 
 
 def next_run_time():  # type: ignore[no-untyped-def]

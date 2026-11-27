@@ -31,6 +31,7 @@ from app.services import (
     ingestion,
     ops_hardening,
     settings_store,
+    wording,
 )
 from app.services import delivery as delivery_service
 from app.services import diagnostics as diagnostics_service
@@ -54,7 +55,11 @@ def run_cycle_now(ctx: AdminUser, db: DbSession, force_org_sync: bool = False) -
         action="ops.cycle_triggered",
         actor=ctx.actor,
         target_type="scheduler",
-        detail=f"Manual cycle requested (force_org_sync={force_org_sync}).",
+        detail=(
+            "Manual cycle requested, with a refresh of the organisation model."
+            if force_org_sync
+            else "Manual cycle requested."
+        ),
     )
     db.commit()
 
@@ -264,8 +269,8 @@ def export_backup(ctx: AdminUser, db: DbSession) -> dict[str, Any]:
         actor=ctx.actor,
         target_type="ops",
         detail=(
-            f"Configuration backup exported: {len(backup['limits'])} limit(s), "
-            f"{len(backup['exemptions'])} override(s)."
+            f"Configuration backup exported: {wording.plural(len(backup['limits']), 'limit')}, "
+            f"{wording.plural(len(backup['exemptions']), 'override')}."
         ),
     )
     db.commit()
