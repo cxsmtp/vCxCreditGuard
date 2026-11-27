@@ -183,6 +183,10 @@ def run_diagnostics(
         checks.append(activity)
     checks.append(_recount_check(session, moment))
     checks.append(_readiness_check(session, moment))
+    checks.append(_fast_check_check(session, moment))
+    webhook = _cx_webhook_check(session, moment)
+    if webhook is not None:
+        checks.append(webhook)
     if settings_store.auto_triage_to_initiator(session):
         # Only while charging auto triage to scan initiators is on, so the
         # report is unchanged for everyone who has not turned it on.
@@ -663,6 +667,47 @@ def _readiness_check(session: Session, moment: datetime) -> Check:
     else:
         prefix = ""
     return Check("readiness", label, WARN if red or drifted else OK, prefix + "; ".join(parts))
+
+
+def _when(moment: datetime, entry: object) -> str:
+    if not isinstance(entry, dict) or not isinstance(entry.get("at"), str):
+        return "never"
+    try:
+        at = datetime.fromisoformat(entry["at"])
+    except ValueError:
+        return "never"
+    return f"{_ago(moment, at)}: {entry.get('result') or 'no result'}"
+
+
+def _fast_check_check(session: Session, moment: datetime) -> Check:
+    """The fast check (app/services/fastcheck.py): last run, last action."""
+    from app.services import fastcheck
+
+    status = fastcheck.describe(session)
+    label = "Fast check"
+    if not status["enabled"]:
+        return Check("fast_check", label, OK, "Off: budgets are checked by the full cycle only.")
+    detail = (
+        f"Every {status['interval_seconds']} seconds. Last run {_when(moment, status['last_run'])}."
+        f" Last action {_when(moment, status['last_action'])}."
+    )
+    return Check("fast_check", label, WARN if status.get("error") else OK, detail)
+
+
+def _cx_webhook_check(session: Session, moment: datetime) -> Check | None:
+    """The Checkmarx One webhook, while it is switched on."""
+    from app.services import cx_webhook
+
+    status = cx_webhook.describe(session)
+    if not status["switched_on"]:
+        return None
+    label = "Checkmarx One webhook"
+    if not status["secret_configured"]:
+        return Check("cx_webhook", label, WARN, "On, but no secret is set: deliveries are refused.")
+    detail = f"Last delivery {_when(moment, status['last_delivery'])}."
+    if status.get("last_rejected"):
+        detail += f" Last refused {_when(moment, status['last_rejected'])}."
+    return Check("cx_webhook", label, OK, detail)
 
 
 def _pending_enforcement_check(session: Session) -> Check:

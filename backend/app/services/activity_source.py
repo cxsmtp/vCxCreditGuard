@@ -238,6 +238,8 @@ class ActivityResult:
     user_outcomes: dict[str, int] = field(default_factory=dict)
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # The budgets the counted events fed (not recorded: the fast check reads it).
+    fed_limit_ids: set[int] = field(default_factory=set)
 
     def as_stats(self) -> dict[str, object]:
         return {
@@ -1573,6 +1575,10 @@ def _count(
         {event.project_id for event, _c, _u, _a in resolved if event.project_id},
         {user_id for _e, _c, user_id, _a in resolved if user_id and not is_subject_entity(user_id)},
     )
+    # What each new Fusion scan cost, for the automatic headroom (headroom.py).
+    from app.services import headroom
+
+    headroom.observe(session, resolved, now)
     adds: dict[tuple[int, str], tuple[Decimal, dict[str, int]]] = {}
     for event, count, user_id, application_id in resolved:
         credits = event.credits * count
@@ -1597,6 +1603,7 @@ def _count(
         return
     limit_ids = sorted({limit_id for limit_id, _key in adds})
     period_keys = sorted({key for _limit_id, key in adds})
+    result.fed_limit_ids.update(limit_ids)
     existing = {
         (row.limit_id, row.period_key): row
         for row in session.scalars(

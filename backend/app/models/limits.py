@@ -102,6 +102,13 @@ class CreditLimit(Base, TimestampMixin):
     # "IS NULL" finds every limit that keeps the legacy behaviour.
     project_actions: Mapped[list[str] | None] = mapped_column(JSONColumn(none_as_null=True))
 
+    # Headroom (app/services/headroom.py): restrict before the budget runs out,
+    # once no more than this many credits are left. Null and off: the budget
+    # restricts at its limit, as before.
+    headroom_credits: Mapped[int | None] = mapped_column(Integer)
+    # The headroom is the median credits of recent Fusion scans instead.
+    headroom_auto: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     period_states: Mapped[list[LimitPeriodState]] = relationship(
         back_populates="limit", cascade="all, delete-orphan"
     )
@@ -224,6 +231,9 @@ class LimitPeriodState(Base):
     # came, so the ceiling does not count it as new again. Null: no rollout
     # under way. Cleared whenever the period stops being restricted.
     rollout_pending: Mapped[list | None] = mapped_column(JSON(none_as_null=True))
+    # The headroom the period was last judged with (credits held back before
+    # the limit; app/services/headroom.py). Null: none, the limit itself.
+    headroom_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
 
     limit: Mapped[CreditLimit] = relationship(back_populates="period_states")
 

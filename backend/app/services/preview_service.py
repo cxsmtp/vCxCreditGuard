@@ -36,7 +36,14 @@ from app.models.enums import (
     LimitStatus,
 )
 from app.models.limits import CreditLimit, EnforcementAction, effective_project_actions
-from app.services import enforcement, evaluation, recount, role_sources, settings_store
+from app.services import (
+    enforcement,
+    evaluation,
+    headroom,
+    recount,
+    role_sources,
+    settings_store,
+)
 from app.services.periods import PeriodError, current_window
 
 
@@ -676,7 +683,9 @@ def _project_one(
     percent = float(credits_used) / limit.credit_limit * 100 if limit.credit_limit > 0 else 100.0
     threshold = Decimal(limit.credit_limit) * Decimal(limit.warning_threshold_pct) / 100
 
-    if credits_used >= Decimal(limit.credit_limit):
+    # The limit, or earlier with a headroom (app/services/headroom.py).
+    held_back = index.headroom.for_limit(limit)
+    if credits_used >= headroom.restrict_at(limit, held_back):
         projected = LimitStatus.BREACHED
     elif credits_used >= threshold:
         projected = LimitStatus.WARNED
@@ -701,6 +710,9 @@ def _project_one(
     )
     if on_summary is not None and evaluation.restriction_started(session, limit.id, window.key):
         on_summary = None  # a restriction in force stays (and is shown as such)
+    early = headroom.early_phrase(
+        limit, credits_used, held_back.credits if held_back.active else None
+    )
     if projected == LimitStatus.BREACHED:
         if exempt:
             note = "Would breach, but the entity is exempt."
@@ -735,6 +747,8 @@ def _project_one(
                     "Would breach and enforce, but no Checkmarx connection is configured, "
                     "so the restriction would be deferred until one is."
                 )
+            if would_enforce and early is not None:
+                note = f"Would restrict early: {early}."
             if would_enforce and recount.applies(session, limit, window):
                 recount_required = True
                 note = f"{note} {recount.PREVIEW_NOTE}" if note else recount.PREVIEW_NOTE

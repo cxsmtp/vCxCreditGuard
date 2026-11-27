@@ -101,6 +101,8 @@ ACTIVITY_DEFAULT_MODULES = (
     "test_review2_activity_attacks",
     "test_log_fed_enforcement",
     "test_recount_gate",
+    "test_fastcheck",
+    "test_headroom",
 )
 
 

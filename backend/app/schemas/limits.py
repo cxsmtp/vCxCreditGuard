@@ -38,6 +38,10 @@ class LimitCreateRequest(StrictModel):
     # Omitted or null: Auto Triage and PR triage and remediation (what every
     # limit did before the choice existed). Not allowed on user limits.
     project_actions: list[ProjectAction] | None = Field(default=None, max_length=3)
+    # Restrict once no more than this many credits are left (app/services/
+    # headroom.py); headroom_auto: the median cost of recent Fusion scans.
+    headroom_credits: int | None = Field(default=None, ge=0, le=100_000_000)
+    headroom_auto: bool = False
 
     @model_validator(mode="after")
     def _check_custom_period(self) -> LimitCreateRequest:
@@ -75,6 +79,9 @@ class LimitUpdateRequest(StrictModel):
     business_unit: str | None = Field(default=None, max_length=128)
     # null puts the limit back on the legacy pair; an empty list is refused.
     project_actions: list[ProjectAction] | None = Field(default=None, max_length=3)
+    # null or 0: no fixed headroom.
+    headroom_credits: int | None = Field(default=None, ge=0, le=100_000_000)
+    headroom_auto: bool | None = None
 
 
 class AutoTriagePartResponse(BaseModel):
@@ -149,6 +156,11 @@ class LimitPeriodStateResponse(BaseModel):
     # (the budget covers the usage again, or the limit no longer enforces, and
     # more are in force than one cycle lifts): how many are still in force.
     lifting_remaining: int | None = None
+    # The headroom the period was last judged with, and, while it is
+    # restricted (or breached) before reaching its limit, why:
+    # "X credits left, below the headroom of Y".
+    headroom_credits: Decimal | None = None
+    restricted_early: str | None = None
 
 
 class LimitResponse(BaseModel):
@@ -177,6 +189,11 @@ class LimitResponse(BaseModel):
     updated_at: datetime
     current_period: LimitPeriodStateResponse | None = None
     active_restrictions: int = 0
+    # As stored, and the headroom in force now (with how it was chosen).
+    headroom_credits: int | None = None
+    headroom_auto: bool = False
+    headroom_effective: Decimal | None = None
+    headroom_description: str | None = None
 
 
 class ExemptionCreateRequest(StrictModel):

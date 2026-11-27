@@ -21,6 +21,7 @@ import logging
 import os
 import socket
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -72,6 +73,10 @@ LOCK_STALE_AFTER = timedelta(minutes=10)
 MAX_CYCLE_DURATION = timedelta(hours=2)
 # Recorded on a run that did not start because another one held the lock.
 LOCK_BUSY_REASON = "a previous cycle is still running"
+# A fast check (app/services/fastcheck.py) holds the same lock for a second or
+# two; a cycle that finds it held by one waits this long rather than skip.
+FAST_CHECK_WAIT_SECONDS = 150.0
+FAST_CHECK_POLL_SECONDS = 0.5
 
 
 @dataclass
@@ -194,6 +199,31 @@ def acquire_lock(session: Session, *, name: str = LOCK_NAME, holder: str | None 
     return acquired
 
 
+def _acquire_for_cycle(session: Session, holder: str) -> bool:
+    """Take the lock for a cycle. Held by a fast check, wait for it to let go
+    (a fast check never starts while a cycle waits); held by a cycle, skip."""
+    if acquire_lock(session, holder=holder):
+        return True
+    from app.services import fastcheck
+
+    deadline = time.monotonic() + FAST_CHECK_WAIT_SECONDS
+    fastcheck.cycle_waiting.set()
+    try:
+        while time.monotonic() < deadline:
+            current = session.get(SchedulerLock, LOCK_NAME, populate_existing=True)
+            session.commit()
+            if current is not None and current.holder is not None:
+                if not current.holder.startswith(fastcheck.HOLDER_PREFIX):
+                    return False
+                time.sleep(FAST_CHECK_POLL_SECONDS)
+                continue
+            if acquire_lock(session, holder=holder):
+                return True
+        return False
+    finally:
+        fastcheck.cycle_waiting.clear()
+
+
 def heartbeat(session: Session, *, name: str = LOCK_NAME, holder: str | None = None) -> None:
     session.execute(
         update(SchedulerLock)
@@ -221,7 +251,7 @@ def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> Cyc
     result = CycleResult()
 
     with session_scope() as session:
-        if not acquire_lock(session, holder=holder):
+        if not _acquire_for_cycle(session, holder):
             result.status = RunStatus.SKIPPED
             result.skipped_reason = LOCK_BUSY_REASON
             run = SchedulerRun(
