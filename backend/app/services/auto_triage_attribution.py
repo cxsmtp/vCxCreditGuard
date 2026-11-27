@@ -119,7 +119,15 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
-from app.services import error_text, ingestion, notifications, pacing, settings_store
+from app.services import (
+    credits_text,
+    error_text,
+    ingestion,
+    notifications,
+    pacing,
+    settings_store,
+    wording,
+)
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome
 
@@ -947,8 +955,10 @@ def collect(
                 f"{budget.max_requests or 'no'} requests)"
             )
             message = (
-                f"Auto-triage attribution reached {why}; {len(left)} project(s) are left on the "
-                "project for now and caught up on the next cycle (the longest waiting first)."
+                f"Auto-triage attribution reached {why}; {wording.plural(len(left), 'project')} "
+                f"{'is' if len(left) == 1 else 'are'} left on the project for now and caught up on "
+                "the next cycle "
+                "(the longest waiting first)."
             )
             result.warnings.append(message)
             logger.warning(message)
@@ -989,7 +999,8 @@ def collect(
                 result.deferred += sum(1 for item in left if isinstance(item, _Increase))
                 if left:
                     result.warnings.append(
-                        f"Checkmarx did not answer, so {len(left)} more project(s) are left "
+                        f"Checkmarx did not answer, so {len(left):,} more "
+                        f"{wording.noun(len(left), 'project is', 'projects are')} left "
                         "for the next cycle."
                     )
                 break
@@ -1806,7 +1817,8 @@ def _sync_initiator_subjects(session: Session, model: AttributionModel, now: dat
                     title=f"Auto-triage credits could not be charged to a person: {info.initiator}",
                     body=(
                         f"Scans started by {info.initiator} triggered auto triage worth "
-                        f"{_q(info.credits)} credits, but {info.initiator} does not match any "
+                        f"{credits_text.credits(info.credits)} credits, but {info.initiator} "
+                        "does not match any "
                         "synced Checkmarx user, so those credits count against the project only. "
                         "If they belong to a person (a bot or integration acting for someone), "
                         "map it to that user under Settings → Attribution."

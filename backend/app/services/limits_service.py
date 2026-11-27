@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -27,7 +26,7 @@ from app.models.activity import SUBJECT_PREFIX, is_subject_entity, subject_entit
 from app.models.enums import PROJECT_ACTION_ORDER, EntityType
 from app.models.limits import CreditLimit, Exemption, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
-from app.services import error_text, evaluation
+from app.services import error_text, evaluation, wording
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -53,6 +52,8 @@ AUDITED_FIELDS = (
     "notes",
     "business_unit",
     "project_actions",
+    "headroom_credits",
+    "headroom_auto",
 )
 
 
@@ -101,6 +102,9 @@ class LimitInput:
     # What a project, group or application limit turns off; None = the legacy
     # pair (Auto Triage, PR triage and remediation). Must be None for users.
     project_actions: list[str] | None = None
+    # Restrict once no more than this many credits are left (headroom.py).
+    headroom_credits: int | None = None
+    headroom_auto: bool = False
 
 
 def normalise_project_actions(value: object) -> list[str] | None:
@@ -119,7 +123,7 @@ def normalise_project_actions(value: object) -> list[str] | None:
     unknown = sorted(names - set(PROJECT_ACTION_ORDER))
     if unknown:
         raise LimitError(
-            f"Unknown project action(s): {', '.join(unknown)}. "
+            f"Unknown project {wording.noun(len(unknown), 'action')}: {', '.join(unknown)}. "
             f"Choose from: {', '.join(PROJECT_ACTION_ORDER)}."
         )
     if not names:
@@ -190,6 +194,14 @@ def _validate(session: Session, data: LimitInput) -> None:
                 "application limits."
             )
         normalise_project_actions(data.project_actions)
+    if data.headroom_credits is not None:
+        if data.headroom_credits < 0:
+            raise LimitError("A headroom cannot be negative.")
+        if data.headroom_credits and data.headroom_credits >= data.credit_limit:
+            raise LimitError(
+                "The headroom must be smaller than the credit limit (it is how many credits "
+                "are left when the budget starts restricting)."
+            )
     if (
         resolve_entity_label(session, entity_type=data.entity_type, entity_id=data.entity_id)
         is None
@@ -233,6 +245,8 @@ def create_limit(session: Session, *, data: LimitInput, actor: AuditActor) -> Cr
         notes=data.notes,
         business_unit=data.business_unit,
         project_actions=normalise_project_actions(data.project_actions),
+        headroom_credits=data.headroom_credits or None,
+        headroom_auto=bool(data.headroom_auto),
         created_by_id=actor.actor_id,
     )
     session.add(limit)
@@ -306,6 +320,10 @@ def update_limit(
                 custom_period_start=limit.custom_period_start,
                 custom_period_end=limit.custom_period_end,
                 project_actions=limit.project_actions,
+                # Checked when it is set: a budget lowered below its headroom
+                # later holds back at most limit - 1 (headroom.py), and stays editable.
+                headroom_credits=limit.headroom_credits if "headroom_credits" in changes else None,
+                headroom_auto=bool(limit.headroom_auto),
             ),
         )
     except LimitError:
@@ -415,7 +433,14 @@ def lift_unjustified_restrictions(
                 LimitPeriodState.status.in_([LimitStatus.RESTRICTED, LimitStatus.BREACHED]),
             )
         )
-        if not any(state.credits_used < Decimal(limit.credit_limit) for state in states):
+        from app.services import headroom
+
+        # Where it restricts: the limit, less its headroom (raising the budget
+        # so that more than the headroom is left lifts, as raising it over the
+        # usage always did).
+        restrict_at = headroom.for_limit(session, limit)
+        threshold = headroom.restrict_at(limit, restrict_at)
+        if not any(state.credits_used < threshold for state in states):
             return lifted
         reason = "credit_increased"
 
@@ -475,7 +500,7 @@ def delete_limit(
         target_id=str(limit.id),
         target_label=limit.entity_label or limit.entity_id,
         before=_snapshot(limit),
-        detail=f"{restored} restriction(s) lifted." if restored else None,
+        detail=f"{wording.plural(restored, 'restriction')} lifted." if restored else None,
     )
     session.delete(limit)
     session.flush()
@@ -506,6 +531,8 @@ def _snapshot(limit: CreditLimit) -> dict[str, Any]:
         "project_actions": list(limit.project_actions)
         if limit.project_actions is not None
         else None,
+        "headroom_credits": limit.headroom_credits,
+        "headroom_auto": bool(limit.headroom_auto),
     }
 
 

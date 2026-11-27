@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.checkmarx.iam import DEFAULT_AI_ROLE_NAMES, never_removed
 from app.checkmarx.usage import DEFAULT_PERIOD
 from app.core.crypto import (
+    PURPOSE_CX_WEBHOOK_SECRET,
     PURPOSE_SMTP_PASSWORD,
     PURPOSE_UPDATE_TOKEN,
     PURPOSE_WEBHOOK_SECRET,
@@ -122,7 +123,11 @@ KEY_AUTO_APPROVE_EXPIRY_DAYS = "automation.auto_approve_expiry_days"
 # ``max_new_enforcements_per_cycle`` would start restricting in one cycle - a
 # sign of bad data or a mistake far more often than of that many people
 # overspending in the same few minutes. ``protected_roles`` are tenant roles
-# whose holders are never restricted.
+# whose holders are never restricted. None by default: everyone over budget is
+# restricted, and where a user keeps an AI role through a composite role or a
+# group that is reported instead (enforcement._report_not_effective). The one
+# identity that is always left alone is the API key's own account
+# (enforcement.protected_user_ids).
 KEY_ENFORCEMENT_PAUSED = "enforcement.paused"
 KEY_ENFORCEMENT_PAUSE_REASON = "enforcement.pause_reason"
 KEY_MAX_NEW_ENFORCEMENTS = "enforcement.max_new_enforcements_per_cycle"
@@ -240,6 +245,13 @@ KEY_READINESS_GATE = "readiness.gate"
 KEY_READINESS_REVIEWED = "readiness.dry_run_reviewed"
 # Each checklist item's last state, to warn when one turns red later.
 KEY_READINESS_LAST = "readiness.last_states"
+# The fast check and the Checkmarx One webhook (app/services/fastcheck.py).
+KEY_FAST_CHECK_ENABLED = "fastcheck.enabled"
+KEY_FAST_CHECK_SECONDS = "fastcheck.interval_seconds"
+KEY_FAST_CHECK_STATUS = "fastcheck.status"
+KEY_CX_WEBHOOK_ENABLED = "fastcheck.webhook_enabled"
+KEY_CX_WEBHOOK_SECRET = "fastcheck.webhook_secret"  # secret
+KEY_CX_WEBHOOK_STATUS = "fastcheck.webhook_status"
 # Rows kept in app_setting that are state rather than settings.
 INTERNAL_KEYS: frozenset[str] = frozenset(
     {
@@ -252,6 +264,8 @@ INTERNAL_KEYS: frozenset[str] = frozenset(
         KEY_READINESS_GATE,
         KEY_READINESS_REVIEWED,
         KEY_READINESS_LAST,
+        KEY_FAST_CHECK_STATUS,
+        KEY_CX_WEBHOOK_STATUS,
     }
 )
 
@@ -268,6 +282,7 @@ SECRET_KEYS: dict[str, str] = {
     # back, and kept out of audit entries and backups like any other secret.
     KEY_WEBHOOK_URL: PURPOSE_WEBHOOK_URL,
     KEY_UPDATE_TOKEN: PURPOSE_UPDATE_TOKEN,
+    KEY_CX_WEBHOOK_SECRET: PURPOSE_CX_WEBHOOK_SECRET,
 }
 
 ALLOWED_INTERVAL_MINUTES: tuple[int, ...] = (2, 5, 15, 60)
@@ -302,7 +317,7 @@ DEFAULTS: dict[str, Any] = {
     KEY_MAX_NEW_ENFORCEMENTS: 25,
     KEY_MAX_NEW_TARGETS: 100,
     KEY_CEILING_WAIVED_ONCE: False,
-    KEY_PROTECTED_ROLES: "ast-admin, iam-admin",
+    KEY_PROTECTED_ROLES: "",
     KEY_FUSION_LOCK: True,
     KEY_AI_ROLES: list(DEFAULT_AI_ROLE_NAMES),
     KEY_AUTO_TRIAGE_TO_INITIATOR: False,
@@ -316,6 +331,9 @@ DEFAULTS: dict[str, Any] = {
     KEY_CYCLE_TIME_BUDGET_PCT: 80,
     KEY_UPDATE_AUTO: True,
     KEY_UPDATE_QUIET_HOUR: 3,
+    KEY_FAST_CHECK_ENABLED: True,
+    KEY_FAST_CHECK_SECONDS: 15,
+    KEY_CX_WEBHOOK_ENABLED: False,
 }
 
 

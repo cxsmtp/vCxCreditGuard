@@ -135,7 +135,7 @@ def test_without_a_feed_figure_fusion_is_not_priced_at_the_listed_rate(
     )
     assert breach is not None
     # The listed rate is known not to be a Fusion price; 2 scans = 4 credits is wrong.
-    assert "= 4 credits" not in breach.body, breach.body
+    assert "= 4.0 credits" not in breach.body, breach.body
 
 
 def test_weighted_share_is_not_described_as_most_of_the_actions() -> None:

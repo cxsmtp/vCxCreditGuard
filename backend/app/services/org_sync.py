@@ -40,7 +40,7 @@ from app.models.org import (
     CxProjectGroup,
     CxUser,
 )
-from app.services import settings_store
+from app.services import settings_store, wording
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,8 @@ def duplicate_groups_message(names: list[str]) -> str:
     """What repeated group names mean, for the notice and Diagnostics."""
     shown = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
     return (
-        f"{len(names)} group name(s) are not unique in this tenant ({shown}). Memberships "
+        f"{wording.plural(len(names), 'group name')} {'is' if len(names) == 1 else 'are'} not "
+        f"unique in this tenant ({shown}). Memberships "
         "reported by name alone cannot be attributed for those groups, so their group "
         "limits may undercount. Rename the groups in Checkmarx One to make them unique."
     )
@@ -331,7 +332,10 @@ def _sync_users(
         for group_name in user.group_names:
             group_id = group_index.resolve(group_name)
             if group_id is None:
-                unresolved_group_names.add(group_name)
+                if group_name.strip().lower() not in group_index.ambiguous_names:
+                    # A repeated group name is not "unknown": it is reported
+                    # once, as a warning, by the duplicate-names notice.
+                    unresolved_group_names.add(group_name)
                 continue
             pending_memberships.append((group_id, user.id))
 
@@ -346,7 +350,8 @@ def _sync_users(
 
     if unresolved_group_names and warn_unresolved:
         result.warnings.append(
-            f"{len(unresolved_group_names)} group name(s) on users did not match any known "
+            f"{wording.plural(len(unresolved_group_names), 'group name')} on users did not match "
+            "any known "
             f"group ({', '.join(sorted(unresolved_group_names)[:5])}). Those memberships "
             "are not counted towards group limits."
         )
@@ -365,8 +370,18 @@ def _sync_projects(
 ) -> set[str]:
     listing = Listing()
     projects = platform.fetch_projects(client, listing=listing)
-    complete = _settle_listing(session, result, kind="project", listing=listing)
     existing = {row.id: row for row in session.scalars(select(CxProject))}
+    complete = _settle_listing(
+        session,
+        result,
+        kind="project",
+        listing=listing,
+        known_missing={
+            row.id: row.name
+            for row in existing.values()
+            if not row.is_deleted and row.id not in listing.ids
+        },
+    )
     seen: set[str] = set()
 
     _replace_links(
@@ -460,7 +475,8 @@ def _sync_applications(
 
     if unknown_links:
         result.warnings.append(
-            f"{unknown_links} application to project link(s) reference projects that are not "
+            f"{wording.plural(unknown_links, 'application to project link')} "
+            f"{'references' if unknown_links == 1 else 'reference'} projects that are not "
             "visible to this API key. Application limits may undercount. Check the service "
             "account's project permissions."
         )
@@ -533,8 +549,13 @@ def _settle_listing(
     ids: set[str] | None = None,
     total: int | None = None,
     note: str | None = None,
+    known_missing: dict[str, str] | None = None,
 ) -> bool:
     """Whether a listing may be treated as complete.
+
+    ``known_missing``: rows synced before that this listing did not return
+    (id -> name). When the listing is short, the warning names them: the row
+    that could not be read is usually one of them.
 
     A listing short of its reported total says nothing about the rows it did
     not return, so nothing is deleted after one. One exception: some servers
@@ -578,9 +599,21 @@ def _settle_listing(
             "everything this API key can see. This is said once."
         )
     elif not accepted:
+        named = ""
+        if known_missing:
+            shown = [
+                f"{row_id} ({name})" if name and name != row_id else row_id
+                for row_id, name in sorted(known_missing.items())[:5]
+            ]
+            more = len(known_missing) - len(shown)
+            named = (
+                f" Not returned this time: {', '.join(shown)}"
+                + (f" and {more} more" if more > 0 else "")
+                + "."
+            )
         result.warnings.append(
             f"The {kind} listing was incomplete ({note or 'fewer rows than reported'}), so "
-            f"no {kind} it did not return was treated as deleted. The next complete "
+            f"no {kind} it did not return was treated as deleted.{named} The next complete "
             "sync settles it."
         )
     settings_store.set_value(session, SHORT_LISTINGS_KEY, memory)

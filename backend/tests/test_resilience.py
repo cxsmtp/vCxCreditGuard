@@ -964,7 +964,7 @@ class TestStepIsolation:
         # Named, not quoted: the detail is in the server log (test_error_exposure.py).
         assert result.steps["org_sync"] == {
             "ok": False,
-            "error": "Unexpected error (RuntimeError); see the server log.",
+            "error": "An unexpected error occurred; see the server log (error type: RuntimeError).",
         }
         assert result.steps["ingest"]["user"]["supported"] is True
         assert "evaluate" in result.steps and "deliver" in result.steps

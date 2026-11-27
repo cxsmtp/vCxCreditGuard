@@ -722,7 +722,7 @@ class TestWindowAndPeriod:
 
 
 class TestEnforcement:
-    def test_turning_it_on_breaches_and_enforces_a_user_limit(
+    def test_turning_it_on_breaches_but_never_restricts_a_user_limit(
         self, db: Session, tenant: FakeTenant
     ) -> None:
         scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
@@ -740,7 +740,15 @@ class TestEnforcement:
         state = period_state(db, limit)
         assert state.attributed_credits == Decimal("10")
         assert state.credits_used == Decimal("13")
-        assert state.status == "restricted"
+        # Over the limit only with the Auto Triage charged from her scans:
+        # that never starts a restriction (the owner's rule).
+        assert state.status == "breached"
+        assert all(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
+
+        # Her own usage over the limit restricts as it always did.
+        tenant.set_user_credits(name="Alice Archer", email=ALICE, credits=6)
+        run()
+        assert period_state(db, limit).status == "restricted"
         assert not any(role in tenant.role_mappings["user-alice"] for role in AI_ROLE_NAMES)
 
     def test_the_simulation_shows_it_before_any_cycle_applies_it(
@@ -754,7 +762,9 @@ class TestEnforcement:
         row = next(item for item in dry["rows"] if item["limit_id"] == limit.id)
         assert Decimal(row["auto_triage_attributed"]) == Decimal("10")
         assert Decimal(row["credits_used"]) == Decimal("13")
-        assert row["would_enforce"] is True
+        # Shown over the limit, but not restricted on reassigned Auto Triage.
+        assert row["would_enforce"] is False
+        assert "Auto Triage" in (row["note"] or "")
 
         run()
         detail = admin_client.get(f"/api/limits/{limit.id}").json()["current_period"]
@@ -764,7 +774,7 @@ class TestEnforcement:
         assert attributed["parts"][0]["project_id"] == "proj-api"
         assert attributed["parts"][0]["basis"] == "estimated"
 
-    def test_turning_it_on_for_many_people_trips_the_safety_ceiling(
+    def test_turning_it_on_for_many_people_restricts_nobody(
         self, db: Session, tenant: FakeTenant
     ) -> None:
         scan(tenant, "scan-h0", ALICE, ago=timedelta(days=4))
@@ -782,8 +792,9 @@ class TestEnforcement:
         turn_on(db)
         result = run()
 
-        guard = settings_store.enforcement_guard(db)
-        assert guard.paused and "safety ceiling of 2" in (guard.pause_reason or "")
+        # Everyone is over only with reassigned Auto Triage, which never starts
+        # a restriction, so there is nothing for the safety ceiling to stop.
+        assert settings_store.enforcement_guard(db).paused is False
         assert result.steps["evaluate"]["enforced"] == 0
         for user_id in ("user-alice", "user-bob", "user-carol"):
             assert all(role in tenant.role_mappings[user_id] for role in AI_ROLE_NAMES)

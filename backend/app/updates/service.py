@@ -52,7 +52,7 @@ from app import __version__
 from app.core.crypto import PURPOSE_UPDATE_TOKEN, DecryptionError, get_secret_box
 from app.db.base import utcnow
 from app.models.enums import Severity
-from app.services import notifications, settings_store
+from app.services import error_text, notifications, settings_store, wording
 from app.services.audit import AuditActor, record_audit
 from app.updates import BUILT_IN, compare_versions, is_release_tag, parse_version
 from app.updates.backup import backup_database, current_revision
@@ -763,7 +763,7 @@ class UpdateService:
                 {
                     "last_check": {
                         "at": at,
-                        "error": f"Unexpected error ({type(exc).__name__}); see the server log.",
+                        "error": error_text.unexpected(exc),
                     }
                 }
             )
@@ -782,7 +782,7 @@ class UpdateService:
                 actor=actor,
                 target_type="updates",
                 detail=(
-                    f"Checked {IMAGE}: {len(releases)} release(s), "
+                    f"Checked {IMAGE}: {wording.plural(len(releases), 'release')}, "
                     f"latest {self.latest() or 'none'}."
                 ),
             )
@@ -1128,7 +1128,7 @@ class UpdateService:
             if isinstance(exc, _EXPLAINED):
                 message = str(exc)
             else:
-                message = f"Unexpected error ({type(exc).__name__}); see the server log."
+                message = error_text.unexpected(exc)
                 logger.exception("Update to %s failed", version)
             job.state = "failed"
             job.error = message
@@ -1234,7 +1234,12 @@ class UpdateService:
                                 if backup.path
                                 else "not backed up by the app (PostgreSQL)."
                             )
-                            + (f" Removed old version(s): {', '.join(removed)}." if removed else "")
+                            + (
+                                f" Removed old {wording.noun(len(removed), 'version')}: "
+                                f"{', '.join(removed)}."
+                                if removed
+                                else ""
+                            )
                         )
                     ),
                 )

@@ -96,7 +96,14 @@ from app.models.selftest import (
     STATUS_WARNING,
     EnforcementSelfTest,
 )
-from app.services import enforcement, notifications, role_sources, settings_store
+from app.services import (
+    credits_text,
+    enforcement,
+    notifications,
+    role_sources,
+    settings_store,
+    wording,
+)
 from app.services.audit import AuditActor, record_audit
 from app.services.periods import PeriodError, current_window
 
@@ -563,9 +570,10 @@ def _budgets_near_limit(
         )
         if close:
             share = (
-                f"{used * 100 / limit.credit_limit:.0f}% of its {limit.credit_limit} credits"
+                f"{wording.percent(used * 100 / limit.credit_limit)} of its "
+                f"{credits_text.credits(limit.credit_limit)} credits"
                 if limit.credit_limit > 0
-                else f"{used} credits of a budget of 0"
+                else f"{credits_text.credits(used)} credits of a budget of 0.0"
             )
             reasons.append(
                 f"{label} is close to its limit ({share}, {state.status}). A real restriction "
@@ -1805,7 +1813,8 @@ def _restore_target(
         "; ".join(errors)
         if errors
         else (
-            f"{sum(1 for item in results if item.get('restored'))} restriction(s) restored."
+            f"{wording.plural(sum(1 for item in results if item.get('restored')), 'restriction')}"
+            " restored."
             if results
             else "Nothing had been changed."
         )

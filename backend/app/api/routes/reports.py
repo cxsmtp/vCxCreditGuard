@@ -15,7 +15,7 @@ from app.schemas.reports import (
     ReportEmailResult,
     ReportResponse,
 )
-from app.services import delivery, reporting_service
+from app.services import delivery, reporting_service, wording
 from app.services.audit import record_audit
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ def _projection_to_response(p: reporting_service.Projection) -> ProjectionRespon
         days_to_exhaustion=p.days_to_exhaustion,
         exhaustion_at=p.exhaustion_at,
         will_breach=p.will_breach,
+        already_over=p.already_over,
     )
 
 
@@ -61,6 +62,7 @@ def report_summary(ctx: CurrentUser, db: DbSession) -> ReportResponse:
         limits_total=report.limits_total,
         limits_enforcing=report.limits_enforcing,
         breaching_soon=report.breaching_soon,
+        already_over=report.already_over,
         impact=_impact_to_response(report.impact)
         if report.impact
         else ImpactResponse(
@@ -142,7 +144,10 @@ def email_report(ctx: AdminUser, db: DbSession) -> ReportEmailResult:
         action="report.emailed_ondemand",
         actor=ctx.actor,
         target_type="report",
-        detail=f"Report emailed to {len(config.smtp_recipients)} recipient(s) on demand.",
+        detail=(
+            f"Report emailed to {wording.plural(len(config.smtp_recipients), 'recipient')} "
+            "on demand."
+        ),
     )
     db.commit()
     return ReportEmailResult(

@@ -440,6 +440,18 @@ def test_connection(
     )
 
 
+def record_success(session: Session) -> None:
+    """A cycle read data from the tenant: the connection's last success is now.
+
+    Without this, "Last success" on the setup page only moved when an admin
+    pressed Test connection, and read as weeks old while every cycle
+    collected data.
+    """
+    connection = get_connection(session)
+    if connection is not None:
+        connection.last_success_at = utcnow()
+
+
 def _total_from(payload: Any) -> int | None:
     if isinstance(payload, dict):
         for key in ("totalCount", "filteredTotalCount", "total"):

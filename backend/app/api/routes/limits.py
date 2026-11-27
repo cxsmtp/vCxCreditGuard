@@ -37,7 +37,7 @@ from app.schemas.limits import (
     LimitUpdateRequest,
 )
 from app.services import connection as connection_service
-from app.services import evaluation, limits_csv, limits_service, settings_store
+from app.services import evaluation, headroom, limits_csv, limits_service, settings_store
 from app.services.periods import PeriodError, PeriodWindow, current_window
 
 logger = logging.getLogger(__name__)
@@ -224,6 +224,17 @@ def _to_response(
                 rollout_total=state.rollout_total,
                 rollout_done=state.rollout_done,
                 lifting_remaining=_lifting_remaining(limit, state, active_restrictions),
+                headroom_credits=state.headroom_credits,
+                restricted_early=(
+                    headroom.early_phrase(limit, state.credits_used, state.headroom_credits)
+                    if state.status in (LimitStatus.BREACHED, LimitStatus.RESTRICTED)
+                    else None
+                ),
+                status_note=(
+                    state.status_note
+                    if state.status in (LimitStatus.BREACHED, LimitStatus.RESTRICTED)
+                    else None
+                ),
             )
             if index is None and limit.entity_type in {EntityType.USER, EntityType.GROUP}:
                 index = _attribution_index(db)
@@ -256,7 +267,24 @@ def _to_response(
         updated_at=limit.updated_at,
         current_period=period_response,
         active_restrictions=active_restrictions,
+        headroom_credits=limit.headroom_credits,
+        headroom_auto=bool(limit.headroom_auto),
+        **_headroom_now(db, limit, index),
     )
+
+
+def _headroom_now(
+    db: Session, limit: CreditLimit, index: evaluation.UsageIndex | None
+) -> dict[str, object]:
+    """The headroom in force now, for a budget that has one configured."""
+    if not headroom.configured(limit):
+        return {}
+    resolver = index.headroom if index is not None else headroom.Resolver(db)
+    found = resolver.for_limit(limit)
+    return {
+        "headroom_effective": found.credits if found.active else None,
+        "headroom_description": found.describe(),
+    }
 
 
 @router.get("", response_model=list[LimitResponse])
@@ -308,6 +336,8 @@ def create_limit(payload: LimitCreateRequest, ctx: AdminUser, db: DbSession) -> 
                     if payload.project_actions is not None
                     else None
                 ),
+                headroom_credits=payload.headroom_credits,
+                headroom_auto=payload.headroom_auto,
             ),
             actor=ctx.actor,
         )
@@ -332,6 +362,10 @@ def update_limit(
         return _to_response(db, limit)
     if changes.get("project_actions") is not None:
         changes["project_actions"] = [str(action) for action in changes["project_actions"]]
+    if "headroom_credits" in changes:
+        changes["headroom_credits"] = changes["headroom_credits"] or None
+    if "headroom_auto" in changes:
+        changes["headroom_auto"] = bool(changes["headroom_auto"])
     try:
         limits_service.update_limit(
             db, limit=limit, changes=changes, actor=ctx.actor, client=_optional_client(db)

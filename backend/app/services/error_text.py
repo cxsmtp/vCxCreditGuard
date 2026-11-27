@@ -71,4 +71,11 @@ def public_error(exc: BaseException) -> str:
     or only the class name of an unexpected one."""
     if is_domain_error(exc):
         return redact(str(exc))
-    return f"Unexpected error ({type(exc).__name__}); {SEE_THE_LOG}."
+    return unexpected(exc)
+
+
+def unexpected(exc: BaseException) -> str:
+    """ "An unexpected error occurred; see the server log (error type: KeyError)."
+
+    The class name stays, labelled, so an admin can find the entry in the log."""
+    return f"An unexpected error occurred; {SEE_THE_LOG} (error type: {type(exc).__name__})."

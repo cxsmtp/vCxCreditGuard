@@ -597,7 +597,7 @@ class TestBreachMessages:
         assert breach is not None
         month = utcnow().strftime("%B %Y")
         # One sentence: the credits against the limit, and what they went on.
-        assert breach.body.startswith(f"4 of 3 credits used in {month}: Fusion scan 4.\n")
+        assert breach.body.startswith(f"4.0 of 3.0 credits used in {month}: Fusion scan 4.0.\n")
         assert "4.0000" not in breach.body
         assert breach.body.count("credits used") == 1
         # This limit predates the choice (legacy pair), so it says Fusion is not turned off.
@@ -608,7 +608,7 @@ class TestBreachMessages:
             select(Notification).where(Notification.title.like("%Auto Triage disabled"))
         )
         assert restricted is not None
-        assert f"4 credits used in {period}: Fusion scan 4." in restricted.body
+        assert f"4.0 credits used in {period}: Fusion scan 4.0." in restricted.body
         assert "Turning off Auto Triage and PR triage and remediation does not stop Fusion" in (
             restricted.body
         )
@@ -635,7 +635,7 @@ class TestBreachMessages:
         )
         assert restricted is not None
         body = restricted.body
-        assert f"17 credits used in {period}." in body
+        assert f"17.0 credits used in {period}." in body
         assert "AI Triage 2 transactions, Fusion scan 10 transactions" in body
         assert "The AI roles were removed: " in body
         assert all(role in body for role in AI_ROLE_NAMES)

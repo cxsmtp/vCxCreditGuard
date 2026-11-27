@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import type { Me } from "../api/types";
 import { LOOKS, PHOSPHORS, useTheme, useToast } from "../lib/ui-context";
@@ -282,7 +291,8 @@ function Toasts() {
 
 /* ---------------------------------------------------------- the look picker */
 
-export function LookPicker() {
+/** ``onAppearancePage``: drop the pointer to Settings → Appearance where it would point at itself. */
+export function LookPicker({ onAppearancePage = false }: { onAppearancePage?: boolean }) {
   const { look, setLook, mode, setMode, phosphor, setPhosphor } = useTheme();
   return (
     <div className="flex flex-col gap-5">
@@ -339,8 +349,9 @@ export function LookPicker() {
         </div>
       )}
       <p className="text-xs" style={{ color: "var(--text-muted)" }}>
-        Remembered on this device. The organisation's accent colour (Settings → Appearance)
-        colours the Standard look.
+        {onAppearancePage
+          ? "Remembered on this device. The organisation's accent colour, below, colours the Standard look."
+          : "Remembered on this device. The organisation's accent colour (Settings → Appearance) colours the Standard look."}
       </p>
     </div>
   );
@@ -368,6 +379,8 @@ function JumpPalette({ me, open, onClose }: { me: Me; open: boolean; onClose: ()
         pages.push({ label: link.label, where: `Settings · ${group}`, to: link.to, icon: "settings" });
       }
     }
+    // Not in the menus (it is a panel on the Overview), but reachable here and at /diagnose.
+    pages.push({ label: "System health", where: "Diagnose", to: "/diagnose", icon: "overview" });
     return pages;
   }, [me]);
 
@@ -377,12 +390,14 @@ function JumpPalette({ me, open, onClose }: { me: Me; open: boolean; onClose: ()
     return targets.filter((t) => `${t.label} ${t.where}`.toLowerCase().includes(q));
   }, [query, targets]);
 
-  useEffect(() => {
+  // A layout effect, so the box has focus before the browser paints and the
+  // first keystrokes typed straight after Ctrl K land in it (a timeout lost them).
+  useLayoutEffect(() => {
     if (!open) return;
     const before = document.activeElement as HTMLElement | null;
     setQuery("");
     setIndex(0);
-    window.setTimeout(() => inputRef.current?.focus(), 0);
+    inputRef.current?.focus();
     return () => before?.focus?.();
   }, [open]);
 
@@ -409,6 +424,7 @@ function JumpPalette({ me, open, onClose }: { me: Me; open: boolean; onClose: ()
           <Icon name="search" />
           <input
             ref={inputRef}
+            autoFocus
             className="cg-input"
             placeholder="Jump to a page or a setting…"
             value={query}

@@ -131,7 +131,7 @@ class TestDashboard:
     def test_tiles_summarise_state(self, admin_client: TestClient, tenant: FakeTenant) -> None:
         tiles = admin_client.get("/api/dashboard").json()["tiles"]
         assert tiles["unresolved_subjects"] == 1
-        assert tiles["schedule"] == "every 15 minute(s)"
+        assert tiles["schedule"] == "every 15 minutes"
         assert tiles["limits_configured"] == 0
 
     def test_unavailable_dimensions_are_surfaced(
@@ -383,7 +383,7 @@ class TestSettingsApi:
         response = admin_client.put("/api/settings", json={"schedule_interval_minutes": 5})
         assert response.status_code == httpx.codes.OK
         assert response.json()["schedule_interval_minutes"] == 5
-        assert response.json()["current_schedule_description"] == "every 5 minute(s)"
+        assert response.json()["current_schedule_description"] == "every 5 minutes"
 
     def test_cron_mode_requires_an_expression(self, admin_client: TestClient) -> None:
         response = admin_client.put("/api/settings", json={"schedule_mode": "cron"})

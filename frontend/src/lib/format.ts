@@ -1,14 +1,13 @@
 /** Formatting helpers. No em dashes in any user visible string. */
 
+const ONE_DECIMAL: Intl.NumberFormatOptions = { minimumFractionDigits: 1, maximumFractionDigits: 1 };
+
+/** Credits always read with exactly one decimal and thousands separators: "12.0", "1,365.5", "0.5". */
 export function formatCredits(value: string | number | null | undefined): string {
-  if (value === null || value === undefined || value === "") return "0";
+  if (value === null || value === undefined || value === "") return (0).toLocaleString(undefined, ONE_DECIMAL);
   const numeric = typeof value === "number" ? value : Number(value);
   if (Number.isNaN(numeric)) return String(value);
-  const fractional = Math.abs(numeric % 1) > 0.0001;
-  return numeric.toLocaleString(undefined, {
-    minimumFractionDigits: fractional ? 2 : 0,
-    maximumFractionDigits: fractional ? 2 : 0,
-  });
+  return numeric.toLocaleString(undefined, ONE_DECIMAL);
 }
 
 export function formatNumber(value: number | null | undefined): string {
@@ -16,9 +15,16 @@ export function formatNumber(value: number | null | undefined): string {
   return value.toLocaleString();
 }
 
-export function formatPercent(value: number | null | undefined, digits = 0): string {
-  if (value === null || value === undefined) return "";
-  return `${value.toFixed(digits)}%`;
+/**
+ * Percentages always read with exactly one decimal, as credits do: "4.9%", "64.2%",
+ * "100.0%". One rule everywhere, and the same as the server's sentences, so the
+ * same figure never reads 4.9% in one place and 5% in another.
+ */
+export function formatPercent(value: number | string | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "";
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (Number.isNaN(numeric)) return "";
+  return `${numeric.toLocaleString(undefined, ONE_DECIMAL)}%`;
 }
 
 export function formatDateTime(value: string | null | undefined): string {
@@ -149,4 +155,41 @@ export function enforcementLabel(kind: string): string {
 
 export function pluralise(count: number, singular: string, plural?: string): string {
   return count === 1 ? singular : (plural ?? `${singular}s`);
+}
+
+/** A count with its noun and thousands separators: "1 entity", "3 entities", "1,250 users". */
+export function countNoun(count: number, singular: string, plural?: string): string {
+  return `${formatNumber(count)} ${pluralise(count, singular, plural)}`;
+}
+
+/** "a project", "an application": the article that fits the word. */
+export function withArticle(word: string): string {
+  return `${/^[aeiou]/i.test(word) ? "an" : "a"} ${word}`;
+}
+
+const RUN_STATUS_LABELS: Record<string, string> = {
+  running: "Running",
+  success: "Succeeded",
+  partial: "Partly succeeded",
+  failed: "Failed",
+  skipped: "Skipped",
+};
+
+/** A cycle's status in words: "Partly succeeded", not "partial". */
+export function runStatusLabel(status: string): string {
+  return RUN_STATUS_LABELS[status] ?? humanise(status);
+}
+
+/**
+ * Checkmarx One's own warning and cut-off thresholds as one phrase. Equal
+ * thresholds read once: "it warns and cuts off at 100%".
+ */
+export function thresholdsPhrase(warnAt?: number | null, cutOffAt?: number | null): string {
+  const hasWarn = warnAt !== undefined && warnAt !== null;
+  const hasCut = cutOffAt !== undefined && cutOffAt !== null;
+  if (hasWarn && hasCut && warnAt === cutOffAt) return `it warns and cuts off at ${warnAt}%`;
+  if (hasWarn && hasCut) return `it warns at ${warnAt}% and cuts off at ${cutOffAt}%`;
+  if (hasWarn) return `it warns at ${warnAt}%`;
+  if (hasCut) return `it cuts off at ${cutOffAt}%`;
+  return "";
 }

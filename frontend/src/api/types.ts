@@ -364,6 +364,13 @@ export interface AttributionSummary {
   user_total_credits: string;
   projects: UnmatchedEntities;
   applications: UnmatchedEntities;
+  /** Tenant total of the same window, and the part of it no project row accounts for. */
+  tenant_total_credits?: string | null;
+  projects_unreported?: string;
+  /** Of the unmatched people, those under Settings → Attribution → Disputes. */
+  unmatched_people_disputed?: number;
+  /** Of the automation, Checkmarx One's own (Auto Triage...), not listed under Attribution. */
+  automation_builtin?: number;
 }
 
 export interface UnmatchedEntity {
@@ -378,6 +385,8 @@ export interface UnmatchedEntity {
   /** Mapped, but the name now matches a synced entity by itself, which wins. */
   overridden?: boolean;
   overridden_by?: string | null;
+  /** The name is a project or application deleted in Checkmarx One. */
+  deleted?: boolean;
   /** After a mapping: where the name's usage counts from now on. */
   confirmation?: string | null;
   /** Keyset paging: the next page starts after this row, from these readings. */
@@ -426,6 +435,10 @@ export interface CreditPoolInfo {
     warningThresholdPct?: number;
     cutoffThresholdPct?: number;
   } | null;
+  /** Granted − used − available when Checkmarx sent all three and they do not add up. */
+  unexplained?: string | null;
+  /** Other figures /credits/info reported, as given (only when there is a gap). */
+  other_figures?: Record<string, string>;
 }
 
 export interface LimitPeriodState {
@@ -449,6 +462,12 @@ export interface LimitPeriodState {
   rollout_total?: number | null;
   rollout_done?: number | null;
   lifting_remaining?: number | null;
+  /** The headroom the period was last judged with (credits held back). */
+  headroom_credits?: string | null;
+  /** "X credits left, below the headroom of Y" while restricted before the limit. */
+  restricted_early?: string | null;
+  /** Why a period over its limit is, or is not, restricted (held, deferred, protected, ...). */
+  status_note?: string | null;
 }
 
 export type AttributionBasis = "observed" | "estimated" | "unattributed";
@@ -549,6 +568,13 @@ export interface Limit {
   updated_at: string;
   current_period: LimitPeriodState | null;
   active_restrictions: number;
+  /** Restrict once no more than this many credits are left (null: no fixed headroom). */
+  headroom_credits?: number | null;
+  /** The headroom is the median cost of recent Fusion scans. */
+  headroom_auto?: boolean;
+  /** The headroom in force now, and how it was chosen. */
+  headroom_effective?: string | null;
+  headroom_description?: string | null;
 }
 
 export type ProjectAction = "auto_triage" | "pr_remediation" | "fusion";
@@ -759,9 +785,14 @@ export interface SchedulerStatus {
   schedule: string;
   enabled: boolean;
   next_run_at: string | null;
+  /** The last full cycle: when it finished (or started, while it runs) and how it went. */
   last_run_at: string | null;
   last_run_status: string | null;
+  /** When the last full cycle without a problem finished. */
   last_success_at: string | null;
+  fast_check_enabled?: boolean;
+  last_fast_check_at?: string | null;
+  last_fast_check_result?: string | null;
   entities_in_warning: number;
   entities_restricted: number;
   unread_notifications: number;
@@ -881,6 +912,8 @@ export interface Projection {
   days_to_exhaustion: number | null;
   exhaustion_at: string | null;
   will_breach: boolean;
+  /** At or over the limit already: not a projected breach, and no date it runs out on. */
+  already_over?: boolean;
 }
 
 export interface ReportImpact {
@@ -896,7 +929,9 @@ export interface ReportSummary {
   generated_at: string;
   limits_total: number;
   limits_enforcing: number;
+  /** Projected to go over by the period's end, not over yet. */
   breaching_soon: number;
+  already_over?: number;
   impact: ReportImpact;
   projections: Projection[];
 }
@@ -1023,12 +1058,16 @@ export interface DryRunRow {
   auto_triage_attributed?: string | null;
   /** A new period-budget restriction: it starts only if a direct recount of the activity log agrees. */
   recount_required?: boolean;
+  /** Would be restricted, but keeps an AI role through a composite role or a group. */
+  cannot_fully_bite?: boolean;
 }
 
 export interface DryRunResult {
   generated_at: string;
   would_enforce_count: number;
   would_warn_count: number;
+  /** Over the limit (or restricting early), restricted or not. */
+  would_breach_count?: number;
   affected_projects: number;
   affected_users: number;
   rows: DryRunRow[];
@@ -1222,4 +1261,36 @@ export interface Readiness {
   all_green: boolean;
   reviewed_at: string | null;
   reviewed_by: string | null;
+}
+
+/** GET /api/fastpath: the fast check and the Checkmarx One webhook. */
+export interface FastPathEntry {
+  at: string;
+  result: string;
+  trigger?: string;
+  requests?: number;
+  seconds?: number;
+  hint?: Record<string, string> | null;
+}
+
+export interface FastPathStatus {
+  fast_check: {
+    enabled: boolean;
+    interval_seconds: number;
+    min_seconds: number;
+    max_seconds: number;
+    last_run: FastPathEntry | null;
+    last_action: FastPathEntry | null;
+    error: string | null;
+    queued: boolean;
+    requests_per_hour: number;
+  };
+  webhook: {
+    enabled: boolean;
+    switched_on: boolean;
+    secret_configured: boolean;
+    path: string;
+    last_delivery: FastPathEntry | null;
+    last_rejected: FastPathEntry | null;
+  };
 }

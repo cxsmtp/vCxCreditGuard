@@ -40,7 +40,15 @@ import {
 import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import { downloadText, timestampedName } from "../lib/export";
-import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
+import {
+  countNoun,
+  formatCredits,
+  formatDateTime,
+  formatNumber,
+  formatPercent,
+  formatRelative,
+  runStatusLabel,
+} from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 import { LookPicker } from "../components/AppShell";
 import { StatTile } from "../components/StatTile";
@@ -48,7 +56,9 @@ import { UpdatesPanel } from "../components/UpdatesPanel";
 import { CoveragePanel } from "../components/CoveragePanel";
 import { ReadinessPanel } from "../components/ReadinessPanel";
 import { SelfTestPanel } from "../components/SelfTestPanel";
+import { FastPathPanel } from "../components/FastPathPanel";
 import { EntityMappingCard } from "../components/EntityMappingCard";
+import { TwoFactorAdvisory } from "../components/TwoFactorAdvisory";
 import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
 /** Unsaved edits. The last three are write only: the server never sends the
@@ -310,7 +320,7 @@ export function SettingsPage({
       if (result.status === "success") toast.success("Cycle finished.");
       else if (result.status === "skipped")
         toast.info(`Cycle skipped: ${result.skipped_reason ?? "unknown reason"}`);
-      else toast.error(`Cycle status ${result.status}. ${result.errors.join("; ")}`);
+      else toast.error(`Cycle ${runStatusLabel(result.status).toLowerCase()}. ${result.errors.join("; ")}`);
       await Promise.all([status.reload(), unresolved.reload()]);
     } catch (caught) {
       toast.error(caught instanceof ApiError ? caught.message : "The cycle could not be started.");
@@ -389,14 +399,14 @@ export function SettingsPage({
                 >
                   {current.allowed_interval_minutes.map((minutes) => (
                     <option key={minutes} value={minutes}>
-                      {minutes < 60 ? `Every ${minutes} minutes` : "Every hour"}
+                      {minutes < 60 ? `Every ${countNoun(minutes, "minute")}` : "Every hour"}
                     </option>
                   ))}
                   {!current.allowed_interval_minutes.includes(
                     Number(value("schedule_interval_minutes") ?? 15),
                   ) && (
                     <option value={String(value("schedule_interval_minutes"))}>
-                      Every {value("schedule_interval_minutes")} minutes (custom)
+                      Every {countNoun(Number(value("schedule_interval_minutes")), "minute")} (custom)
                     </option>
                   )}
                 </Select>
@@ -433,10 +443,10 @@ export function SettingsPage({
               <KeyValue label="Next run">
                 {status.data?.next_run_at ? formatRelative(status.data.next_run_at) : "Not scheduled"}
               </KeyValue>
-              <KeyValue label="Last run">
+              <KeyValue label="Last full cycle">
                 {status.data?.last_run_at ? formatDateTime(status.data.last_run_at) : "Never"}
               </KeyValue>
-              <KeyValue label="Last run status">
+              <KeyValue label="Last full cycle status">
                 {status.data?.last_run_status ? (
                   <Badge
                     tone={
@@ -447,19 +457,30 @@ export function SettingsPage({
                           : "warning"
                     }
                   >
-                    {status.data.last_run_status}
+                    {runStatusLabel(status.data.last_run_status)}
                   </Badge>
                 ) : (
                   "Never run"
                 )}
               </KeyValue>
-              <KeyValue label="Last success">
-                {status.data?.last_success_at ? formatRelative(status.data.last_success_at) : "Never"}
+              <KeyValue label="Last full cycle without problems">
+                {status.data?.last_success_at ? formatDateTime(status.data.last_success_at) : "Never"}
+              </KeyValue>
+              <KeyValue label="Last fast check">
+                {!status.data?.fast_check_enabled
+                  ? "Off"
+                  : status.data.last_fast_check_at
+                    ? `${formatRelative(status.data.last_fast_check_at)}${
+                        status.data.last_fast_check_result ? `: ${status.data.last_fast_check_result}` : ""
+                      }`
+                    : "Not run yet"}
               </KeyValue>
             </div>
           </div>
         </Card>
         )}
+
+        {section === "general" && <FastPathPanel isAdmin={isAdmin} />}
 
         {section === "general" && (
         <Card
@@ -574,6 +595,14 @@ export function SettingsPage({
           }
         >
           <div className="flex flex-col gap-5">
+            {!current.webhook_url_configured &&
+              !(current.smtp_host && current.smtp_from && current.smtp_recipients?.trim()) && (
+                <InfoNote tone="warning">
+                  No delivery channel is set up: alerts are only shown in the Notification Center,
+                  so nobody is told when a budget is breached. Set up email (an SMTP host, a from
+                  address and at least one recipient) or a webhook, save, then use Send a test.
+                </InfoNote>
+              )}
             {testResult && (
               <InfoNote tone={testResult.ok ? "good" : "critical"}>
                 {Object.entries(testResult.channels).map(([channel, outcome]) => (
@@ -733,7 +762,7 @@ export function SettingsPage({
                 title="Your look"
                 description="Standard or Command Center, light or dark. Remembered on this device."
               >
-                <LookPicker />
+                <LookPicker onAppearancePage />
               </Card>
               <AppearanceCard
                 isAdmin={isAdmin}
@@ -835,13 +864,13 @@ export function SettingsPage({
                 </Field>
                 <Field
                   label="Protected roles"
-                  hint="Comma separated Checkmarx One role names. A user holding any of them is never restricted automatically; an admin is told instead. The account your API key belongs to is always protected."
+                  hint="Comma separated Checkmarx One role names; none by default. A user holding any of them is never restricted automatically; an admin is told instead. The account your API key belongs to is always protected: restricting it could remove rights CreditGuard needs to restore others."
                 >
                   <Input
                     disabled={!isAdmin}
                     value={value("protected_roles") ?? ""}
                     onChange={(event) => set({ protected_roles: event.target.value })}
-                    placeholder="ast-admin, iam-admin"
+                    placeholder="None (everyone over budget is restricted)"
                     spellCheck={false}
                   />
                 </Field>
@@ -1059,9 +1088,9 @@ function UsageSourceNote({ status }: { status: UsageSourceStatus | null }) {
       text += ` It has failed since ${formatDateTime(status.failing_since)}: nothing new is counted until it answers.`;
     }
     if (reconciliation?.status === "match") {
-      text += ` Its sum matched the summary (${reconciliation.summary_credits} credits, ${reconciliation.period?.replace(/_/g, " ")}).`;
+      text += ` Its sum matched the summary (${formatCredits(reconciliation.summary_credits)} credits, ${reconciliation.period?.replace(/_/g, " ")}).`;
     } else if (reconciliation?.status === "mismatch") {
-      text += ` Its sum (${reconciliation.activity_credits}) did not match the summary (${reconciliation.summary_credits}): see Diagnose.`;
+      text += ` Its sum (${formatCredits(reconciliation.activity_credits)}) did not match the summary (${formatCredits(reconciliation.summary_credits)}): see Diagnose.`;
     }
   } else if (status.status === "fallback") {
     text = `The activity log could not be read (${status.last_error ?? "unknown error"}); the consumption summary is the source until it answers again.`;
@@ -1218,7 +1247,7 @@ function AutoTriageCard({
         label="Charge auto-triage credits to the person who started the scan"
         description={
           checked
-            ? "On: auto triage counts against the scan starter's own budget, and a group budget that includes its members' usage. With many people near their budget, turning this on can restrict several at once: the enforcement safety ceiling still applies, and the Simulation shows the effect first."
+            ? "On: auto triage counts against the scan starter's own budget, and a group budget that includes its members' usage. It shows in their figures and can warn, but it never starts a restriction: a person is restricted only when their own usage reaches the limit. The Simulation shows the effect first."
             : "Off: auto triage counts against the project, its application and the tenant only, as Checkmarx One reports it."
         }
       />
@@ -1415,7 +1444,7 @@ const ACCOUNT_VIEW: ViewColumn<UtilityAccount>[] = [
 ];
 
 function confidence(score: number | null | undefined): string {
-  return score == null ? "" : `${Math.round(score * 100)}%`;
+  return score == null ? "" : formatPercent(score * 100);
 }
 
 // A subject is counted when its credits currently reach a user's budget — an
@@ -1498,6 +1527,21 @@ function AppearanceCard({
       )}
     </Card>
   );
+}
+
+/** "2 people, 2 automation identities and 1 scan initiator." for the Unmatched tab. */
+function unmatchedBreakdown(rows: UnresolvedSubject[]): string {
+  const initiators = rows.filter((s) => s.source === "scan_initiator").length;
+  const automation = rows.filter((s) => s.is_bot && s.source !== "scan_initiator").length;
+  const people = rows.length - initiators - automation;
+  const parts = [
+    `${formatNumber(people)} ${people === 1 ? "person" : "people"}`,
+    `${formatNumber(automation)} automation ${automation === 1 ? "identity" : "identities"}`,
+  ];
+  if (initiators > 0) {
+    parts.push(`${formatNumber(initiators)} scan ${initiators === 1 ? "initiator" : "initiators"}`);
+  }
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}.`;
 }
 
 function AttributionCard({
@@ -1634,6 +1678,13 @@ function AttributionCard({
       <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
         {TAB_BLURB[tab]}
       </p>
+      {tab === "unmatched" && rows.length > 0 && (
+        <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
+          {unmatchedBreakdown(rows)} The Overview counts the people here together with those under
+          Disputes, and its automation also includes Checkmarx One&apos;s own Auto-triage, which is
+          not listed here.
+        </p>
+      )}
       <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
         Automation (a [bot] account, Auto-triage, an integration such as an SCM connector) counts
         towards nobody&apos;s user budget when its project had an active project budget at the time:
@@ -1693,7 +1744,8 @@ function AttributionCard({
                     </span>
                   )}
                   <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
-                    Seen {subject.times_seen} times, last {formatRelative(subject.last_seen_at)}
+                    Seen {subject.times_seen === 1 ? "once" : `${countNoun(subject.times_seen, "time")}`}, last{" "}
+                    {formatRelative(subject.last_seen_at)}
                   </span>
                 </Td>
                 <Td align="right">
@@ -1857,8 +1909,8 @@ function OperationsCard() {
       const parsed = JSON.parse(await file.text());
       const result = await api.post<RestoreResult>("/api/ops/restore", parsed);
       toast.success(
-        `Restored ${result.limits_created + result.limits_updated} limit(s), ` +
-          `${result.settings} setting(s), ${result.exemptions} override(s).`,
+        `Restored ${countNoun(result.limits_created + result.limits_updated, "limit")}, ` +
+          `${countNoun(result.settings, "setting")}, ${countNoun(result.exemptions, "override")}.`,
       );
       await Promise.all([attestation.reload(), watchdog.reload()]);
     } catch (caught) {
@@ -1961,6 +2013,9 @@ function AccountsCard() {
     [],
   );
   const view = useTableView(accounts.data ?? [], ACCOUNT_VIEW);
+  const adminsWithoutTotp = (accounts.data ?? []).filter(
+    (account) => account.role === "admin" && !account.totp_enabled,
+  );
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<UtilityAccount | null>(null);
   const [resettingTotp, setResettingTotp] = useState<UtilityAccount | null>(null);
@@ -2078,6 +2133,18 @@ function AccountsCard() {
       {accounts.initialLoading ? (
         <Spinner />
       ) : (
+        <>
+        {adminsWithoutTotp.length > 0 && (
+          <div className="mb-4">
+            <TwoFactorAdvisory scope="accounts">
+              {countNoun(adminsWithoutTotp.length, "admin account")}{" "}
+              {adminsWithoutTotp.length === 1 ? "has" : "have"} no two factor authentication (
+              {adminsWithoutTotp.map((account) => account.username).join(", ")}). An admin can
+              restrict tenant users, so each admin should set it up under Your account. It is
+              recommended, not required.
+            </TwoFactorAdvisory>
+          </div>
+        )}
         <Table before={<FilterNote shown={view.rows.length} total={view.total} filtered={view.filtered} onClear={view.clearFilters} />}>
           <thead>
             <tr>
@@ -2170,6 +2237,7 @@ function AccountsCard() {
             ))}
           </tbody>
         </Table>
+        </>
       )}
 
       <Modal

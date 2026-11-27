@@ -21,10 +21,11 @@ import logging
 import os
 import socket
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import insert, select, update
@@ -53,6 +54,7 @@ from app.services import (
     retention,
     settings_store,
     violations,
+    wording,
 )
 from app.services import connection as connection_service
 from app.services.audit import AuditActor, record_audit
@@ -72,6 +74,10 @@ LOCK_STALE_AFTER = timedelta(minutes=10)
 MAX_CYCLE_DURATION = timedelta(hours=2)
 # Recorded on a run that did not start because another one held the lock.
 LOCK_BUSY_REASON = "a previous cycle is still running"
+# A fast check (app/services/fastcheck.py) holds the same lock for a second or
+# two; a cycle that finds it held by one waits this long rather than skip.
+FAST_CHECK_WAIT_SECONDS = 150.0
+FAST_CHECK_POLL_SECONDS = 0.5
 
 
 @dataclass
@@ -194,6 +200,31 @@ def acquire_lock(session: Session, *, name: str = LOCK_NAME, holder: str | None 
     return acquired
 
 
+def _acquire_for_cycle(session: Session, holder: str) -> bool:
+    """Take the lock for a cycle. Held by a fast check, wait for it to let go
+    (a fast check never starts while a cycle waits); held by a cycle, skip."""
+    if acquire_lock(session, holder=holder):
+        return True
+    from app.services import fastcheck
+
+    deadline = time.monotonic() + FAST_CHECK_WAIT_SECONDS
+    fastcheck.cycle_waiting.set()
+    try:
+        while time.monotonic() < deadline:
+            current = session.get(SchedulerLock, LOCK_NAME, populate_existing=True)
+            session.commit()
+            if current is not None and current.holder is not None:
+                if not current.holder.startswith(fastcheck.HOLDER_PREFIX):
+                    return False
+                time.sleep(FAST_CHECK_POLL_SECONDS)
+                continue
+            if acquire_lock(session, holder=holder):
+                return True
+        return False
+    finally:
+        fastcheck.cycle_waiting.clear()
+
+
 def heartbeat(session: Session, *, name: str = LOCK_NAME, holder: str | None = None) -> None:
     session.execute(
         update(SchedulerLock)
@@ -221,7 +252,7 @@ def run_cycle(*, trigger: str = "schedule", force_org_sync: bool = False) -> Cyc
     result = CycleResult()
 
     with session_scope() as session:
-        if not acquire_lock(session, holder=holder):
+        if not _acquire_for_cycle(session, holder):
             result.status = RunStatus.SKIPPED
             result.skipped_reason = LOCK_BUSY_REASON
             run = SchedulerRun(
@@ -506,6 +537,9 @@ def _execute_tenant_steps(
             _warn(session, "ingest", "; ".join(problems))
         _notify_unresolved(session)
         usage_fresh["value"] = ingest_result.fresh
+        if any(not dimension.read_failed for dimension in ingest_result.dimensions.values()):
+            # Usage was read from the tenant: the connection worked just now.
+            connection_service.record_success(session)
 
     _run_step(session, result, "ingest", ingest)
     usage_ok = usage_fresh["value"]
@@ -673,6 +707,45 @@ def _execute_tenant_steps(
     _run_step(session, result, "report_email", email_report, degrades_run=False)
 
 
+@dataclass(frozen=True, slots=True)
+class CycleTimes:
+    """When the full cycle last ran and last ran without a problem.
+
+    Both are when a run finished (or, for one still running, started), so the
+    last success is never later than the last run. Fast checks are not full
+    cycles and are reported separately (``fastcheck.describe``).
+    """
+
+    last_run_at: datetime | None
+    last_run_status: str | None
+    last_success_at: datetime | None
+
+
+def cycle_times(session: Session) -> CycleTimes:
+    """The Scheduler card's and the Overview's "last full cycle" figures."""
+    last = session.scalar(
+        select(SchedulerRun)
+        .where(SchedulerRun.kind == "cycle")
+        .order_by(SchedulerRun.started_at.desc(), SchedulerRun.id.desc())
+        .limit(1)
+    )
+    success = session.scalar(
+        select(SchedulerRun.finished_at)
+        .where(
+            SchedulerRun.kind == "cycle",
+            SchedulerRun.status == RunStatus.SUCCESS,
+            SchedulerRun.finished_at.is_not(None),
+        )
+        .order_by(SchedulerRun.started_at.desc(), SchedulerRun.id.desc())
+        .limit(1)
+    )
+    return CycleTimes(
+        last_run_at=(last.finished_at or last.started_at) if last is not None else None,
+        last_run_status=last.status if last is not None else None,
+        last_success_at=success,
+    )
+
+
 def _org_sync_due(session: Session) -> bool:
     config = settings_store.schedule_config(session)
     cutoff = utcnow() - timedelta(minutes=config.org_refresh_minutes)
@@ -745,7 +818,9 @@ def _send_weekly_report(session: Session) -> bool:
         action="report.emailed",
         actor=AuditActor.system("reporter"),
         target_type="report",
-        detail=f"Weekly report emailed to {len(config.smtp_recipients)} recipient(s).",
+        detail=(
+            f"Weekly report emailed to {wording.plural(len(config.smtp_recipients), 'recipient')}."
+        ),
     )
     return True
 

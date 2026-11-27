@@ -16,12 +16,26 @@ import { DiagnosticsPanel } from "../components/DiagnosticsPanel";
 import { Button, Card, ErrorNote, InfoNote, PageHeader, Spinner, Tabs } from "../components/ui";
 import { useInterval, useResource } from "../hooks/useResource";
 import { UsageSourceBanner } from "../components/UsageSourceBanner";
-import { formatCredits, formatDateTime, formatNumber, formatRelative } from "../lib/format";
+import {
+  formatCredits,
+  formatDateTime,
+  formatNumber,
+  formatPercent,
+  formatRelative,
+  runStatusLabel,
+  thresholdsPhrase,
+} from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
 type ConsumerTab = "users" | "projects" | "groups" | "applications";
 
-export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
+export function DashboardPage({
+  isAdmin,
+  needsTwoFactor = false,
+}: {
+  isAdmin: boolean;
+  needsTwoFactor?: boolean;
+}) {
   const toast = useToast();
   const [tab, setTab] = useState<ConsumerTab>("users");
   const [running, setRunning] = useState(false);
@@ -53,7 +67,7 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
         toast.info(`Cycle skipped: ${result.skipped_reason ?? "unknown reason"}`);
       } else {
         toast.error(
-          `Cycle finished with status ${result.status}. ${result.errors.join("; ") || "See the notifications."}`,
+          `Cycle finished: ${runStatusLabel(result.status).toLowerCase()}. ${result.errors.join("; ") || "See the notifications."}`,
         );
       }
       await Promise.all([dashboard.reload(), unresolved.reload()]);
@@ -117,7 +131,7 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
       <UsageSourceBanner />
 
       <div className="mb-5">
-        <DiagnosticsPanel />
+        <DiagnosticsPanel needsTwoFactor={needsTwoFactor} />
       </div>
 
       {data.unavailable_dimensions.length > 0 && (
@@ -165,7 +179,9 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
             data.tenant_total_credits === null ? "No data" : formatCredits(data.tenant_total_credits)
           }
           detail={
-            data.collected_at ? `Collected ${formatRelative(data.collected_at)}` : "No poll yet"
+            data.collected_at
+              ? `Consumption feed, rolling window. Collected ${formatRelative(data.collected_at)}`
+              : "No poll yet"
           }
         />
         <StatTile
@@ -268,12 +284,16 @@ function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
   const pct = (value: number) => `${Math.min(100, Math.max(0, (value / scale) * 100))}%`;
 
   const figure = (v: string | null) => (v === null ? "—" : formatCredits(v));
+  const thresholds = thresholdsPhrase(
+    pool.checkmarx_enforcement?.warningThresholdPct,
+    pool.checkmarx_enforcement?.cutoffThresholdPct,
+  );
 
   return (
     <div className="mb-6">
       <Card
         title="Credit pool"
-        description="The tenant's AI credit balance against what your budgets have claimed."
+        description="The tenant's AI credit balance against what your budgets have claimed. Granted, Used and Available are Checkmarx One's balance for the current grant (its credit info), shown as it reports them. “Credits reported” above comes from the consumption feed over a rolling window, which can reach back past the start of this grant, so it can be higher than Granted."
       >
         <div className="mb-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
           <PoolFigure label="Total granted" value={figure(pool.total)} />
@@ -334,12 +354,26 @@ function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
                 "state not reported"
               )}
               {pool.checkmarx_enforcement.consumptionPct !== undefined &&
-                `, ${pool.checkmarx_enforcement.consumptionPct}% consumed`}
-              {pool.checkmarx_enforcement.warningThresholdPct !== undefined &&
-                `; it warns at ${pool.checkmarx_enforcement.warningThresholdPct}%`}
-              {pool.checkmarx_enforcement.cutoffThresholdPct !== undefined &&
-                ` and cuts off at ${pool.checkmarx_enforcement.cutoffThresholdPct}%`}
+                `, ${formatPercent(pool.checkmarx_enforcement.consumptionPct)} consumed`}
+              {thresholds && `; ${thresholds}`}
               . CreditGuard does not change it.
+            </InfoNote>
+          </div>
+        )}
+
+        {pool.unexplained !== null && pool.unexplained !== undefined && (
+          <div className="mt-3">
+            <InfoNote tone="info">
+              Checkmarx One&apos;s own figures do not add up: Granted − Used is{" "}
+              {formatCredits(Number(pool.total) - Number(pool.used))}, but it reports{" "}
+              {figure(pool.available)} available ({formatCredits(Math.abs(Number(pool.unexplained)))}{" "}
+              {Number(pool.unexplained) > 0 ? "less" : "more"}). Its credit info does not say why
+              {Object.keys(pool.other_figures ?? {}).length > 0
+                ? `; it also reports ${Object.entries(pool.other_figures ?? {})
+                    .map(([key, value]) => `${key} ${formatCredits(value)}`)
+                    .join(", ")}`
+                : ""}
+              . CreditGuard shows each figure as reported and does not fill the gap in.
             </InfoNote>
           </div>
         )}
@@ -372,7 +406,12 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
       credits: summary.automation_credits,
       total: summary.user_total_credits,
       note:
-        "Auto Triage, bots and integrations without an email. Counted tenant wide and on projects, towards no user limit; not a person to chase.",
+        "Auto Triage, bots and integrations without an email. Counted tenant wide and on projects, towards no user limit; not a person to chase." +
+        ((summary.automation_builtin ?? 0) > 0
+          ? ` ${formatNumber(summary.automation_builtin ?? 0)} of them ${
+              summary.automation_builtin === 1 ? "is" : "are"
+            } Checkmarx One's own (such as Auto-triage), which Settings → Attribution does not list; the rest are listed there under Unmatched, marked Automation.`
+          : " Listed under Settings → Attribution → Unmatched, marked Automation."),
     });
   }
   if (summary.unmatched_people > 0) {
@@ -382,7 +421,11 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
       count: summary.unmatched_people,
       credits: summary.unmatched_people_credits,
       total: summary.user_total_credits,
-      note: "Reported under a name or address that matches no synced user.",
+      note:
+        "Reported under a name or address that matches no synced user." +
+        ((summary.unmatched_people_disputed ?? 0) > 0
+          ? ` Under Settings → Attribution: ${formatNumber(summary.unmatched_people_disputed ?? 0)} under Disputes (a likely match to confirm), the rest under Unmatched.`
+          : " Listed under Settings → Attribution → Unmatched."),
     });
   }
   for (const [key, label, found] of [
@@ -393,13 +436,25 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
       const names = found.top.slice(0, 3).map((entry) => entry.name).join(", ");
       rows.push({
         key,
-        label: `${label[0]!.toUpperCase()}${label.slice(1)} names not matched`,
+        label: `${label[0]!.toUpperCase()}${label.slice(1)} ${found.count === 1 ? "name" : "names"} not matched`,
         count: found.count,
         credits: found.credits,
         total: found.total_credits,
-        note: `Usage under a repository name that matches no ${label} in Checkmarx One (such as ${names}). It counts towards no ${label}, group or application limit.`,
+        note: `Usage under a repository name that matches no ${label} in Checkmarx One (such as ${names}). It counts towards no ${
+          key === "projects" ? "project, group or application" : "application"
+        } limit.`,
       });
     }
+  }
+  if (Number(summary.projects_unreported ?? 0) > 0 && summary.tenant_total_credits) {
+    rows.push({
+      key: "unreported",
+      label: "Not under any project",
+      count: 0,
+      credits: summary.projects_unreported ?? "0",
+      total: summary.tenant_total_credits,
+      note: "Checkmarx One reports this much more usage tenant wide than its project rows add up to: usage it files under no project, a project row with no name, or a row the last read did not return. It counts towards no project, group or application limit and cannot be mapped here; it is still counted tenant wide.",
+    });
   }
   if (rows.length === 0) return null;
   return (
@@ -422,11 +477,13 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
               <li key={row.key} className="text-[13px]">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <span className="font-medium">
-                    {formatNumber(row.count)} {row.label.toLowerCase()}
+                    {row.key === "unreported"
+                      ? row.label
+                      : `${formatNumber(row.count)} ${row.label.toLowerCase()}`}
                   </span>
                   <span className="tabular" style={{ color: "var(--text-secondary)" }}>
                     {formatCredits(row.credits)} credits
-                    {share !== null && ` (${share.toFixed(share < 10 ? 1 : 0)}% of ${formatCredits(row.total)})`}
+                    {share !== null && ` (${formatPercent(share)} of ${formatCredits(row.total)})`}
                   </span>
                 </div>
                 <p className="text-xs" style={{ color: "var(--text-muted)" }}>

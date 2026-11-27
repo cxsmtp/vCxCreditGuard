@@ -41,7 +41,7 @@ from app.checkmarx.errors import (
 )
 from app.db.base import utcnow
 from app.models.activity import is_subject_entity
-from app.models.audit import AuditLogEntry
+from app.models.audit import AuditLogEntry, Notification
 from app.models.enums import (
     LEGACY_PROJECT_ACTIONS,
     EnforcementKind,
@@ -59,6 +59,7 @@ from app.models.limits import (
 )
 from app.models.org import CxApplicationProject, CxProject, CxProjectGroup, CxUser
 from app.services import (
+    credits_text,
     error_text,
     ingestion,
     key_permissions,
@@ -67,6 +68,7 @@ from app.services import (
     role_sources,
     settings_store,
     usage_mix,
+    wording,
 )
 from app.services.audit import AuditActor, record_audit
 
@@ -90,6 +92,26 @@ DESELECTED_REASON = "action_deselected"
 # Period key prefix of the enforcement self-test's restrictions (they have no
 # limit). See app/services/enforcement_selftest.py.
 SELFTEST_PERIOD_PREFIX = "selftest-"
+
+# Why a restriction was lifted, in the words an audit entry shows. The stored
+# reversal_reason keeps its code; only the sentence uses these.
+_REASON_TEXT: dict[str, str] = {
+    ADMIN_REASON: "an administrator restored access",
+    EXEMPTED_REASON: "an exemption was granted",
+    DESELECTED_REASON: "the limit no longer turns this off",
+    "credit_increased": "the limit was raised or usage is within budget again",
+    "limit_removed": "the limit was removed or disabled",
+    "period_rollover": "a new budget period started",
+    "protected": "the target holds a protected role",
+    "selftest": "the self-test put it back",
+    "selftest_cleanup": "a self-test's restriction was cleaned up",
+}
+
+
+def reason_text(reason: str | None) -> str:
+    """A lift reason in plain words: "a new budget period started", not "period_rollover"."""
+    code = str(reason or "")
+    return _REASON_TEXT.get(code) or code.replace("_", " ") or "no reason recorded"
 
 
 def is_selftest(action: EnforcementAction) -> bool:
@@ -440,6 +462,24 @@ class ProtectedTarget(NotRestricted):
 PROTECTED_REASON = "protected"
 
 
+# Why the API key's own account is never restricted, in the words every
+# notification, audit entry and Simulation row uses.
+API_KEY_OWNER_REASON = (
+    "this is the account the Checkmarx One API key belongs to: restricting it could remove "
+    "rights CreditGuard needs to restore others"
+)
+
+
+def protection_remedy(why: str) -> str:
+    """What the admin can do about a protected user, depending on why."""
+    if why == API_KEY_OWNER_REASON:
+        return (
+            "Raise it with them, or connect CreditGuard with an API key of an account that "
+            "does not use AI features."
+        )
+    return "Raise it with them, or change the protected roles under Settings → Enforcement."
+
+
 def protected_user_ids(session: Session) -> frozenset[str]:
     """Tenant users the utility never restricts.
 
@@ -466,7 +506,7 @@ def protection_reason(
     has just read them from the tenant, on their roles as they are now.
     """
     if user_id in protected_user_ids(session):
-        return "it is the account the Checkmarx One API key belongs to"
+        return API_KEY_OWNER_REASON
     if protected_roles is None:
         protected_roles = settings_store.enforcement_guard(session).protected_roles
     if not protected_roles:
@@ -495,6 +535,77 @@ def protected_users(session: Session, user_ids: Iterable[str]) -> set[str]:
                 if {str(name).lower() for name in (names or [])} & roles:
                     found.add(user_id)
     return found
+
+
+PROTECTION_ENDED = "enforcement.protection_ended"
+
+
+def _note_protection_ended(
+    session: Session, *, limit: CreditLimit, period_key: str, actor: AuditActor
+) -> None:
+    """A user said to be protected earlier in this period is restricted now.
+
+    Protection is judged afresh every cycle (the user's roles as last synced
+    and as read now, the protected roles, the API key's account), and the
+    "protected" notice is raised once per period. When the judgement changes,
+    the restriction must not follow that notice unexplained: this says, once
+    per limit and period, that the user is no longer protected and why.
+    """
+    action_ids = list(
+        session.scalars(
+            select(EnforcementAction.id).where(
+                EnforcementAction.limit_id == limit.id,
+                EnforcementAction.period_key == period_key,
+                EnforcementAction.kind == EnforcementKind.REMOVE_USER_ROLES,
+            )
+        )
+    )
+    keys = [notifications.bounded_key(notifications.protected_key(limit.id, period_key))]
+    keys += [notifications.bounded_key(notifications.not_restricted_key(i)) for i in action_ids]
+    earlier = session.scalar(
+        select(Notification)
+        .where(Notification.dedupe_key.in_(keys), Notification.title.like("%but protected"))
+        .order_by(Notification.created_at.desc())
+        .limit(1)
+    )
+    if earlier is None:
+        return
+    label = limit.entity_label or limit.entity_id
+    roles = settings_store.enforcement_guard(session).protected_roles
+    now = (
+        f"{label} holds none of the protected roles ({', '.join(sorted(roles))}) now"
+        if roles
+        else "no role is protected now (Settings → Enforcement)"
+    )
+    since = earlier.created_at.strftime("%Y-%m-%d %H:%M UTC")
+    raised = notifications.notify(
+        session,
+        category=notifications.CATEGORY_ENFORCEMENT,
+        severity=Severity.WARNING,
+        title=f"{label} is no longer protected",
+        body=(
+            f"{label} was not restricted at {since} because they were protected "
+            f"({earlier.title}). That no longer holds: {now}, and it is not the account "
+            "the API key belongs to. They are over budget, so they are restricted now."
+        ),
+        entity_type=limit.entity_type,
+        entity_id=limit.entity_id,
+        entity_label=limit.entity_label,
+        dedupe_key=f"protection_ended:{limit.id}:{period_key}",
+    )
+    if raised is not None:
+        record_audit(
+            session,
+            action=PROTECTION_ENDED,
+            actor=actor,
+            target_type=TARGET_USER,
+            target_id=limit.entity_id,
+            target_label=label,
+            detail=(
+                f"Reported as protected in {period_key} at {since}; no longer protected: {now}. "
+                "Restricted."
+            ),
+        )
 
 
 def target_released(session: Session, action: EnforcementAction) -> str | None:
@@ -757,8 +868,7 @@ def apply_enforcement(
                 title=f"{label} is over budget but protected",
                 body=(
                     f"{label} has gone over their credit limit, but their AI access is "
-                    f"not removed automatically because {why}. Raise it with them, or "
-                    "change the protected roles under Settings → Enforcement."
+                    f"not removed automatically because {why}. {protection_remedy(why)}"
                 ),
                 entity_type=limit.entity_type,
                 entity_id=limit.entity_id,
@@ -1199,6 +1309,8 @@ def _enforce_target(
         )
     session.flush()
     outcome.applied.append(action)
+    if target.kind == EnforcementKind.REMOVE_USER_ROLES:
+        _note_protection_ended(session, limit=limit, period_key=period_key, actor=actor)
 
     record_audit(
         session,
@@ -1212,6 +1324,12 @@ def _enforce_target(
         detail=(
             f"Limit on {limit.entity_type} {limit.entity_label or limit.entity_id} "
             f"was breached in {period_key}."
+            + (
+                f" {_cannot_bite_audit(target.target_label or target.target_id, snapshot)}"
+                if target.kind == EnforcementKind.REMOVE_USER_ROLES
+                and snapshot.get("kept_effective")
+                else ""
+            )
         ),
     )
     notifications.notify(
@@ -1229,7 +1347,7 @@ def _enforce_target(
         entity_type=limit.entity_type,
         entity_id=limit.entity_id,
         entity_label=limit.entity_label,
-        dedupe_key=notifications.enforcement_key(action.id),
+        dedupe_key=notifications.enforcement_key(action.id, action.applied_at),
         enforcement_action_id=action.id,
     )
     if target.kind == EnforcementKind.REMOVE_USER_ROLES and snapshot.get("kept_effective"):
@@ -1263,6 +1381,72 @@ def _not_effective_lines(target_label: str, snapshot: dict[str, Any]) -> list[st
     return lines
 
 
+def _kept_by_source(
+    snapshot: dict[str, Any],
+) -> list[tuple[list[str], list[role_sources.RoleSource]]]:
+    """The AI roles kept, grouped by where they come from, in a stable order."""
+    grouped: dict[tuple[role_sources.RoleSource, ...], list[str]] = {}
+    for name, sources in role_sources.kept_from_entries(snapshot.get("kept_effective")).items():
+        grouped.setdefault(tuple(sources), []).append(name)
+    return [(names, list(sources)) for sources, names in grouped.items()]
+
+
+def _kept_phrase(kept: list[tuple[list[str], list[role_sources.RoleSource]]]) -> str:
+    """ "create-fusion-scan, manage-fusion through role ast-admin; ... through group /G" """
+    return "; ".join(
+        f"{', '.join(names)} through {role_sources.describe_sources(sources)}"
+        for names, sources in kept
+    )
+
+
+def _remedy(sources: Iterable[role_sources.RoleSource]) -> str:
+    """What to change in Checkmarx One so the restriction bites."""
+    steps: list[str] = []
+    for source in sources:
+        if source.kind == role_sources.SOURCE_COMPOSITE and source.group:
+            step = f"remove {source.role} from group {source.group}"
+        elif source.kind == role_sources.SOURCE_COMPOSITE:
+            step = f"remove {source.role} from them"
+        elif source.kind == role_sources.SOURCE_GROUP:
+            step = f"take them out of group {source.group}"
+        else:
+            step = "find where they get it and remove that from them"
+        if step not in steps:
+            steps.append(step)
+    text = " and ".join(steps) or "find where they get it and remove that from them"
+    return f"{text[0].upper()}{text[1:]} in Checkmarx One to make it bite."
+
+
+def cannot_bite_sentence(target_label: str, snapshot: dict[str, Any]) -> str | None:
+    """The one-paragraph warning for a restriction a composite role or a group
+    keeps from biting, or None when nothing is kept."""
+    kept = _kept_by_source(snapshot)
+    if not kept:
+        return None
+    through = _kept_phrase(kept)
+    sources = [source for _names, group in kept for source in group]
+    return (
+        f"{target_label} is over budget and was restricted, but keeps {through}; the "
+        f"restriction cannot stop them using Fusion. {_remedy(sources)}"
+    )
+
+
+def _nothing_removed(snapshot: dict[str, Any]) -> bool:
+    return not snapshot.get("removed_roles")
+
+
+def _cannot_bite_audit(target_label: str, snapshot: dict[str, Any]) -> str:
+    """The audit detail's addition for a restriction that cannot fully bite."""
+    kept = _kept_by_source(snapshot)
+    through = _kept_phrase(kept)
+    if _nothing_removed(snapshot):
+        return (
+            f"Nothing to remove, kept through composite or group: {target_label} has no AI "
+            f"role mapped directly (nothing was written to Checkmarx One) and keeps {through}."
+        )
+    return f"Cannot fully bite: {target_label} keeps {through}."
+
+
 def _report_not_effective(
     session: Session,
     *,
@@ -1280,15 +1464,15 @@ def _report_not_effective(
     """
     label = target.target_label or target.target_id
     lines = _not_effective_lines(label, snapshot)
-    if not lines:
+    headline = cannot_bite_sentence(label, snapshot)
+    if not lines or headline is None:
         return
     body = (
-        "\n".join(lines)
-        + "\nThe restriction is not effective for "
-        + ("this role" if len(lines) == 1 else "these roles")
-        + ". Remove it from the group or role in Checkmarx One, or add the user to an "
-        "exemption. CreditGuard does not change groups or composite roles: that would take "
-        "the role from everyone else who holds it that way."
+        headline
+        + "\n"
+        + "\n".join(lines)
+        + "\nOr add the user to an exemption. CreditGuard does not change groups or composite "
+        "roles: that would take the role from everyone else who holds it that way."
     )
     unread = snapshot.get("role_sources_unread") or []
     if unread:
@@ -1297,7 +1481,7 @@ def _report_not_effective(
         session,
         category=notifications.CATEGORY_ENFORCEMENT,
         severity=Severity.WARNING,
-        title=f"{label} keeps AI access through a group or role",
+        title=f"{label} restricted, but keeps AI access through a group or role",
         body=body,
         entity_type=limit.entity_type,
         entity_id=limit.entity_id,
@@ -1322,8 +1506,11 @@ def _report_not_effective(
             target_type=AUDIT_TARGET_ACTION,
             target_id=str(action.id),
             target_label=label,
-            after={"kept_effective": snapshot.get("kept_effective")},
-            detail=" ".join(lines),
+            after={
+                "kept_effective": snapshot.get("kept_effective"),
+                "nothing_removed": _nothing_removed(snapshot),
+            },
+            detail=f"{_cannot_bite_audit(label, snapshot)} {' '.join(lines)}",
         )
 
 
@@ -1778,8 +1965,7 @@ def _capture_user_roles(
     if why is not None:
         raise ProtectedTarget(
             f"{target.target_label}'s AI access is not removed automatically because "
-            f"{why}. Raise it with them, or change the protected roles under "
-            "Settings → Enforcement.",
+            f"{why}. {protection_remedy(why)}",
             label=target.target_label,
         )
     ai_roles = settings_store.ai_role_names(session)
@@ -3056,6 +3242,32 @@ def may_be_in_force(action: EnforcementAction) -> bool:
     )
 
 
+def restricted_entities(session: Session) -> set[tuple[str, str]]:
+    """The budgets' entities (type, id) with a restriction in force now.
+
+    In force: applied, or written with an outcome in doubt (it may be in
+    place). What every page counts as "entities restricted": the Overview,
+    Reports and the scheduler status, from this one place. A budget that is
+    over its limit without a restriction (held, deferred, protected) is not
+    restricted, whatever its period's status.
+    """
+    from app.services import enforcement_selftest
+
+    found = {
+        (str(entity_type), str(entity_id))
+        for entity_type, entity_id in session.execute(
+            select(EnforcementAction.entity_type, EnforcementAction.entity_id)
+            .where(EnforcementAction.status == EnforcementStatus.APPLIED)
+            .distinct()
+        )
+    }
+    found.update(
+        (str(action.entity_type), str(action.entity_id))
+        for action in enforcement_selftest.unsettled_in_force(session)
+    )
+    return found
+
+
 def restore_action(
     session: Session,
     client: CheckmarxClient,
@@ -3135,8 +3347,10 @@ def _restore_action_locked(
             before={"kind": action.kind, "restricted": True},
             after={"kind": action.kind, "restricted": True, "still_restricted_by": len(siblings)},
             detail=(
-                f"This limit no longer restricts {action.target_label} ({reason}), but "
-                f"{len(siblings)} other limit(s) still do, so nothing was changed in "
+                f"This limit no longer restricts {action.target_label} "
+                f"({reason_text(reason)}), but "
+                f"{wording.plural(len(siblings), 'other limit')} still "
+                f"{'does' if len(siblings) == 1 else 'do'}, so nothing was changed in "
                 "Checkmarx One."
             ),
         )
@@ -3222,11 +3436,16 @@ def _restore_action_locked(
         category=notifications.CATEGORY_RESTORATION,
         severity=Severity.INFO,
         title=_restoration_title(action),
-        body=_restoration_body(action, snapshot, reason),
+        body=_restoration_body(
+            action,
+            snapshot,
+            reason,
+            limit=session.get(CreditLimit, action.limit_id) if action.limit_id else None,
+        ),
         entity_type=action.entity_type,
         entity_id=action.entity_id,
         entity_label=action.entity_label,
-        dedupe_key=notifications.restoration_key(action.id),
+        dedupe_key=notifications.restoration_key(action.id, action.reversed_at),
         enforcement_action_id=action.id,
     )
     # Committed here, inside the lock, and before any further network call so the
@@ -3239,11 +3458,14 @@ def _reversal_detail(reason: str, *, was_applied: bool, also_lifted: int) -> str
     if not was_applied:
         return (
             "A restriction whose outcome was never confirmed was undone to be safe "
-            f"({reason}): its previous state was put back."
+            f"({reason_text(reason)}): its previous state was put back."
         )
-    detail = f"Access restored ({reason})."
+    detail = f"Access restored ({reason_text(reason)})."
     if also_lifted:
-        detail += f" {also_lifted} other limit(s) restricting it were lifted too."
+        detail += (
+            f" {wording.plural(also_lifted, 'other limit')} restricting it "
+            f"{'was' if also_lifted == 1 else 'were'} lifted too."
+        )
     return detail
 
 
@@ -3863,7 +4085,7 @@ def _enforcement_body(
     entity = limit.entity_label or limit.entity_id
     lines = [
         f"The {limit.entity_type} limit on {entity} was reached in {period_key} "
-        f"({limit.credit_limit} credits).",
+        f"({credits_text.credits(limit.credit_limit)} credits).",
     ]
     if mix is not None:
         lines.append(
@@ -3924,7 +4146,13 @@ def _restoration_title(action: EnforcementAction) -> str:
     return f"Project {action.target_label}: PR triage and remediation re-enabled"
 
 
-def _restoration_body(action: EnforcementAction, snapshot: dict[str, Any], reason: str) -> str:
+def _restoration_body(
+    action: EnforcementAction,
+    snapshot: dict[str, Any],
+    reason: str,
+    *,
+    limit: CreditLimit | None = None,
+) -> str:
     explanation = {
         "admin": "An administrator restored access from the Notification Center.",
         "period_rollover": "A new budget period started, so the restriction was lifted.",
@@ -3968,6 +4196,14 @@ def _restoration_body(action: EnforcementAction, snapshot: dict[str, Any], reaso
     else:
         severities = snapshot.get("severities_before") or []
         detail = f"PR remediation severities restored to: {', '.join(severities) or 'none'}."
+    if limit is not None and limit.is_active:
+        # The limit in force now, not the one the restriction was applied under.
+        entity = limit.entity_label or limit.entity_id
+        explanation += (
+            f" The {limit.entity_type} limit on {entity} is now "
+            f"{credits_text.credits(limit.credit_limit)} credits"
+            + ("." if limit.enforce else ", monitor only.")
+        )
     return f"{explanation}\n{detail}"
 
 

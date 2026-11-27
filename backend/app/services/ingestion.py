@@ -41,7 +41,14 @@ from app.models.usage import (
     UsageRecord,
     UsageSnapshot,
 )
-from app.services import activity_source, error_text, ledger, subject_matching
+from app.services import (
+    activity_source,
+    credits_text,
+    error_text,
+    ledger,
+    subject_matching,
+    wording,
+)
 from app.services.audit import AuditActor, record_audit
 from app.services.subject_matching import MatchMethod, MatchOutcome, UserProfile
 
@@ -489,7 +496,8 @@ def ingest_usage(
                 more = len(dimension.doubted_falls) - 5
                 result.warnings.append(
                     f"Consumption by {view} looked incomplete (a row repeated or missing), and "
-                    f"{len(dimension.doubted_falls)} name(s) reported less than before: {names}"
+                    f"{wording.plural(len(dimension.doubted_falls), 'name')} reported less than "
+                    f"before: {names}"
                     + (f" and {more} more" if more > 0 else "")
                     + ". Their falls are not believed until a complete reading confirms them, "
                     f"or for at most {ledger.DIP_MAX_DOUBTS} readings or "
@@ -814,7 +822,8 @@ def _hold_reason(
         )
         return None
     return (
-        f"Checkmarx reported {total} credits by {view}, down from {previous.total_credits} "
+        f"Checkmarx reported {credits_text.credits(total)} credits by {view}, down from "
+        f"{credits_text.credits(previous.total_credits)} "
         f"on the last accepted read. A collapse like that is usually a faulty answer "
         f"rather than real usage, so it is being held back and limits are still judged "
         f"on the previous figures. It is accepted once it has persisted for at least "

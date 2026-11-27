@@ -18,7 +18,15 @@ import {
 import { FilterNote, Pager, usePaged, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import type { ExportColumn } from "../lib/export";
-import { entityLabel, formatCredits, formatDate, formatDateTime } from "../lib/format";
+import {
+  countNoun,
+  entityLabel,
+  formatCredits,
+  formatDate,
+  formatDateTime,
+  formatNumber,
+  formatPercent,
+} from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
 const PROJECTION_COLUMNS: ExportColumn<Projection>[] = [
@@ -29,9 +37,15 @@ const PROJECTION_COLUMNS: ExportColumn<Projection>[] = [
   { key: "burn", header: "Burn / day", value: (p) => Number(p.burn_per_day).toFixed(1) },
   { key: "projected", header: "Projected period end", value: (p) => Number(p.projected_period_end).toFixed(0) },
   { key: "percent", header: "% at period end", value: (p) => (p.percent_at_period_end == null ? "" : p.percent_at_period_end.toFixed(0)) },
-  { key: "exhausts", header: "Exhausts", value: (p) => p.exhaustion_at ?? "" },
-  { key: "breach", header: "Will breach", value: (p) => (p.will_breach ? "yes" : "no") },
+  { key: "exhausts", header: "Exhausts", value: (p) => (p.already_over ? "already over" : (p.exhaustion_at ?? "")) },
+  { key: "breach", header: "Outlook", value: (p) => projectionOutlook(p) },
 ];
+
+/** "Already over" for a budget past its limit: it is not projected to breach. */
+function projectionOutlook(p: Projection): string {
+  if (p.already_over) return "Already over";
+  return p.will_breach ? "Will breach" : "Within budget";
+}
 
 export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
   const toast = useToast();
@@ -49,7 +63,7 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
     setEmailing(true);
     try {
       const result = await api.post<{ sent: boolean; recipients: number }>("/api/reports/email");
-      if (result.sent) toast.success(`Report emailed to ${result.recipients} recipient(s).`);
+      if (result.sent) toast.success(`Report emailed to ${countNoun(result.recipients, "recipient")}.`);
     } catch (caught) {
       toast.error(caught instanceof ApiError ? caught.message : "The report could not be emailed.");
     } finally {
@@ -97,8 +111,8 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
             <StatTile
               label="Active restrictions"
-              value={String(data.impact.active_restrictions)}
-              detail={`${data.impact.entities_restricted} entity(ies)`}
+              value={formatNumber(data.impact.active_restrictions)}
+              detail={countNoun(data.impact.entities_restricted, "entity", "entities")}
               tone={data.impact.active_restrictions > 0 ? "critical" : "neutral"}
             />
             <StatTile
@@ -109,13 +123,13 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
             />
             <StatTile
               label="Projected to breach"
-              value={String(data.breaching_soon)}
-              detail="This period, at current burn"
+              value={formatNumber(data.breaching_soon)}
+              detail={`This period, at current burn${data.already_over ? `; ${formatNumber(data.already_over)} already over` : ""}`}
               tone={data.breaching_soon > 0 ? "warning" : "neutral"}
             />
             <StatTile
               label="Enforcing limits"
-              value={`${data.limits_enforcing} / ${data.limits_total}`}
+              value={`${formatNumber(data.limits_enforcing)} / ${formatNumber(data.limits_total)}`}
               detail="Enforce / total"
             />
           </div>
@@ -123,7 +137,8 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
           {data.impact.monitor_only_breaches > 0 && (
             <Card>
               <p className="text-sm">
-                {data.impact.monitor_only_breaches} monitor-only limit(s) are over budget but not
+                {countNoun(data.impact.monitor_only_breaches, "monitor-only limit")}{" "}
+                {data.impact.monitor_only_breaches === 1 ? "is" : "are"} over budget but not
                 restricting anything. Turn on enforcement from the Budgets page if you want them to
                 act.
               </p>
@@ -168,21 +183,23 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
                         {formatCredits(p.credits_used)} / {formatCredits(p.credit_limit)}
                       </Td>
                       <Td align="right" className="tabular">
-                        {formatCredits(Number(p.burn_per_day).toFixed(1))}
+                        {formatCredits(p.burn_per_day)}
                       </Td>
                       <Td align="right" className="tabular">
-                        {formatCredits(Number(p.projected_period_end).toFixed(0))}
+                        {formatCredits(p.projected_period_end)}
                         {p.percent_at_period_end != null && (
                           <span className="ml-1 text-xs" style={{ color: "var(--text-muted)" }}>
-                            ({p.percent_at_period_end.toFixed(0)}%)
+                            ({formatPercent(p.percent_at_period_end)})
                           </span>
                         )}
                       </Td>
                       <Td className="whitespace-nowrap">
-                        {p.exhaustion_at ? formatDate(p.exhaustion_at) : "—"}
+                        {p.already_over ? "Already over" : p.exhaustion_at ? formatDate(p.exhaustion_at) : "—"}
                       </Td>
                       <Td>
-                        {p.will_breach ? (
+                        {p.already_over ? (
+                          <Badge tone="critical">Already over</Badge>
+                        ) : p.will_breach ? (
                           <Badge tone="critical">Will breach</Badge>
                         ) : (
                           <Badge tone="good">Within budget</Badge>
@@ -208,7 +225,7 @@ const PROJECTION_VIEW: ViewColumn<Projection>[] = [
   { key: "burn", value: (p) => Number(p.burn_per_day), filter: false },
   { key: "projected", value: (p) => Number(p.projected_period_end), filter: false },
   { key: "exhausts", value: (p) => p.exhaustion_at, filter: false },
-  { key: "outlook", value: (p) => (p.will_breach ? "Will breach" : "Within budget") },
+  { key: "outlook", value: (p) => projectionOutlook(p) },
 ];
 
 const CHARGEBACK_COLUMNS: ExportColumn<ChargebackRow>[] = [
@@ -290,7 +307,9 @@ function ChargebackCard({
             </span>
             {data.unassigned_limits > 0 && (
               <span>
-                {data.unassigned_limits} limit(s) have no business unit and are not attributed.
+                {countNoun(data.unassigned_limits, "limit")}{" "}
+                {data.unassigned_limits === 1 ? "has" : "have"} no business unit and{" "}
+                {data.unassigned_limits === 1 ? "is" : "are"} not attributed.
               </span>
             )}
           </div>

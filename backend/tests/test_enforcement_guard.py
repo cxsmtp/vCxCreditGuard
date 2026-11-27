@@ -208,6 +208,12 @@ class TestPause:
         assert response.status_code == httpx.codes.FORBIDDEN
 
 
+def _protect_admins(db: Session) -> None:
+    """An admin's own protected-roles list (the default is none)."""
+    settings_store.set_value(db, settings_store.KEY_PROTECTED_ROLES, "ast-admin, iam-admin")
+    db.commit()
+
+
 def _with_admin_role(tenant: FakeTenant, user_id: str) -> FakeTenant:
     """Give a tenant user the administrator role, as the user list reports it."""
     for user in tenant.users:
@@ -236,9 +242,18 @@ class TestProtectedIdentities:
         enforcement.apply_enforcement(db, client, limit=other, period_key=PERIOD, actor=ACTOR)
         assert not has_ai_roles(tenant, "user-bob")
 
-    def test_a_tenant_administrator_is_not_restricted(self, db: Session) -> None:
+    def test_a_tenant_administrator_is_restricted_by_default(self, db: Session) -> None:
         tenant = _with_admin_role(populated_tenant(), "user-alice")
         tenant, client = synced(db, tenant)
+        outcome = enforcement.apply_enforcement(
+            db, client, limit=limit_on(db, "user-alice"), period_key=PERIOD, actor=ACTOR
+        )
+        assert len(outcome.applied) == 1 and not has_ai_roles(tenant, "user-alice")
+
+    def test_a_listed_protected_role_is_not_restricted(self, db: Session) -> None:
+        tenant = _with_admin_role(populated_tenant(), "user-alice")
+        tenant, client = synced(db, tenant)
+        _protect_admins(db)
         limit = limit_on(db, "user-alice")
 
         for _ in range(3):
@@ -274,6 +289,7 @@ class TestProtectedIdentities:
 
         tenant = _with_admin_role(populated_tenant(), "user-alice")
         tenant, client = synced(db, tenant)
+        _protect_admins(db)
         limit_on(db, "user-alice")
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         tenant.set_user_credits(name="Alice Archer", email="alice.archer@example.com", credits=50)
@@ -287,6 +303,7 @@ class TestProtectedIdentities:
         """The plan is made from the last sync; the tenant is asked again at the
         moment of restricting."""
         tenant, client = synced(db)
+        _protect_admins(db)
         tenant.role_mappings["user-alice"] = [*ALL_ROLES, "ast-admin"]
         ALL_ROLES["ast-admin"] = "b2660f23-52cb-4361-9d49-7abae5e520fd"
         try:
@@ -309,7 +326,8 @@ class TestProtectedIdentities:
         enforcement.apply_enforcement(db, client, limit=limit, period_key=PERIOD, actor=ACTOR)
         assert not has_ai_roles(tenant, "user-alice")
 
-        # They are given the administrator role; the next sync records it.
+        # They are given a protected role; the next sync records it.
+        _protect_admins(db)
         _with_admin_role(tenant, "user-alice")
         org_sync.sync_org_model(db, client)
         db.commit()
@@ -328,6 +346,7 @@ class TestProtectedIdentities:
     def test_the_protected_roles_are_configurable(self, db: Session) -> None:
         tenant = _with_admin_role(populated_tenant(), "user-alice")
         tenant, client = synced(db, tenant)
+        _protect_admins(db)
         settings_store.set_value(db, settings_store.KEY_PROTECTED_ROLES, "")
         db.commit()
         limit = limit_on(db, "user-alice")
@@ -556,6 +575,7 @@ class TestCeilingCountsOnlyWhatWouldReallyChange:
     def test_protected_users_do_not_count(self, db: Session) -> None:
         tenant = _with_admin_role(_with_admin_role(populated_tenant(), "user-alice"), "user-bob")
         tenant, client = synced(db, tenant)
+        _protect_admins(db)
         limit_on(db, "user-alice")
         limit_on(db, "user-bob")
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
@@ -657,7 +677,7 @@ class TestPauseIsImmediate:
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         notice = db.scalar(
-            select(Notification).where(Notification.title.like("%reached its credit limit"))
+            select(Notification).where(Notification.title.like("%reached their credit limit"))
         )
         assert "enforcement is paused" in notice.body
         assert "being restricted now" not in notice.body
@@ -715,6 +735,7 @@ class TestBackupsDoNotLoosenTheGuard:
             settings_store.PACING_KEYS
         )
 
+        _protect_admins(db)  # an admin's choice, which a backup must not undo
         backup = {
             "backup_version": 1,
             "settings": {

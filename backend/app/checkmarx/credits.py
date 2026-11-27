@@ -74,26 +74,64 @@ def _first(payload: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
     return None
 
 
+_KNOWN_KEYS = (*_TOTAL_KEYS, *_USED_KEYS, *_AVAILABLE_KEYS)
+
+
+def _source(payload: dict[str, Any]) -> dict[str, Any]:
+    """Prefer figures at the top level; only unwrap a common envelope when the
+    top level carries none of the keys we recognise."""
+    if not any(key in payload for key in _KNOWN_KEYS):
+        for envelope in ("credits", "data", "result"):
+            inner = payload.get(envelope)
+            if isinstance(inner, dict) and any(k in inner for k in _KNOWN_KEYS):
+                return inner
+    return payload
+
+
+def reported_figures(payload: Any) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """(total, used, available) exactly as the body reports them: nothing
+    derived, so a figure Checkmarx did not send stays None."""
+    if not isinstance(payload, dict):
+        return None, None, None
+    source = _source(payload)
+    return (
+        _first(source, _TOTAL_KEYS),
+        _first(source, _USED_KEYS),
+        _first(source, _AVAILABLE_KEYS),
+    )
+
+
+def other_figures(payload: Any, *, limit: int = 6) -> dict[str, str]:
+    """Numeric figures the body carries besides total, used and available, as
+    given (a reserved or adjusted amount, say), so a gap between the three can
+    be shown next to what Checkmarx itself reports rather than explained away."""
+    if not isinstance(payload, dict):
+        return {}
+    found: dict[str, str] = {}
+    for key, value in _source(payload).items():
+        if key in _KNOWN_KEYS or not isinstance(key, str):
+            continue
+        # An id or a percentage is not a credit figure.
+        if key.lower().endswith(("id", "pct", "percent", "percentage")):
+            continue
+        if isinstance(value, bool) or not isinstance(value, int | float | str):
+            continue
+        coerced = _coerce(value)
+        if coerced is None:
+            continue
+        found[key[:64]] = str(coerced)
+        if len(found) >= limit:
+            break
+    return found
+
+
 def parse_credit_balance(payload: Any) -> CreditBalance | None:
     """Parse a ``/credits/info`` body. Returns None when it is not an object."""
     if not isinstance(payload, dict):
         logger.warning("Credit balance response was %s, expected an object", type(payload).__name__)
         return None
 
-    # Prefer figures at the top level; only unwrap a common envelope when the
-    # top level carries none of the keys we recognise.
-    source = payload
-    _known = (*_TOTAL_KEYS, *_USED_KEYS, *_AVAILABLE_KEYS)
-    if not any(key in payload for key in _known):
-        for envelope in ("credits", "data", "result"):
-            inner = payload.get(envelope)
-            if isinstance(inner, dict) and any(k in inner for k in _known):
-                source = inner
-                break
-
-    total = _first(source, _TOTAL_KEYS)
-    used = _first(source, _USED_KEYS)
-    available = _first(source, _AVAILABLE_KEYS)
+    total, used, available = reported_figures(payload)
 
     # Fill in the third figure from the other two when it is missing, but never
     # fabricate two unknowns into one.

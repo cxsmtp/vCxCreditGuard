@@ -22,7 +22,14 @@ from app.db import locking
 from app.db.base import utcnow
 from app.models.enums import EntityType, PeriodType, RequestStatus, Severity
 from app.models.limits import CreditLimit, CreditRequest
-from app.services import error_text, limits_service, notifications, settings_store
+from app.services import (
+    credits_text,
+    error_text,
+    limits_service,
+    notifications,
+    settings_store,
+    wording,
+)
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -112,7 +119,7 @@ def create_request(
         target_id=str(request.id),
         target_label=request.entity_label or request.entity_id,
         after={"entity_id": request.entity_id, "requested_limit": request.requested_limit},
-        detail=f"Requested a budget of {request.requested_limit} credits.",
+        detail=f"Requested a budget of {credits_text.credits(request.requested_limit)} credits.",
     )
     return request
 
@@ -253,7 +260,7 @@ def approve_request(
             "approved_limit": target,
             "expires_at": expires_at.isoformat() if expires_at else None,
         },
-        detail=f"Granted {target} credits{window}.",
+        detail=f"Granted {credits_text.credits(target)} credits{window}.",
     )
     if existing is not None:
         # Unblock the entity now rather than at the next cycle. This commits the
@@ -368,7 +375,11 @@ def auto_decide_pending(
             if policy.auto_approve_expiry_days > 0
             else None
         )
-        window = f" for {policy.auto_approve_expiry_days} day(s)" if expires_at is not None else ""
+        window = (
+            f" for {wording.plural(policy.auto_approve_expiry_days, 'day')}"
+            if expires_at is not None
+            else ""
+        )
         # Each grant is its own transaction, so one failure rolls back only that
         # request and the batch continues, rather than half-applying a grant or
         # poisoning the cycle. (Not a savepoint: lifting a restriction commits as
@@ -381,8 +392,9 @@ def auto_decide_pending(
                 actor=actor,
                 expires_at=expires_at,
                 note=(
-                    f"Auto-approved by hands-off automation: an increase of {increase} "
-                    f"credit(s) is within the {policy.auto_approve_max_increase}-credit "
+                    "Auto-approved by hands-off automation: an increase of "
+                    f"{credits_text.credits(increase)} credits is within the "
+                    f"{credits_text.credits(policy.auto_approve_max_increase)}-credit "
                     f"cap{window}."
                 ),
                 client=client,
@@ -408,7 +420,8 @@ def auto_decide_pending(
             body=(
                 f"Request #{request.id} for "
                 f"{request.entity_label or request.entity_id} was auto-approved at "
-                f"{request.requested_limit} credits{window} under hands-off automation."
+                f"{credits_text.credits(request.requested_limit)} credits{window} under "
+                "hands-off automation."
             ),
             entity_type=request.entity_type,
             entity_id=request.entity_id,
@@ -487,7 +500,8 @@ def revert_expired_grants(
             failures.append(f"request {request_id}: {error_text.public_error(exc)}")
     if failures:
         raise GrantExpiryError(
-            f"{len(failures)} expired grant(s) could not be rolled back and will be "
+            f"{wording.plural(len(failures), 'expired grant')} could not be rolled back and "
+            "will be "
             f"retried: {'; '.join(failures)}"
         )
     return reverted
@@ -514,10 +528,12 @@ def _revert_one_grant(
                 actor=actor,
                 client=client,
             )
-        detail = (
-            f"Temporary grant expired; budget restored to "
-            f"{request.previous_limit if request.previous_limit is not None else 'none'}."
+        restored = (
+            credits_text.credits(request.previous_limit)
+            if request.previous_limit is not None
+            else "none"
         )
+        detail = f"Temporary grant expired; budget restored to {restored}."
     else:
         # The limit was changed (or removed) since the grant, so there is
         # nothing safe to undo. Record that we stood down.

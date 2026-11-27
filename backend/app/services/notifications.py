@@ -13,6 +13,7 @@ import logging
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -190,8 +191,18 @@ def monitor_only_key(limit_id: int, period_key: str) -> str:
     return f"monitor:{limit_id}:{period_key}"
 
 
-def enforcement_key(action_id: int) -> str:
-    return f"enforced:{action_id}"
+def _moment(at: datetime | None) -> str:
+    return at.strftime("%Y%m%dT%H%M%S%f") if at is not None else "-"
+
+
+def enforcement_key(action_id: int, applied_at: datetime | None = None) -> str:
+    """One "restricted" notice per application of a restriction.
+
+    A restriction lifted and applied again (a budget lowered after it was
+    raised) reuses its row, so the moment it was applied is part of the key:
+    every application is announced, not only the first.
+    """
+    return f"enforced:{action_id}:{_moment(applied_at)}"
 
 
 def reconcile_key(action_id: int, period_key: str) -> str:
@@ -214,8 +225,9 @@ def not_effective_key(action_id: int) -> str:
     return f"noteffective:{action_id}"
 
 
-def restoration_key(action_id: int) -> str:
-    return f"restored:{action_id}"
+def restoration_key(action_id: int, reversed_at: datetime | None = None) -> str:
+    """One "restored" notice per lift of a restriction (see ``enforcement_key``)."""
+    return f"restored:{action_id}:{_moment(reversed_at)}"
 
 
 def enforcement_failed_key(action_id: int, day: str) -> str:

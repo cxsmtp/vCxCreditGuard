@@ -47,6 +47,7 @@ from app.models.auth import (
     UtilityUser,
 )
 from app.models.enums import UtilityRole
+from app.services import wording
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -120,7 +121,7 @@ class AccountLocked(AuthError):
         minutes = max(1, round(retry_after_seconds / 60))
         super().__init__(
             f"This account is temporarily locked after repeated failed logins. "
-            f"Try again in about {minutes} minute(s)."
+            f"Try again in about {wording.plural(minutes, 'minute')}."
         )
 
 

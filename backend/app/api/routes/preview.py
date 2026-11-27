@@ -176,6 +176,7 @@ def get_dry_run(ctx: CurrentUser, db: DbSession) -> DryRunResponse:
         user_roles_note=result.user_roles_note,
         would_enforce_count=result.would_enforce_count,
         would_warn_count=result.would_warn_count,
+        would_breach_count=result.would_breach_count,
         affected_projects=result.affected_projects,
         affected_users=result.affected_users,
         rows=[
@@ -200,6 +201,7 @@ def get_dry_run(ctx: CurrentUser, db: DbSession) -> DryRunResponse:
                 note=row.note,
                 auto_triage_attributed=row.auto_triage_attributed,
                 recount_required=row.recount_required,
+                cannot_fully_bite=row.cannot_fully_bite,
             )
             for row in result.rows
         ],

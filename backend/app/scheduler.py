@@ -16,13 +16,14 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.db import instance_guard
 from app.db.session import get_engine, session_scope
-from app.services import settings_store
+from app.services import settings_store, wording
 from app.services.cycle import run_cycle
 
 logger = logging.getLogger(__name__)
 
 JOB_ID = "governance-cycle"
 UPDATE_JOB_ID = "update-check"
+FAST_JOB_ID = "fast-check"
 # Tolerate a late fire rather than dropping the run entirely.
 MISFIRE_GRACE_SECONDS = 300
 
@@ -93,6 +94,7 @@ def start() -> None:
     else:
         scheduler.add_job(_job, trigger=trigger, id=JOB_ID, replace_existing=True)
     _add_update_job(scheduler)
+    _apply_fast_job(scheduler)
     if not scheduler.running:
         scheduler.start()
     logger.info("Scheduler started with %s", describe_schedule())
@@ -122,9 +124,53 @@ def _add_update_job(scheduler: BackgroundScheduler) -> None:
     )
 
 
+def _fast_job() -> None:
+    if not instance_guard.still_held(get_engine()):
+        return
+    from app.services import fastcheck
+
+    fastcheck.run_scheduled()
+
+
+def _apply_fast_job(scheduler: BackgroundScheduler) -> None:
+    """The fast check (app/services/fastcheck.py): its own job, every few
+    seconds, while it and the scheduler are on."""
+    from app.services import fastcheck
+
+    with session_scope() as session:
+        on = settings_store.schedule_config(session).enabled
+        config = fastcheck.config(session)
+    if not (on and config.enabled):
+        if scheduler.get_job(FAST_JOB_ID) is not None:
+            scheduler.remove_job(FAST_JOB_ID)
+        return
+    scheduler.add_job(
+        _fast_job,
+        trigger=IntervalTrigger(seconds=config.interval_seconds, timezone="UTC"),
+        id=FAST_JOB_ID,
+        replace_existing=True,
+        misfire_grace_time=max(5, config.interval_seconds),
+    )
+
+
+def wake_fast_check(delay: float = 0.0) -> bool:
+    """Run the fast check as soon as possible (after ``delay`` seconds).
+    False when no fast check job runs in this process."""
+    from datetime import UTC, datetime, timedelta
+
+    if _scheduler is None or not _scheduler.running:
+        return False
+    job = _scheduler.get_job(FAST_JOB_ID)
+    if job is None:
+        return False
+    job.modify(next_run_time=datetime.now(UTC) + timedelta(seconds=max(0.0, delay)))
+    return True
+
+
 def reconfigure() -> str:
     """Apply the current settings to the running scheduler. Returns a description."""
     scheduler = get_scheduler()
+    _apply_fast_job(scheduler)
     trigger = _build_trigger()
     if trigger is None:
         if scheduler.get_job(JOB_ID) is not None:
@@ -143,7 +189,7 @@ def describe_schedule() -> str:
         return "disabled"
     if config.mode == "cron" and config.cron:
         return f"cron {config.cron} (UTC)"
-    return f"every {config.interval_minutes} minute(s)"
+    return f"every {wording.plural(config.interval_minutes, 'minute')}"
 
 
 def next_run_time():  # type: ignore[no-untyped-def]

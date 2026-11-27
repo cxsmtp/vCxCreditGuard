@@ -36,7 +36,14 @@ from app.models.enums import (
     LimitStatus,
 )
 from app.models.limits import CreditLimit, EnforcementAction, effective_project_actions
-from app.services import enforcement, evaluation, recount, role_sources, settings_store
+from app.services import (
+    enforcement,
+    evaluation,
+    headroom,
+    recount,
+    role_sources,
+    settings_store,
+)
 from app.services.periods import PeriodError, current_window
 
 
@@ -526,6 +533,26 @@ class DryRunRow:
     # A new restriction of a monthly or quarterly budget: it starts only if the
     # independent recount of the activity log agrees (app/services/recount.py).
     recount_required: bool = False
+    # Would be restricted, but keeps an AI role through a composite role or a
+    # group (read from the tenant for the Simulation): the note says which.
+    cannot_fully_bite: bool = False
+
+
+def cannot_fully_bite(blast: BlastRadius) -> str | None:
+    """ "keeps X through role ast-admin; Y through group /G" for the users this
+    restriction would leave an AI role, or None when every read user loses them all."""
+    parts: list[str] = []
+    for user in blast.user_roles:
+        if not user.read or not user.kept:
+            continue
+        through: dict[str, list[str]] = {}
+        for role in user.kept:
+            through.setdefault(" and ".join(role.sources), []).append(role.name)
+        kept = "; ".join(f"{', '.join(names)} through {where}" for where, names in through.items())
+        nothing = "" if user.removed else "nothing to remove, "
+        who = f"{user.user_label or user.user_id} " if len(blast.user_roles) > 1 else ""
+        parts.append(f"{who}{nothing}keeps {kept}")
+    return "; ".join(parts) or None
 
 
 @dataclass(slots=True)
@@ -533,7 +560,10 @@ class DryRunResult:
     generated_at: datetime
     rows: list[DryRunRow] = field(default_factory=list)
     would_enforce_count: int = 0
+    # Near the limit, not over it (projected status "warned").
     would_warn_count: int = 0
+    # Over the limit (or restricting early), whether or not it is restricted.
+    would_breach_count: int = 0
     affected_projects: int = 0
     affected_users: int = 0
     # Set when more users would be restricted than one preview reads roles for.
@@ -587,6 +617,8 @@ def dry_run(
         result.rows.append(row)
         if row.projected_status == LimitStatus.WARNED:
             result.would_warn_count += 1
+        elif row.projected_status == LimitStatus.BREACHED:
+            result.would_breach_count += 1
         if row.would_enforce:
             result.would_enforce_count += 1
             if row.blast is not None:
@@ -676,7 +708,9 @@ def _project_one(
     percent = float(credits_used) / limit.credit_limit * 100 if limit.credit_limit > 0 else 100.0
     threshold = Decimal(limit.credit_limit) * Decimal(limit.warning_threshold_pct) / 100
 
-    if credits_used >= Decimal(limit.credit_limit):
+    # The limit, or earlier with a headroom (app/services/headroom.py).
+    held_back = index.headroom.for_limit(limit)
+    if credits_used >= headroom.restrict_at(limit, held_back):
         projected = LimitStatus.BREACHED
     elif credits_used >= threshold:
         projected = LimitStatus.WARNED
@@ -687,6 +721,7 @@ def _project_one(
     would_enforce = False
     note: str | None = None
     recount_required = False
+    cannot_bite = False
     on_summary = (
         evaluation.summary_hold(
             session,
@@ -701,11 +736,16 @@ def _project_one(
     )
     if on_summary is not None and evaluation.restriction_started(session, limit.id, window.key):
         on_summary = None  # a restriction in force stays (and is shown as such)
+    early = headroom.early_phrase(
+        limit, credits_used, held_back.credits if held_back.active else None
+    )
     if projected == LimitStatus.BREACHED:
         if exempt:
             note = "Would breach, but the entity is exempt."
         elif not limit.enforce:
             note = "Would breach, but the limit is monitor only."
+        elif on_summary == evaluation.AUTO_TRIAGE_HOLD:
+            note = f"Would breach, but not be restricted, because {on_summary}."
         elif on_summary is not None:
             note = f"Would breach on summary totals, but not be restricted, because {on_summary}."
         else:
@@ -735,6 +775,14 @@ def _project_one(
                     "Would breach and enforce, but no Checkmarx connection is configured, "
                     "so the restriction would be deferred until one is."
                 )
+            kept = cannot_fully_bite(blast) if would_enforce else None
+            if kept is not None:
+                cannot_bite = True
+                bite = f"Would enforce: Yes (cannot fully bite: {kept})."
+                note = f"{bite} {note}" if note else bite
+            if would_enforce and early is not None:
+                restrict_early = f"Would restrict early: {early}."
+                note = f"{note} {restrict_early}" if note else restrict_early
             if would_enforce and recount.applies(session, limit, window):
                 recount_required = True
                 note = f"{note} {recount.PREVIEW_NOTE}" if note else recount.PREVIEW_NOTE
@@ -757,4 +805,5 @@ def _project_one(
         period_key=window.key,
         auto_triage_attributed=auto_triage,
         recount_required=recount_required,
+        cannot_fully_bite=cannot_bite,
     )

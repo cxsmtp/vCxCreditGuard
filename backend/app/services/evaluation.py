@@ -77,8 +77,10 @@ from app.models.org import (
 from app.models.usage import BudgetUsage
 from app.services import (
     auto_triage_attribution,
+    credits_text,
     enforcement,
     error_text,
+    headroom,
     ingestion,
     ledger,
     notifications,
@@ -86,6 +88,7 @@ from app.services import (
     recount,
     settings_store,
     usage_mix,
+    wording,
 )
 from app.services.audit import AuditActor, record_audit
 from app.services.periods import PeriodError, PeriodWindow, current_window, describe_window
@@ -192,6 +195,8 @@ class UsageIndex:
         self._log_counted: dict[str, dict[int, Decimal]] = {}
         self._restriction_hold: object = False
         self._exempt: set[tuple[str, str]] | None = None
+        # Each budget's headroom (app/services/headroom.py), read once.
+        self.headroom = headroom.Resolver(session)
 
     def counter(self, limit_id: int, period_key: str) -> tuple[Decimal, dict[str, int]] | None:
         """A limit's ledger counter for a period, read for every limit at once
@@ -400,8 +405,15 @@ def evaluate_all(
     client: CheckmarxClient | None = None,
     now: datetime | None = None,
     actor: AuditActor | None = None,
+    only: frozenset[int] | None = None,
 ) -> EvaluationResult:
     """Evaluate every active limit, warn, enforce and handle period rollover.
+
+    ``only``: the fast check (app/services/fastcheck.py) evaluates and
+    enforces just these budgets, with every gate of a cycle (the pause and
+    the safety ceilings, ``summary_hold``, the recount) and none of its
+    housekeeping: no closed-period settling, no sweep of unjustified
+    restrictions and no verification pass. The full cycle does those.
 
     ``client`` may be omitted to evaluate without any possibility of a write to
     Checkmarx, which is what the monitor-only path and the tests use.
@@ -424,7 +436,8 @@ def evaluate_all(
     result = EvaluationResult()
     # Periods already over whose counters grew since they were last evaluated
     # (an increase observed before the rollover, evaluated after it).
-    _settle_closed_periods(session, moment)
+    if only is None:
+        _settle_closed_periods(session, moment)
     # What the project budgets are now, recorded before any limit is judged:
     # the integration-account rule for auto-triage charges reads it, and a
     # past charge's outcome must never change (app/services/activity_source.py).
@@ -445,14 +458,17 @@ def evaluate_all(
             writes=config.max_writes_per_cycle or None,
             postpone_large=LARGE_ROLLOUT_WRITES if config.max_writes_per_cycle else None,
         )
-        _lift_unjustified_restrictions(session, client, actor=actor, result=result, budget=budget)
-        try:
-            enforcement.return_roles_outside_the_restriction(
-                session, client, actor=actor, resolver=resolver
+        if only is None:
+            _lift_unjustified_restrictions(
+                session, client, actor=actor, result=result, budget=budget
             )
-        except Exception:  # noqa: BLE001 - a housekeeping pass must not stop the cycle
-            session.rollback()
-            logger.warning("Could not return roles outside the restriction", exc_info=True)
+            try:
+                enforcement.return_roles_outside_the_restriction(
+                    session, client, actor=actor, resolver=resolver
+                )
+            except Exception:  # noqa: BLE001 - a housekeeping pass must not stop the cycle
+                session.rollback()
+                logger.warning("Could not return roles outside the restriction", exc_info=True)
         # Decided once, before anything is restricted: either the whole cycle
         # may apply new restrictions or none of it may. Giving access back is
         # never held up by this.
@@ -477,6 +493,8 @@ def evaluate_all(
             select(CreditLimit.id).where(CreditLimit.is_active.is_(True)).order_by(CreditLimit.id)
         )
     )
+    if only is not None:
+        limit_ids = [limit_id for limit_id in limit_ids if limit_id in only]
     for limit_id in limit_ids:
         # Re-read at the start of each limit's own transaction: an admin may have
         # edited, disabled or deleted it while earlier limits were being worked on.
@@ -538,6 +556,27 @@ def evaluate_all(
     # Pass 2: read back the restrictions in force chosen for this cycle.
     if result.enforcement_paused is None:
         result.enforcement_paused = _manual_pause(session)
+    if only is not None:
+        # The fast check: no verification pass (the full cycle's), and no
+        # restriction in force is read back by the enforcement below.
+        budget.verify_ids = frozenset()
+        if result.enforcement_paused is None and to_enforce and recounter is not None:
+            _prepare_recount(session, recounter, to_enforce, moment=moment)
+        if result.enforcement_paused is None and to_enforce:
+            budget.postpone_large = None
+            _enforce_pending(
+                session,
+                client,
+                to_enforce,
+                moment=moment,
+                actor=actor,
+                resolver=resolver,
+                result=result,
+                budget=budget,
+                recounter=recounter,
+            )
+        result.pacing = {"writes": budget.as_stats()}
+        return result
     plan = _plan_verification(
         session,
         config,
@@ -687,6 +726,7 @@ def _owners(
         limit.id: limit
         for limit in session.scalars(select(CreditLimit).where(CreditLimit.id.in_(limit_ids)))
     }
+    headrooms = headroom.Resolver(session, moment)
     exempt = {
         (str(kind), eid)
         for kind, eid in session.execute(select(Exemption.entity_type, Exemption.entity_id))
@@ -788,7 +828,7 @@ def _owners(
                 and window.is_active
                 and state is not None
                 and state.usage_available
-                and state.credits_used < Decimal(limit.credit_limit)
+                and state.credits_used < headrooms.restrict_at(limit)
             )
             owners[row.id] = OWNER_LIFTING if within_budget else OWNER_KEPT
         if owners[row.id] == OWNER_KEPT and ((row.target_type, row.target_id) in deleted):
@@ -1034,7 +1074,8 @@ def _notify_unverified(
         category=notifications.CATEGORY_ENFORCEMENT,
         severity=Severity.WARNING,
         title=(
-            f"{total:,} restriction(s) in force not confirmed in Checkmarx One for more than "
+            f"{wording.plural(total, 'restriction')} in force not confirmed in Checkmarx One "
+            f"for more than "
             f"{hours:g} hours (not read back)"
         ),
         body=(
@@ -1191,6 +1232,15 @@ def _enforce_pending(
                 evaluation = by_limit.get(limit.id)
                 if evaluation is not None:
                     evaluation.note = held
+                state.status_note = _status_note(held)
+                _notify_breach(
+                    session,
+                    limit,
+                    state,
+                    window,
+                    exempt=False,
+                    outcome=(f"Enforcement is on. {held}", False),
+                )
                 session.commit()
                 continue
             outcome = enforcement.apply_enforcement(
@@ -1214,8 +1264,13 @@ def _enforce_pending(
             if _has_active_enforcement(session, limit.id, window.key):
                 state.status = LimitStatus.RESTRICTED
                 state.restricted_at = state.restricted_at or moment
+            tail, note, restricted = _enforcement_result(session, limit, window.key, outcome)
+            state.status_note = _status_note(note)
+            _notify_breach(session, limit, state, window, exempt=False, outcome=(tail, restricted))
             evaluation = by_limit.get(limit.id)
             if evaluation is not None:
+                if note is not None and not restricted:
+                    evaluation.note = note
                 evaluation.status = state.status
                 earlier = evaluation.enforced
                 if earlier is not None:
@@ -1268,12 +1323,21 @@ def _count_deferred(
             continue
         if _would_start_restricting(session, limit, window.key):
             result.deferred += 1
+            note = (
+                f"Enforcement is paused, so no restriction was applied. {result.enforcement_paused}"
+            )
             evaluation = next((e for e in result.evaluations if e.limit.id == limit_id), None)
             if evaluation is not None:
-                evaluation.note = (
-                    f"Enforcement is paused, so no restriction was applied. "
-                    f"{result.enforcement_paused}"
+                evaluation.note = note
+            state = session.scalar(
+                select(LimitPeriodState).where(
+                    LimitPeriodState.limit_id == limit.id,
+                    LimitPeriodState.period_key == window.key,
                 )
+            )
+            if state is not None:
+                state.status_note = _status_note(note)
+                _notify_breach(session, limit, state, window, exempt=False, paused=True)
 
 
 def _manual_pause(session: Session) -> str | None:
@@ -1773,6 +1837,10 @@ def _evaluate_one(
         float(state.credits_used) / limit.credit_limit * 100 if limit.credit_limit > 0 else 100.0
     )
     threshold_credits = Decimal(limit.credit_limit) * Decimal(limit.warning_threshold_pct) / 100
+    # Restricts at the limit, or earlier with a headroom (app/services/headroom.py).
+    held_back = index.headroom.for_limit(limit)
+    restrict_at = headroom.restrict_at(limit, held_back)
+    state.headroom_credits = held_back.credits if held_back.active else None
 
     evaluation = LimitEvaluation(
         limit=limit,
@@ -1799,21 +1867,34 @@ def _evaluate_one(
         # A restriction already in force (or started) stays in force.
         on_summary = None
 
-    if state.credits_used >= Decimal(limit.credit_limit):
+    if state.credits_used >= restrict_at:
         state.status = LimitStatus.BREACHED
+        # An enforcing limit this cycle restricts is announced once the
+        # restriction has been tried (``_enforce_pending``), so the notice says
+        # what happened rather than what was about to.
+        awaits_enforcement = (
+            limit.enforce
+            and not exempt
+            and on_summary is None
+            and client is not None
+            and hold is None
+            and to_enforce is not None
+        )
         if state.breached_at is None:
             state.breached_at = moment
             evaluation.newly_breached = True
             result.breached += 1
-            _notify_breach(
-                session,
-                limit,
-                state,
-                window,
-                exempt=exempt,
-                paused=hold is not None,
-                on_summary=on_summary,
-            )
+            if not awaits_enforcement:
+                _notify_breach(
+                    session,
+                    limit,
+                    state,
+                    window,
+                    exempt=exempt,
+                    paused=hold is not None,
+                    on_summary=on_summary,
+                )
+        early = headroom.early_phrase(limit, state.credits_used, state.headroom_credits)
         if exempt:
             evaluation.note = "Exempt from enforcement."
         elif not limit.enforce:
@@ -1823,7 +1904,9 @@ def _evaluate_one(
             # Over budget on summary totals: warned, never restricted.
             result.summary_held += 1
             evaluation.note = (
-                f"Over budget on summary totals; not restricted, because {on_summary}."
+                f"Over budget; not restricted, because {on_summary}."
+                if on_summary == AUTO_TRIAGE_HOLD
+                else f"Over budget on summary totals; not restricted, because {on_summary}."
             )
         elif client is None:
             evaluation.note = "No Checkmarx connection available, enforcement deferred."
@@ -1833,14 +1916,21 @@ def _evaluate_one(
             evaluation.note = f"Enforcement is paused, so no restriction was applied. {hold}"
             if _would_start_restricting(session, limit, window.key):
                 result.deferred += 1
+            if not _has_active_enforcement(session, limit.id, window.key):
+                # Breached earlier, while not paused, and not announced yet
+                # (once per period: the notice is deduplicated).
+                _notify_breach(session, limit, state, window, exempt=False, paused=True)
+            else:
+                evaluation.note = (
+                    "Enforcement is paused: the restriction in force stays, and nothing new is "
+                    f"restricted. {hold}"
+                )
         elif to_enforce is not None:
-            # Applied after every lift of the cycle (evaluate_all).
+            # Applied after every lift of the cycle (evaluate_all), and
+            # announced then.
             to_enforce.append(limit.id)
-            if not evaluation.newly_breached:
-                # Breached earlier without a restriction (held on summary
-                # totals, say): the restriction now starting is announced.
-                # Raised once per period (the notice is deduplicated).
-                _notify_breach(session, limit, state, window, exempt=False)
+            if early is not None:
+                evaluation.note = f"Restricted early: {early}."
         # RESTRICTED means "a restriction from this limit is in force for this
         # period", not "a restriction was newly applied this cycle". Deriving it
         # from the action rows keeps it true on every later cycle of the period,
@@ -1881,7 +1971,8 @@ def _evaluate_one(
                     lifting = True
                     state.status = LimitStatus.RESTRICTED
                     evaluation.note = (
-                        f"Within budget again: {restored:,} restriction(s) lifted this cycle, "
+                        f"Within budget again: {wording.plural(restored, 'restriction')} lifted "
+                        "this cycle, "
                         f"{left:,} left for the next cycles."
                     )
                 elif restored > 0:
@@ -1903,9 +1994,102 @@ def _evaluate_one(
 
     if state.status not in (LimitStatus.BREACHED, LimitStatus.RESTRICTED):
         _clear_rollout(state)
+        state.status_note = None
+    elif to_enforce is None or limit.id not in to_enforce:
+        # Over the limit and not enforced this cycle: why (exempt, monitor
+        # only, summary totals, paused, no connection). One enforced this
+        # cycle gets its note from the outcome (``_enforce_pending``).
+        state.status_note = _status_note(evaluation.note)
     evaluation.status = state.status
     session.flush()
     return evaluation
+
+
+def _status_note(text: str | None) -> str | None:
+    return text[:1000] if text else None
+
+
+def _enforcement_result(
+    session: Session,
+    limit: CreditLimit,
+    period_key: str,
+    outcome: enforcement.EnforcementOutcome,
+) -> tuple[str, str | None, bool]:
+    """What enforcing a breached limit did this time, in words.
+
+    Returns the breach notice's closing sentence, the note the Budgets page
+    shows next to the status (None when restricted with nothing more to say)
+    and whether a restriction is in force. Every path that enforces (the
+    cycle, the fast check) says it the same way.
+    """
+    if outcome.applied or _has_active_enforcement(session, limit.id, period_key):
+        tail = "Enforcement is on, so access was restricted."
+        note: str | None = None
+        kept = [
+            sentence
+            for action in session.scalars(
+                select(EnforcementAction).where(
+                    EnforcementAction.limit_id == limit.id,
+                    EnforcementAction.period_key == period_key,
+                    EnforcementAction.status == EnforcementStatus.APPLIED,
+                    EnforcementAction.kind == EnforcementKind.REMOVE_USER_ROLES,
+                )
+            )
+            if (
+                sentence := enforcement.cannot_bite_sentence(
+                    action.target_label or action.target_id, action.undo_snapshot or {}
+                )
+            )
+        ]
+        if kept:
+            note = f"Restricted, but it cannot fully bite. {kept[0]}"
+            tail = f"{tail} It cannot fully bite. {kept[0]}"
+        if outcome.deferred:
+            more = (
+                f"{outcome.deferred_targets:,} more are restricted by the next cycles "
+                "(this cycle's changes ran out)."
+            )
+            tail = f"{tail} {more}"
+            note = f"{note} {more}" if note else f"Restricting: {more}"
+        return tail, note, True
+    why = (
+        enforcement.protection_reason(session, limit.entity_id)
+        if limit.entity_type == EntityType.USER
+        else None
+    )
+    if why is not None:
+        return (
+            f"Enforcement is on, but access was not restricted, because {why}. "
+            f"{enforcement.protection_remedy(why)}",
+            f"Not restricted: {why}.",
+            False,
+        )
+    if outcome.failed:
+        return (
+            "Enforcement is on, but the restriction could not be applied; it is tried again "
+            "on the next cycle (the error is in the Notification Center).",
+            "Not restricted yet: the restriction failed and is retried on the next cycle.",
+            False,
+        )
+    if outcome.deferred or outcome.postponed:
+        return (
+            "Enforcement is on; the restriction is applied by the next cycle (this cycle's "
+            "changes ran out).",
+            "Deferred: restricted by the next cycle (this cycle's changes ran out).",
+            False,
+        )
+    if outcome.skipped:
+        reason = outcome.skipped[0].rstrip(".")
+        return (
+            f"Enforcement is on, but nothing was restricted: {reason}.",
+            f"Not restricted: {reason}.",
+            False,
+        )
+    return (
+        "Enforcement is on, but there is nothing to restrict.",
+        "Not restricted: nothing to restrict.",
+        False,
+    )
 
 
 def _in_force_count(session: Session, limit_id: int, period_key: str) -> int:
@@ -1999,6 +2183,14 @@ def counts_from_totals(session: Session, limit: CreditLimit, window: PeriodWindo
     )
 
 
+# Why a budget over its limit only through Auto Triage charged from the
+# person's scans is not restricted (``summary_hold``).
+AUTO_TRIAGE_HOLD = (
+    "only the Auto Triage credits charged from scans they started take it over the limit, "
+    "and those never start a restriction"
+)
+
+
 def summary_hold(
     session: Session,
     *,
@@ -2016,18 +2208,25 @@ def summary_hold(
     tell a glitch from a real fall, so only the log's part may start a new
     restriction; summary-counted usage warns. So do the auto-triage credits
     charged to the person who started the scan: they always derive from the
-    summary's project readings (they still count towards the figure). Not for a
-    budget that counts current totals (lifetime, custom, count existing
-    usage, a demo budget), and not when the admin chose the summary only and
-    allowed restrictions from it (``usage.summary_restricts``). A restriction
-    already in force is not affected (the caller checks)."""
-    if credits_used < Decimal(limit.credit_limit):
+    summary's project readings (they still count towards the figure). That
+    rule holds for every budget: when the person's own usage is under the
+    limit and only the auto-triage credits take it over, nothing is
+    restricted, whatever the budget counts or the settings allow. The
+    summary rule itself is not for a budget that counts current totals
+    (lifetime, custom, count existing usage, a demo budget), and not when the
+    admin chose the summary only and allowed restrictions from it
+    (``usage.summary_restricts``). A restriction already in force is not
+    affected (the caller checks)."""
+    restrict_at = index.headroom.restrict_at(limit)
+    if credits_used < restrict_at:
         return None
+    if attributed and attributed > 0 and credits_used - attributed < restrict_at:
+        return AUTO_TRIAGE_HOLD
     if counts_from_totals(session, limit, window):
         return None
     if settings_store.summary_restricts(session):
         return None
-    if index.log_counter(limit.id, window.key) >= Decimal(limit.credit_limit):
+    if index.log_counter(limit.id, window.key) >= restrict_at:
         return None
     hold = index.restriction_hold
     if hold is None:
@@ -2278,6 +2477,11 @@ def _close_stale_periods(
 # ------------------------------------------------------------------ notifications
 
 
+def _possessive(limit: CreditLimit) -> str:
+    """ "their" for a person, "its" for a project, group or application."""
+    return "their" if limit.entity_type == EntityType.USER else "its"
+
+
 def _notify_warning(
     session: Session,
     limit: CreditLimit,
@@ -2291,10 +2495,12 @@ def _notify_warning(
         category=notifications.CATEGORY_WARNING,
         severity=Severity.WARNING,
         title=(
-            f"{limit.entity_type.capitalize()} {entity} reached {percent:.0f}% of its credit limit"
+            f"{limit.entity_type.capitalize()} {entity} reached {wording.percent(percent)} of "
+            f"{_possessive(limit)} credit limit"
         ),
         body=(
-            f"{state.credits_used} of {limit.credit_limit} credits used "
+            f"{credits_text.credits(state.credits_used)} of "
+            f"{credits_text.credits(limit.credit_limit)} credits used "
             f"{describe_window(window)}. The warning threshold is "
             f"{limit.warning_threshold_pct}%.\n"
             f"{'Enforcement is on' if limit.enforce else 'This limit is monitor only'}, "
@@ -2317,10 +2523,23 @@ def _notify_breach(
     exempt: bool,
     paused: bool = False,
     on_summary: str | None = None,
+    outcome: tuple[str, bool] | None = None,
 ) -> None:
+    """The breach notice, once per period.
+
+    ``outcome``: what enforcing it did (the closing sentence, and whether a
+    restriction is in force), for a limit the cycle has just tried to
+    restrict. An enforcing limit without one was not tried: enforcement is
+    paused, or there is no connection.
+    """
     entity = limit.entity_label or limit.entity_id
+    restricting = False
     if exempt:
         tail = "This entity is on the exemption list, so no action was taken."
+        severity = Severity.WARNING
+        dedupe = notifications.monitor_only_key(limit.id, window.key)
+    elif limit.enforce and on_summary == AUTO_TRIAGE_HOLD:
+        tail = f"Not restricted, because {on_summary}."
         severity = Severity.WARNING
         dedupe = notifications.monitor_only_key(limit.id, window.key)
     elif limit.enforce and on_summary is not None:
@@ -2338,9 +2557,16 @@ def _notify_breach(
         )
         severity = Severity.CRITICAL
         dedupe = notifications.breach_key(limit.id, window.key)
+    elif limit.enforce and outcome is not None:
+        tail, restricting = outcome
+        severity = Severity.CRITICAL if restricting else Severity.WARNING
+        dedupe = notifications.breach_key(limit.id, window.key)
     elif limit.enforce:
-        tail = "Enforcement is on, so access is being restricted now."
-        severity = Severity.CRITICAL
+        tail = (
+            "This limit enforces, but no Checkmarx One connection is available, so nothing "
+            "has been restricted. It will be once the connection works, if still over."
+        )
+        severity = Severity.WARNING
         dedupe = notifications.breach_key(limit.id, window.key)
     else:
         tail = "This limit is monitor only, so no action was taken."
@@ -2365,6 +2591,13 @@ def _notify_breach(
             f"{usage_mix.format_credits(state.credits_used)} of "
             f"{usage_mix.format_credits(limit.credit_limit)} credits used {when}."
         )
+    early = headroom.early_phrase(limit, state.credits_used, state.headroom_credits)
+    title = f"{limit.entity_type.capitalize()} {entity} reached {_possessive(limit)} credit limit"
+    if early is not None:
+        # Not over budget: inside the headroom kept before the limit.
+        title = f"{limit.entity_type.capitalize()} {entity} is nearly out of credits"
+        first = "Restricted early" if restricting else "Inside the headroom"
+        tail = f"{first}: {early}. {tail}"
     lines = [headline, tail]
     if limit.enforce and not exempt:
         kind = usage_mix.restriction_kind_for(limit.entity_type)
@@ -2388,7 +2621,7 @@ def _notify_breach(
         if not limit.enforce
         else notifications.CATEGORY_ENFORCEMENT,
         severity=severity,
-        title=f"{limit.entity_type.capitalize()} {entity} reached its credit limit",
+        title=title,
         body="\n".join(lines),
         entity_type=limit.entity_type,
         entity_id=limit.entity_id,
@@ -2437,7 +2670,8 @@ def restore_on_limit_change(
                 target_id=str(limit.id),
                 target_label=limit.entity_label,
                 detail=(
-                    f"{restored} restriction(s) lifted because the limit changed ({reason}); "
+                    f"{wording.plural(restored, 'restriction')} lifted because the limit changed "
+                    f"({enforcement.reason_text(reason)}); "
                     f"{budget.writes_deferred - deferred_before} more are lifted by the next "
                     "cycles."
                 ),
@@ -2465,7 +2699,10 @@ def restore_on_limit_change(
             target_type="credit_limit",
             target_id=str(limit.id),
             target_label=limit.entity_label,
-            detail=f"{restored} restriction(s) lifted because the limit changed ({reason}).",
+            detail=(
+                f"{wording.plural(restored, 'restriction')} lifted because the limit changed "
+                f"({enforcement.reason_text(reason)})."
+            ),
         )
     return restored
 

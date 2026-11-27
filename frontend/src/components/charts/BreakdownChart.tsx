@@ -150,7 +150,7 @@ export function BreakdownChart({ items }: Props) {
                 <Td>{labelOf(row)}</Td>
                 <Td align="right">{usesCredits ? formatCredits(row.credits) : ""}</Td>
                 <Td align="right">{formatNumber(row.transactions)}</Td>
-                <Td align="right">{formatPercent(row.percent_of_total, 1)}</Td>
+                <Td align="right">{formatPercent(row.percent_of_total)}</Td>
                 {anyPrice && (
                   <Td align="right">
                     {priceOf(row)}
@@ -187,7 +187,7 @@ export function BreakdownChart({ items }: Props) {
                         light-mode contrast warning on some series colours. */}
                     <span className="tabular whitespace-nowrap" style={{ color: "var(--text-secondary)" }}>
                       {usesCredits ? `${formatCredits(value)} credits` : `${formatNumber(value)} actions`}
-                      {row.percent_of_total ? ` (${formatPercent(row.percent_of_total, 1)})` : ""}
+                      {row.percent_of_total ? ` (${formatPercent(row.percent_of_total)})` : ""}
                     </span>
                   </div>
                   {/* Track plus a thin mark with 4px rounded data-end. */}

@@ -57,7 +57,14 @@ from app.db.base import utcnow
 from app.models.activity import is_subject_entity
 from app.models.enums import EntityType, PeriodType, Severity
 from app.models.limits import CreditLimit
-from app.services import activity_source, error_text, notifications, pacing, settings_store
+from app.services import (
+    activity_source,
+    credits_text,
+    error_text,
+    notifications,
+    pacing,
+    settings_store,
+)
 from app.services.periods import PeriodError, PeriodWindow, current_window
 
 logger = logging.getLogger(__name__)
@@ -281,7 +288,12 @@ class Recounter:
             logger.exception("The recount failed")
             return Verdict(agrees=None, reason=f"the recount failed ({exc})"[:500])
         recount = fetch.totals.get(limit.id, ZERO)
-        return Verdict(agrees=recount >= Decimal(limit.credit_limit), recount=recount)
+        # At or over where the budget restricts: its limit, less its headroom
+        # (app/services/headroom.py), the same rule as the evaluation.
+        from app.services import headroom
+
+        threshold = headroom.Resolver(session, self.now).restrict_at(limit)
+        return Verdict(agrees=recount >= threshold, recount=recount)
 
 
 # ------------------------------------------------------------- the gate
@@ -290,7 +302,12 @@ class Recounter:
 def _credits(value: Decimal | None) -> str:
     if value is None:
         return "unknown"
-    return f"{value.quantize(Decimal('0.01')).normalize():f}"
+    return credits_text.credits(value)
+
+
+def _stored(value: Decimal | None) -> str | None:
+    """The amount kept in the refusal record (read back by Diagnose, which words it)."""
+    return None if value is None else f"{value.quantize(Decimal('0.01')).normalize():f}"
 
 
 def gate(
@@ -347,8 +364,8 @@ def gate(
             "entity_label": str(entity),
             "period_key": window.key,
             "credit_limit": limit.credit_limit,
-            "counted": _credits(counted),
-            "recount": None if verdict.recount is None else _credits(verdict.recount),
+            "counted": _stored(counted),
+            "recount": _stored(verdict.recount),
             "reason": verdict.reason,
             "at": moment.isoformat(),
         },

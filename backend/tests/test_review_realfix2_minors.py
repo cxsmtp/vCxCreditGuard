@@ -64,7 +64,7 @@ class TestAutomationNoticeOnceEver:
         )
         assert notice is not None
         # Credits are written as credits, not as a raw decimal.
-        assert notice.body.startswith("40 credits"), notice.body
+        assert notice.body.startswith("40.0 credits"), notice.body
         # Cleared away (read and pruned): not raised again.
         db.execute(delete(Notification).where(Notification.id == notice.id))
         db.commit()

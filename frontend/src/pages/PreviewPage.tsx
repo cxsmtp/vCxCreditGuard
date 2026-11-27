@@ -75,7 +75,11 @@ export function PreviewPage({ isAdmin = false }: { isAdmin?: boolean }) {
     { key: "limit", header: "Credit limit", value: (r) => r.credit_limit },
     { key: "percent", header: "Percent used", value: (r) => (r.percent_used == null ? "" : r.percent_used.toFixed(1)) },
     { key: "status", header: "Projected status", value: (r) => r.projected_status },
-    { key: "enforce", header: "Would enforce", value: (r) => (r.would_enforce ? "yes" : "no") },
+    {
+      key: "enforce",
+      header: "Would enforce",
+      value: (r) => (r.would_enforce ? (r.cannot_fully_bite ? "yes (cannot fully bite)" : "yes") : "no"),
+    },
     { key: "projects", header: "Projects affected", value: (r) => r.blast?.affected_projects ?? 0 },
     { key: "users", header: "Users affected", value: (r) => r.blast?.affected_users ?? 0 },
     { key: "note", header: "Note", value: (r) => r.note ?? "" },
@@ -126,9 +130,10 @@ export function PreviewPage({ isAdmin = false }: { isAdmin?: boolean }) {
         <ErrorNote>The simulation could not be run.</ErrorNote>
       ) : (
         <div className="flex flex-col gap-6">
-          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-            <StatTile label="Would enforce" value={String(data.would_enforce_count)} tone={data.would_enforce_count > 0 ? "critical" : "neutral"} />
-            <StatTile label="Would warn" value={String(data.would_warn_count)} tone={data.would_warn_count > 0 ? "warning" : "neutral"} />
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
+            <StatTile label="Would breach" value={String(data.would_breach_count ?? 0)} detail="Over the limit" tone={(data.would_breach_count ?? 0) > 0 ? "critical" : "neutral"} />
+            <StatTile label="Would enforce" value={String(data.would_enforce_count)} detail="Of those, restricted" tone={data.would_enforce_count > 0 ? "critical" : "neutral"} />
+            <StatTile label="Would warn" value={String(data.would_warn_count)} detail="Near the limit, not over" tone={data.would_warn_count > 0 ? "warning" : "neutral"} />
             <StatTile label="Projects affected" value={String(data.affected_projects)} />
             <StatTile label="Users affected" value={String(data.affected_users)} />
           </div>
@@ -198,7 +203,14 @@ export function PreviewPage({ isAdmin = false }: { isAdmin?: boolean }) {
                       </Td>
                       <Td>
                         {row.would_enforce ? (
-                          <Badge tone="critical">Yes</Badge>
+                          <>
+                            <Badge tone="critical">Yes</Badge>
+                            {row.cannot_fully_bite && (
+                              <p className="mt-0.5 text-xs" style={{ color: "var(--status-warning)" }}>
+                                cannot fully bite
+                              </p>
+                            )}
+                          </>
                         ) : (
                           <span className="text-xs" style={{ color: "var(--text-muted)" }}>
                             No

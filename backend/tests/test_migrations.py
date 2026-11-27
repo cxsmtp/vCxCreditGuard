@@ -41,6 +41,7 @@ EXPECTED_TABLES = {
     "enforcement_action",
     "enforcement_selftest",
     "exemption",
+    "fusion_scan_cost",
     "limit_period_state",
     "login_attempt",
     "notification",

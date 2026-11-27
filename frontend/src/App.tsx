@@ -20,6 +20,7 @@ import { RequestsPage } from "./pages/RequestsPage";
 import { SettingsPage, type SettingsSection } from "./pages/SettingsPage";
 import { AboutPage } from "./pages/AboutPage";
 import { SetupPage } from "./pages/SetupPage";
+import { DiagnosePage, NotFoundPage } from "./pages/StatusPages";
 import { ViolationsPage } from "./pages/ViolationsPage";
 
 type AuthState = "checking" | "signedOut" | "signedIn";
@@ -56,7 +57,7 @@ function SettingsRoute({
   onSettingsSaved: () => Promise<unknown>;
 }) {
   const { section } = useParams();
-  if (!SECTIONS.includes(section as SettingsSection)) return <Navigate to="/settings/general" replace />;
+  if (!SECTIONS.includes(section as SettingsSection)) return <NotFoundPage />;
   // Accounts, backups and health, and updates are an admin's only.
   if (!isAdmin && (section === "accounts" || section === "operations" || section === "updates")) {
     return <Navigate to="/settings/general" replace />;
@@ -208,6 +209,7 @@ export function App() {
   }
 
   const isAdmin = me.role === "admin";
+  const needsTwoFactor = isAdmin && !me.totp_enabled;
 
   return (
     <AppShell me={me} unreadCount={unread} onSignOut={signOut} onMeChanged={refreshMe}>
@@ -215,7 +217,8 @@ export function App() {
         <Navigate to="/setup" replace />
       )}
       <Routes>
-        <Route path="/" element={<DashboardPage isAdmin={isAdmin} />} />
+        <Route path="/" element={<DashboardPage isAdmin={isAdmin} needsTwoFactor={needsTwoFactor} />} />
+        <Route path="/diagnose" element={<DiagnosePage needsTwoFactor={needsTwoFactor} />} />
         <Route path="/setup" element={<SetupPage isAdmin={isAdmin} onConnected={loadMe} />} />
         <Route path="/limits" element={<LimitsPage isAdmin={isAdmin} />} />
         <Route path="/preview" element={<PreviewPage isAdmin={isAdmin} />} />
@@ -241,7 +244,7 @@ export function App() {
           path="/account"
           element={<AccountPage me={me} onChanged={loadMe} onPasswordChanged={passwordChanged} />}
         />
-        <Route path="*" element={<Navigate to="/" replace />} />
+        <Route path="*" element={<NotFoundPage />} />
       </Routes>
     </AppShell>
   );

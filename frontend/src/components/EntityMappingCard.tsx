@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { ApiError, api } from "../api/client";
 import type { OrgEntity, UnmatchedEntity } from "../api/types";
 import { useResource } from "../hooks/useResource";
-import { formatCredits } from "../lib/format";
+import { formatCredits, withArticle } from "../lib/format";
 import { useToast } from "../lib/ui-context";
 import {
   Badge,
@@ -151,7 +151,15 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
             {data.map((row) => (
               <tr key={`${row.view}:${row.subject_key}`}>
                 <Td>
-                  <span className="text-sm">{row.name}</span>
+                  <span className="text-sm">
+                    {row.name}
+                    {row.deleted && " (deleted)"}
+                  </span>
+                  {row.deleted && (
+                    <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
+                      Deleted in Checkmarx One: counted tenant wide, towards no project budget.
+                    </span>
+                  )}
                 </Td>
                 <Td>{row.view === "project" ? "Project" : "Application"}</Td>
                 <Td align="right">
@@ -182,7 +190,7 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
                       setQuery(row.name.split("/").pop() ?? "");
                     }}
                   >
-                    {row.mapped_entity_id ? "Change" : `Map to a ${row.view}`}
+                    {row.mapped_entity_id ? "Change" : `Map to ${withArticle(row.view)}`}
                   </button>
                 </Td>
               </tr>
@@ -200,7 +208,7 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
 
       <Modal
         open={mapping !== null}
-        title={mapping ? `Map this usage to a ${mapping.view}` : ""}
+        title={mapping ? `Map this usage to ${withArticle(mapping.view)}` : ""}
         description={mapping ? `Reported as ${mapping.name}` : ""}
         onClose={() => setMapping(null)}
       >

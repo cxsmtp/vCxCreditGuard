@@ -16,6 +16,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.checkmarx import credits as credits_api
 from app.models.enums import EntityType, LimitStatus, UsageView
 from app.models.limits import CreditLimit, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxProjectGroup, CxUser
@@ -27,6 +28,7 @@ from app.models.usage import (
 )
 from app.services import auto_triage_attribution, ingestion, settings_store
 from app.services.periods import PeriodError, current_window, describe_window
+from app.services.subject_matching import MatchMethod
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,12 @@ class CreditPool:
     collected_at: object
     assigned: Decimal
     over_allocation: Decimal | None
+    # Granted - Used - Available, when Checkmarx sent all three itself and they
+    # do not add up (its own figures; none is derived here). Shown as it is,
+    # never filled in or explained away.
+    unexplained: Decimal | None = None
+    # Other figures /credits/info carries (a reserved amount, say), as given.
+    other_figures: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -118,6 +126,18 @@ class AttributionSummary:
     user_total_credits: Decimal = Decimal("0")
     projects: UnmatchedEntities = field(default_factory=UnmatchedEntities)
     applications: UnmatchedEntities = field(default_factory=UnmatchedEntities)
+    # The tenant total of the same window (action view, else user view), and
+    # how much of it the project view does not account for: usage Checkmarx
+    # reported under no project row, or a row the read did not return. Shown,
+    # so no project usage vanishes without a trace.
+    tenant_total_credits: Decimal | None = None
+    projects_unreported: Decimal = Decimal("0")
+    # So the counts reconcile with Settings → Attribution: unmatched people
+    # waiting under Disputes (the rest are under Unmatched), and automation
+    # that is Checkmarx One's own (Auto Triage, Auto Remediation), which that
+    # page does not list (the rest are listed under Unmatched, marked).
+    unmatched_people_disputed: int = 0
+    automation_builtin: int = 0
 
 
 @dataclass
@@ -154,6 +174,13 @@ def credit_pool(session: Session) -> CreditPool:
 
     total = snapshot.total_credits if snapshot else None
     over = total is not None and assigned_dec > total
+    raw = snapshot.raw if snapshot is not None else None
+    unexplained = None
+    granted, used, available = credits_api.reported_figures(raw)
+    if granted is not None and used is not None and available is not None:
+        gap = granted - used - available
+        if gap != 0:
+            unexplained = gap
     return CreditPool(
         total=total,
         used=snapshot.used_credits if snapshot else None,
@@ -161,6 +188,8 @@ def credit_pool(session: Session) -> CreditPool:
         collected_at=snapshot.collected_at if snapshot else None,
         assigned=assigned_dec,
         over_allocation=(assigned_dec - total) if over else None,
+        unexplained=unexplained,
+        other_figures=credits_api.other_figures(raw) if unexplained is not None else {},
     )
 
 
@@ -284,30 +313,55 @@ def automation_keys(session: Session, keys: list[str]) -> set[str]:
 
 
 def top_users(session: Session, *, limit: int = DEFAULT_TOP_N) -> list[Consumer]:
+    """The largest consumers, one row per person.
+
+    Every handle that counts towards one user (their email and a mapped
+    handle, say) is one row with their credits added up, as their budget
+    counts them. Rows that would still read the same (a separate account
+    that shares a person's display name) carry the reported handle."""
     records = latest_snapshot_records(session, UsageView.USER)
     total = sum((record.credits_used for record in records), Decimal("0"))
-    shown = records[:limit]
+    rows: dict[str, list[UsageRecord]] = {}
+    for record in records:
+        key = f"user:{record.entity_id}" if record.entity_id else f"subject:{record.subject_key}"
+        rows.setdefault(key, []).append(record)
+    ranked = sorted(
+        rows.values(),
+        key=lambda group: -sum((r.credits_used for r in group), Decimal("0")),
+    )[:limit]
     automated = automation_keys(
-        session, [record.subject_key for record in shown if record.entity_id is None]
+        session, [group[0].subject_key for group in ranked if group[0].entity_id is None]
     )
     consumers: list[Consumer] = []
-    for record in shown:
-        label = record.subject_name or record.subject_key
-        if record.entity_id:
-            user = session.get(CxUser, record.entity_id)
+    handles: list[str] = []
+    for group in ranked:
+        first = group[0]
+        credits = sum((r.credits_used for r in group), Decimal("0"))
+        label = first.subject_name or first.subject_key
+        handle = first.subject_email or first.subject_key
+        if first.entity_id:
+            user = session.get(CxUser, first.entity_id)
             if user is not None:
                 label = user.display_name
+                handle = user.email or user.username or handle
+        handles.append(handle)
         consumers.append(
             Consumer(
                 entity_type=EntityType.USER,
-                entity_id=record.entity_id,
+                entity_id=first.entity_id,
                 label=label,
-                credits=record.credits_used,
-                resolved=record.entity_id is not None,
-                percent_of_total=_percent(record.credits_used, total),
-                automation=record.subject_key in automated,
+                credits=credits,
+                resolved=first.entity_id is not None,
+                percent_of_total=_percent(credits, total),
+                automation=first.subject_key in automated,
             )
         )
+    seen: dict[str, int] = {}
+    for consumer in consumers:
+        seen[consumer.label.casefold()] = seen.get(consumer.label.casefold(), 0) + 1
+    for consumer, handle in zip(consumers, handles, strict=True):
+        if seen[consumer.label.casefold()] > 1 and handle.casefold() != consumer.label.casefold():
+            consumer.label = f"{consumer.label} ({handle})"
     if settings_store.auto_triage_to_initiator(session):
         model = auto_triage_attribution.build_model(session)
         for consumer in consumers:
@@ -393,7 +447,7 @@ def _unmatched_entities(session: Session, view: UsageView) -> UnmatchedEntities:
     ).one()
     found.count = int(count or 0)
     found.credits = Decimal(str(credits or 0))
-    found.top = [
+    top = [
         (record.subject_name or record.subject_key, record.credits_used)
         for record in session.scalars(
             select(UsageRecord)
@@ -401,6 +455,12 @@ def _unmatched_entities(session: Session, view: UsageView) -> UnmatchedEntities:
             .order_by(UsageRecord.credits_used.desc())
             .limit(5)
         )
+    ]
+    model = CxProject if view == UsageView.PROJECT else CxApplication
+    gone = deleted_names(session, model, [name for name, _credits in top])
+    found.top = [
+        (f"{name}{DELETED_SUFFIX}" if name.strip().lower() in gone else name, credits)
+        for name, credits in top
     ]
     return found
 
@@ -416,6 +476,12 @@ def attribution_summary(session: Session) -> AttributionSummary:
     ).one()
     summary.unmatched_people = int(count or 0)
     summary.unmatched_people_credits = Decimal(str(credits or 0))
+    summary.unmatched_people_disputed = int(
+        session.scalar(
+            select(func.count()).where(*people, UnresolvedSubject.status == MatchMethod.DISPUTED)
+        )
+        or 0
+    )
 
     snapshot = ingestion.latest_snapshot(session, UsageView.USER)
     if snapshot is not None:
@@ -435,10 +501,34 @@ def attribution_summary(session: Session) -> AttributionSummary:
                 counted.add(key)
         # One per distinct subject, however many rows it has.
         summary.automation = len(counted)
+        summary.automation_builtin = sum(
+            1 for key in counted if ingestion.is_synthetic_subject(key)
+        )
 
     summary.projects = _unmatched_entities(session, UsageView.PROJECT)
     summary.applications = _unmatched_entities(session, UsageView.APPLICATION)
+    summary.tenant_total_credits, summary.projects_unreported = _projects_unreported(session)
     return summary
+
+
+def _projects_unreported(session: Session) -> tuple[Decimal | None, Decimal]:
+    """(tenant total, the part of it no project row accounts for).
+
+    Compared only between readings of the same window. The project view can
+    fall short of the tenant total: usage Checkmarx files under no project, a
+    row with no name (the parser cannot keep it), or a row a read did not
+    return. Whatever the cause, the shortfall is shown, never dropped."""
+    projects = ingestion.latest_snapshot(session, UsageView.PROJECT)
+    tenant = ingestion.latest_snapshot(session, UsageView.ACTION) or ingestion.latest_snapshot(
+        session, UsageView.USER
+    )
+    if tenant is None:
+        return None, Decimal("0")
+    total = Decimal(tenant.total_credits or 0)
+    if projects is None or projects.period_param != tenant.period_param:
+        return total, Decimal("0")
+    gap = total - Decimal(projects.total_credits or 0)
+    return total, gap if gap > 0 else Decimal("0")
 
 
 def credit_enforcement(session: Session) -> dict[str, object] | None:
@@ -470,12 +560,39 @@ def unavailable_dimensions(session: Session) -> list[str]:
     ]
 
 
+DELETED_SUFFIX = " (deleted)"
+
+
+def deleted_names(session: Session, model, names: list[str]) -> set[str]:
+    """Which of these reported names (lowercased) are a deleted project or
+    application, and no live one: Checkmarx keeps reporting a deleted
+    project's usage under its name, which then matches nothing."""
+    wanted = {name.strip().lower() for name in names if name}
+    if not wanted:
+        return set()
+    found: dict[str, bool] = {}
+    for name, is_deleted in session.execute(
+        select(model.name, model.is_deleted).where(
+            func.lower(func.trim(model.name)).in_(sorted(wanted))
+        )
+    ):
+        key = (name or "").strip().lower()
+        if key in wanted:
+            found[key] = found.get(key, True) and bool(is_deleted)
+    return {key for key, gone in found.items() if gone}
+
+
 def _label_for(session: Session, model, record: UsageRecord) -> str:
     if record.entity_id:
         row = session.get(model, record.entity_id)
         if row is not None:
-            return row.name
-    return record.subject_name or record.subject_key
+            return f"{row.name}{DELETED_SUFFIX}" if row.is_deleted else row.name
+    name = record.subject_name or record.subject_key
+    if deleted_names(session, model, [name]):
+        # Usage of a deleted project counts towards no project budget; the
+        # label says why it is not matched, as Checkmarx One marks it.
+        return f"{name}{DELETED_SUFFIX}"
+    return name
 
 
 def _percent(value: Decimal, total: Decimal) -> float | None:
@@ -554,12 +671,8 @@ def warning_and_restriction_counts(session: Session) -> tuple[int, int]:
         )
         or 0
     )
-    breached = int(
-        session.scalar(
-            select(func.count())
-            .select_from(LimitPeriodState)
-            .where(LimitPeriodState.status.in_([LimitStatus.BREACHED, LimitStatus.RESTRICTED]))
-        )
-        or 0
-    )
-    return warned, breached
+    from app.services import enforcement
+
+    # Restrictions in force, counted as every other page counts them; a period
+    # over its limit without one (held, deferred, an earlier period) is not.
+    return warned, len(enforcement.restricted_entities(session))

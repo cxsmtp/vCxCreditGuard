@@ -133,10 +133,22 @@ def _first_repo_id(payload: dict[str, Any]) -> str | None:
 
 
 def parse_project(payload: dict[str, Any]) -> PlatformProject | None:
+    """One project row, or None when it has no usable id.
+
+    Tolerant of the rest: a numeric id is read as text, and a row with no name
+    (or a blank one) is kept under its id. Dropping it would make a listing
+    that read every row look as if the project were gone.
+    """
     project_id = payload.get("id")
-    name = payload.get("name")
-    if not isinstance(project_id, str) or not isinstance(name, str):
+    if isinstance(project_id, int) and not isinstance(project_id, bool):
+        project_id = str(project_id)
+    if not isinstance(project_id, str) or not project_id.strip():
+        logger.warning("Skipping a project row with no id (name %r)", payload.get("name"))
         return None
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        logger.warning("Project %s came with no name; it is kept under its id", project_id)
+        name = project_id
     return PlatformProject(
         id=project_id,
         name=name,

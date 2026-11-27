@@ -20,7 +20,6 @@ from app.models.org import CxApplication, CxGroup, CxProject, CxUser
 from app.models.usage import (
     AutoTriageCharge,
     EntityMapping,
-    SchedulerRun,
     UnresolvedSubject,
     UsageRecord,
     UsageSnapshot,
@@ -58,6 +57,7 @@ from app.services import (
     settings_store,
     violations,
 )
+from app.services import cycle as cycle_service
 from app.services import dashboard as dashboard_service
 from app.services import notifications as notification_service
 from app.services.audit import record_audit
@@ -141,6 +141,8 @@ def _pool_info(pool, enforcement=None) -> CreditPoolInfo:  # type: ignore[no-unt
         assigned=pool.assigned,
         over_allocation=pool.over_allocation,
         checkmarx_enforcement=enforcement,
+        unexplained=pool.unexplained,
+        other_figures=pool.other_figures,
     )
 
 
@@ -162,6 +164,10 @@ def _attribution_info(summary) -> AttributionSummaryInfo:  # type: ignore[no-unt
         user_total_credits=summary.user_total_credits,
         projects=_unmatched_info(summary.projects),
         applications=_unmatched_info(summary.applications),
+        tenant_total_credits=summary.tenant_total_credits,
+        projects_unreported=summary.projects_unreported,
+        unmatched_people_disputed=summary.unmatched_people_disputed,
+        automation_builtin=summary.automation_builtin,
     )
 
 
@@ -175,13 +181,8 @@ def get_dashboard(
     total, collected_at = dashboard_service.tenant_total(db)
     warned, restricted = dashboard_service.warning_and_restriction_counts(db)
 
-    last_run = db.scalar(select(SchedulerRun).order_by(SchedulerRun.started_at.desc()).limit(1))
-    last_success = db.scalar(
-        select(SchedulerRun.finished_at)
-        .where(SchedulerRun.status.in_(["success", "partial"]))
-        .order_by(SchedulerRun.started_at.desc())
-        .limit(1)
-    )
+    times = cycle_service.cycle_times(db)
+    last_success = times.last_success_at
     active_restrictions = int(
         db.scalar(
             select(func.count())
@@ -267,7 +268,7 @@ def get_dashboard(
             limits_enforcing=limits_enforcing,
             next_run_at=scheduler.next_run_time(),
             last_success_at=last_success,
-            last_run_status=last_run.status if last_run else None,
+            last_run_status=times.last_run_status,
             schedule=scheduler.describe_schedule(),
             unresolved_scan_initiators=unresolved_initiators,
         ),
@@ -822,6 +823,10 @@ def _entity_row(db, view, key, name, credits, mapping, record) -> UnmatchedEntit
         mapping_broken=broken,
         overridden=overridden_by is not None,
         overridden_by=overridden_by,
+        deleted=(
+            (record is None or record.entity_id is None)
+            and bool(dashboard_service.deleted_names(db, model, [name]))
+        ),
     )
 
 

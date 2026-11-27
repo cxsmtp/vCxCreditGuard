@@ -25,6 +25,7 @@ class ProjectionResponse(BaseModel):
     days_to_exhaustion: float | None
     exhaustion_at: datetime | None
     will_breach: bool
+    already_over: bool = False
 
 
 class ImpactResponse(BaseModel):
@@ -41,6 +42,7 @@ class ReportResponse(BaseModel):
     limits_total: int
     limits_enforcing: int
     breaching_soon: int
+    already_over: int = 0
     impact: ImpactResponse
     projections: list[ProjectionResponse]
 

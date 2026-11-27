@@ -37,7 +37,7 @@ from app.models.audit import AuditLogEntry
 from app.models.connection import CxConnection
 from app.models.enums import ConnectionStatus, Severity
 from app.models.selftest import STATUS_PASSED, STATUS_WARNING, EnforcementSelfTest
-from app.services import notifications, settings_store
+from app.services import credits_text, notifications, settings_store
 from app.services.audit import AuditActor, record_audit
 
 GREEN = "green"
@@ -173,8 +173,8 @@ def _counts(session: Session) -> Item:
             "counts_match",
             label,
             RED,
-            f"The log counted {record.get('activity_credits')}, the summary "
-            f"{record.get('summary_credits')} credits.",
+            f"The log counted {_credits(record.get('activity_credits'))}, the summary "
+            f"{_credits(record.get('summary_credits'))} credits.",
             hint,
             link,
         )
@@ -390,3 +390,10 @@ def check_drift(session: Session, *, now: datetime | None = None) -> list[str]:
         remember(session, current, still)
     session.commit()
     return [item.key for item in fresh]
+
+
+def _credits(value: object) -> str:
+    """A credit amount in a sentence; "unknown" when the record has none."""
+    if value is None or value == "":
+        return "unknown"
+    return credits_text.credits(value)

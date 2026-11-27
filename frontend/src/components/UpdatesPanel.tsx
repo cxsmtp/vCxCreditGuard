@@ -207,8 +207,12 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
                 "–"
               )}
             </KeyValue>
-            <KeyValue label="Last check">
-              {data.last_check ? formatRelative(data.last_check.at) : "Never"}
+            <KeyValue label="Last registry check">
+              {data.last_check ? (
+                <span title={formatDateTime(data.last_check.at)}>{formatRelative(data.last_check.at)}</span>
+              ) : (
+                "Never"
+              )}
             </KeyValue>
           </dl>
 
@@ -217,7 +221,9 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
           )}
           {data.last_auto && (
             <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
-              Auto-update, {formatRelative(data.last_auto.at)}: {data.last_auto.result}
+              Auto-update last looked{" "}
+              <span title={formatDateTime(data.last_auto.at)}>{formatRelative(data.last_auto.at)}</span>{" "}
+              (it works from the last registry check, above): {data.last_auto.result}
             </p>
           )}
 
@@ -422,18 +428,21 @@ export function UpdatesPanel({ onChanged }: { onChanged?: () => Promise<unknown>
         actions={
           supervised && (
             <>
-              <Button
-                size="sm"
-                variant="secondary"
-                disabled={!data.rollback.possible || busy !== null || switching}
-                title={data.rollback.possible ? undefined : data.rollback.reason}
-                onClick={() => setRollingBack(true)}
-              >
-                Roll back
-                {data.rollback.possible && data.rollback.target_version
-                  ? ` to v${data.rollback.target_version}`
-                  : ""}
-              </Button>
+              {/* Only when there is an earlier version to go back to. */}
+              {data.rollback.target && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={!data.rollback.possible || busy !== null || switching}
+                  title={data.rollback.possible ? undefined : data.rollback.reason}
+                  onClick={() => setRollingBack(true)}
+                >
+                  Roll back
+                  {data.rollback.possible && data.rollback.target_version
+                    ? ` to v${data.rollback.target_version}`
+                    : ""}
+                </Button>
+              )}
               <Button
                 size="sm"
                 variant="ghost"

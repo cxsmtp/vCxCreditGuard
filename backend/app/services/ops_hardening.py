@@ -33,7 +33,7 @@ from app.db.base import utcnow
 from app.models.enums import EntityType, RunStatus
 from app.models.limits import CreditLimit, Exemption
 from app.models.usage import SchedulerRun
-from app.services import limits_service, settings_store
+from app.services import limits_service, settings_store, wording
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -213,6 +213,8 @@ _LIMIT_FIELDS = (
     "notes",
     "business_unit",
     "project_actions",
+    "headroom_credits",
+    "headroom_auto",
 )
 
 
@@ -299,6 +301,10 @@ def _limit_input(row: dict[str, Any]) -> limits_service.LimitInput:
             notes=row.get("notes"),
             business_unit=row.get("business_unit"),
             project_actions=limits_service.normalise_project_actions(row.get("project_actions")),
+            headroom_credits=(
+                int(row["headroom_credits"]) if row.get("headroom_credits") else None
+            ),
+            headroom_auto=bool(row.get("headroom_auto", False)),
         )
     except (KeyError, ValueError, TypeError) as exc:
         raise BackupError(f"Invalid limit entry in backup: {exc}") from exc
@@ -369,7 +375,8 @@ def _validate_restored_settings(settings_in: dict[str, Any]) -> None:
             SettingsUpdateRequest(**fields)
         except ValidationError as exc:
             raise BackupError(
-                f"Backup contains settings that fail validation: {exc.error_count()} issue(s)."
+                f"Backup contains settings that fail validation: "
+                f"{wording.plural(exc.error_count(), 'issue')}."
             ) from exc
     window = settings_in.get(settings_store.KEY_USAGE_PERIOD)
     if window is not None and str(window) not in usage_api.SUPPORTED_PERIODS:
@@ -475,8 +482,10 @@ def restore_config_backup(session: Session, *, data: Any, actor: AuditActor) -> 
         target_type="ops",
         after=stats,
         detail=(
-            f"Restored configuration from a backup: {restored_settings} setting(s), "
-            f"{created} limit(s) created, {updated} updated, {exemptions_restored} override(s)."
+            "Restored configuration from a backup: "
+            f"{wording.plural(restored_settings, 'setting')}, "
+            f"{wording.plural(created, 'limit')} created, {updated:,} updated, "
+            f"{wording.plural(exemptions_restored, 'override')}."
         ),
     )
     return stats

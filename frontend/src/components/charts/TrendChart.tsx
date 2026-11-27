@@ -152,7 +152,7 @@ export function TrendChart({ points }: Props) {
                   fill="var(--text-muted)"
                   className="tabular"
                 >
-                  {formatCredits(Math.round(tick.value))}
+                  {formatCredits(tick.value)}
                 </text>
               </g>
             ))}

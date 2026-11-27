@@ -34,6 +34,8 @@ PURPOSE_TOTP_SECRET: Final = "totp-secret"
 PURPOSE_KEY_CHECK: Final = "master-key-check"
 PURPOSE_RECOVERY_CODE: Final = "totp-recovery-code"
 PURPOSE_UPDATE_TOKEN: Final = "update-registry-token"
+# The shared secret Checkmarx One signs its webhook deliveries with (fastcheck).
+PURPOSE_CX_WEBHOOK_SECRET: Final = "cx-webhook-secret"
 
 
 class DecryptionError(RuntimeError):

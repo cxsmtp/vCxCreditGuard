@@ -494,7 +494,7 @@ class CheckmarxClient:
             if not items:
                 distinct = len(listing.ids) if listing.ids else seen
                 if total is not None and distinct < total:
-                    listing.incomplete(f"{distinct} of {total} rows could be read", "shortfall")
+                    listing.incomplete(listing.shortfall_note(distinct, total), "shortfall")
                 return
             first = items[0].get("id", items[0]) if isinstance(items[0], dict) else items[0]
             if page and first == previous_first:
@@ -505,8 +505,19 @@ class CheckmarxClient:
 
             yield from items
             for item in items:
-                if isinstance(item, dict) and item.get("id") is not None:
-                    listing.ids.add(str(item["id"]))
+                row_id = item.get("id") if isinstance(item, dict) else None
+                if row_id is None or str(row_id) == "":
+                    # Read, but cannot be told apart from the others.
+                    listing.without_id += 1
+                    if len(listing.without_id_names) < 5:
+                        listing.without_id_names.append(_row_name(item))
+                elif str(row_id) in listing.ids:
+                    # Returned again: the order shifted while it was read,
+                    # so another row was skipped.
+                    if len(listing.repeated) < 5:
+                        listing.repeated.append(str(row_id))
+                else:
+                    listing.ids.add(str(row_id))
             seen += len(items)
             # Rows told apart by id: a listing whose order shifts while it is
             # read can repeat one row and skip another, and must not then look
@@ -522,7 +533,7 @@ class CheckmarxClient:
                 if offset_is_page_number and len(items) < page_size:
                     # A short page by index cannot be continued without
                     # skipping rows.
-                    listing.incomplete(f"{distinct} of {total} rows could be read", "shortfall")
+                    listing.incomplete(listing.shortfall_note(distinct, total), "shortfall")
                     return
                 continue
             if len(items) < page_size and offset_is_page_number:
@@ -548,11 +559,41 @@ class Listing:
     # (the server ignored the offset) or "page_limit".
     reason: str | None = None
     ids: set[str] = field(default_factory=set)
+    # Ids returned more than once (the listing's order shifted while it was
+    # read), and rows that came with no id (how many, and the first names).
+    repeated: list[str] = field(default_factory=list)
+    without_id: int = 0
+    without_id_names: list[str] = field(default_factory=list)
 
     def incomplete(self, note: str, reason: str) -> None:
         self.complete = False
         self.note = note
         self.reason = reason
+
+    def shortfall_note(self, distinct: int, total: int) -> str:
+        """ "1978 of 1979 rows could be read", and why, naming the rows."""
+        note = f"{distinct:,} of {total:,} rows could be read"
+        if self.repeated:
+            shown = ", ".join(sorted(set(self.repeated)))
+            note += (
+                f"; id {shown} came back twice, so the listing's order shifted while it was "
+                "read and as many rows were skipped"
+            )
+        if self.without_id:
+            shown = ", ".join(self.without_id_names)
+            rows = "row" if self.without_id == 1 else "rows"
+            note += f"; {self.without_id} {rows} came with no id ({shown})"
+        return note
+
+
+def _row_name(item: Any) -> str:
+    """How a row with no id is named in a warning."""
+    if isinstance(item, dict):
+        for key in ("name", "username", "email"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return repr(value.strip()[:80])
+    return "unnamed"
 
 
 def _extract_items(payload: Any, items_key: str | None) -> list[dict[str, Any]]:

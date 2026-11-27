@@ -346,7 +346,7 @@ def test_domain_errors_keep_their_message() -> None:
     )
     assert "master key" in error_text.public_error(ConfigError("The master key is wrong."))
     assert error_text.public_error(KeyError("secret")) == (
-        "Unexpected error (KeyError); see the server log."
+        "An unexpected error occurred; see the server log (error type: KeyError)."
     )
 
 

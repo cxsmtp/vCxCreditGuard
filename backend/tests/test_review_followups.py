@@ -414,7 +414,7 @@ class TestFusionWithoutAFeedFigure:
             select(Notification).where(Notification.title.like("%reached its credit limit"))
         )
         assert breach is not None
-        assert "= 4 credits" not in breach.body
+        assert "= 4.0 credits" not in breach.body
         assert "not known from this tenant's data" in breach.body, breach.body
 
 

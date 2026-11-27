@@ -44,7 +44,7 @@ def configured_tenant(db: Session, monkeypatch: pytest.MonkeyPatch) -> FakeTenan
 
 def test_public_error_names_unexpected_errors_and_keeps_domain_ones() -> None:
     shown = error_text.public_error(RuntimeError(SECRET_DETAIL))
-    assert shown == "Unexpected error (RuntimeError); see the server log."
+    assert shown == "An unexpected error occurred; see the server log (error type: RuntimeError)."
     domain = error_text.public_error(
         CheckmarxResponseError("Checkmarx answered 500 (Bearer abc.def.ghi)")
     )
@@ -67,7 +67,7 @@ class TestRunHistory:
             result = cycle.run_cycle(trigger="manual", force_org_sync=True)
 
         assert result.status == RunStatus.PARTIAL
-        shown = "Unexpected error (RuntimeError); see the server log."
+        shown = "An unexpected error occurred; see the server log (error type: RuntimeError)."
         assert result.steps["org_sync"] == {"ok": False, "error": shown}
         with session_scope() as session:
             run = session.get(SchedulerRun, result.run_id)
@@ -91,10 +91,14 @@ class TestRunHistory:
         result = cycle.run_cycle(trigger="manual")
 
         assert result.status == RunStatus.FAILED
-        assert result.errors == ["Unexpected error (ValueError); see the server log."]
+        assert result.errors == [
+            "An unexpected error occurred; see the server log (error type: ValueError)."
+        ]
         with session_scope() as session:
             run = session.get(SchedulerRun, result.run_id)
-            assert run.error == "Unexpected error (ValueError); see the server log."
+            assert run.error == (
+                "An unexpected error occurred; see the server log (error type: ValueError)."
+            )
 
     def test_a_checkmarx_error_keeps_its_message(
         self, configured_tenant: FakeTenant, monkeypatch: pytest.MonkeyPatch
@@ -128,7 +132,8 @@ class TestRoleListing:
         assert body["available"] is False
         assert SECRET_DETAIL not in body["message"]
         assert body["message"] == (
-            "The tenant's roles could not be read: Unexpected error (KeyError); see the server log."
+            "The tenant's roles could not be read: An unexpected error occurred; "
+            "see the server log (error type: KeyError)."
         )
 
     def test_a_checkmarx_error_is_still_explained(
