@@ -671,12 +671,8 @@ def warning_and_restriction_counts(session: Session) -> tuple[int, int]:
         )
         or 0
     )
-    breached = int(
-        session.scalar(
-            select(func.count())
-            .select_from(LimitPeriodState)
-            .where(LimitPeriodState.status.in_([LimitStatus.BREACHED, LimitStatus.RESTRICTED]))
-        )
-        or 0
-    )
-    return warned, breached
+    from app.services import enforcement
+
+    # Restrictions in force, counted as every other page counts them; a period
+    # over its limit without one (held, deferred, an earlier period) is not.
+    return warned, len(enforcement.restricted_entities(session))

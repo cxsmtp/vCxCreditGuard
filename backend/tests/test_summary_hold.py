@@ -338,4 +338,4 @@ def test_a_restriction_after_a_summary_held_breach_is_announced(
         for note in db.scalars(select(Notification).where(Notification.entity_id == ALICE))
     ]
     assert any("summary totals" in body for body in titles)
-    assert any("being restricted now" in body for body in titles)
+    assert any("access was restricted" in body for body in titles)

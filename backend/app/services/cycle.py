@@ -25,7 +25,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import insert, select, update
@@ -537,6 +537,9 @@ def _execute_tenant_steps(
             _warn(session, "ingest", "; ".join(problems))
         _notify_unresolved(session)
         usage_fresh["value"] = ingest_result.fresh
+        if any(not dimension.read_failed for dimension in ingest_result.dimensions.values()):
+            # Usage was read from the tenant: the connection worked just now.
+            connection_service.record_success(session)
 
     _run_step(session, result, "ingest", ingest)
     usage_ok = usage_fresh["value"]
@@ -702,6 +705,45 @@ def _execute_tenant_steps(
             result.steps["report_email"] = {"skipped": "disabled or not due"}
 
     _run_step(session, result, "report_email", email_report, degrades_run=False)
+
+
+@dataclass(frozen=True, slots=True)
+class CycleTimes:
+    """When the full cycle last ran and last ran without a problem.
+
+    Both are when a run finished (or, for one still running, started), so the
+    last success is never later than the last run. Fast checks are not full
+    cycles and are reported separately (``fastcheck.describe``).
+    """
+
+    last_run_at: datetime | None
+    last_run_status: str | None
+    last_success_at: datetime | None
+
+
+def cycle_times(session: Session) -> CycleTimes:
+    """The Scheduler card's and the Overview's "last full cycle" figures."""
+    last = session.scalar(
+        select(SchedulerRun)
+        .where(SchedulerRun.kind == "cycle")
+        .order_by(SchedulerRun.started_at.desc(), SchedulerRun.id.desc())
+        .limit(1)
+    )
+    success = session.scalar(
+        select(SchedulerRun.finished_at)
+        .where(
+            SchedulerRun.kind == "cycle",
+            SchedulerRun.status == RunStatus.SUCCESS,
+            SchedulerRun.finished_at.is_not(None),
+        )
+        .order_by(SchedulerRun.started_at.desc(), SchedulerRun.id.desc())
+        .limit(1)
+    )
+    return CycleTimes(
+        last_run_at=(last.finished_at or last.started_at) if last is not None else None,
+        last_run_status=last.status if last is not None else None,
+        last_success_at=success,
+    )
 
 
 def _org_sync_due(session: Session) -> bool:

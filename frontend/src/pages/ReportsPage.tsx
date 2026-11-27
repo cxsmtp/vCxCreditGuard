@@ -37,9 +37,15 @@ const PROJECTION_COLUMNS: ExportColumn<Projection>[] = [
   { key: "burn", header: "Burn / day", value: (p) => Number(p.burn_per_day).toFixed(1) },
   { key: "projected", header: "Projected period end", value: (p) => Number(p.projected_period_end).toFixed(0) },
   { key: "percent", header: "% at period end", value: (p) => (p.percent_at_period_end == null ? "" : p.percent_at_period_end.toFixed(0)) },
-  { key: "exhausts", header: "Exhausts", value: (p) => p.exhaustion_at ?? "" },
-  { key: "breach", header: "Will breach", value: (p) => (p.will_breach ? "yes" : "no") },
+  { key: "exhausts", header: "Exhausts", value: (p) => (p.already_over ? "already over" : (p.exhaustion_at ?? "")) },
+  { key: "breach", header: "Outlook", value: (p) => projectionOutlook(p) },
 ];
+
+/** "Already over" for a budget past its limit: it is not projected to breach. */
+function projectionOutlook(p: Projection): string {
+  if (p.already_over) return "Already over";
+  return p.will_breach ? "Will breach" : "Within budget";
+}
 
 export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
   const toast = useToast();
@@ -118,7 +124,7 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
             <StatTile
               label="Projected to breach"
               value={formatNumber(data.breaching_soon)}
-              detail="This period, at current burn"
+              detail={`This period, at current burn${data.already_over ? `; ${formatNumber(data.already_over)} already over` : ""}`}
               tone={data.breaching_soon > 0 ? "warning" : "neutral"}
             />
             <StatTile
@@ -188,10 +194,12 @@ export function ReportsPage({ isAdmin }: { isAdmin: boolean }) {
                         )}
                       </Td>
                       <Td className="whitespace-nowrap">
-                        {p.exhaustion_at ? formatDate(p.exhaustion_at) : "—"}
+                        {p.already_over ? "Already over" : p.exhaustion_at ? formatDate(p.exhaustion_at) : "—"}
                       </Td>
                       <Td>
-                        {p.will_breach ? (
+                        {p.already_over ? (
+                          <Badge tone="critical">Already over</Badge>
+                        ) : p.will_breach ? (
                           <Badge tone="critical">Will breach</Badge>
                         ) : (
                           <Badge tone="good">Within budget</Badge>
@@ -217,7 +225,7 @@ const PROJECTION_VIEW: ViewColumn<Projection>[] = [
   { key: "burn", value: (p) => Number(p.burn_per_day), filter: false },
   { key: "projected", value: (p) => Number(p.projected_period_end), filter: false },
   { key: "exhausts", value: (p) => p.exhaustion_at, filter: false },
-  { key: "outlook", value: (p) => (p.will_breach ? "Will breach" : "Within budget") },
+  { key: "outlook", value: (p) => projectionOutlook(p) },
 ];
 
 const CHARGEBACK_COLUMNS: ExportColumn<ChargebackRow>[] = [

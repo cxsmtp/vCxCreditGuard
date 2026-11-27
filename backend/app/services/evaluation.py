@@ -1232,6 +1232,15 @@ def _enforce_pending(
                 evaluation = by_limit.get(limit.id)
                 if evaluation is not None:
                     evaluation.note = held
+                state.status_note = _status_note(held)
+                _notify_breach(
+                    session,
+                    limit,
+                    state,
+                    window,
+                    exempt=False,
+                    outcome=(f"Enforcement is on. {held}", False),
+                )
                 session.commit()
                 continue
             outcome = enforcement.apply_enforcement(
@@ -1255,8 +1264,13 @@ def _enforce_pending(
             if _has_active_enforcement(session, limit.id, window.key):
                 state.status = LimitStatus.RESTRICTED
                 state.restricted_at = state.restricted_at or moment
+            tail, note, restricted = _enforcement_result(session, limit, window.key, outcome)
+            state.status_note = _status_note(note)
+            _notify_breach(session, limit, state, window, exempt=False, outcome=(tail, restricted))
             evaluation = by_limit.get(limit.id)
             if evaluation is not None:
+                if note is not None and not restricted:
+                    evaluation.note = note
                 evaluation.status = state.status
                 earlier = evaluation.enforced
                 if earlier is not None:
@@ -1309,12 +1323,21 @@ def _count_deferred(
             continue
         if _would_start_restricting(session, limit, window.key):
             result.deferred += 1
+            note = (
+                f"Enforcement is paused, so no restriction was applied. {result.enforcement_paused}"
+            )
             evaluation = next((e for e in result.evaluations if e.limit.id == limit_id), None)
             if evaluation is not None:
-                evaluation.note = (
-                    f"Enforcement is paused, so no restriction was applied. "
-                    f"{result.enforcement_paused}"
+                evaluation.note = note
+            state = session.scalar(
+                select(LimitPeriodState).where(
+                    LimitPeriodState.limit_id == limit.id,
+                    LimitPeriodState.period_key == window.key,
                 )
+            )
+            if state is not None:
+                state.status_note = _status_note(note)
+                _notify_breach(session, limit, state, window, exempt=False, paused=True)
 
 
 def _manual_pause(session: Session) -> str | None:
@@ -1846,19 +1869,31 @@ def _evaluate_one(
 
     if state.credits_used >= restrict_at:
         state.status = LimitStatus.BREACHED
+        # An enforcing limit this cycle restricts is announced once the
+        # restriction has been tried (``_enforce_pending``), so the notice says
+        # what happened rather than what was about to.
+        awaits_enforcement = (
+            limit.enforce
+            and not exempt
+            and on_summary is None
+            and client is not None
+            and hold is None
+            and to_enforce is not None
+        )
         if state.breached_at is None:
             state.breached_at = moment
             evaluation.newly_breached = True
             result.breached += 1
-            _notify_breach(
-                session,
-                limit,
-                state,
-                window,
-                exempt=exempt,
-                paused=hold is not None,
-                on_summary=on_summary,
-            )
+            if not awaits_enforcement:
+                _notify_breach(
+                    session,
+                    limit,
+                    state,
+                    window,
+                    exempt=exempt,
+                    paused=hold is not None,
+                    on_summary=on_summary,
+                )
         early = headroom.early_phrase(limit, state.credits_used, state.headroom_credits)
         if exempt:
             evaluation.note = "Exempt from enforcement."
@@ -1881,16 +1916,21 @@ def _evaluate_one(
             evaluation.note = f"Enforcement is paused, so no restriction was applied. {hold}"
             if _would_start_restricting(session, limit, window.key):
                 result.deferred += 1
+            if not _has_active_enforcement(session, limit.id, window.key):
+                # Breached earlier, while not paused, and not announced yet
+                # (once per period: the notice is deduplicated).
+                _notify_breach(session, limit, state, window, exempt=False, paused=True)
+            else:
+                evaluation.note = (
+                    "Enforcement is paused: the restriction in force stays, and nothing new is "
+                    f"restricted. {hold}"
+                )
         elif to_enforce is not None:
-            # Applied after every lift of the cycle (evaluate_all).
+            # Applied after every lift of the cycle (evaluate_all), and
+            # announced then.
             to_enforce.append(limit.id)
             if early is not None:
                 evaluation.note = f"Restricted early: {early}."
-            if not evaluation.newly_breached:
-                # Breached earlier without a restriction (held on summary
-                # totals, say): the restriction now starting is announced.
-                # Raised once per period (the notice is deduplicated).
-                _notify_breach(session, limit, state, window, exempt=False)
         # RESTRICTED means "a restriction from this limit is in force for this
         # period", not "a restriction was newly applied this cycle". Deriving it
         # from the action rows keeps it true on every later cycle of the period,
@@ -1954,9 +1994,102 @@ def _evaluate_one(
 
     if state.status not in (LimitStatus.BREACHED, LimitStatus.RESTRICTED):
         _clear_rollout(state)
+        state.status_note = None
+    elif to_enforce is None or limit.id not in to_enforce:
+        # Over the limit and not enforced this cycle: why (exempt, monitor
+        # only, summary totals, paused, no connection). One enforced this
+        # cycle gets its note from the outcome (``_enforce_pending``).
+        state.status_note = _status_note(evaluation.note)
     evaluation.status = state.status
     session.flush()
     return evaluation
+
+
+def _status_note(text: str | None) -> str | None:
+    return text[:1000] if text else None
+
+
+def _enforcement_result(
+    session: Session,
+    limit: CreditLimit,
+    period_key: str,
+    outcome: enforcement.EnforcementOutcome,
+) -> tuple[str, str | None, bool]:
+    """What enforcing a breached limit did this time, in words.
+
+    Returns the breach notice's closing sentence, the note the Budgets page
+    shows next to the status (None when restricted with nothing more to say)
+    and whether a restriction is in force. Every path that enforces (the
+    cycle, the fast check) says it the same way.
+    """
+    if outcome.applied or _has_active_enforcement(session, limit.id, period_key):
+        tail = "Enforcement is on, so access was restricted."
+        note: str | None = None
+        kept = [
+            sentence
+            for action in session.scalars(
+                select(EnforcementAction).where(
+                    EnforcementAction.limit_id == limit.id,
+                    EnforcementAction.period_key == period_key,
+                    EnforcementAction.status == EnforcementStatus.APPLIED,
+                    EnforcementAction.kind == EnforcementKind.REMOVE_USER_ROLES,
+                )
+            )
+            if (
+                sentence := enforcement.cannot_bite_sentence(
+                    action.target_label or action.target_id, action.undo_snapshot or {}
+                )
+            )
+        ]
+        if kept:
+            note = f"Restricted, but it cannot fully bite. {kept[0]}"
+            tail = f"{tail} It cannot fully bite. {kept[0]}"
+        if outcome.deferred:
+            more = (
+                f"{outcome.deferred_targets:,} more are restricted by the next cycles "
+                "(this cycle's changes ran out)."
+            )
+            tail = f"{tail} {more}"
+            note = f"{note} {more}" if note else f"Restricting: {more}"
+        return tail, note, True
+    why = (
+        enforcement.protection_reason(session, limit.entity_id)
+        if limit.entity_type == EntityType.USER
+        else None
+    )
+    if why is not None:
+        return (
+            f"Enforcement is on, but access was not restricted, because {why}. "
+            f"{enforcement.protection_remedy(why)}",
+            f"Not restricted: {why}.",
+            False,
+        )
+    if outcome.failed:
+        return (
+            "Enforcement is on, but the restriction could not be applied; it is tried again "
+            "on the next cycle (the error is in the Notification Center).",
+            "Not restricted yet: the restriction failed and is retried on the next cycle.",
+            False,
+        )
+    if outcome.deferred or outcome.postponed:
+        return (
+            "Enforcement is on; the restriction is applied by the next cycle (this cycle's "
+            "changes ran out).",
+            "Deferred: restricted by the next cycle (this cycle's changes ran out).",
+            False,
+        )
+    if outcome.skipped:
+        reason = outcome.skipped[0].rstrip(".")
+        return (
+            f"Enforcement is on, but nothing was restricted: {reason}.",
+            f"Not restricted: {reason}.",
+            False,
+        )
+    return (
+        "Enforcement is on, but there is nothing to restrict.",
+        "Not restricted: nothing to restrict.",
+        False,
+    )
 
 
 def _in_force_count(session: Session, limit_id: int, period_key: str) -> int:
@@ -2390,8 +2523,17 @@ def _notify_breach(
     exempt: bool,
     paused: bool = False,
     on_summary: str | None = None,
+    outcome: tuple[str, bool] | None = None,
 ) -> None:
+    """The breach notice, once per period.
+
+    ``outcome``: what enforcing it did (the closing sentence, and whether a
+    restriction is in force), for a limit the cycle has just tried to
+    restrict. An enforcing limit without one was not tried: enforcement is
+    paused, or there is no connection.
+    """
     entity = limit.entity_label or limit.entity_id
+    restricting = False
     if exempt:
         tail = "This entity is on the exemption list, so no action was taken."
         severity = Severity.WARNING
@@ -2415,9 +2557,16 @@ def _notify_breach(
         )
         severity = Severity.CRITICAL
         dedupe = notifications.breach_key(limit.id, window.key)
+    elif limit.enforce and outcome is not None:
+        tail, restricting = outcome
+        severity = Severity.CRITICAL if restricting else Severity.WARNING
+        dedupe = notifications.breach_key(limit.id, window.key)
     elif limit.enforce:
-        tail = "Enforcement is on, so access is being restricted now."
-        severity = Severity.CRITICAL
+        tail = (
+            "This limit enforces, but no Checkmarx One connection is available, so nothing "
+            "has been restricted. It will be once the connection works, if still over."
+        )
+        severity = Severity.WARNING
         dedupe = notifications.breach_key(limit.id, window.key)
     else:
         tail = "This limit is monitor only, so no action was taken."
@@ -2447,7 +2596,7 @@ def _notify_breach(
     if early is not None:
         # Not over budget: inside the headroom kept before the limit.
         title = f"{limit.entity_type.capitalize()} {entity} is nearly out of credits"
-        first = "Restricted early" if limit.enforce and not exempt else "Inside the headroom"
+        first = "Restricted early" if restricting else "Inside the headroom"
         tail = f"{first}: {early}. {tail}"
     lines = [headline, tail]
     if limit.enforce and not exempt:

@@ -113,8 +113,8 @@ _REMEDIATION: dict[tuple[str, str], str] = {
         "recounts again."
     ),
     ("readiness", WARN): (
-        "Open Settings → Enforcement: the Readiness card says what each red item needs and "
-        "links to where to fix it."
+        "Open Settings → Enforcement: the Readiness card says what each item that is not "
+        "green needs and links to where to fix it."
     ),
     ("notifications", WARN): (
         "Open Settings → Notifications & reports and set up email (an SMTP host, a from "
@@ -673,7 +673,9 @@ def _recount_check(session: Session, moment: datetime) -> Check:
 
 
 def _readiness_check(session: Session, moment: datetime) -> Check:
-    """The readiness checklist, as one line: red items warn."""
+    """The readiness checklist, as one line, from the same items the
+    Readiness card shows: OK only while every item is green. An item that is
+    pending (amber) or red warns."""
     from app.services import readiness
 
     current = readiness.report(session, now=moment)
@@ -681,17 +683,14 @@ def _readiness_check(session: Session, moment: datetime) -> Check:
     if current.all_green:
         return Check("readiness", label, OK, "Every readiness item is green.")
     parts = [f"{item.label}: {item.status} ({item.detail})" for item in current.not_green()]
-    # Red warns while a new install watches only, and when an item that was
-    # green has turned red (drift); otherwise the checklist is information.
     drifted = readiness.drifted(session, current)
-    red = current.gate_active and any(item.status == readiness.RED for item in current.items)
     if current.gate_active:
         prefix = "Watch-only until these are green or overridden. "
     elif drifted:
         prefix = "No longer green: " + ", ".join(item.label for item in drifted) + ". "
     else:
         prefix = ""
-    return Check("readiness", label, WARN if red or drifted else OK, prefix + "; ".join(parts))
+    return Check("readiness", label, WARN, prefix + "; ".join(parts))
 
 
 def _when(moment: datetime, entry: object) -> str:

@@ -560,7 +560,10 @@ class DryRunResult:
     generated_at: datetime
     rows: list[DryRunRow] = field(default_factory=list)
     would_enforce_count: int = 0
+    # Near the limit, not over it (projected status "warned").
     would_warn_count: int = 0
+    # Over the limit (or restricting early), whether or not it is restricted.
+    would_breach_count: int = 0
     affected_projects: int = 0
     affected_users: int = 0
     # Set when more users would be restricted than one preview reads roles for.
@@ -614,6 +617,8 @@ def dry_run(
         result.rows.append(row)
         if row.projected_status == LimitStatus.WARNED:
             result.would_warn_count += 1
+        elif row.projected_status == LimitStatus.BREACHED:
+            result.would_breach_count += 1
         if row.would_enforce:
             result.would_enforce_count += 1
             if row.blast is not None:

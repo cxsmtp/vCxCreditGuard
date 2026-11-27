@@ -234,6 +234,11 @@ class LimitPeriodState(Base):
     # The headroom the period was last judged with (credits held back before
     # the limit; app/services/headroom.py). Null: none, the limit itself.
     headroom_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    # Why a period over its limit is, or is not, restricted, in the words the
+    # breach notice used: held by the recount, deferred, protected, cannot
+    # fully bite, monitor only, ... Null while within budget, and while
+    # restricted with nothing more to say.
+    status_note: Mapped[str | None] = mapped_column(String(1000))
 
     limit: Mapped[CreditLimit] = relationship(back_populates="period_states")
 

@@ -10,9 +10,9 @@ from fastapi import APIRouter, Body, HTTPException, status
 from sqlalchemy import func, select
 
 from app.api.deps import AdminUser, CurrentUser, DbSession
-from app.models.enums import EnforcementStatus, LimitStatus, RunStatus
-from app.models.limits import EnforcementAction, LimitPeriodState
-from app.models.usage import SchedulerRun, UnresolvedSubject
+from app.models.enums import LimitStatus
+from app.models.limits import LimitPeriodState
+from app.models.usage import UnresolvedSubject
 from app.schemas.limits import (
     AttestationResponse,
     AuditChainResponse,
@@ -27,12 +27,14 @@ from app.schemas.limits import (
 from app.services import (
     audit_chain,
     demo_service,
-    enforcement_selftest,
+    enforcement,
+    fastcheck,
     ingestion,
     ops_hardening,
     settings_store,
     wording,
 )
+from app.services import cycle as cycle_service
 from app.services import delivery as delivery_service
 from app.services import diagnostics as diagnostics_service
 from app.services import notifications as notification_service
@@ -99,13 +101,9 @@ def scheduler_status(ctx: CurrentUser, db: DbSession) -> SchedulerStatusResponse
     from app import scheduler as scheduler_module
 
     config = settings_store.schedule_config(db)
-    last_run = db.scalar(select(SchedulerRun).order_by(SchedulerRun.started_at.desc()).limit(1))
-    last_success = db.scalar(
-        select(SchedulerRun.finished_at)
-        .where(SchedulerRun.status.in_([RunStatus.SUCCESS, RunStatus.PARTIAL]))
-        .order_by(SchedulerRun.started_at.desc())
-        .limit(1)
-    )
+    times = cycle_service.cycle_times(db)
+    fast = fastcheck.describe(db)
+    fast_run = fast.get("last_run") if isinstance(fast.get("last_run"), dict) else None
 
     warned = int(
         db.scalar(
@@ -115,17 +113,7 @@ def scheduler_status(ctx: CurrentUser, db: DbSession) -> SchedulerStatusResponse
         )
         or 0
     )
-    restricted = len(
-        set(
-            db.scalars(
-                select(func.distinct(EnforcementAction.entity_id)).where(
-                    EnforcementAction.status == EnforcementStatus.APPLIED
-                )
-            )
-        )
-        # In doubt (a write or a self-test restore not confirmed): may be in force.
-        | {action.entity_id for action in enforcement_selftest.unsettled_in_force(db)}
-    )
+    restricted = len(enforcement.restricted_entities(db))
     # The same number the dashboard and Diagnostics show (unmatched people).
     unresolved = int(
         db.scalar(
@@ -140,9 +128,12 @@ def scheduler_status(ctx: CurrentUser, db: DbSession) -> SchedulerStatusResponse
         schedule=scheduler_module.describe_schedule(),
         enabled=config.enabled,
         next_run_at=scheduler_module.next_run_time(),
-        last_run_at=last_run.started_at if last_run else None,
-        last_run_status=last_run.status if last_run else None,
-        last_success_at=last_success,
+        last_run_at=times.last_run_at,
+        last_run_status=times.last_run_status,
+        last_success_at=times.last_success_at,
+        fast_check_enabled=bool(fast.get("enabled")),
+        last_fast_check_at=fast_run.get("at") if fast_run else None,
+        last_fast_check_result=fast_run.get("result") if fast_run else None,
         entities_in_warning=warned,
         entities_restricted=restricted,
         unread_notifications=notification_service.unread_count(db),

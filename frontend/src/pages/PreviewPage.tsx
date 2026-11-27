@@ -130,9 +130,10 @@ export function PreviewPage({ isAdmin = false }: { isAdmin?: boolean }) {
         <ErrorNote>The simulation could not be run.</ErrorNote>
       ) : (
         <div className="flex flex-col gap-6">
-          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-            <StatTile label="Would enforce" value={String(data.would_enforce_count)} tone={data.would_enforce_count > 0 ? "critical" : "neutral"} />
-            <StatTile label="Would warn" value={String(data.would_warn_count)} tone={data.would_warn_count > 0 ? "warning" : "neutral"} />
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
+            <StatTile label="Would breach" value={String(data.would_breach_count ?? 0)} detail="Over the limit" tone={(data.would_breach_count ?? 0) > 0 ? "critical" : "neutral"} />
+            <StatTile label="Would enforce" value={String(data.would_enforce_count)} detail="Of those, restricted" tone={data.would_enforce_count > 0 ? "critical" : "neutral"} />
+            <StatTile label="Would warn" value={String(data.would_warn_count)} detail="Near the limit, not over" tone={data.would_warn_count > 0 ? "warning" : "neutral"} />
             <StatTile label="Projects affected" value={String(data.affected_projects)} />
             <StatTile label="Users affected" value={String(data.affected_users)} />
           </div>
