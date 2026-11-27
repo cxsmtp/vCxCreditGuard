@@ -449,6 +449,10 @@ export interface LimitPeriodState {
   rollout_total?: number | null;
   rollout_done?: number | null;
   lifting_remaining?: number | null;
+  /** The headroom the period was last judged with (credits held back). */
+  headroom_credits?: string | null;
+  /** "X credits left, below the headroom of Y" while restricted before the limit. */
+  restricted_early?: string | null;
 }
 
 export type AttributionBasis = "observed" | "estimated" | "unattributed";
@@ -549,6 +553,13 @@ export interface Limit {
   updated_at: string;
   current_period: LimitPeriodState | null;
   active_restrictions: number;
+  /** Restrict once no more than this many credits are left (null: no fixed headroom). */
+  headroom_credits?: number | null;
+  /** The headroom is the median cost of recent Fusion scans. */
+  headroom_auto?: boolean;
+  /** The headroom in force now, and how it was chosen. */
+  headroom_effective?: string | null;
+  headroom_description?: string | null;
 }
 
 export type ProjectAction = "auto_triage" | "pr_remediation" | "fusion";
@@ -1222,4 +1233,36 @@ export interface Readiness {
   all_green: boolean;
   reviewed_at: string | null;
   reviewed_by: string | null;
+}
+
+/** GET /api/fastpath: the fast check and the Checkmarx One webhook. */
+export interface FastPathEntry {
+  at: string;
+  result: string;
+  trigger?: string;
+  requests?: number;
+  seconds?: number;
+  hint?: Record<string, string> | null;
+}
+
+export interface FastPathStatus {
+  fast_check: {
+    enabled: boolean;
+    interval_seconds: number;
+    min_seconds: number;
+    max_seconds: number;
+    last_run: FastPathEntry | null;
+    last_action: FastPathEntry | null;
+    error: string | null;
+    queued: boolean;
+    requests_per_hour: number;
+  };
+  webhook: {
+    enabled: boolean;
+    switched_on: boolean;
+    secret_configured: boolean;
+    path: string;
+    last_delivery: FastPathEntry | null;
+    last_rejected: FastPathEntry | null;
+  };
 }

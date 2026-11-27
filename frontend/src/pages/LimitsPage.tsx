@@ -101,6 +101,9 @@ interface LimitForm {
   business_unit: string;
   /** What a project, group or application limit turns off on its projects. */
   project_actions: ProjectAction[];
+  /** Restrict early: off, a fixed number of credits left, or automatic. */
+  headroom_mode: "off" | "fixed" | "auto";
+  headroom_credits: string;
 }
 
 const ALL_PROJECT_ACTIONS: ProjectAction[] = PROJECT_ACTIONS.map((action) => action.id);
@@ -125,6 +128,8 @@ const EMPTY_FORM: LimitForm = {
   // New limits turn off all three; a limit saved before the choice existed
   // keeps Auto Triage and PR triage and remediation only.
   project_actions: ALL_PROJECT_ACTIONS,
+  headroom_mode: "off",
+  headroom_credits: "",
 };
 
 function statusOf(limit: Limit): [BadgeTone, string] {
@@ -134,9 +139,9 @@ function statusOf(limit: Limit): [BadgeTone, string] {
   if (state && !state.usage_available) return ["neutral", "Usage not reported"];
   switch (state?.status) {
     case "restricted":
-      return ["critical", "Restricted"];
+      return ["critical", state.restricted_early ? "Restricted early" : "Restricted"];
     case "breached":
-      return ["critical", "Over limit"];
+      return ["critical", state.restricted_early ? "Inside headroom" : "Over limit"];
     case "warned":
       return ["warning", "Near limit"];
     case "restored":
@@ -254,6 +259,17 @@ function UsageBar({ limit }: { limit: Limit }) {
  * cycles, and "Lifting: 760 left" while a large one is being lifted. */
 function rolloutNote(limit: Limit) {
   const period = limit.current_period;
+  if (period?.restricted_early) {
+    return (
+      <span
+        className="text-xs"
+        style={{ color: "var(--status-warning)" }}
+        title="Not over budget yet: the budget restricts once no more than its headroom is left, so the scan that would overrun it does not start."
+      >
+        {period.restricted_early}
+      </span>
+    );
+  }
   const lifting = period?.lifting_remaining ?? null;
   if (lifting != null && lifting > 0) {
     return (
@@ -814,6 +830,8 @@ function LimitDialog({
           project_actions: limit.effective_project_actions?.length
             ? limit.effective_project_actions
             : ALL_PROJECT_ACTIONS,
+          headroom_mode: limit.headroom_auto ? "auto" : limit.headroom_credits ? "fixed" : "off",
+          headroom_credits: limit.headroom_credits ? String(limit.headroom_credits) : "",
         }
       : EMPTY_FORM,
   );
@@ -894,6 +912,11 @@ function LimitDialog({
         count_existing_usage: form.count_existing_usage,
         notes: form.notes.trim() || null,
         business_unit: form.business_unit.trim() || null,
+        headroom_credits:
+          form.headroom_mode === "fixed" && form.headroom_credits
+            ? Number(form.headroom_credits)
+            : null,
+        headroom_auto: form.headroom_mode === "auto",
       };
       if (projectLevel && (!editing || !sameActions(form.project_actions, initialActions))) {
         payload.project_actions = form.project_actions;
@@ -1080,6 +1103,14 @@ function LimitDialog({
               reports, including consumption from before the limit was created.
             </InfoNote>
           )}
+
+          <HeadroomChoice
+            mode={form.headroom_mode}
+            credits={form.headroom_credits}
+            onMode={(value) => update("headroom_mode", value)}
+            onCredits={(value) => update("headroom_credits", value)}
+            current={limit?.headroom_description ?? null}
+          />
 
           <Toggle
             checked={form.hold_until_released}
@@ -1574,5 +1605,61 @@ function OverrideDialog({
         )}
       </div>
     </Modal>
+  );
+}
+
+/** "Restrict early when less than N credits are left", or automatic. */
+function HeadroomChoice({
+  mode,
+  credits,
+  onMode,
+  onCredits,
+  current,
+}: {
+  mode: "off" | "fixed" | "auto";
+  credits: string;
+  onMode: (value: "off" | "fixed" | "auto") => void;
+  onCredits: (value: string) => void;
+  current: string | null;
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      <Toggle
+        checked={mode !== "off"}
+        onChange={(value) => onMode(value ? "fixed" : "off")}
+        label="Restrict early, before the budget runs out"
+        description="Checkmarx shows a scan's credits only once it bills them, usually when the scan finishes, so the scan that crosses the limit normally completes. With a headroom, the budget restricts once no more than that many credits are left, so the next scan, the one that would overrun, does not start."
+      />
+      {mode !== "off" && (
+        <div className="ml-12 flex flex-col gap-2">
+          <Field label="Restrict early when less than N credits are left">
+            <div className="flex items-center gap-3">
+              <Input
+                type="number"
+                min={1}
+                value={mode === "auto" ? "" : credits}
+                placeholder={mode === "auto" ? "Automatic" : "e.g. 50"}
+                disabled={mode === "auto"}
+                onChange={(event) => onCredits(event.target.value)}
+                className="max-w-[140px]"
+              />
+              <label className="flex items-center gap-2 text-[13px]">
+                <input
+                  type="checkbox"
+                  checked={mode === "auto"}
+                  onChange={(event) => onMode(event.target.checked ? "auto" : "fixed")}
+                />
+                Automatic
+              </label>
+            </div>
+          </Field>
+          <p className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+            Automatic: the median cost of this budget&apos;s Fusion scans over the last 30 days
+            (the whole tenant&apos;s when it has fewer than three), at most half the budget.
+            {current ? ` Now: ${current}` : ""}
+          </p>
+        </div>
+      )}
+    </div>
   );
 }
