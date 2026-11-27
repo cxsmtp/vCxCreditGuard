@@ -263,7 +263,8 @@ class TestRoleSources:
         assert note is not None
         assert f"keeps {RM} through group /AI Users" in note.body
         assert "CreditGuard removed only the direct mapping" in note.body
-        assert "Remove it from the group or role in Checkmarx One" in note.body
+        assert "the restriction cannot stop them using Fusion" in note.body
+        assert "Take them out of group /AI Users in Checkmarx One to make it bite." in note.body
         assert "exemption" in note.body
         restricted = db.scalar(select(Notification).where(Notification.title.like("% restricted")))
         assert restricted is not None and "not effective" in restricted.body
@@ -835,6 +836,9 @@ class TestSettingsApi:
         self, admin_client: TestClient, connected: FakeTenant, role: str
     ) -> None:
         connected.add_client_role(role)
+        # None is protected by default; an admin's list is what is checked.
+        listed = admin_client.put("/api/settings", json={"protected_roles": "ast-admin, iam-admin"})
+        assert listed.status_code == 200, listed.text
         refused = admin_client.put(
             "/api/settings", json={"ai_roles": [role, RM], "confirm_admin_roles": True}
         )
@@ -862,6 +866,13 @@ class TestSettingsApi:
     ) -> None:
         connected.add_client_role("manage-users")
         connected.add_client_role("ast-admin")
+        default = {
+            role["name"]: role
+            for role in admin_client.get("/api/settings/client-roles").json()["roles"]
+        }
+        assert default["ast-admin"]["protected"] is False  # none by default
+        listed = admin_client.put("/api/settings", json={"protected_roles": "ast-admin"})
+        assert listed.status_code == 200
         roles = {
             role["name"]: role
             for role in admin_client.get("/api/settings/client-roles").json()["roles"]

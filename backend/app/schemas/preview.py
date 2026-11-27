@@ -101,6 +101,9 @@ class DryRunRowResponse(BaseModel):
     # A new restriction of a monthly or quarterly budget: it starts only if a
     # direct recount of the activity log agrees (not run by the preview).
     recount_required: bool = False
+    # Would be restricted, but keeps an AI role through a composite role or a
+    # group, so the restriction cannot fully bite (the note says which).
+    cannot_fully_bite: bool = False
 
 
 class DryRunResponse(BaseModel):

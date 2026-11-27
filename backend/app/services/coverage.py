@@ -10,7 +10,8 @@ role. On a live tenant (2026-11) that left almost nobody restrictable:
   ``update-llm-scan-mode``, ``manage-llm-configuration``), and ``scan-fusion``
   contains ``create-fusion-scan``: their holders keep Fusion through the
   composite whatever is removed directly;
-* ``ast-admin`` is also a protected role, so 93% of users are never restricted;
+* ``ast-admin`` was a protected role by default (it no longer is), which left 93%
+  of users never restricted;
 * ``ast-scanner``, ``ast-risk-manager`` and ``manage-project`` contain none of
   the default AI roles, so people who have those plus ``create-fusion-scan``
   directly are the ones a user budget can stop.

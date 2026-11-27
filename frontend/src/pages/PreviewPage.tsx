@@ -75,7 +75,11 @@ export function PreviewPage({ isAdmin = false }: { isAdmin?: boolean }) {
     { key: "limit", header: "Credit limit", value: (r) => r.credit_limit },
     { key: "percent", header: "Percent used", value: (r) => (r.percent_used == null ? "" : r.percent_used.toFixed(1)) },
     { key: "status", header: "Projected status", value: (r) => r.projected_status },
-    { key: "enforce", header: "Would enforce", value: (r) => (r.would_enforce ? "yes" : "no") },
+    {
+      key: "enforce",
+      header: "Would enforce",
+      value: (r) => (r.would_enforce ? (r.cannot_fully_bite ? "yes (cannot fully bite)" : "yes") : "no"),
+    },
     { key: "projects", header: "Projects affected", value: (r) => r.blast?.affected_projects ?? 0 },
     { key: "users", header: "Users affected", value: (r) => r.blast?.affected_users ?? 0 },
     { key: "note", header: "Note", value: (r) => r.note ?? "" },
@@ -198,7 +202,14 @@ export function PreviewPage({ isAdmin = false }: { isAdmin?: boolean }) {
                       </Td>
                       <Td>
                         {row.would_enforce ? (
-                          <Badge tone="critical">Yes</Badge>
+                          <>
+                            <Badge tone="critical">Yes</Badge>
+                            {row.cannot_fully_bite && (
+                              <p className="mt-0.5 text-xs" style={{ color: "var(--status-warning)" }}>
+                                cannot fully bite
+                              </p>
+                            )}
+                          </>
                         ) : (
                           <span className="text-xs" style={{ color: "var(--text-muted)" }}>
                             No

@@ -53,7 +53,8 @@ const FEATURES: FeatureGroup[] = [
       "Readiness checklist (Settings → Enforcement and Diagnose): connection, activity log, counts matching Checkmarx, a passed self-test on a user and a project, and a reviewed dry run. A new install starts watch-only and turns enforcement on once every item is green, or with an audited override typed by an admin.",
       "Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users and projects restricts nobody and pauses itself.",
       "A pause switch stops new restrictions at once; warnings and giving access back carry on.",
-      "Protected roles (ast-admin and iam-admin by default) are never restricted.",
+      "Everyone over an enforcing user budget is restricted, administrators included. Where someone keeps an AI role through a composite role (ast-admin contains create-fusion-scan) or a group, CreditGuard still removes what it can, and says once per period, in the audit log, a warning and the Simulation (\"cannot fully bite\"), that the restriction cannot stop them and what to remove in Checkmarx One.",
+      "The account the API key belongs to is never restricted: restricting it could remove rights CreditGuard needs to restore others. It is audited and reported instead. Protected roles (none by default) can be listed in Settings → Enforcement to shield their holders the same way.",
       "A sudden fall in reported usage is held, not believed, until later readings confirm it.",
       "Enforcement self-test: restricts a chosen user or project for real through the budget-breach code, reads it back (saying when a role kept through a group or composite means it cannot bite), restores it and checks every setting reads exactly as before. Refuses anything restricted, near a budget, protected or mid-scan; the restore always runs.",
     ],
@@ -127,9 +128,10 @@ const LIMITATIONS: Limitation[] = [
     meaning: (
       <>
         A user budget cannot stop someone who gets Fusion through a composite
-        role: ast-admin (held by 274 of 296 users on a live tenant, and
-        protected) and scan-fusion both contain create-fusion-scan, so
-        removing the direct mapping takes nothing away. The fix is on the
+        role: ast-admin (held by 274 of 296 users on a live tenant) and
+        scan-fusion both contain create-fusion-scan, so removing the direct
+        mapping takes nothing away. Such a person is still restricted, and
+        CreditGuard warns that it cannot fully bite and what to remove. The fix is on the
         tenant: give people ast-scanner or ast-risk-manager, which contain no
         AI role, plus create-fusion-scan directly where they should run Fusion.
         Check Enforcement coverage (Simulation or Settings → Enforcement)

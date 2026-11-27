@@ -1023,6 +1023,8 @@ export interface DryRunRow {
   auto_triage_attributed?: string | null;
   /** A new period-budget restriction: it starts only if a direct recount of the activity log agrees. */
   recount_required?: boolean;
+  /** Would be restricted, but keeps an AI role through a composite role or a group. */
+  cannot_fully_bite?: boolean;
 }
 
 export interface DryRunResult {

@@ -526,6 +526,26 @@ class DryRunRow:
     # A new restriction of a monthly or quarterly budget: it starts only if the
     # independent recount of the activity log agrees (app/services/recount.py).
     recount_required: bool = False
+    # Would be restricted, but keeps an AI role through a composite role or a
+    # group (read from the tenant for the Simulation): the note says which.
+    cannot_fully_bite: bool = False
+
+
+def cannot_fully_bite(blast: BlastRadius) -> str | None:
+    """ "keeps X through role ast-admin; Y through group /G" for the users this
+    restriction would leave an AI role, or None when every read user loses them all."""
+    parts: list[str] = []
+    for user in blast.user_roles:
+        if not user.read or not user.kept:
+            continue
+        through: dict[str, list[str]] = {}
+        for role in user.kept:
+            through.setdefault(" and ".join(role.sources), []).append(role.name)
+        kept = "; ".join(f"{', '.join(names)} through {where}" for where, names in through.items())
+        nothing = "" if user.removed else "nothing to remove, "
+        who = f"{user.user_label or user.user_id} " if len(blast.user_roles) > 1 else ""
+        parts.append(f"{who}{nothing}keeps {kept}")
+    return "; ".join(parts) or None
 
 
 @dataclass(slots=True)
@@ -687,6 +707,7 @@ def _project_one(
     would_enforce = False
     note: str | None = None
     recount_required = False
+    cannot_bite = False
     on_summary = (
         evaluation.summary_hold(
             session,
@@ -735,6 +756,11 @@ def _project_one(
                     "Would breach and enforce, but no Checkmarx connection is configured, "
                     "so the restriction would be deferred until one is."
                 )
+            kept = cannot_fully_bite(blast) if would_enforce else None
+            if kept is not None:
+                cannot_bite = True
+                bite = f"Would enforce: Yes (cannot fully bite: {kept})."
+                note = f"{bite} {note}" if note else bite
             if would_enforce and recount.applies(session, limit, window):
                 recount_required = True
                 note = f"{note} {recount.PREVIEW_NOTE}" if note else recount.PREVIEW_NOTE
@@ -757,4 +783,5 @@ def _project_one(
         period_key=window.key,
         auto_triage_attributed=auto_triage,
         recount_required=recount_required,
+        cannot_fully_bite=cannot_bite,
     )

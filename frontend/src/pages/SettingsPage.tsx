@@ -835,13 +835,13 @@ export function SettingsPage({
                 </Field>
                 <Field
                   label="Protected roles"
-                  hint="Comma separated Checkmarx One role names. A user holding any of them is never restricted automatically; an admin is told instead. The account your API key belongs to is always protected."
+                  hint="Comma separated Checkmarx One role names; none by default. A user holding any of them is never restricted automatically; an admin is told instead. The account your API key belongs to is always protected: restricting it could remove rights CreditGuard needs to restore others."
                 >
                   <Input
                     disabled={!isAdmin}
                     value={value("protected_roles") ?? ""}
                     onChange={(event) => set({ protected_roles: event.target.value })}
-                    placeholder="ast-admin, iam-admin"
+                    placeholder="None (everyone over budget is restricted)"
                     spellCheck={false}
                   />
                 </Field>
