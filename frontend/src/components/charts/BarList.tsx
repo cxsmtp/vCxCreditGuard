@@ -132,7 +132,7 @@ export function BarList({ items, emptyTitle, emptyDescription, unavailable }: Pr
                   style={{ background: "var(--hover)" }}
                   role="img"
                   aria-label={`${item.label}: ${formatCredits(value)} credits${
-                    item.limit !== null ? ` against a limit of ${item.limit}` : ""
+                    item.limit !== null ? ` against a limit of ${formatCredits(item.limit)}` : ""
                   }`}
                 >
                   <div

@@ -25,7 +25,7 @@ from app.models.usage import (
     SchedulerRun,
     UsageSnapshot,
 )
-from app.services import settings_store
+from app.services import credits_text, settings_store
 
 OK = "ok"
 WARN = "warn"
@@ -324,9 +324,11 @@ def _attribution_check(session: Session) -> Check:
     )
 
 
-def _credits(value: Decimal) -> str:
-    text = f"{Decimal(value).normalize():f}"
-    return text.rstrip("0").rstrip(".") if "." in text else text
+def _credits(value: Decimal | str | None) -> str:
+    """A credit amount in a sentence: one decimal ("12.0", "1,365.5")."""
+    if value is None or value == "":
+        return "unknown"
+    return credits_text.credits(value)
 
 
 def _unmatched_entities_check(session: Session) -> Check:
@@ -467,14 +469,14 @@ def _activity_check(session: Session, moment: datetime) -> Check | None:
                 label,
                 WARN,
                 f"{detail} But over {reconciliation.get('period')} the log adds up to "
-                f"{reconciliation.get('activity_credits')} credits and the consumption summary "
-                f"reports {reconciliation.get('summary_credits')} (checked "
+                f"{_credits(reconciliation.get('activity_credits'))} credits and the consumption "
+                f"summary reports {_credits(reconciliation.get('summary_credits'))} (checked "
                 f"{reconciliation.get('at')}): some usage may be missing from one of them.",
             )
         if isinstance(reconciliation, dict) and reconciliation.get("status") == "match":
             detail += (
                 f" Over {reconciliation.get('period')} it adds up to the consumption summary's "
-                f"total ({reconciliation.get('summary_credits')} credits)."
+                f"total ({_credits(reconciliation.get('summary_credits'))} credits)."
             )
         return Check("activity_source", label, OK, detail)
     if status == activity_source.FALLBACK:
@@ -545,9 +547,10 @@ def _auto_triage_check(session: Session) -> Check:
         )
     )
     detail = (
-        f"{total} auto-triage credits in the lookback window: {observed} traced to the scans "
-        f"that triggered them, {estimated} estimated from earlier scans, {unresolved} held by "
-        f"initiators that are not a synced user, {on_project} on the project only."
+        f"{_credits(total)} auto-triage credits in the lookback window: {_credits(observed)} "
+        f"traced to the scans that triggered them, {_credits(estimated)} estimated from earlier "
+        f"scans, {_credits(unresolved)} held by initiators that are not a synced user, "
+        f"{_credits(on_project)} on the project only."
     )
     problems: list[str] = []
     if initiators:
@@ -626,13 +629,14 @@ def _recount_check(session: Session, moment: datetime) -> Check:
         what = f"{entry.get('entity_type')} {entry.get('entity_label')}, {entry.get('period_key')}"
         if entry.get("kind") == recount.DISAGREE:
             lines.append(
-                f"{what}: CreditGuard counted {entry.get('counted')}, the activity log "
-                f"{entry.get('recount')} (limit {entry.get('credit_limit')}); not restricted"
+                f"{what}: CreditGuard counted {_credits(entry.get('counted'))}, the activity log "
+                f"{_credits(entry.get('recount'))} (limit {_credits(entry.get('credit_limit'))}); "
+                "not restricted"
             )
         else:
             lines.append(
                 f"{what}: no recount ({entry.get('reason')}); CreditGuard counted "
-                f"{entry.get('counted')}; not restricted"
+                f"{_credits(entry.get('counted'))}; not restricted"
             )
     try:
         latest = datetime.fromisoformat(str(entries[0].get("at")))

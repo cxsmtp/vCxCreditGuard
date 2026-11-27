@@ -1059,9 +1059,9 @@ function UsageSourceNote({ status }: { status: UsageSourceStatus | null }) {
       text += ` It has failed since ${formatDateTime(status.failing_since)}: nothing new is counted until it answers.`;
     }
     if (reconciliation?.status === "match") {
-      text += ` Its sum matched the summary (${reconciliation.summary_credits} credits, ${reconciliation.period?.replace(/_/g, " ")}).`;
+      text += ` Its sum matched the summary (${formatCredits(reconciliation.summary_credits)} credits, ${reconciliation.period?.replace(/_/g, " ")}).`;
     } else if (reconciliation?.status === "mismatch") {
-      text += ` Its sum (${reconciliation.activity_credits}) did not match the summary (${reconciliation.summary_credits}): see Diagnose.`;
+      text += ` Its sum (${formatCredits(reconciliation.activity_credits)}) did not match the summary (${formatCredits(reconciliation.summary_credits)}): see Diagnose.`;
     }
   } else if (status.status === "fallback") {
     text = `The activity log could not be read (${status.last_error ?? "unknown error"}); the consumption summary is the source until it answers again.`;

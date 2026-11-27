@@ -59,6 +59,7 @@ from app.models.limits import (
 )
 from app.models.org import CxApplicationProject, CxProject, CxProjectGroup, CxUser
 from app.services import (
+    credits_text,
     error_text,
     ingestion,
     key_permissions,
@@ -3863,7 +3864,7 @@ def _enforcement_body(
     entity = limit.entity_label or limit.entity_id
     lines = [
         f"The {limit.entity_type} limit on {entity} was reached in {period_key} "
-        f"({limit.credit_limit} credits).",
+        f"({credits_text.credits(limit.credit_limit)} credits).",
     ]
     if mix is not None:
         lines.append(

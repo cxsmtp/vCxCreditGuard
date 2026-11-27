@@ -1,14 +1,13 @@
 /** Formatting helpers. No em dashes in any user visible string. */
 
+const ONE_DECIMAL: Intl.NumberFormatOptions = { minimumFractionDigits: 1, maximumFractionDigits: 1 };
+
+/** Credits always read with exactly one decimal and thousands separators: "12.0", "1,365.5", "0.5". */
 export function formatCredits(value: string | number | null | undefined): string {
-  if (value === null || value === undefined || value === "") return "0";
+  if (value === null || value === undefined || value === "") return (0).toLocaleString(undefined, ONE_DECIMAL);
   const numeric = typeof value === "number" ? value : Number(value);
   if (Number.isNaN(numeric)) return String(value);
-  const fractional = Math.abs(numeric % 1) > 0.0001;
-  return numeric.toLocaleString(undefined, {
-    minimumFractionDigits: fractional ? 2 : 0,
-    maximumFractionDigits: fractional ? 2 : 0,
-  });
+  return numeric.toLocaleString(undefined, ONE_DECIMAL);
 }
 
 export function formatNumber(value: number | null | undefined): string {

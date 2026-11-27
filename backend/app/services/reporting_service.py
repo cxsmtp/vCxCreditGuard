@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.db.base import utcnow
 from app.models.enums import EnforcementStatus, LimitStatus
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
-from app.services import evaluation, settings_store
+from app.services import credits_text, evaluation, settings_store
 from app.services.periods import PeriodError, current_window
 
 # A day in seconds, as a Decimal, for burn-rate arithmetic.
@@ -341,7 +341,8 @@ def report_as_text(report: Report) -> str:
             "Impact right now:",
             f"  Active restrictions: {report.impact.active_restrictions} "
             f"across {report.impact.entities_restricted} entity(ies)",
-            f"  Credits over budget on enforced limits: {report.impact.credits_over_budget}",
+            "  Credits over budget on enforced limits: "
+            f"{credits_text.credits(report.impact.credits_over_budget)}",
             f"  Entities warned: {report.impact.warnings_active}",
             f"  Monitor-only limits over budget (not restricted): "
             f"{report.impact.monitor_only_breaches}",
@@ -352,8 +353,9 @@ def report_as_text(report: Report) -> str:
             when = p.exhaustion_at.date().isoformat() if p.exhaustion_at else "not this period"
             lines.append(
                 f"  {p.entity_label or p.entity_id} ({p.entity_type}): "
-                f"{p.credits_used} of {p.credit_limit} used, "
-                f"~{p.projected_period_end.quantize(Decimal('1'))} by period end, "
+                f"{credits_text.credits(p.credits_used)} of "
+                f"{credits_text.credits(p.credit_limit)} used, "
+                f"~{credits_text.credits(p.projected_period_end)} by period end, "
                 f"exhausts {when}"
             )
     return "\n".join(lines)

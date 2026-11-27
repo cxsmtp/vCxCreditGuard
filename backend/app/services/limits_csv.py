@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from app.checkmarx.client import CheckmarxClient
 from app.models.enums import EntityType, PeriodType
 from app.models.limits import CreditLimit
-from app.services import limits_service
+from app.services import credits_text, limits_service
 from app.services.audit import AuditActor, record_audit
 from app.services.periods import PeriodError, current_window
 
@@ -307,7 +307,7 @@ def import_limits(
                 entity_id=data.entity_id,
                 action=action,
                 detail=(
-                    f"{data.credit_limit} credits per {data.period_type}, "
+                    f"{credits_text.credits(data.credit_limit)} credits per {data.period_type}, "
                     f"{'enforcing' if data.enforce else 'monitor only'}"
                 ),
             )

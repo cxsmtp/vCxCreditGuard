@@ -234,8 +234,8 @@ class TestRates:
 
         month = utcnow().strftime("%B %Y")
         assert breach.body.startswith(
-            f"4 of 3 credits used in {month}: Fusion scan (Opus 5.5) 2 scans = 4 credits "
-            "(2 per scan, the listed rate).\n"
+            f"4.0 of 3.0 credits used in {month}: Fusion scan (Opus 5.5) 2 scans = 4.0 credits "
+            "(2.0 per scan, the listed rate).\n"
         ), breach.body
         assert "cannot switch Fusion off yet" not in breach.body
         assert "Auto Triage, PR triage and remediation and Fusion are turned off" in breach.body
@@ -273,7 +273,7 @@ class TestRates:
         assert mix.fusion_priced is None
         text = usage_mix.describe(mix, period_key="2026-11", entity_type="project")
         assert "Fusion scan 2 transactions" in text
-        assert "= 4 credits" not in text
+        assert "= 4.0 credits" not in text
 
     def test_an_unpriced_model_is_not_priced(self, db: Session, monkeypatch) -> None:
         tenant = _connected(db, monkeypatch)
@@ -300,7 +300,7 @@ class TestRates:
         mix = usage_mix.for_period(db, limit, _period_key(limit))
         assert mix is not None and mix.fusion_priced is None
         assert usage_mix.describe(mix, period_key="2026-11", entity_type="project").endswith(
-            "Fusion scan 4."
+            "Fusion scan 4.0."
         )
 
 

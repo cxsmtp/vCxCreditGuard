@@ -22,7 +22,7 @@ from app.db import locking
 from app.db.base import utcnow
 from app.models.enums import EntityType, PeriodType, RequestStatus, Severity
 from app.models.limits import CreditLimit, CreditRequest
-from app.services import error_text, limits_service, notifications, settings_store
+from app.services import credits_text, error_text, limits_service, notifications, settings_store
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -112,7 +112,7 @@ def create_request(
         target_id=str(request.id),
         target_label=request.entity_label or request.entity_id,
         after={"entity_id": request.entity_id, "requested_limit": request.requested_limit},
-        detail=f"Requested a budget of {request.requested_limit} credits.",
+        detail=f"Requested a budget of {credits_text.credits(request.requested_limit)} credits.",
     )
     return request
 
@@ -253,7 +253,7 @@ def approve_request(
             "approved_limit": target,
             "expires_at": expires_at.isoformat() if expires_at else None,
         },
-        detail=f"Granted {target} credits{window}.",
+        detail=f"Granted {credits_text.credits(target)} credits{window}.",
     )
     if existing is not None:
         # Unblock the entity now rather than at the next cycle. This commits the
@@ -381,8 +381,9 @@ def auto_decide_pending(
                 actor=actor,
                 expires_at=expires_at,
                 note=(
-                    f"Auto-approved by hands-off automation: an increase of {increase} "
-                    f"credit(s) is within the {policy.auto_approve_max_increase}-credit "
+                    "Auto-approved by hands-off automation: an increase of "
+                    f"{credits_text.credits(increase)} credit(s) is within the "
+                    f"{credits_text.credits(policy.auto_approve_max_increase)}-credit "
                     f"cap{window}."
                 ),
                 client=client,
@@ -408,7 +409,8 @@ def auto_decide_pending(
             body=(
                 f"Request #{request.id} for "
                 f"{request.entity_label or request.entity_id} was auto-approved at "
-                f"{request.requested_limit} credits{window} under hands-off automation."
+                f"{credits_text.credits(request.requested_limit)} credits{window} under "
+                "hands-off automation."
             ),
             entity_type=request.entity_type,
             entity_id=request.entity_id,
@@ -514,10 +516,12 @@ def _revert_one_grant(
                 actor=actor,
                 client=client,
             )
-        detail = (
-            f"Temporary grant expired; budget restored to "
-            f"{request.previous_limit if request.previous_limit is not None else 'none'}."
+        restored = (
+            credits_text.credits(request.previous_limit)
+            if request.previous_limit is not None
+            else "none"
         )
+        detail = f"Temporary grant expired; budget restored to {restored}."
     else:
         # The limit was changed (or removed) since the grant, so there is
         # nothing safe to undo. Record that we stood down.
