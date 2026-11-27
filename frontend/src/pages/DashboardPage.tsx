@@ -165,7 +165,9 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
             data.tenant_total_credits === null ? "No data" : formatCredits(data.tenant_total_credits)
           }
           detail={
-            data.collected_at ? `Collected ${formatRelative(data.collected_at)}` : "No poll yet"
+            data.collected_at
+              ? `Consumption feed, rolling window. Collected ${formatRelative(data.collected_at)}`
+              : "No poll yet"
           }
         />
         <StatTile
@@ -273,7 +275,7 @@ function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
     <div className="mb-6">
       <Card
         title="Credit pool"
-        description="The tenant's AI credit balance against what your budgets have claimed."
+        description="The tenant's AI credit balance against what your budgets have claimed. Granted, Used and Available are Checkmarx One's balance for the current grant (its credit info), shown as it reports them. “Credits reported” above comes from the consumption feed over a rolling window, which can reach back past the start of this grant, so it can be higher than Granted."
       >
         <div className="mb-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
           <PoolFigure label="Total granted" value={figure(pool.total)} />
@@ -344,6 +346,23 @@ function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
           </div>
         )}
 
+        {pool.unexplained !== null && pool.unexplained !== undefined && (
+          <div className="mt-3">
+            <InfoNote tone="info">
+              Checkmarx One&apos;s own figures do not add up: Granted − Used is{" "}
+              {formatCredits(Number(pool.total) - Number(pool.used))}, but it reports{" "}
+              {figure(pool.available)} available ({formatCredits(Math.abs(Number(pool.unexplained)))}{" "}
+              {Number(pool.unexplained) > 0 ? "less" : "more"}). Its credit info does not say why
+              {Object.keys(pool.other_figures ?? {}).length > 0
+                ? `; it also reports ${Object.entries(pool.other_figures ?? {})
+                    .map(([key, value]) => `${key} ${formatCredits(value)}`)
+                    .join(", ")}`
+                : ""}
+              . CreditGuard shows each figure as reported and does not fill the gap in.
+            </InfoNote>
+          </div>
+        )}
+
         {over && (
           <div className="mt-3">
             <InfoNote tone="warning">
@@ -372,7 +391,12 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
       credits: summary.automation_credits,
       total: summary.user_total_credits,
       note:
-        "Auto Triage, bots and integrations without an email. Counted tenant wide and on projects, towards no user limit; not a person to chase.",
+        "Auto Triage, bots and integrations without an email. Counted tenant wide and on projects, towards no user limit; not a person to chase." +
+        ((summary.automation_builtin ?? 0) > 0
+          ? ` ${formatNumber(summary.automation_builtin ?? 0)} of them ${
+              summary.automation_builtin === 1 ? "is" : "are"
+            } Checkmarx One's own (such as Auto-triage), which Settings → Attribution does not list; the rest are listed there under Unmatched, marked Automation.`
+          : " Listed under Settings → Attribution → Unmatched, marked Automation."),
     });
   }
   if (summary.unmatched_people > 0) {
@@ -382,7 +406,11 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
       count: summary.unmatched_people,
       credits: summary.unmatched_people_credits,
       total: summary.user_total_credits,
-      note: "Reported under a name or address that matches no synced user.",
+      note:
+        "Reported under a name or address that matches no synced user." +
+        ((summary.unmatched_people_disputed ?? 0) > 0
+          ? ` Under Settings → Attribution: ${formatNumber(summary.unmatched_people_disputed ?? 0)} under Disputes (a likely match to confirm), the rest under Unmatched.`
+          : " Listed under Settings → Attribution → Unmatched."),
     });
   }
   for (const [key, label, found] of [
@@ -400,6 +428,16 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
         note: `Usage under a repository name that matches no ${label} in Checkmarx One (such as ${names}). It counts towards no ${label}, group or application limit.`,
       });
     }
+  }
+  if (Number(summary.projects_unreported ?? 0) > 0 && summary.tenant_total_credits) {
+    rows.push({
+      key: "unreported",
+      label: "Not under any project",
+      count: 0,
+      credits: summary.projects_unreported ?? "0",
+      total: summary.tenant_total_credits,
+      note: "Checkmarx One reports this much more usage tenant wide than its project rows add up to: usage it files under no project, a project row with no name, or a row the last read did not return. It counts towards no project, group or application limit and cannot be mapped here; it is still counted tenant wide.",
+    });
   }
   if (rows.length === 0) return null;
   return (
@@ -422,7 +460,9 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
               <li key={row.key} className="text-[13px]">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <span className="font-medium">
-                    {formatNumber(row.count)} {row.label.toLowerCase()}
+                    {row.key === "unreported"
+                      ? row.label
+                      : `${formatNumber(row.count)} ${row.label.toLowerCase()}`}
                   </span>
                   <span className="tabular" style={{ color: "var(--text-secondary)" }}>
                     {formatCredits(row.credits)} credits

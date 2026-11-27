@@ -151,7 +151,15 @@ export function EntityMappingCard({ isAdmin }: { isAdmin: boolean }) {
             {data.map((row) => (
               <tr key={`${row.view}:${row.subject_key}`}>
                 <Td>
-                  <span className="text-sm">{row.name}</span>
+                  <span className="text-sm">
+                    {row.name}
+                    {row.deleted && " (deleted)"}
+                  </span>
+                  {row.deleted && (
+                    <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
+                      Deleted in Checkmarx One: counted tenant wide, towards no project budget.
+                    </span>
+                  )}
                 </Td>
                 <Td>{row.view === "project" ? "Project" : "Application"}</Td>
                 <Td align="right">

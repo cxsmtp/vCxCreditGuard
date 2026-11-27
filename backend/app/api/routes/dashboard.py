@@ -141,6 +141,8 @@ def _pool_info(pool, enforcement=None) -> CreditPoolInfo:  # type: ignore[no-unt
         assigned=pool.assigned,
         over_allocation=pool.over_allocation,
         checkmarx_enforcement=enforcement,
+        unexplained=pool.unexplained,
+        other_figures=pool.other_figures,
     )
 
 
@@ -162,6 +164,10 @@ def _attribution_info(summary) -> AttributionSummaryInfo:  # type: ignore[no-unt
         user_total_credits=summary.user_total_credits,
         projects=_unmatched_info(summary.projects),
         applications=_unmatched_info(summary.applications),
+        tenant_total_credits=summary.tenant_total_credits,
+        projects_unreported=summary.projects_unreported,
+        unmatched_people_disputed=summary.unmatched_people_disputed,
+        automation_builtin=summary.automation_builtin,
     )
 
 
@@ -822,6 +828,10 @@ def _entity_row(db, view, key, name, credits, mapping, record) -> UnmatchedEntit
         mapping_broken=broken,
         overridden=overridden_by is not None,
         overridden_by=overridden_by,
+        deleted=(
+            (record is None or record.entity_id is None)
+            and bool(dashboard_service.deleted_names(db, model, [name]))
+        ),
     )
 
 

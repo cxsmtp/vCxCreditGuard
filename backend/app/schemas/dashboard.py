@@ -80,6 +80,15 @@ class AttributionSummaryInfo(BaseModel):
     user_total_credits: Decimal = Decimal("0")
     projects: UnmatchedEntitiesInfo = UnmatchedEntitiesInfo()
     applications: UnmatchedEntitiesInfo = UnmatchedEntitiesInfo()
+    # The tenant total of the same window, and the part of it no project row
+    # accounts for (reported under no project, or not returned by the read).
+    tenant_total_credits: Decimal | None = None
+    projects_unreported: Decimal = Decimal("0")
+    # How these counts read on Settings → Attribution: people under Disputes
+    # (the rest under Unmatched), and automation that is Checkmarx One's own
+    # (Auto Triage, Auto Remediation), which that page does not list.
+    unmatched_people_disputed: int = 0
+    automation_builtin: int = 0
 
 
 class StatusTiles(BaseModel):
@@ -115,6 +124,11 @@ class CreditPoolInfo(BaseModel):
     # Checkmarx's own credit enforcement as /credits/info reports it, read only:
     # {"state", "consumptionPct", "warningThresholdPct", "cutoffThresholdPct"}.
     checkmarx_enforcement: dict[str, str | int | float] | None = None
+    # Total - used - available when Checkmarx sent all three and they do not
+    # add up: a gap in its own figures, shown as it is.
+    unexplained: Decimal | None = None
+    # Other figures /credits/info reported (when there is a gap), as given.
+    other_figures: dict[str, str] = {}
 
 
 class DashboardResponse(BaseModel):
@@ -228,6 +242,9 @@ class UnmatchedEntityResponse(BaseModel):
     # Mapped, but the name now matches a synced entity by itself, which wins.
     overridden: bool = False
     overridden_by: str | None = None
+    # The name is a project or application deleted in Checkmarx One: why it
+    # matches nothing (its usage counts tenant wide, towards no budget).
+    deleted: bool = False
     # After a mapping: where the name's usage counts from now on.
     confirmation: str | None = None
     # Keyset paging: pass the last row's cursor as ``after``, and ``readings``

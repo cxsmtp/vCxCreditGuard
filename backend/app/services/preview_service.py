@@ -739,6 +739,8 @@ def _project_one(
             note = "Would breach, but the entity is exempt."
         elif not limit.enforce:
             note = "Would breach, but the limit is monitor only."
+        elif on_summary == evaluation.AUTO_TRIAGE_HOLD:
+            note = f"Would breach, but not be restricted, because {on_summary}."
         elif on_summary is not None:
             note = f"Would breach on summary totals, but not be restricted, because {on_summary}."
         else:

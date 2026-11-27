@@ -233,7 +233,7 @@ function UsageBar({ limit }: { limit: Limit }) {
           className="mt-1 text-xs tabular"
           style={{ color: "var(--text-muted)" }}
           title={
-            "Auto triage that ran after scans this person started, charged to them (Settings → Attribution):\n" +
+            "Auto Triage that ran after scans this person started, reassigned to them (Settings → Attribution). Checkmarx One reports it under its Auto-triage account, not under this person, and it never starts a restriction on its own:\n" +
             state.auto_triage_attributed.parts
               .filter((part) => Number(part.counted) > 0)
               .map(
@@ -248,7 +248,12 @@ function UsageBar({ limit }: { limit: Limit }) {
               : "")
           }
         >
-          incl. {formatCredits(state.auto_triage_attributed.counted)} auto triage from their scans
+          incl. {formatCredits(state.auto_triage_attributed.counted)} reassigned Auto Triage from
+          their scans (own usage{" "}
+          {formatCredits(
+            Math.max(0, Number(state.credits_used) - Number(state.auto_triage_attributed.counted)),
+          )}
+          )
         </p>
       )}
     </div>

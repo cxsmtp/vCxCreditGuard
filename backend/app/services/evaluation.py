@@ -1867,7 +1867,9 @@ def _evaluate_one(
             # Over budget on summary totals: warned, never restricted.
             result.summary_held += 1
             evaluation.note = (
-                f"Over budget on summary totals; not restricted, because {on_summary}."
+                f"Over budget; not restricted, because {on_summary}."
+                if on_summary == AUTO_TRIAGE_HOLD
+                else f"Over budget on summary totals; not restricted, because {on_summary}."
             )
         elif client is None:
             evaluation.note = "No Checkmarx connection available, enforcement deferred."
@@ -2045,6 +2047,14 @@ def counts_from_totals(session: Session, limit: CreditLimit, window: PeriodWindo
     )
 
 
+# Why a budget over its limit only through Auto Triage charged from the
+# person's scans is not restricted (``summary_hold``).
+AUTO_TRIAGE_HOLD = (
+    "only the Auto Triage credits charged from scans they started take it over the limit, "
+    "and those never start a restriction"
+)
+
+
 def summary_hold(
     session: Session,
     *,
@@ -2062,14 +2072,20 @@ def summary_hold(
     tell a glitch from a real fall, so only the log's part may start a new
     restriction; summary-counted usage warns. So do the auto-triage credits
     charged to the person who started the scan: they always derive from the
-    summary's project readings (they still count towards the figure). Not for a
-    budget that counts current totals (lifetime, custom, count existing
-    usage, a demo budget), and not when the admin chose the summary only and
-    allowed restrictions from it (``usage.summary_restricts``). A restriction
-    already in force is not affected (the caller checks)."""
+    summary's project readings (they still count towards the figure). That
+    rule holds for every budget: when the person's own usage is under the
+    limit and only the auto-triage credits take it over, nothing is
+    restricted, whatever the budget counts or the settings allow. The
+    summary rule itself is not for a budget that counts current totals
+    (lifetime, custom, count existing usage, a demo budget), and not when the
+    admin chose the summary only and allowed restrictions from it
+    (``usage.summary_restricts``). A restriction already in force is not
+    affected (the caller checks)."""
     restrict_at = index.headroom.restrict_at(limit)
     if credits_used < restrict_at:
         return None
+    if attributed and attributed > 0 and credits_used - attributed < restrict_at:
+        return AUTO_TRIAGE_HOLD
     if counts_from_totals(session, limit, window):
         return None
     if settings_store.summary_restricts(session):
@@ -2369,6 +2385,10 @@ def _notify_breach(
     entity = limit.entity_label or limit.entity_id
     if exempt:
         tail = "This entity is on the exemption list, so no action was taken."
+        severity = Severity.WARNING
+        dedupe = notifications.monitor_only_key(limit.id, window.key)
+    elif limit.enforce and on_summary == AUTO_TRIAGE_HOLD:
+        tail = f"Not restricted, because {on_summary}."
         severity = Severity.WARNING
         dedupe = notifications.monitor_only_key(limit.id, window.key)
     elif limit.enforce and on_summary is not None:
