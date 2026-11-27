@@ -48,6 +48,7 @@ import { UpdatesPanel } from "../components/UpdatesPanel";
 import { CoveragePanel } from "../components/CoveragePanel";
 import { ReadinessPanel } from "../components/ReadinessPanel";
 import { SelfTestPanel } from "../components/SelfTestPanel";
+import { FastPathPanel } from "../components/FastPathPanel";
 import { EntityMappingCard } from "../components/EntityMappingCard";
 import { settingsDraft, useSettingsDraft, useWarnBeforeUnload } from "../lib/settingsDraft";
 
@@ -460,6 +461,8 @@ export function SettingsPage({
           </div>
         </Card>
         )}
+
+        {section === "general" && <FastPathPanel isAdmin={isAdmin} />}
 
         {section === "general" && (
         <Card

@@ -20,6 +20,7 @@ from app.api.routes import (
     auth,
     connection,
     dashboard,
+    fastpath,
     health,
     limits,
     notifications,
@@ -31,6 +32,7 @@ from app.api.routes import (
     selftest,
     updates,
     violations,
+    webhooks,
 )
 from app.api.routes import (
     settings as settings_routes,
@@ -157,6 +159,8 @@ def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) 
     api.include_router(dashboard.router)
     api.include_router(violations.router)
     api.include_router(updates.router)
+    api.include_router(fastpath.router)
+    api.include_router(webhooks.router)
     app.include_router(api)
     app.include_router(health.router)
 

@@ -56,6 +56,12 @@ point links to the section below that explains it.
   period's starting point discounted; `scripts/diagnose_usage.py` walks the
   whole chain ([Runbook](#runbook-a-figure-on-screen-does-not-match-checkmarx)).
 
+- **Fast check**, on by default: every 15 seconds, between cycles, the newest
+  rows of the activity log are counted and a budget they take over its limit is
+  restricted within seconds, through the same recount, ceilings and pause as a
+  cycle; optionally triggered at once by a Checkmarx One webhook when a scan
+  ends ([Faster enforcement](#faster-enforcement-the-fast-check-headroom-and-the-webhook)).
+
 **Budgets and requests**
 
 - Budgets per user, group, project or application: monthly, quarterly, a custom
@@ -165,7 +171,7 @@ telemetry, no analytics, and nothing else is contacted.
 
 | Limitation | What it means for you |
 | ---------- | --------------------- |
-| **It acts once a cycle**, not the moment credits are spent. | Usage is read and budgets judged once a cycle (every 15 minutes by default), and Checkmarx can report credits a little after they are spent. Usage in between can take a budget past its limit before the restriction lands, so leave some headroom. A large group or application is restricted over several cycles (at most 1,000 changes a cycle by default; [Sizing and scale](#sizing-and-scale)). |
+| **It acts once Checkmarx bills the credits**, not the moment they are spent. | Credits appear in Checkmarx One only once it bills the action, usually when a scan finishes, so **the scan that crosses a budget usually completes**. The fast check restricts within seconds of the credits appearing (every 15 seconds by default); set a budget's **headroom** to stop the scan that would overrun it, by restricting while a few credits are still left. Without the fast check, or while the activity log is unavailable, budgets are judged once a cycle (every 15 minutes by default). A large group or application is restricted over several cycles (at most 1,000 changes a cycle by default; [Sizing and scale](#sizing-and-scale), [Faster enforcement](#faster-enforcement-the-fast-check-headroom-and-the-webhook)). |
 | **It restricts access, it does not meter credits.** | It removes roles and turns settings off; it cannot stop an action already running or cap a budget to the exact credit. |
 | **Only roles held directly are removed.** | An AI role a person holds through a group or a composite role stays in effect. CreditGuard says so once and never changes the group or role, because that would affect everyone in it. Remove it there in Checkmarx One, or exempt the person ([Restricting a user, in detail](#what-the-enforcement-actions-actually-are)). |
 | **User budgets may not bite at all.** | A user budget cannot stop someone who gets Fusion through a composite role: `ast-admin` (held by 274 of 296 users on a live tenant) and `scan-fusion` both contain `create-fusion-scan`, so removing the direct mapping takes nothing away. Such a person is still restricted, and CreditGuard warns once per period that the restriction cannot fully bite and what to remove. The fix is on the tenant: give people `ast-scanner` or `ast-risk-manager` (which contain no AI role) plus `create-fusion-scan` directly where they should run Fusion. Check *Enforcement coverage* (Simulation or Settings → Enforcement) before relying on user budgets. Project, group and application budgets do not depend on roles: they turn AI features off on the projects. |
@@ -548,7 +554,9 @@ monthly or quarterly budget (pass 3 of the cycle, `_enforce_pending`), the
 budget's usage in the period is counted again, independently: straight from
 the raw rows of `GET /api/credits/activity`, never from `budget_usage`,
 `usage_delta` or the log's own counter. The restriction is applied only when
-that recount is also at or over the limit (the evaluation's own threshold).
+that recount is also at or over the limit (the evaluation's own threshold:
+for a budget with a [headroom](#headroom-restrict-before-the-budget-runs-out),
+`limit - headroom`).
 
 * **Where the rows come from.** CreditGuard keeps no raw rows (only how many
   of each identity it has seen), so the log is read afresh, at most once per
@@ -1023,6 +1031,160 @@ repeated page or the page limit never is. Groups come in one IAM call with no
 count: more than one group and more than a fifth of them missing at once is
 acted on only when the next sync misses the same groups. Every complete listing
 is remembered (`org_sync.complete_listings`).
+
+## Faster enforcement: the fast check, headroom and the webhook
+
+**What "instant" can mean.** Credits appear in Checkmarx One only once it
+**bills** an action, and a scan is usually billed when it finishes. So the scan
+that takes a budget over its limit normally **completes**, whatever CreditGuard
+does: by the time its credits are visible they are spent. The fast check makes
+the restriction land seconds after the credits appear instead of minutes;
+**headroom** is how to stop the scan that would overrun the budget, by
+restricting while a few credits are still left. The webhook only makes the fast
+check run at once when a scan ends; it never enforces anything itself.
+
+### The fast check
+
+`app/services/fastcheck.py`, a scheduler job of its own (`fast-check`), every
+15 seconds by default (Settings → Schedule & data → *Fast check*: on/off, 10 to
+300 seconds). The full cycle keeps its own interval and stays the source of
+truth. Each tick:
+
+1. **Reads the tail of the activity log**: from where its last read ended (in
+   this process; the activity source's cursor after a restart), a little earlier
+   for rows that aged out meanwhile, to the end. Normally **one request**; two
+   when the tail crosses a page boundary (500 rows); at most 4 pages, the rest
+   left to the cycle. No database transaction is open while Checkmarx is called,
+   and the read is under the cycle's pacing (a time budget of 120 seconds).
+2. **Counts new events through the activity source's own code**
+   (`activity_source._reconcile` and `_count`, under the attribution lock): the
+   same multiset rule, the same paging rule (a date met at a page boundary
+   waits), so a row is counted once whichever read sees it first, the fast check
+   or the cycle. It does not move the activity source's cursor: the next cycle
+   reads everything again and finds nothing new.
+3. **Evaluates only the budgets those events fed** that are now at or over where
+   they restrict (their limit, or inside their headroom), with
+   `evaluation.evaluate_all(only=...)`: the same pause and watch-only state,
+   safety ceilings, `summary_hold`, recount and blast-radius rules as a cycle,
+   and none of its housekeeping (no verification pass, no sweep, no settling of
+   closed periods). Already-restricted and monitor-only budgets already
+   announced are skipped; a budget whose restriction the recount refused is
+   tried by a fast check at most every 5 minutes (each cycle tries it anyway).
+
+**Never at the same time as a cycle.** It holds the cycle's own lock
+(`scheduler_lock`, holder `fastcheck:…`) and skips the tick when the lock is
+busy. A cycle that finds a fast check holding it waits for it (up to 150
+seconds) instead of skipping, and no fast check starts while a cycle waits.
+
+**When it does nothing:** turned off, the scheduler off, **demo mode** (demo
+data is never read from a tenant), the usage source *Summary only*, or the
+activity log not the source right now (a fallback to the summary). Summary
+totals never restrict anyway.
+
+**The safety ceiling** counts per cycle. So that several fast checks between
+two cycles cannot together start more than one cycle may, a fast check also
+counts the budgets and targets that started restricting over the last cycle
+interval and leaves anything beyond the ceiling to the full cycle (which applies
+its own, and trips the breaker as before).
+
+**What it costs** (measured with the fake tenant in `tests/test_fastcheck.py`):
+
+| | At 15 seconds |
+| --- | --- |
+| Checkmarx requests, nothing restricted | 1 per tick, 2 when the tail crosses a 500-row page: **240 to 480 an hour** (`requests_per_hour` on the Settings card). |
+| When a budget starts restricting | plus the recount's read of the period (as in a cycle) and the restriction's own writes. |
+| Database writes per tick, nothing new | **2 single-row UPDATEs of `scheduler_lock`** (take and release), nothing else: no cycle record, no status row (`test_no_database_writes_when_nothing_changed`). The status is written when something happened, and otherwise at most every 5 minutes. |
+| Database writes per tick, new events | the activity source's own counting writes (keys seen, the budget counters), as a cycle would make for the same rows. |
+
+**Status.** Diagnose shows *Fast check: last run, last action*; the Settings
+card shows the same. A tick creates no `scheduler_run` row.
+
+### Headroom: restrict before the budget runs out
+
+Per budget, optional, off by default (`credit_limit.headroom_credits` and
+`headroom_auto`, migration `c8f2a6d4e1b7`). One rule for every caller
+(`app/services/headroom.py`): the evaluation, the recount gate, the Simulation
+and dry run, the safety ceiling and the lift on a credit increase:
+
+```
+restrict_at = credit_limit - headroom
+restricted when credits_used >= restrict_at    (remaining <= headroom)
+lifted     when credits_used <  restrict_at    (remaining >  headroom)
+```
+
+With no headroom `restrict_at` is the limit: exactly the behaviour before.
+Remaining exactly equal to the headroom counts as inside it, as usage exactly at
+the limit always counted as over it.
+
+* **Fixed**: *Restrict early when less than N credits are left*. Must be smaller
+  than the limit; at most `limit - 1` credits are ever held back, so a headroom
+  never restricts a budget nobody has used.
+* **Automatic**: the median cost of the budget's entity's **Fusion scans** over
+  the last 30 days (a project's, a person's, an application's projects', a
+  group's projects'), else the tenant-wide median when the entity has fewer than
+  3, else none for now. At most half the limit. The budget form shows the number
+  it chose and why. Scan costs come from the activity log as it counts (the
+  `fusion_scan_cost` table: each new Fusion row added once to its scan, kept 30
+  days), so an upgraded install has no automatic headroom until Fusion scans
+  have been counted.
+* **Messages.** A budget restricted inside its headroom says *Restricted early:
+  X credits left, below the headroom of Y* (the breach notice, titled *… is
+  nearly out of credits*, the evaluation note, the budget's period and its
+  status *Restricted early*), never *over budget*. The Simulation says *Would
+  restrict early*.
+* **The recount** confirms `recount >= limit - headroom`.
+* **Lifting.** Raising the budget so that more than the headroom is left lifts
+  the restriction as any credit increase does (`credit_increased`); so does
+  turning the headroom off or lowering it.
+
+### The Checkmarx One webhook (optional)
+
+`POST /api/webhooks/checkmarx` (`app/services/cx_webhook.py`). Off unless an
+admin turns it on and creates a secret (Settings → Schedule & data → *Fast
+check*); while off it answers 404.
+
+**What Checkmarx One documents** (read on 27 November 2026):
+
+* [Tenant-level Webhooks](https://docs.checkmarx.com/en/34965-378162-tenant-level-webhooks.html):
+  a webhook has a name, an *Active* switch, a payload URL, an optional
+  *Secret (for added security)*, SSL verification and events: **Completed
+  Scan, Failed Scan, Partial Scan, Project Created**. No payload or header
+  details on that page.
+* [Configuring Projects → Webhooks](https://docs.checkmarx.com/en/34965-68538-configuring-projects.html)
+  (project level): post-scan events only, `X-Cx-Webhook-Event:
+  scan_completed_successfully` or `scan_failed`, `Content-Type:
+  application/json`, and `X-Cx-Webhook-Signature: sha256=<value>`, described as
+  the event data "encrypted using the sha256" with the webhook secret; the
+  example value is base64 (`sha256=Jw9m7mG+…=`). The payload holds `scanId`,
+  `projectId`, `projectName`, `correlationId`, `initiator`, `userAgent`,
+  `sourceType`, `sourceOrigin`, `branch`, `mainBranch`, `repoURL` and
+  `statusInfo` (one entry per scanner plus `general`, each with a status, and
+  `loc` and `errorCode` where they apply).
+* **There is no scan-started event**, and no documented retry, ping or
+  replay protection. The header values of the tenant-level *Partial Scan* and
+  *Project Created* events are not documented.
+
+**What CreditGuard does with it.** A delivery is accepted only with a valid
+`X-Cx-Webhook-Signature`: HMAC-SHA256 of the raw body keyed with the secret,
+compared in constant time as base64 or hex (the documentation does not name the
+encoding). Bodies over 64 KiB are refused (413), more than 60 deliveries a
+minute too (429), unsigned or wrongly signed ones get 401; refusals are kept in
+memory only, so nobody can make the app write to its database by posting
+rubbish. A scan event (any event name containing `scan`, or a body with a
+`scanId`) queues **one** fast check and returns 202 at once: no enforcement work
+in the request, and a burst of deliveries coalesces into the single queued
+check (never closer than 5 seconds to the previous one). *Project Created* is
+accepted and ignored: nothing is billed. Nothing in the payload is trusted: the
+project, scan and initiator are recorded as a hint for Diagnose only. The route
+needs no session, so it carries no CSRF token: it is the only one, and it is
+authenticated by the signature alone. Creating or replacing the secret is
+admin only and audited (`webhook.secret_created`, `webhook.secret_rotated`,
+never the value); the secret is shown once.
+
+In Checkmarx One add a tenant-level webhook with the URL shown on the Settings
+card, the secret, and the events Completed Scan, Failed Scan and Partial Scan.
+The URL must be reachable from Checkmarx One. Without a webhook the fast check
+still finds the same credits within its interval.
 
 ## What the enforcement actions actually are
 

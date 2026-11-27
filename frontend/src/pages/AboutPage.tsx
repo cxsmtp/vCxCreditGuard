@@ -51,6 +51,9 @@ const FEATURES: FeatureGroup[] = [
       "Enforcement coverage: how many of the people holding an AI role a user restriction could actually take it from, and why not the rest (composite roles, groups, protected roles), with a warning when user budgets will not bite. It never changes the role list.",
       "Recount before restricting (always on): before a new restriction of a monthly or quarterly budget, CreditGuard recounts the budget's period straight from the Checkmarx activity log, independently of its own counters, and restricts only if that recount is also at or over the limit. If the counts disagree, or the recount cannot be done, it warns instead and Diagnose shows it.",
       "Readiness checklist (Settings → Enforcement and Diagnose): connection, activity log, counts matching Checkmarx, a passed self-test on a user and a project, and a reviewed dry run. A new install starts watch-only and turns enforcement on once every item is green, or with an audited override typed by an admin.",
+      "Fast check (on by default): every 15 seconds, between full cycles, the newest rows of the activity log are counted, and a budget they take over its limit is restricted within seconds, through the same recount, ceilings and pause as a cycle. About 240 small requests an hour, and no database writes while nothing changes.",
+      "Headroom (per budget, off by default): restrict once fewer than N credits are left, or automatically at the median cost of the budget's recent Fusion scans, so the scan that would overrun the budget does not start. Shown as \"Restricted early: X credits left\".",
+      "Optional Checkmarx One webhook: when a scan ends, Checkmarx One calls CreditGuard (signed with a secret only an admin can set) and a fast check runs at once.",
       "Safety ceilings: a cycle about to restrict more than 25 budgets or 100 users and projects restricts nobody and pauses itself.",
       "A pause switch stops new restrictions at once; warnings and giving access back carry on.",
       "Everyone over an enforcing user budget is restricted, administrators included. Where someone keeps an AI role through a composite role (ast-admin contains create-fusion-scan) or a group, CreditGuard still removes what it can, and says once per period, in the audit log, a warning and the Simulation (\"cannot fully bite\"), that the restriction cannot stop them and what to remove in Checkmarx One.",
@@ -87,15 +90,19 @@ type LimitGroup = "enforcement" | "data" | "running";
 
 const LIMITATIONS: Limitation[] = [
   {
-    title: "It acts once a cycle, not the moment credits are spent.",
+    title: "It acts once Checkmarx bills the credits, not the moment they are spent.",
     group: "enforcement",
     meaning: (
       <>
-        Usage is read and budgets judged once a cycle (every 15 minutes by
-        default), and Checkmarx can report credits a little after they are
-        spent. Usage in between can take a budget past its limit before the
-        restriction lands, so leave some headroom. A large group or application
-        is restricted over several cycles (at most 1,000 changes a cycle by
+        Credits appear in Checkmarx One only once it bills the action, which
+        for a scan is usually when the scan finishes. So the scan that takes a
+        budget over its limit normally completes: the fast check restricts
+        seconds after the credits appear, not before they are spent. A
+        budget&apos;s headroom is how to stop the scan that would overrun it:
+        it restricts while a few credits are still left. Without the fast check
+        (or while the activity log is unavailable) budgets are judged once a
+        cycle (every 15 minutes by default). A large group or application is
+        restricted over several cycles (at most 1,000 changes a cycle by
         default).
       </>
     ),

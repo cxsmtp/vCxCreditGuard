@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.checkmarx.iam import DEFAULT_AI_ROLE_NAMES, never_removed
 from app.checkmarx.usage import DEFAULT_PERIOD
 from app.core.crypto import (
+    PURPOSE_CX_WEBHOOK_SECRET,
     PURPOSE_SMTP_PASSWORD,
     PURPOSE_UPDATE_TOKEN,
     PURPOSE_WEBHOOK_SECRET,
@@ -244,6 +245,13 @@ KEY_READINESS_GATE = "readiness.gate"
 KEY_READINESS_REVIEWED = "readiness.dry_run_reviewed"
 # Each checklist item's last state, to warn when one turns red later.
 KEY_READINESS_LAST = "readiness.last_states"
+# The fast check and the Checkmarx One webhook (app/services/fastcheck.py).
+KEY_FAST_CHECK_ENABLED = "fastcheck.enabled"
+KEY_FAST_CHECK_SECONDS = "fastcheck.interval_seconds"
+KEY_FAST_CHECK_STATUS = "fastcheck.status"
+KEY_CX_WEBHOOK_ENABLED = "fastcheck.webhook_enabled"
+KEY_CX_WEBHOOK_SECRET = "fastcheck.webhook_secret"  # secret
+KEY_CX_WEBHOOK_STATUS = "fastcheck.webhook_status"
 # Rows kept in app_setting that are state rather than settings.
 INTERNAL_KEYS: frozenset[str] = frozenset(
     {
@@ -256,6 +264,8 @@ INTERNAL_KEYS: frozenset[str] = frozenset(
         KEY_READINESS_GATE,
         KEY_READINESS_REVIEWED,
         KEY_READINESS_LAST,
+        KEY_FAST_CHECK_STATUS,
+        KEY_CX_WEBHOOK_STATUS,
     }
 )
 
@@ -272,6 +282,7 @@ SECRET_KEYS: dict[str, str] = {
     # back, and kept out of audit entries and backups like any other secret.
     KEY_WEBHOOK_URL: PURPOSE_WEBHOOK_URL,
     KEY_UPDATE_TOKEN: PURPOSE_UPDATE_TOKEN,
+    KEY_CX_WEBHOOK_SECRET: PURPOSE_CX_WEBHOOK_SECRET,
 }
 
 ALLOWED_INTERVAL_MINUTES: tuple[int, ...] = (2, 5, 15, 60)
@@ -320,6 +331,9 @@ DEFAULTS: dict[str, Any] = {
     KEY_CYCLE_TIME_BUDGET_PCT: 80,
     KEY_UPDATE_AUTO: True,
     KEY_UPDATE_QUIET_HOUR: 3,
+    KEY_FAST_CHECK_ENABLED: True,
+    KEY_FAST_CHECK_SECONDS: 15,
+    KEY_CX_WEBHOOK_ENABLED: False,
 }
 
 

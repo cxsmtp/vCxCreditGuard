@@ -288,7 +288,12 @@ class Recounter:
             logger.exception("The recount failed")
             return Verdict(agrees=None, reason=f"the recount failed ({exc})"[:500])
         recount = fetch.totals.get(limit.id, ZERO)
-        return Verdict(agrees=recount >= Decimal(limit.credit_limit), recount=recount)
+        # At or over where the budget restricts: its limit, less its headroom
+        # (app/services/headroom.py), the same rule as the evaluation.
+        from app.services import headroom
+
+        threshold = headroom.Resolver(session, self.now).restrict_at(limit)
+        return Verdict(agrees=recount >= threshold, recount=recount)
 
 
 # ------------------------------------------------------------- the gate
