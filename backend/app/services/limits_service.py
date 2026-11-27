@@ -320,7 +320,9 @@ def update_limit(
                 custom_period_start=limit.custom_period_start,
                 custom_period_end=limit.custom_period_end,
                 project_actions=limit.project_actions,
-                headroom_credits=limit.headroom_credits,
+                # Checked when it is set: a budget lowered below its headroom
+                # later holds back at most limit - 1 (headroom.py), and stays editable.
+                headroom_credits=limit.headroom_credits if "headroom_credits" in changes else None,
                 headroom_auto=bool(limit.headroom_auto),
             ),
         )

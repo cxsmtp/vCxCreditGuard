@@ -213,6 +213,8 @@ _LIMIT_FIELDS = (
     "notes",
     "business_unit",
     "project_actions",
+    "headroom_credits",
+    "headroom_auto",
 )
 
 
@@ -299,6 +301,10 @@ def _limit_input(row: dict[str, Any]) -> limits_service.LimitInput:
             notes=row.get("notes"),
             business_unit=row.get("business_unit"),
             project_actions=limits_service.normalise_project_actions(row.get("project_actions")),
+            headroom_credits=(
+                int(row["headroom_credits"]) if row.get("headroom_credits") else None
+            ),
+            headroom_auto=bool(row.get("headroom_auto", False)),
         )
     except (KeyError, ValueError, TypeError) as exc:
         raise BackupError(f"Invalid limit entry in backup: {exc}") from exc

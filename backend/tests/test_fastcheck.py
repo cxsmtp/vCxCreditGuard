@@ -333,12 +333,17 @@ def test_scheduled_runs_take_one_queued_request(
     from app import scheduler
 
     woken: list[float] = []
-    monkeypatch.setattr(scheduler, "wake_fast_check", lambda delay=0.0: woken.append(delay))
+
+    def wake(delay: float = 0.0) -> bool:
+        woken.append(delay)
+        return True
+
+    monkeypatch.setattr(scheduler, "wake_fast_check", wake)
     world = World(db, monkeypatch, log=True)
     ready(world)
     db.commit()
-    assert fastcheck.request(hint={"project_id": "proj-api"})
-    assert not fastcheck.request(hint={"project_id": "proj-web"})  # merged
+    assert fastcheck.request(hint={"project_id": "proj-api"}) == fastcheck.QUEUED
+    assert fastcheck.request(hint={"project_id": "proj-web"}) == fastcheck.MERGED
     assert len(woken) == 1
     monkeypatch.setattr(
         fastcheck, "run_fast_check", lambda **kwargs: fastcheck.FastCheckResult(**kwargs)

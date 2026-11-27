@@ -181,19 +181,28 @@ def reset_memory() -> None:
     cycle_waiting.clear()
 
 
-def request(trigger: str = "webhook", hint: dict[str, str] | None = None) -> bool:
-    """Ask for a fast check as soon as possible. False when one is already
-    queued (the request is merged into it): at most one is ever queued."""
+QUEUED = "queued"
+MERGED = "merged"
+NOT_RUNNING = "not running"
+
+
+def request(trigger: str = "webhook", hint: dict[str, str] | None = None) -> str:
+    """Ask for a fast check as soon as possible: ``QUEUED``, ``MERGED`` into
+    the one already queued (at most one ever is), or ``NOT_RUNNING`` when no
+    fast check runs in this process (turned off, or no scheduler here)."""
     global _pending
     with _memory_lock:
         if _pending is not None:
-            return False
+            return MERGED
         _pending = (trigger, hint)
         next_at = max(time.monotonic(), _last_started + MIN_SPACING_SECONDS)
     from app import scheduler
 
-    scheduler.wake_fast_check(delay=max(0.0, next_at - time.monotonic()))
-    return True
+    if scheduler.wake_fast_check(delay=max(0.0, next_at - time.monotonic())):
+        return QUEUED
+    with _memory_lock:
+        _pending = None
+    return NOT_RUNNING
 
 
 def pending() -> bool:
@@ -540,7 +549,10 @@ def _ceiling_defers(session: Session, moment: datetime, starting: int) -> str | 
     """Leave the new restrictions to the full cycle when fast checks would,
     together, start more over one cycle interval than one cycle may."""
     guard = settings_store.enforcement_guard(session)
-    if guard.paused or guard.ceiling_waived_once:
+    if guard.ceiling_waived_once:
+        # An admin's resume lets one cycle's batch through: the cycle's.
+        return "left to the full cycle: the resumed batch goes through with it"
+    if guard.paused:
         return None  # the evaluation's own gate says what happens
     interval = settings_store.schedule_config(session).interval_minutes
     since = moment - timedelta(minutes=max(1, interval))

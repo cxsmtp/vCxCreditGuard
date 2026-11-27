@@ -35,7 +35,12 @@ def fresh_memory(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[float]]:
     fastcheck.reset_memory()
     cx_webhook.reset_memory()
     woken: list[float] = []
-    monkeypatch.setattr(scheduler, "wake_fast_check", lambda delay=0.0: woken.append(delay))
+
+    def wake(delay: float = 0.0) -> bool:
+        woken.append(delay)
+        return True
+
+    monkeypatch.setattr(scheduler, "wake_fast_check", wake)
     yield woken
     fastcheck.reset_memory()
     cx_webhook.reset_memory()
@@ -157,6 +162,19 @@ def test_the_rate_limit(client: TestClient, db: Session, monkeypatch: pytest.Mon
     secret = turn_on(db)
     codes = [deliver(client, secret).status_code for _ in range(5)]
     assert codes == [202, 202, 202, 429, 429]
+
+
+def test_with_no_fast_check_running_nothing_is_queued(
+    client: TestClient, db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scheduler, "wake_fast_check", lambda delay=0.0: False)
+    secret = turn_on(db)
+    response = deliver(client, secret)
+    assert response.status_code == 202 and response.json() == {"queued": False}
+    assert not fastcheck.pending()
+    db.expire_all()
+    status = settings_store.get_value(db, settings_store.KEY_CX_WEBHOOK_STATUS)
+    assert status["result"] == "ignored: the fast check is not running"
 
 
 def test_not_json_is_refused(client: TestClient, db: Session) -> None:

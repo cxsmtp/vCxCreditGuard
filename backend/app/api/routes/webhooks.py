@@ -81,8 +81,11 @@ async def checkmarx_webhook(request: Request) -> JSONResponse:
     if not cx_webhook.is_scan_event(event, payload):
         await run_in_threadpool(_record, "ignored: not a scan event", hint)
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"queued": False})
-    queued = fastcheck.request(trigger="webhook", hint=hint)
-    await run_in_threadpool(
-        _record, "fast check queued" if queued else "merged into the queued fast check", hint
-    )
-    return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"queued": True})
+    outcome = fastcheck.request(trigger="webhook", hint=hint)
+    shown = {
+        fastcheck.QUEUED: "fast check queued",
+        fastcheck.MERGED: "merged into the queued fast check",
+    }.get(outcome, "ignored: the fast check is not running")
+    await run_in_threadpool(_record, shown, hint)
+    queued = outcome != fastcheck.NOT_RUNNING
+    return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"queued": queued})
