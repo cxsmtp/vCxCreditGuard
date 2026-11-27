@@ -93,5 +93,8 @@ def test_sqlite_past_its_advised_size_suggests_postgresql(db: Session) -> None:
     )
     db.commit()
     check = _check(db, "database")
+    if db.get_bind().dialect.name != "sqlite":
+        assert check is None  # already on PostgreSQL: nothing to advise
+        return
     assert check is not None and check.status == diagnostics.WARN
     assert "501 projects" in check.detail and "PostgreSQL" in check.detail
