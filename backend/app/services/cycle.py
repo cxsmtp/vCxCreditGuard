@@ -54,6 +54,7 @@ from app.services import (
     retention,
     settings_store,
     violations,
+    wording,
 )
 from app.services import connection as connection_service
 from app.services.audit import AuditActor, record_audit
@@ -775,7 +776,9 @@ def _send_weekly_report(session: Session) -> bool:
         action="report.emailed",
         actor=AuditActor.system("reporter"),
         target_type="report",
-        detail=f"Weekly report emailed to {len(config.smtp_recipients)} recipient(s).",
+        detail=(
+            f"Weekly report emailed to {wording.plural(len(config.smtp_recipients), 'recipient')}."
+        ),
     )
     return True
 

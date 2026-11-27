@@ -42,7 +42,7 @@ from app.checkmarx import iam
 from app.checkmarx.client import CheckmarxClient
 from app.db.base import utcnow
 from app.models.org import CxGroup, CxGroupMembership, CxUser
-from app.services import role_sources, settings_store
+from app.services import role_sources, settings_store, wording
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ class Coverage:
         why = "; ".join(note.rstrip(".") for note in self.notes) or "the tenant could not be read"
         return (
             f"Whether user budgets can bite could not be determined: the role sources of the "
-            f"{self.ai_holders} users who hold an AI role could not be read "
+            f"{wording.plural(self.ai_holders, 'user')} who hold an AI role could not be read "
             f"({why}). "
             "It is checked "
             "again shortly."
@@ -167,11 +167,11 @@ class Coverage:
                 f"{f' ({held})' if held else ''} or a group, which removing the role's direct "
                 "mapping does not take away"
             )
-        share = round((self.share or 0) * 100)
+        share = wording.percent((self.share or 0) * 100)
         text = (
             f"User budgets will not bite on this tenant: a user restriction can take AI access "
             f"from only {self.restrictable} of the {self.known} users who have it and whose "
-            f"roles could be read ({share}%). Of those it cannot reach, "
+            f"roles could be read ({share}). Of those it cannot reach, "
             f"{'; '.join(reasons) or 'the reason is unknown'}."
         )
         if self.unknown:

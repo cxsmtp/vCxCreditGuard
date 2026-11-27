@@ -169,7 +169,7 @@ from app.models.org import (
     CxProjectGroup,
 )
 from app.models.usage import BudgetUsage, UnresolvedSubject, UsageSnapshot
-from app.services import error_text, pacing, settings_store, subject_matching
+from app.services import error_text, pacing, settings_store, subject_matching, wording
 
 logger = logging.getLogger(__name__)
 
@@ -1444,7 +1444,8 @@ def _write(
         result.issues.append(f"stopped_by_{(read.stopped_by or 'cap').replace(' ', '_')}")
         result.warnings.append(
             f"The credit activity log was not read to its end this cycle ({read.stopped_by}, "
-            f"{len(read.pages)} page(s)). What was read completely is counted; the rest is "
+            f"{wording.plural(len(read.pages), 'page')}). What was read completely is counted; "
+            "the rest is "
             "counted in the next cycles."
         )
     result.complete = (

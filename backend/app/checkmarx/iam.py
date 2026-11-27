@@ -247,7 +247,7 @@ def fetch_users(
     collected = list(seen.values())
     if len(collected) < reported_total:
         warning = (
-            f"IAM reported {reported_total} users but only {len(collected)} could be read. "
+            f"IAM reported {reported_total:,} users but only {len(collected):,} could be read. "
             "Usage for the missing users cannot be attributed, so their limits are not "
             "evaluated. Confirm the pagination parameters for /users/v2."
         )

@@ -25,6 +25,7 @@ from app.services import (
     readiness,
     role_sources,
     settings_store,
+    wording,
 )
 from app.services.audit import record_audit
 
@@ -336,7 +337,7 @@ def update_settings(
             key: ("[REDACTED]" if key in _REDACT_IN_AUDIT else after.get(key))
             for key in audited_changes
         },
-        detail=f"{len(audited_changes)} setting(s) changed.",
+        detail=f"{wording.plural(len(audited_changes), 'setting')} changed.",
     )
     db.commit()
 

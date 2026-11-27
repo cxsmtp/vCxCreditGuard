@@ -13,6 +13,7 @@ import {
   PageHeader,
 } from "../components/ui";
 import { AuthFrame } from "../components/AppShell";
+import { TwoFactorAdvisory } from "../components/TwoFactorAdvisory";
 import { BrandMark } from "../components/Icon";
 import { downloadText } from "../lib/export";
 import { useToast } from "../lib/ui-context";
@@ -260,10 +261,19 @@ function TwoFactorCard({ me, onChanged }: { me: Me; onChanged: () => Promise<unk
         </div>
       ) : (
         <div className="flex flex-col items-start gap-3">
-          <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
-            Recommended for every administrator: this account can restrict access for people in
-            your Checkmarx One tenant.
-          </p>
+          {me.role === "admin" ? (
+            <div className="w-full">
+              <TwoFactorAdvisory>
+                This admin account has no two factor authentication. An admin can restrict access
+                for people in your Checkmarx One tenant, so a stolen password is enough to do that.
+                Set it up below; it is recommended, not required.
+              </TwoFactorAdvisory>
+            </div>
+          ) : (
+            <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
+              Recommended: a stolen password alone is then not enough to sign in.
+            </p>
+          )}
           <Button variant="primary" onClick={() => setStep({ name: "password", purpose: "enable" })}>
             Set up two factor
           </Button>

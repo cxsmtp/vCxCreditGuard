@@ -55,7 +55,7 @@ from app.db.session import session_scope
 from app.models.enums import EnforcementStatus, LimitStatus
 from app.models.limits import CreditLimit, EnforcementAction, LimitPeriodState
 from app.models.usage import SchedulerLock
-from app.services import activity_source, error_text, pacing, settings_store
+from app.services import activity_source, credits_text, error_text, pacing, settings_store, wording
 from app.services.audit import AuditActor
 
 logger = logging.getLogger(__name__)
@@ -138,13 +138,16 @@ class FastCheckResult:
             return f"error: {self.error}"
         if not self.events_counted:
             return "nothing new"
-        text = f"counted {self.events_counted} new event(s), {self.credits_counted} credits"
+        text = (
+            f"counted {wording.plural(self.events_counted, 'new event')}, "
+            f"{credits_text.credits(self.credits_counted)} credits"
+        )
         if self.deferred:
             return f"{text}; {self.deferred}"
         if self.evaluated:
-            text += f"; evaluated {self.evaluated} budget(s)"
+            text += f"; evaluated {wording.plural(self.evaluated, 'budget')}"
             if self.enforced:
-                text += f", applied {self.enforced} restriction(s)"
+                text += f", applied {wording.plural(self.enforced, 'restriction')}"
             if self.held:
                 text += f", {self.held} held (recount, summary totals or pause)"
         return text
@@ -571,7 +574,7 @@ def _ceiling_defers(session: Session, moment: datetime, starting: int) -> str | 
     if over_limits or over_targets:
         return (
             "left to the full cycle: restrictions started in the last "
-            f"{interval} minute(s) are at the safety ceiling"
+            f"{wording.plural(interval, 'minute')} are at the safety ceiling"
         )
     return None
 

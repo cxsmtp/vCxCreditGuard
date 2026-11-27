@@ -241,7 +241,7 @@ class TestTheApiKeysAccount:
             assert outcome.applied == [] and outcome.failed == []
         assert all(role in tenant.role_mappings["user-alice"] for role in AI)
         why = (
-            "it is the account the Checkmarx One API key belongs to: restricting it could "
+            "this is the account the Checkmarx One API key belongs to: restricting it could "
             "remove rights CreditGuard needs to restore others"
         )
         assert enforcement.protection_reason(db, "user-alice") == why
@@ -265,7 +265,7 @@ class TestTheApiKeysAccount:
         [row] = preview_service.dry_run(db, now=AUGUST).rows
         assert row.would_enforce is False
         assert row.note == (
-            "Would breach, but this user is not restricted because it is the account the "
+            "Would breach, but this user is not restricted because this is the account the "
             "Checkmarx One API key belongs to: restricting it could remove rights CreditGuard "
             "needs to restore others."
         )

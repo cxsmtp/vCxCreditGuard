@@ -176,11 +176,11 @@ class TestScheduler:
         from app import scheduler as scheduler_module
         from app.services import settings_store
 
-        assert scheduler_module.describe_schedule() == "every 15 minute(s)"
+        assert scheduler_module.describe_schedule() == "every 15 minutes"
 
         settings_store.set_value(db, settings_store.KEY_SCHEDULE_INTERVAL_MINUTES, 5)
         db.commit()
-        assert scheduler_module.describe_schedule() == "every 5 minute(s)"
+        assert scheduler_module.describe_schedule() == "every 5 minutes"
 
     def test_cron_mode_is_described(self, db: Session) -> None:
         from app import scheduler as scheduler_module
@@ -220,7 +220,7 @@ class TestScheduler:
 
             settings_store.set_value(db, settings_store.KEY_SCHEDULE_INTERVAL_MINUTES, 2)
             db.commit()
-            assert scheduler_module.reconfigure() == "every 2 minute(s)"
+            assert scheduler_module.reconfigure() == "every 2 minutes"
             job = scheduler_module.get_scheduler().get_job(scheduler_module.JOB_ID)
             assert job is not None
             assert job.trigger.interval == timedelta(minutes=2)

@@ -25,7 +25,7 @@ from app.models.usage import (
     SchedulerRun,
     UsageSnapshot,
 )
-from app.services import credits_text, settings_store
+from app.services import credits_text, settings_store, wording
 
 OK = "ok"
 WARN = "warn"
@@ -116,6 +116,14 @@ _REMEDIATION: dict[tuple[str, str], str] = {
         "Open Settings → Enforcement: the Readiness card says what each red item needs and "
         "links to where to fix it."
     ),
+    ("notifications", WARN): (
+        "Open Settings → Notifications & reports and set up email (an SMTP host, a from "
+        "address and at least one recipient) or a webhook, then use Send a test."
+    ),
+    ("database", WARN): (
+        "Move to PostgreSQL: the production Compose file runs CreditGuard with PostgreSQL "
+        "(README, Deploy and Sizing and scale)."
+    ),
     ("dimensions", FAIL): (
         "This tenant does not report per-user consumption. Govern with project, application, "
         "or group limits instead, or ask Checkmarx to enable per-user reporting."
@@ -165,7 +173,11 @@ def run_diagnostics(
         _unmatched_entities_check(session),
         _pending_enforcement_check(session),
         _dimensions_check(session),
+        _notification_channel_check(session),
     ]
+    database = _database_scale_check(session)
+    if database is not None:
+        checks.append(database)
     group_names = _group_names_check(session)
     if group_names is not None:
         checks.append(group_names)
@@ -307,7 +319,7 @@ def _attribution_check(session: Session) -> Check:
     automation = ""
     if summary.automation:
         automation = (
-            f" {summary.automation} automation identit{'y' if summary.automation == 1 else 'ies'}"
+            f" {wording.plural(summary.automation, 'automation identity', 'automation identities')}"
             f" (Auto Triage, bots, integrations without an email) used "
             f"{_credits(summary.automation_credits)} credits; that usage is shown as "
             "automation and counts towards no user limit."
@@ -323,7 +335,7 @@ def _attribution_check(session: Session) -> Check:
         "attribution",
         "Usage attribution",
         WARN,
-        f"{count} consumer(s) could not be matched to a user, so that usage counts "
+        f"{wording.plural(count, 'consumer')} could not be matched to a user, so that usage counts "
         f"towards no user limit. Resolve them under Settings → Attribution.{automation}",
     )
 
@@ -345,15 +357,15 @@ def _unmatched_entities_check(session: Session) -> Check:
         if not found.count:
             continue
         share = (
-            f" ({round(float(found.credits) / float(found.total_credits) * 100)}% of "
+            f" ({wording.percent(found.credits / found.total_credits * 100)} of "
             f"{_credits(found.total_credits)})"
             if found.total_credits > 0
             else ""
         )
         names = ", ".join(name for name, _credits_used in found.top[:3])
         parts.append(
-            f"{_credits(found.credits)} {label} credits{share} under {found.count} name(s) that "
-            f"match no {label}, such as {names}"
+            f"{_credits(found.credits)} {label} credits{share} under "
+            f"{wording.plural(found.count, 'name')} that match no {label}, such as {names}"
         )
     if not parts:
         return Check(
@@ -395,8 +407,8 @@ def _coverage_check(session: Session) -> Check | None:
         "enforcement_coverage",
         label,
         OK,
-        f"A user restriction can take AI access from {report.get('restrictable', 0)} of the "
-        f"{holders} users who hold an AI role.",
+        f"A user restriction can take AI access from {report.get('restrictable', 0):,} of the "
+        f"{wording.plural(holders, 'user')} who hold an AI role.",
     )
 
 
@@ -421,7 +433,8 @@ def _doubted_falls_check(session: Session) -> Check | None:
         "doubted_falls",
         "Doubted usage falls",
         WARN,
-        f"{len(names)} name(s) reported less usage in a reading that looked incomplete "
+        f"{wording.plural(len(names), 'name')} reported less usage in a reading that looked "
+        "incomplete "
         f"(a row repeated or missing): {shown}. The fall is not believed until a complete "
         f"reading confirms it, for at most {ledger.DIP_MAX_DOUBTS} readings or "
         f"{int(ledger.DIP_MAX_AGE.total_seconds() // 3600)} hours.",
@@ -472,14 +485,16 @@ def _activity_check(session: Session, moment: datetime) -> Check | None:
                 "activity_source",
                 label,
                 WARN,
-                f"{detail} But over {reconciliation.get('period')} the log adds up to "
+                f"{detail} But over the {_period_words(reconciliation.get('period'))} the log "
+                "adds up to "
                 f"{_credits(reconciliation.get('activity_credits'))} credits and the consumption "
                 f"summary reports {_credits(reconciliation.get('summary_credits'))} (checked "
                 f"{reconciliation.get('at')}): some usage may be missing from one of them.",
             )
         if isinstance(reconciliation, dict) and reconciliation.get("status") == "match":
             detail += (
-                f" Over {reconciliation.get('period')} it adds up to the consumption summary's "
+                f" Over the {_period_words(reconciliation.get('period'))} it adds up to the "
+                "consumption summary's "
                 f"total ({_credits(reconciliation.get('summary_credits'))} credits)."
             )
         return Check("activity_source", label, OK, detail)
@@ -509,6 +524,11 @@ def _activity_check(session: Session, moment: datetime) -> Check | None:
         f"The credit activity log is not available: {info.get('last_error')} Usage comes "
         "from the consumption summary, matched by name." + paused,
     )
+
+
+def _period_words(period: object) -> str:
+    """ "last 30 days", not "last_30_days"."""
+    return str(period or "same window").replace("_", " ")
 
 
 def _group_names_check(session: Session) -> Check | None:
@@ -559,10 +579,11 @@ def _auto_triage_check(session: Session) -> Check:
     problems: list[str] = []
     if initiators:
         shown = ", ".join(initiators[:5]) + ("..." if len(initiators) > 5 else "")
-        problems.append(f"{len(initiators)} scan initiator(s) to map: {shown}.")
+        problems.append(f"{wording.plural(len(initiators), 'scan initiator')} to map: {shown}.")
     if failing:
         problems.append(
-            f"{len(failing)} project(s) with a note from the last attempt to read their scans."
+            f"{wording.plural(len(failing), 'project')} with a note from the last attempt to read "
+            "their scans."
         )
     if problems:
         return Check("auto_triage_attribution", label, WARN, f"{detail} {' '.join(problems)}")
@@ -729,7 +750,8 @@ def _pending_enforcement_check(session: Session) -> Check:
         "enforcement",
         "Enforcement actions",
         WARN,
-        f"{count} enforcement action(s) are pending, usually because the connection was down "
+        f"{wording.plural(count, 'enforcement action')} {'is' if count == 1 else 'are'} pending, "
+        "usually because the connection was down "
         "when they were due. The next healthy cycle retries them.",
     )
 
@@ -762,14 +784,76 @@ def _dimensions_check(session: Session) -> Check:
     return Check("dimensions", "Usage dimensions", OK, "All probed dimensions are reported.")
 
 
+def _notification_channel_check(session: Session) -> Check:
+    """Whether an alert reaches anyone outside the app: email or a webhook."""
+    from app.services import delivery
+
+    config = delivery.load_config(session)
+    label = "Notification delivery"
+    channels = []
+    if config.email_enabled:
+        channels.append(f"by email to {wording.plural(len(config.smtp_recipients), 'recipient')}")
+    if config.webhook_enabled:
+        channels.append("to a webhook")
+    if channels:
+        return Check("notifications", label, OK, f"Alerts are sent {' and '.join(channels)}.")
+    missing = ""
+    if config.smtp_host or config.smtp_from or config.smtp_recipients:
+        missing = (
+            " Email is only partly set up: it needs an SMTP host, a from address and at least "
+            "one recipient."
+        )
+    return Check(
+        "notifications",
+        label,
+        WARN,
+        "No email or webhook is set up, so alerts are only shown in the Notification Center "
+        f"and nobody is told when a budget is breached.{missing}",
+    )
+
+
+# SQLite is advised up to about this many projects or users (About → Limits).
+SQLITE_MAX_PROJECTS = 500
+SQLITE_MAX_USERS = 300
+
+
+def _database_scale_check(session: Session) -> Check | None:
+    """SQLite past the size it is advised for; None when that does not apply."""
+    from app.models.org import CxProject, CxUser
+
+    if session.get_bind().dialect.name != "sqlite":
+        return None
+    projects = int(
+        session.scalar(
+            select(func.count()).select_from(CxProject).where(CxProject.is_deleted.is_(False))
+        )
+        or 0
+    )
+    users = int(
+        session.scalar(select(func.count()).select_from(CxUser).where(CxUser.is_deleted.is_(False)))
+        or 0
+    )
+    if projects <= SQLITE_MAX_PROJECTS and users <= SQLITE_MAX_USERS:
+        return None
+    return Check(
+        "database",
+        "Database",
+        WARN,
+        f"This install uses SQLite and the tenant has {wording.plural(projects, 'project')} "
+        f"and {wording.plural(users, 'user')}. SQLite is advised up to about "
+        f"{SQLITE_MAX_PROJECTS:,} projects or {SQLITE_MAX_USERS:,} users; above that, use "
+        "PostgreSQL.",
+    )
+
+
 def _ago(now: datetime, then: datetime) -> str:
     seconds = max(0, int((now - then).total_seconds()))
     if seconds < 90:
         return "just now" if seconds < 45 else "a minute ago"
     minutes = seconds // 60
     if minutes < 90:
-        return f"{minutes} minutes ago"
+        return f"{wording.plural(minutes, 'minute')} ago"
     hours = minutes // 60
     if hours < 36:
-        return f"{hours} hours ago"
-    return f"{hours // 24} days ago"
+        return f"{wording.plural(hours, 'hour')} ago"
+    return f"{wording.plural(hours // 24, 'day')} ago"

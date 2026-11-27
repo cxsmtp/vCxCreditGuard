@@ -88,6 +88,7 @@ from app.services import (
     recount,
     settings_store,
     usage_mix,
+    wording,
 )
 from app.services.audit import AuditActor, record_audit
 from app.services.periods import PeriodError, PeriodWindow, current_window, describe_window
@@ -1073,7 +1074,8 @@ def _notify_unverified(
         category=notifications.CATEGORY_ENFORCEMENT,
         severity=Severity.WARNING,
         title=(
-            f"{total:,} restriction(s) in force not confirmed in Checkmarx One for more than "
+            f"{wording.plural(total, 'restriction')} in force not confirmed in Checkmarx One "
+            f"for more than "
             f"{hours:g} hours (not read back)"
         ),
         body=(
@@ -1929,7 +1931,8 @@ def _evaluate_one(
                     lifting = True
                     state.status = LimitStatus.RESTRICTED
                     evaluation.note = (
-                        f"Within budget again: {restored:,} restriction(s) lifted this cycle, "
+                        f"Within budget again: {wording.plural(restored, 'restriction')} lifted "
+                        "this cycle, "
                         f"{left:,} left for the next cycles."
                     )
                 elif restored > 0:
@@ -2341,6 +2344,11 @@ def _close_stale_periods(
 # ------------------------------------------------------------------ notifications
 
 
+def _possessive(limit: CreditLimit) -> str:
+    """ "their" for a person, "its" for a project, group or application."""
+    return "their" if limit.entity_type == EntityType.USER else "its"
+
+
 def _notify_warning(
     session: Session,
     limit: CreditLimit,
@@ -2354,7 +2362,8 @@ def _notify_warning(
         category=notifications.CATEGORY_WARNING,
         severity=Severity.WARNING,
         title=(
-            f"{limit.entity_type.capitalize()} {entity} reached {percent:.0f}% of its credit limit"
+            f"{limit.entity_type.capitalize()} {entity} reached {wording.percent(percent)} of "
+            f"{_possessive(limit)} credit limit"
         ),
         body=(
             f"{credits_text.credits(state.credits_used)} of "
@@ -2434,7 +2443,7 @@ def _notify_breach(
             f"{usage_mix.format_credits(limit.credit_limit)} credits used {when}."
         )
     early = headroom.early_phrase(limit, state.credits_used, state.headroom_credits)
-    title = f"{limit.entity_type.capitalize()} {entity} reached its credit limit"
+    title = f"{limit.entity_type.capitalize()} {entity} reached {_possessive(limit)} credit limit"
     if early is not None:
         # Not over budget: inside the headroom kept before the limit.
         title = f"{limit.entity_type.capitalize()} {entity} is nearly out of credits"
@@ -2512,7 +2521,8 @@ def restore_on_limit_change(
                 target_id=str(limit.id),
                 target_label=limit.entity_label,
                 detail=(
-                    f"{restored} restriction(s) lifted because the limit changed ({reason}); "
+                    f"{wording.plural(restored, 'restriction')} lifted because the limit changed "
+                    f"({enforcement.reason_text(reason)}); "
                     f"{budget.writes_deferred - deferred_before} more are lifted by the next "
                     "cycles."
                 ),
@@ -2540,7 +2550,10 @@ def restore_on_limit_change(
             target_type="credit_limit",
             target_id=str(limit.id),
             target_label=limit.entity_label,
-            detail=f"{restored} restriction(s) lifted because the limit changed ({reason}).",
+            detail=(
+                f"{wording.plural(restored, 'restriction')} lifted because the limit changed "
+                f"({enforcement.reason_text(reason)})."
+            ),
         )
     return restored
 

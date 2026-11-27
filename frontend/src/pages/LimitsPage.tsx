@@ -43,6 +43,7 @@ import {
 import { useResource } from "../hooks/useResource";
 import {
   PROJECT_ACTIONS,
+  countNoun,
   entityLabel,
   projectActionsLabel,
   formatCredits,
@@ -425,7 +426,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
       const result = await api.delete<{ restrictions_lifted: number }>(`/api/limits/${deleting.id}`);
       toast.success(
         result.restrictions_lifted > 0
-          ? `Limit deleted and ${result.restrictions_lifted} restriction(s) lifted.`
+          ? `Limit deleted and ${countNoun(result.restrictions_lifted, "restriction")} lifted.`
           : "Limit deleted.",
       );
       setDeleting(null);
@@ -779,7 +780,7 @@ export function LimitsPage({ isAdmin }: { isAdmin: boolean }) {
           deleting
             ? `The limit on ${deleting.entity_label ?? deleting.entity_id} will be removed.` +
               (deleting.active_restrictions > 0
-                ? `\n\n${deleting.active_restrictions} active restriction(s) caused by it will be lifted first, so nobody is left locked out by a limit that no longer exists.`
+                ? `\n\n${countNoun(deleting.active_restrictions, "active restriction")} caused by it will be lifted first, so nobody is left locked out by a limit that no longer exists.`
                 : "")
             : ""
         }
@@ -1317,9 +1318,9 @@ function BulkDialog({
         toast.error(result.errors.join("; "));
       }
       toast.success(
-        `${result.updated} limit(s) updated.` +
+        `${countNoun(result.updated, "limit")} updated.` +
           (result.restrictions_lifted > 0
-            ? ` ${result.restrictions_lifted} restriction(s) lifted.`
+            ? ` ${countNoun(result.restrictions_lifted, "restriction")} lifted.`
             : ""),
       );
       await onSaved();
@@ -1333,7 +1334,7 @@ function BulkDialog({
   return (
     <Modal
       open
-      title={`Bulk edit ${ids.length} limit(s)`}
+      title={`Bulk edit ${countNoun(ids.length, "limit")}`}
       description="Only the fields you set are changed. The rest are left alone."
       onClose={onClose}
       footer={

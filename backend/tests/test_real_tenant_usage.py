@@ -314,7 +314,7 @@ class TestUnmatchedPeople:
         diag = {c["key"]: c for c in admin_client.get("/api/ops/diagnostics").json()["checks"]}
         assert dashboard["tiles"]["unresolved_subjects"] == 1
         assert status["unresolved_subjects"] == 1
-        assert diag["attribution"]["detail"].startswith("1 consumer(s) could not be matched")
+        assert diag["attribution"]["detail"].startswith("1 consumer could not be matched")
         assert "2 automation identities" in diag["attribution"]["detail"]
 
         # Automation stays visible on the dashboard.

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import type { TopConsumer } from "../../api/types";
-import { formatCredits, formatPercent } from "../../lib/format";
+import { formatCredits, formatPercent, withArticle } from "../../lib/format";
 import { Badge, EmptyState, Table, Td, Th } from "../ui";
 
 /**
@@ -71,7 +71,7 @@ export function BarList({ items, emptyTitle, emptyDescription, unavailable }: Pr
               <tr key={`${item.entity_type}-${item.entity_id ?? item.label}`}>
                 <Td>{item.label}</Td>
                 <Td align="right">{formatCredits(item.credits)}</Td>
-                <Td align="right">{formatPercent(item.percent_of_total, 1)}</Td>
+                <Td align="right">{formatPercent(item.percent_of_total)}</Td>
                 <Td align="right">{item.limit === null ? "none" : formatCredits(item.limit)}</Td>
                 <Td align="right">
                   {item.credits_used_in_period === null
@@ -112,7 +112,7 @@ export function BarList({ items, emptyTitle, emptyDescription, unavailable }: Pr
                         <Badge tone="warning">
                           {item.entity_type === "user"
                             ? "Not matched to a user"
-                            : `Not matched to a ${item.entity_type}`}
+                            : `Not matched to ${withArticle(item.entity_type)}`}
                         </Badge>
                       ))}
                     {item.status === "restricted" && <Badge tone="critical">Restricted</Badge>}

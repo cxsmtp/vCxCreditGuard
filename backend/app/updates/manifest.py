@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.services import wording
 from app.updates import parse_version
 
 MANIFEST_FILE = "release-manifest.json"
@@ -322,7 +323,8 @@ def verify_release(files: Mapping[str, bytes], *, public_key: Any) -> VerifiedRe
     if problems:
         shown = ", ".join(problems[:3]) + (" ..." if len(problems) > 3 else "")
         raise ReleaseRejected(
-            f"{version}'s files do not match its manifest ({len(problems)} difference(s): "
+            f"{version}'s files do not match its manifest "
+            f"({wording.plural(len(problems), 'difference')}: "
             f"{shown}): not installed."
         )
     return VerifiedRelease(

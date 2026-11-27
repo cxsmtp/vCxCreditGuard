@@ -112,7 +112,7 @@ def assert_lifted(db: Session, tenant: FakeTenant, limit: CreditLimit, before: l
         )
     ).all()
     assert len(audited) == 1
-    assert "credit_increased" in (audited[0].detail or "")
+    assert "the limit was raised or usage is within budget again" in (audited[0].detail or "")
 
 
 def raise_budget(db: Session, client, limit: CreditLimit, credits: int = 50) -> None:

@@ -320,8 +320,8 @@ def test_status_on_diagnose(db: Session, monkeypatch: pytest.MonkeyPatch) -> Non
     db.expire_all()
     check = next(c for c in diagnostics.run_diagnostics(db).checks if c.key == "fast_check")
     assert check.status == diagnostics.OK
-    assert "Last run just now: counted 1 new event(s)" in check.detail
-    assert "applied 1 restriction(s)" in check.detail
+    assert "Last run just now: counted 1 new event" in check.detail
+    assert "applied 1 restriction" in check.detail
     stored = settings_store.get_value(db, settings_store.KEY_FAST_CHECK_STATUS)
     assert stored["last_action"]["trigger"] == "schedule"
     assert fastcheck.describe(db)["requests_per_hour"] == 240

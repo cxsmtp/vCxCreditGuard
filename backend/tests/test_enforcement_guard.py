@@ -677,7 +677,7 @@ class TestPauseIsImmediate:
         db.commit()
         evaluation.evaluate_all(db, client=client, now=AUGUST, actor=ACTOR)
         notice = db.scalar(
-            select(Notification).where(Notification.title.like("%reached its credit limit"))
+            select(Notification).where(Notification.title.like("%reached their credit limit"))
         )
         assert "enforcement is paused" in notice.body
         assert "being restricted now" not in notice.body

@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from app.checkmarx.client import CheckmarxClient
 from app.models.enums import EntityType, PeriodType
 from app.models.limits import CreditLimit
-from app.services import credits_text, limits_service
+from app.services import credits_text, limits_service, wording
 from app.services.audit import AuditActor, record_audit
 from app.services.periods import PeriodError, current_window
 
@@ -217,7 +217,8 @@ def import_limits(
     missing = {"entity_type", "entity_id", "credit_limit"} - headers
     if missing:
         result.errors.append(
-            f"Missing required column(s): {', '.join(sorted(missing))}. "
+            f"Missing required {wording.noun(len(missing), 'column')}: "
+            f"{', '.join(sorted(missing))}. "
             f"Expected header: {', '.join(COLUMNS)}"
         )
         return result
@@ -355,7 +356,9 @@ def import_limits(
             actor=actor,
             target_type="credit_limit",
             after={"created": result.created, "updated": result.updated},
-            detail=f"CSV import applied {result.created + result.updated} limit(s).",
+            detail=(
+                f"CSV import applied {wording.plural(result.created + result.updated, 'limit')}."
+            ),
         )
         if not result.errors:
             # Every row is applied and audited. Lifting commits all of that as one

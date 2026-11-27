@@ -15,7 +15,7 @@ from app.schemas.reports import (
     ReportEmailResult,
     ReportResponse,
 )
-from app.services import delivery, reporting_service
+from app.services import delivery, reporting_service, wording
 from app.services.audit import record_audit
 
 logger = logging.getLogger(__name__)
@@ -142,7 +142,10 @@ def email_report(ctx: AdminUser, db: DbSession) -> ReportEmailResult:
         action="report.emailed_ondemand",
         actor=ctx.actor,
         target_type="report",
-        detail=f"Report emailed to {len(config.smtp_recipients)} recipient(s) on demand.",
+        detail=(
+            f"Report emailed to {wording.plural(len(config.smtp_recipients), 'recipient')} "
+            "on demand."
+        ),
     )
     db.commit()
     return ReportEmailResult(

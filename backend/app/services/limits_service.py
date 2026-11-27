@@ -26,7 +26,7 @@ from app.models.activity import SUBJECT_PREFIX, is_subject_entity, subject_entit
 from app.models.enums import PROJECT_ACTION_ORDER, EntityType
 from app.models.limits import CreditLimit, Exemption, LimitPeriodState
 from app.models.org import CxApplication, CxGroup, CxProject, CxUser
-from app.services import error_text, evaluation
+from app.services import error_text, evaluation, wording
 from app.services.audit import AuditActor, record_audit
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ def normalise_project_actions(value: object) -> list[str] | None:
     unknown = sorted(names - set(PROJECT_ACTION_ORDER))
     if unknown:
         raise LimitError(
-            f"Unknown project action(s): {', '.join(unknown)}. "
+            f"Unknown project {wording.noun(len(unknown), 'action')}: {', '.join(unknown)}. "
             f"Choose from: {', '.join(PROJECT_ACTION_ORDER)}."
         )
     if not names:
@@ -500,7 +500,7 @@ def delete_limit(
         target_id=str(limit.id),
         target_label=limit.entity_label or limit.entity_id,
         before=_snapshot(limit),
-        detail=f"{restored} restriction(s) lifted." if restored else None,
+        detail=f"{wording.plural(restored, 'restriction')} lifted." if restored else None,
     )
     session.delete(limit)
     session.flush()

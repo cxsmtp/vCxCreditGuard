@@ -16,12 +16,26 @@ import { DiagnosticsPanel } from "../components/DiagnosticsPanel";
 import { Button, Card, ErrorNote, InfoNote, PageHeader, Spinner, Tabs } from "../components/ui";
 import { useInterval, useResource } from "../hooks/useResource";
 import { UsageSourceBanner } from "../components/UsageSourceBanner";
-import { formatCredits, formatDateTime, formatNumber, formatRelative } from "../lib/format";
+import {
+  formatCredits,
+  formatDateTime,
+  formatNumber,
+  formatPercent,
+  formatRelative,
+  runStatusLabel,
+  thresholdsPhrase,
+} from "../lib/format";
 import { useToast } from "../lib/ui-context";
 
 type ConsumerTab = "users" | "projects" | "groups" | "applications";
 
-export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
+export function DashboardPage({
+  isAdmin,
+  needsTwoFactor = false,
+}: {
+  isAdmin: boolean;
+  needsTwoFactor?: boolean;
+}) {
   const toast = useToast();
   const [tab, setTab] = useState<ConsumerTab>("users");
   const [running, setRunning] = useState(false);
@@ -53,7 +67,7 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
         toast.info(`Cycle skipped: ${result.skipped_reason ?? "unknown reason"}`);
       } else {
         toast.error(
-          `Cycle finished with status ${result.status}. ${result.errors.join("; ") || "See the notifications."}`,
+          `Cycle finished: ${runStatusLabel(result.status).toLowerCase()}. ${result.errors.join("; ") || "See the notifications."}`,
         );
       }
       await Promise.all([dashboard.reload(), unresolved.reload()]);
@@ -117,7 +131,7 @@ export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
       <UsageSourceBanner />
 
       <div className="mb-5">
-        <DiagnosticsPanel />
+        <DiagnosticsPanel needsTwoFactor={needsTwoFactor} />
       </div>
 
       {data.unavailable_dimensions.length > 0 && (
@@ -270,6 +284,10 @@ function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
   const pct = (value: number) => `${Math.min(100, Math.max(0, (value / scale) * 100))}%`;
 
   const figure = (v: string | null) => (v === null ? "—" : formatCredits(v));
+  const thresholds = thresholdsPhrase(
+    pool.checkmarx_enforcement?.warningThresholdPct,
+    pool.checkmarx_enforcement?.cutoffThresholdPct,
+  );
 
   return (
     <div className="mb-6">
@@ -336,11 +354,8 @@ function CreditPoolCard({ pool }: { pool: CreditPoolInfo | null }) {
                 "state not reported"
               )}
               {pool.checkmarx_enforcement.consumptionPct !== undefined &&
-                `, ${pool.checkmarx_enforcement.consumptionPct}% consumed`}
-              {pool.checkmarx_enforcement.warningThresholdPct !== undefined &&
-                `; it warns at ${pool.checkmarx_enforcement.warningThresholdPct}%`}
-              {pool.checkmarx_enforcement.cutoffThresholdPct !== undefined &&
-                ` and cuts off at ${pool.checkmarx_enforcement.cutoffThresholdPct}%`}
+                `, ${formatPercent(pool.checkmarx_enforcement.consumptionPct)} consumed`}
+              {thresholds && `; ${thresholds}`}
               . CreditGuard does not change it.
             </InfoNote>
           </div>
@@ -421,11 +436,13 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
       const names = found.top.slice(0, 3).map((entry) => entry.name).join(", ");
       rows.push({
         key,
-        label: `${label[0]!.toUpperCase()}${label.slice(1)} names not matched`,
+        label: `${label[0]!.toUpperCase()}${label.slice(1)} ${found.count === 1 ? "name" : "names"} not matched`,
         count: found.count,
         credits: found.credits,
         total: found.total_credits,
-        note: `Usage under a repository name that matches no ${label} in Checkmarx One (such as ${names}). It counts towards no ${label}, group or application limit.`,
+        note: `Usage under a repository name that matches no ${label} in Checkmarx One (such as ${names}). It counts towards no ${
+          key === "projects" ? "project, group or application" : "application"
+        } limit.`,
       });
     }
   }
@@ -466,7 +483,7 @@ function AttributionCard({ summary, isAdmin }: { summary: AttributionSummary; is
                   </span>
                   <span className="tabular" style={{ color: "var(--text-secondary)" }}>
                     {formatCredits(row.credits)} credits
-                    {share !== null && ` (${share.toFixed(share < 10 ? 1 : 0)}% of ${formatCredits(row.total)})`}
+                    {share !== null && ` (${formatPercent(share)} of ${formatCredits(row.total)})`}
                   </span>
                 </div>
                 <p className="text-xs" style={{ color: "var(--text-muted)" }}>

@@ -319,8 +319,8 @@ SPECS: tuple[CheckSpec, ...] = (
         needed_for=(NEED_ENFORCE_FUSION,),
         breaks=(
             "A project's Fusion setting cannot be read before it is changed, so limits that "
-            "turn Fusion off cannot (or put it back exactly as it was), and Fusion turned off "
-            "cannot be verified."
+            "turn Fusion off cannot change it (or put it back exactly as it was), and Fusion "
+            "turned off cannot be verified."
         ),
     ),
     CheckSpec(
