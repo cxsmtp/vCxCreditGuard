@@ -127,6 +127,16 @@ export function BarList({ items, emptyTitle, emptyDescription, unavailable }: Pr
                     {item.limit !== null && ` of ${formatCredits(item.limit)}`}
                   </span>
                 </div>
+                {item.auto_triage_attributed && Number(item.auto_triage_attributed) > 0 && (
+                  <p
+                    className="mb-1 text-xs tabular"
+                    style={{ color: "var(--text-muted)" }}
+                    title="Auto Triage that ran after scans this person started, reassigned to them (Settings → Attribution). Checkmarx One reports it under its Auto-triage account, not under this person, and it never starts a restriction."
+                  >
+                    Also charged {formatCredits(item.auto_triage_attributed)} reassigned Auto Triage
+                    from their scans (not in this figure)
+                  </p>
+                )}
                 <div
                   className="relative h-2 w-full overflow-hidden rounded-sm"
                   style={{ background: "var(--hover)" }}

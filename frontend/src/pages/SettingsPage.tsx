@@ -40,7 +40,7 @@ import {
 import { FilterNote, useTableView, type ViewColumn } from "../components/tableView";
 import { useResource } from "../hooks/useResource";
 import { downloadText, timestampedName } from "../lib/export";
-import { formatCredits, formatDateTime, formatRelative } from "../lib/format";
+import { formatCredits, formatDateTime, formatNumber, formatRelative } from "../lib/format";
 import { applyAccent, useToast } from "../lib/ui-context";
 import { LookPicker } from "../components/AppShell";
 import { StatTile } from "../components/StatTile";
@@ -1221,7 +1221,7 @@ function AutoTriageCard({
         label="Charge auto-triage credits to the person who started the scan"
         description={
           checked
-            ? "On: auto triage counts against the scan starter's own budget, and a group budget that includes its members' usage. With many people near their budget, turning this on can restrict several at once: the enforcement safety ceiling still applies, and the Simulation shows the effect first."
+            ? "On: auto triage counts against the scan starter's own budget, and a group budget that includes its members' usage. It shows in their figures and can warn, but it never starts a restriction: a person is restricted only when their own usage reaches the limit. The Simulation shows the effect first."
             : "Off: auto triage counts against the project, its application and the tenant only, as Checkmarx One reports it."
         }
       />
@@ -1503,6 +1503,21 @@ function AppearanceCard({
   );
 }
 
+/** "2 people, 2 automation identities and 1 scan initiator." for the Unmatched tab. */
+function unmatchedBreakdown(rows: UnresolvedSubject[]): string {
+  const initiators = rows.filter((s) => s.source === "scan_initiator").length;
+  const automation = rows.filter((s) => s.is_bot && s.source !== "scan_initiator").length;
+  const people = rows.length - initiators - automation;
+  const parts = [
+    `${formatNumber(people)} ${people === 1 ? "person" : "people"}`,
+    `${formatNumber(automation)} automation ${automation === 1 ? "identity" : "identities"}`,
+  ];
+  if (initiators > 0) {
+    parts.push(`${formatNumber(initiators)} scan ${initiators === 1 ? "initiator" : "initiators"}`);
+  }
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}.`;
+}
+
 function AttributionCard({
   isAdmin,
   subjects,
@@ -1637,6 +1652,13 @@ function AttributionCard({
       <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
         {TAB_BLURB[tab]}
       </p>
+      {tab === "unmatched" && rows.length > 0 && (
+        <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
+          {unmatchedBreakdown(rows)} The Overview counts the people here together with those under
+          Disputes, and its automation also includes Checkmarx One&apos;s own Auto-triage, which is
+          not listed here.
+        </p>
+      )}
       <p className="mb-4 text-xs" style={{ color: "var(--text-secondary)" }}>
         Automation (a [bot] account, Auto-triage, an integration such as an SCM connector) counts
         towards nobody&apos;s user budget when its project had an active project budget at the time:

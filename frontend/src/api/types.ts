@@ -364,6 +364,13 @@ export interface AttributionSummary {
   user_total_credits: string;
   projects: UnmatchedEntities;
   applications: UnmatchedEntities;
+  /** Tenant total of the same window, and the part of it no project row accounts for. */
+  tenant_total_credits?: string | null;
+  projects_unreported?: string;
+  /** Of the unmatched people, those under Settings → Attribution → Disputes. */
+  unmatched_people_disputed?: number;
+  /** Of the automation, Checkmarx One's own (Auto Triage...), not listed under Attribution. */
+  automation_builtin?: number;
 }
 
 export interface UnmatchedEntity {
@@ -378,6 +385,8 @@ export interface UnmatchedEntity {
   /** Mapped, but the name now matches a synced entity by itself, which wins. */
   overridden?: boolean;
   overridden_by?: string | null;
+  /** The name is a project or application deleted in Checkmarx One. */
+  deleted?: boolean;
   /** After a mapping: where the name's usage counts from now on. */
   confirmation?: string | null;
   /** Keyset paging: the next page starts after this row, from these readings. */
@@ -426,6 +435,10 @@ export interface CreditPoolInfo {
     warningThresholdPct?: number;
     cutoffThresholdPct?: number;
   } | null;
+  /** Granted − used − available when Checkmarx sent all three and they do not add up. */
+  unexplained?: string | null;
+  /** Other figures /credits/info reported, as given (only when there is a gap). */
+  other_figures?: Record<string, string>;
 }
 
 export interface LimitPeriodState {
