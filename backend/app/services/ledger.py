@@ -1058,7 +1058,11 @@ def _feed(
 
 
 def _as_row(credits: Decimal, counts: dict[str, int]) -> SimpleNamespace:
-    return SimpleNamespace(actions=plain_actions(counts), credits_used=credits, raw=None)
+    # The shape Auto Triage attribution reads from a usage row: a start built from
+    # partner totals has no reported transaction count (an unknown, never 0).
+    return SimpleNamespace(
+        actions=plain_actions(counts), credits_used=credits, raw=None, transactions=None
+    )
 
 
 class _Shifts:
